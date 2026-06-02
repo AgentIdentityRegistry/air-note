@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { receive, buildOutboundEnvelope } from "../src/core.mjs";
-import { history, closeArchive, getCursor } from "../src/archive.mjs";
+import { receive, buildOutboundEnvelope, blockOp, unblockOp, listBlockedOp, reportSpamOp, deleteOp, historyOp } from "../src/core.mjs";
+import { history, closeArchive, getCursor, archiveMessage } from "../src/archive.mjs";
 import { block, loadBlocklist } from "../src/moderation.mjs";
 import { generateIdentity, pubKeyMultibase } from "../src/crypto.mjs";
 
@@ -75,4 +75,73 @@ test("receive() hard-drops a blocked sender, archives the rest, advances cursor 
   assert.equal(rows[0].peer_did, OK_DID);
   assert.equal(getCursor(), 7);                   // advanced past BOTH (max seq incl. blocked)
   assert.equal(loadBlocklist().blocked[BLOCKED_DID].drop_count, 1); // tally bumped
+});
+
+test("blockOp resolves a DID and lists it; unblockOp removes it", async () => {
+  const r = await blockOp({ peer: BLOCKED_DID });
+  assert.equal(r.status, "blocked");
+  const list = listBlockedOp();
+  assert.equal(list.count, 1);
+  assert.equal(list.blocked[0].did, BLOCKED_DID);
+  assert.equal((await unblockOp({ peer: BLOCKED_DID })).status, "unblocked");
+  assert.equal(listBlockedOp().count, 0);
+});
+
+test("reportSpamOp errors on an unknown id, hides + reports on a known received row", async () => {
+  await assert.rejects(() => reportSpamOp({ envelope_id: "missing" }), /no received message/);
+
+  archiveMessage({
+    envelope_id: "junk1", direction: "received", thread_id: "t", peer_did: OK_DID,
+    from_did: OK_DID, to_did: ME_DID, timestamp: "2026-06-01T00:00:00Z",
+    body: { type: "text", text: "spam" }, encrypted: false, verified: true, relay_seq: 1,
+  });
+  global.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) }); // abuse endpoint up
+  const r = await reportSpamOp({ envelope_id: "junk1" });
+  assert.equal(r.hidden, true);
+  assert.equal(r.reported, true);
+  assert.equal(r.subject, "AIR-OK");
+  assert.equal(history().length, 0);                      // hidden from default inbox
+  assert.equal(history({ includeSpam: true }).length, 1); // still there, flagged
+});
+
+test("deleteOp refuses without confirm and requires exactly one selector", async () => {
+  await assert.rejects(() => deleteOp({ envelope_id: "x" }), /confirm/);
+  await assert.rejects(() => deleteOp({ envelope_id: "x", peer: "y", confirm: true }), /exactly one/);
+});
+
+test("deleteOp deletes a conversation when confirmed", async () => {
+  archiveMessage({
+    envelope_id: "c1", direction: "received", thread_id: "t", peer_did: OK_DID,
+    from_did: OK_DID, to_did: ME_DID, timestamp: "2026-06-01T00:00:00Z",
+    body: { type: "text", text: "hi" }, encrypted: false, verified: true, relay_seq: 1,
+  });
+  const r = await deleteOp({ peer: OK_DID, confirm: true });
+  assert.equal(r.deleted, 1);
+  assert.equal(r.scope, "conversation");
+});
+
+test("deleteOp deletes a single message when envelope_id is given", async () => {
+  archiveMessage({
+    envelope_id: "m1", direction: "received", thread_id: "t", peer_did: OK_DID,
+    from_did: OK_DID, to_did: ME_DID, timestamp: "2026-06-01T00:00:00Z",
+    body: { type: "text", text: "x" }, encrypted: false, verified: true, relay_seq: 1,
+  });
+  const r = await deleteOp({ envelope_id: "m1", confirm: true });
+  assert.equal(r.deleted, 1);
+  assert.equal(r.scope, "message");
+  assert.equal(history({ includeSpam: true }).length, 0);
+});
+
+test("reportSpamOp hides locally even when the abuse report fails", async () => {
+  archiveMessage({
+    envelope_id: "junk2", direction: "received", thread_id: "t", peer_did: OK_DID,
+    from_did: OK_DID, to_did: ME_DID, timestamp: "2026-06-01T00:00:00Z",
+    body: { type: "text", text: "spam" }, encrypted: false, verified: true, relay_seq: 1,
+  });
+  global.fetch = async () => { throw new Error("network down"); };
+  const r = await reportSpamOp({ envelope_id: "junk2" });
+  assert.equal(r.hidden, true);
+  assert.equal(r.reported, false);
+  assert.ok(r.reason);
+  assert.equal(history({ includeSpam: true }).length, 1); // still marked spam
 });

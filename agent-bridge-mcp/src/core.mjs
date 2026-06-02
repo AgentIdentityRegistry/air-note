@@ -19,7 +19,10 @@ import {
   buildAad,
 } from "./crypto.mjs";
 import { ensureIdentity, loadIdentity, registerNewIdentity } from "./identity.mjs";
-import { archiveMessage, getCursor, setCursor, history as archiveHistory, recentForInbox } from "./archive.mjs";
+import {
+  archiveMessage, getCursor, setCursor, history as archiveHistory, recentForInbox,
+  markSpam, getReceived, deleteMessage, deleteConversation,
+} from "./archive.mjs";
 import {
   addContact,
   listContacts,
@@ -29,7 +32,10 @@ import {
   getContactByDid,
   loadContacts,
 } from "./contacts.mjs";
-import { isBlocked, recordBlockedDrops } from "./moderation.mjs";
+import {
+  isBlocked, recordBlockedDrops,
+  block as blockDid, unblock as unblockDid, listBlocked, reportAbuse,
+} from "./moderation.mjs";
 
 export const CORE_VERSION = "0.3.0";
 
@@ -468,14 +474,63 @@ export async function health() {
 }
 
 /** Read message history from the local archive. `peer` may be a DID, AIR id, or contact alias. */
-export function historyOp({ peer, thread, limit = 50, before } = {}) {
+export function historyOp({ peer, thread, limit = 50, before, includeSpam = false } = {}) {
   const resolvedPeer = peer ? resolveRecipient(peer) : undefined;
-  const messages = archiveHistory({ peer: resolvedPeer, thread, limit, before });
+  const messages = archiveHistory({ peer: resolvedPeer, thread, limit, before, includeSpam });
   return { count: messages.length, messages, resolvedPeer };
 }
 
 /** Recent messages across all conversations (the inbox view), from the local archive. */
-export function recentInbox({ limit = 20 } = {}) {
-  const messages = recentForInbox(limit);
+export function recentInbox({ limit = 20, includeSpam = false } = {}) {
+  const messages = recentForInbox(limit, { includeSpam });
   return { count: messages.length, messages };
+}
+
+export function blockOp({ peer }) {
+  if (!peer) throw new Error("peer (DID, AIR id, or alias) is required");
+  const did = resolveRecipient(peer);
+  const contact = getContactByDid(did);
+  const r = blockDid(did, { alias: contact?.alias ?? null });
+  return { status: r.already ? "already blocked" : "blocked", did: r.did, air_id: r.air_id, alias: r.alias };
+}
+
+export function unblockOp({ peer }) {
+  if (!peer) throw new Error("peer (DID, AIR id, or alias) is required");
+  const did = resolveRecipient(peer);
+  const { removed } = unblockDid(did);
+  return { status: removed ? "unblocked" : "not blocked", did };
+}
+
+export function listBlockedOp() {
+  const blocked = listBlocked();
+  return { count: blocked.length, blocked };
+}
+
+export async function reportSpamOp({ envelope_id }) {
+  if (!envelope_id) throw new Error("envelope_id is required (copy it from inbox/history)");
+  const row = getReceived(envelope_id);
+  if (!row) throw new Error(`no received message with envelope_id ${envelope_id} in your diary`);
+  const identity = await ensureIdentity();
+  const report = await reportAbuse({ identity, subjectDid: row.peer_did });
+  markSpam(envelope_id);
+  return {
+    hidden: true,
+    reported: report.reported,
+    subject: airIdFromDid(row.peer_did) ?? row.peer_did,
+    ...(report.reason ? { reason: report.reason } : {}),
+  };
+}
+
+export async function deleteOp({ envelope_id, peer, confirm = false } = {}) {
+  const hasId = !!envelope_id, hasPeer = !!peer;
+  if (!hasId && !hasPeer) throw new Error("pass exactly one of envelope_id or peer — got neither");
+  if (hasId && hasPeer)   throw new Error("pass exactly one of envelope_id or peer — got both");
+  if (confirm !== true)   throw new Error("refusing to delete without confirm:true (CLI: pass --yes)");
+  if (envelope_id) {
+    const { deleted } = deleteMessage(envelope_id);
+    return { deleted, scope: "message", envelope_id };
+  }
+  const did = resolveRecipient(peer);
+  const { deleted } = deleteConversation(did);
+  return { deleted, scope: "conversation", peer: did };
 }
