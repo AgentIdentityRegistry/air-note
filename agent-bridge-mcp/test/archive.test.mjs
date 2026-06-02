@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   archiveMessage, history, threads, getCursor, setCursor, closeArchive,
   markSpam, getReceived, recentForInbox, openArchive,
+  deleteMessage, deleteConversation,
 } from "../src/archive.mjs";
 
 let dir;
@@ -116,4 +117,23 @@ test("threads() excludes spam-flagged messages from counts and listing", () => {
   markSpam("tk2");
   const t = threads().find((x) => x.thread_id === "tT");
   assert.equal(t.count, 1); // the spam row is excluded from the count
+});
+
+test("deleteMessage removes all rows for an envelope_id and reports the count", () => {
+  const base = rec({ envelope_id: "d1", peer_did: "did:me", from_did: "did:me", to_did: "did:me" });
+  archiveMessage({ ...base, direction: "sent" });
+  archiveMessage({ ...base, direction: "received", relay_seq: 2 });
+  assert.equal(deleteMessage("d1").deleted, 2);
+  assert.equal(history({ includeSpam: true }).length, 0);
+  assert.equal(deleteMessage("d1").deleted, 0); // already gone
+});
+
+test("deleteConversation removes the whole two-way thread for a peer", () => {
+  archiveMessage(rec({ envelope_id: "r1", direction: "received", peer_did: "did:P" }));
+  archiveMessage(rec({ envelope_id: "s1", direction: "sent", peer_did: "did:P" }));
+  archiveMessage(rec({ envelope_id: "x1", direction: "received", peer_did: "did:OTHER" }));
+  assert.equal(deleteConversation("did:P").deleted, 2);
+  const left = history({ includeSpam: true });
+  assert.equal(left.length, 1);
+  assert.equal(left[0].peer_did, "did:OTHER");
 });

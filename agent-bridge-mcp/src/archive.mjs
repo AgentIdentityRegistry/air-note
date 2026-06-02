@@ -141,6 +141,20 @@ export function markSpam(envelope_id) {
   return { updated: res.changes };
 }
 
+/** Delete a message entirely from the local diary (all directions of its id). */
+export function deleteMessage(envelope_id) {
+  const db = openArchive();
+  const res = db.prepare(`DELETE FROM messages WHERE envelope_id = ?`).run(envelope_id);
+  return { deleted: res.changes };
+}
+
+/** Delete the whole two-way conversation with a peer (received + sent rows). */
+export function deleteConversation(peer_did) {
+  const db = openArchive();
+  const res = db.prepare(`DELETE FROM messages WHERE peer_did = ?`).run(peer_did);
+  return { deleted: res.changes };
+}
+
 /** Fetch the received row for an envelope_id (used to find the spam subject), or null. */
 export function getReceived(envelope_id) {
   const db = openArchive();
