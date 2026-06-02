@@ -12,9 +12,12 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { signRaw, jcsCanonical } from "./crypto.mjs";
 import { bridgeHome } from "./identity.mjs";
 
 const BLOCKLIST_VERSION = 1;
+const ABUSE_REPORT_VERSION = 1;
 const blocklistPath = () => join(bridgeHome(), "blocklist.json");
 
 /** Extract an AIR id from a DID (local copy — must not depend on core.mjs). */
@@ -94,5 +97,42 @@ export function recordBlockedDrops(countsByDid) {
     saveBlocklist(store);
   } catch (err) {
     process.stderr.write(`[blocklist] drop-tally write failed: ${err.message ?? err}\n`);
+  }
+}
+
+/** Spec §7 seam: build + sign a private abuse report and POST it. Always best-effort —
+ *  any failure returns {reported:false} and never throws (the local spam-hide already
+ *  applied). report_id + version make the signed report replay-safe + versionable. */
+export async function reportAbuse({ identity, subjectDid, report_type = "spam",
+  log = (s) => process.stderr.write(s + "\n") }) {
+  if (!identity?.air_id) return { reported: false, reason: "identity has no air_id" };
+  const subject_air_id = airIdFromDid(subjectDid);
+  if (!subject_air_id) return { reported: false, reason: "no AIR id in subject" };
+  if (subject_air_id === identity.air_id) return { reported: false, reason: "cannot report yourself" };
+
+  const payload = {
+    report_id: randomUUID(),
+    version: ABUSE_REPORT_VERSION,
+    reporter_air_id: identity.air_id,
+    subject_air_id,
+    report_type,
+    reported_at: new Date().toISOString(),
+  };
+
+  try {
+    const signature_multibase = signRaw(Buffer.from(jcsCanonical(payload), "utf8"), identity.privateKey);
+    const resp = await fetch(`${identity.air_url}/api/v1/agents/${subject_air_id}/abuse-reports`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Agent-Secret": identity.agent_secret },
+      body: JSON.stringify({ ...payload, signature_multibase }),
+    });
+    if (!resp.ok) {
+      log(`[abuse-report] ${subject_air_id} → HTTP ${resp.status} (kept local hide)`);
+      return { reported: false, reason: `HTTP ${resp.status}` };
+    }
+    return { reported: true };
+  } catch (e) {
+    log(`[abuse-report] ${subject_air_id} → ${e.message ?? e} (kept local hide)`);
+    return { reported: false, reason: String(e.message ?? e) };
   }
 }

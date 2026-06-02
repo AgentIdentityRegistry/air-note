@@ -4,8 +4,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  isBlocked, block, unblock, listBlocked, recordBlockedDrops, loadBlocklist,
+  isBlocked, block, unblock, listBlocked, recordBlockedDrops, loadBlocklist, reportAbuse,
 } from "../src/moderation.mjs";
+import { generateIdentity } from "../src/crypto.mjs";
 
 const DID_A = "did:wba:agentidentityregistry.org:agents:AIR-AAAA";
 const DID_B = "did:wba:agentidentityregistry.org:agents:AIR-BBBB";
@@ -71,4 +72,80 @@ test("listBlocked returns entries with the DID included", () => {
 
 test("listBlocked returns [] on a fresh store", () => {
   assert.deepEqual(listBlocked(), []);
+});
+
+const SUBJECT_DID = "did:wba:agentidentityregistry.org:agents:AIR-BAD0";
+function fakeIdentity() {
+  const k = generateIdentity(); // fresh Ed25519
+  return {
+    air_id: "AIR-ME00", air_url: "http://air.test",
+    agent_secret: "s3cret", privateKey: k.privateKey,
+  };
+}
+
+test("reportAbuse posts a signed, replay-keyed report and returns reported:true on 2xx", async () => {
+  const real = global.fetch;
+  let captured;
+  global.fetch = async (url, opts) => {
+    captured = { url: String(url), opts };
+    return { ok: true, status: 200, json: async () => ({ status: "received" }) };
+  };
+  try {
+    const r = await reportAbuse({ identity: fakeIdentity(), subjectDid: SUBJECT_DID });
+    assert.equal(r.reported, true);
+    assert.match(captured.url, /\/api\/v1\/agents\/AIR-BAD0\/abuse-reports$/);
+    assert.equal(captured.opts.headers["X-Agent-Secret"], "s3cret");
+    const body = JSON.parse(captured.opts.body);
+    assert.equal(body.version, 1);
+    assert.equal(body.report_type, "spam");
+    assert.equal(body.reporter_air_id, "AIR-ME00");
+    assert.equal(body.subject_air_id, "AIR-BAD0");
+    assert.ok(body.report_id && body.reported_at && body.signature_multibase);
+  } finally {
+    global.fetch = real;
+  }
+});
+
+test("reportAbuse degrades to reported:false on HTTP error and on network throw (never throws)", async () => {
+  const real = global.fetch;
+  try {
+    global.fetch = async () => ({ ok: false, status: 404, text: async () => "no route" });
+    const r404 = await reportAbuse({ identity: fakeIdentity(), subjectDid: SUBJECT_DID });
+    assert.equal(r404.reported, false);
+
+    global.fetch = async () => { throw new Error("ECONNREFUSED"); };
+    const rNet = await reportAbuse({ identity: fakeIdentity(), subjectDid: SUBJECT_DID });
+    assert.equal(rNet.reported, false);
+  } finally {
+    global.fetch = real;
+  }
+});
+
+test("reportAbuse refuses to report yourself (no fetch)", async () => {
+  const real = global.fetch;
+  let called = false;
+  global.fetch = async () => { called = true; return { ok: true, status: 200, json: async () => ({}) }; };
+  try {
+    const id = fakeIdentity();
+    const selfDid = "did:wba:agentidentityregistry.org:agents:" + id.air_id;
+    const r = await reportAbuse({ identity: id, subjectDid: selfDid });
+    assert.equal(r.reported, false);
+    assert.equal(called, false);
+  } finally {
+    global.fetch = real;
+  }
+});
+
+test("reportAbuse never throws even if signing fails (bad key) — degrades to reported:false", async () => {
+  const real = global.fetch;
+  let called = false;
+  global.fetch = async () => { called = true; return { ok: true, status: 200, json: async () => ({}) }; };
+  try {
+    const badId = { air_id: "AIR-ME00", air_url: "http://air.test", agent_secret: "s", privateKey: null };
+    const r = await reportAbuse({ identity: badId, subjectDid: SUBJECT_DID });
+    assert.equal(r.reported, false); // degraded, did NOT throw
+    assert.equal(called, false);     // failed at signing, before fetch
+  } finally {
+    global.fetch = real;
+  }
 });
