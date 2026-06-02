@@ -12,6 +12,7 @@ import { CORE_VERSION } from "./core.mjs";
 import { ensureIdentity } from "./identity.mjs";
 import { watch } from "./watch.mjs";
 import { makeChannelPush } from "./channel.mjs";
+import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 
 const server = new Server(
   { name: "air-msg-channel", version: CORE_VERSION },
@@ -27,12 +28,13 @@ const server = new Server(
 async function main() {
   await server.connect(new StdioServerTransport());
   const identity = await ensureIdentity();
+  if (!acquireOrExit("channel-server")) return;
   // mute feeds the push gate (channelGate inside makeChannelPush). watch() builds its
   // own mute from AIRMSG_MUTE for the (here no-op) notifier path, so we construct ours here.
   const mute = new Set((process.env.AIRMSG_MUTE || "").split(",").map((s) => s.trim()).filter(Boolean));
   const ac = new AbortController();
-  process.once("SIGINT", () => ac.abort());
-  process.once("SIGTERM", () => ac.abort());
+  process.once("SIGINT", () => { ac.abort(); releaseConsumerLock(); });
+  process.once("SIGTERM", () => { ac.abort(); releaseConsumerLock(); });
 
   process.stderr.write(`air-msg-channel v${CORE_VERSION} watching ${identity.did} (push gate: verified+pinned)\n`);
 
@@ -43,6 +45,7 @@ async function main() {
     openResolver: () => null,                        // unused on the channel path
     onMessage: makeChannelPush(server, { mute }),
   }).catch((e) => { if (e?.name !== "AbortError") throw e; });   // clean signal shutdown
+  releaseConsumerLock();
 }
 
 main().catch((e) => {

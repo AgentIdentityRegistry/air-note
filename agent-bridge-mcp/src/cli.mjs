@@ -24,6 +24,7 @@ import { ensureIdentity } from "./identity.mjs";
 import { createNotifier } from "./notifier.mjs";
 import { resolveOpenCommand, runOpenCommand, detectAiCmd } from "./open-conversation.mjs";
 import { watch } from "./watch.mjs";
+import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 
 const tty = process.stdout.isTTY;
 const c = {
@@ -189,6 +190,7 @@ async function main() {
     }
     case "watch": {
       const identity = await ensureIdentity();
+      if (!acquireOrExit("watch")) break;
       const openMode = process.env.AIRMSG_OPEN || "terminal-history";
       const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
       const openResolver = (peer, info) =>
@@ -197,7 +199,7 @@ async function main() {
       const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
 
       const ac = new AbortController();
-      const stop = () => { console.log(c.dim("\n…stopping watch")); ac.abort(); };
+      const stop = () => { console.log(c.dim("\n…stopping watch")); ac.abort(); releaseConsumerLock(); };
       process.once("SIGINT", stop);
       process.once("SIGTERM", stop);
 
@@ -215,6 +217,7 @@ async function main() {
           console.log(`    ${txt}`);
         },
       }).catch((e) => { if (e?.name !== "AbortError") throw e; });
+      releaseConsumerLock();
       break;
     }
     case "add": {
