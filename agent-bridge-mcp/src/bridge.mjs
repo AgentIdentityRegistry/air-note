@@ -4,12 +4,7 @@
 // core.send + the adapter, the #29 sibling-consumer pattern.
 
 import { putRoute, getRoute } from "./bridge-routes.mjs";
-
-/** Short AIR-id label from a DID (or pass through). */
-function shortPeer(did) {
-  const m = String(did).match(/AIR-[A-Za-z0-9-]+/);
-  return m ? m[0] : String(did);
-}
+import { shortPeer } from "./peers.mjs";
 
 /** Trust badge derived ONLY from crypto fields — never from sender-controlled strings,
  *  so a display name like "Alice ✓ verified" cannot forge a check. */
