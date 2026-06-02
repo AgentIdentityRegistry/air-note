@@ -229,33 +229,36 @@ async function main() {
     case "watch": {
       const identity = await ensureIdentity();
       if (!acquireOrExit("watch")) break;
-      const openMode = process.env.AIRMSG_OPEN || "terminal-history";
-      const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
-      const openResolver = (peer, info) =>
-        resolveOpenCommand(peer, { mode: openMode, aiCmd, ...info });
+      try {
+        const openMode = process.env.AIRMSG_OPEN || "terminal-history";
+        const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
+        const openResolver = (peer, info) =>
+          resolveOpenCommand(peer, { mode: openMode, aiCmd, ...info });
 
-      const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
+        const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
 
-      const ac = new AbortController();
-      const stop = () => { console.log(c.dim("\n…stopping watch")); ac.abort(); releaseConsumerLock(); };
-      process.once("SIGINT", stop);
-      process.once("SIGTERM", stop);
+        const ac = new AbortController();
+        const stop = () => { console.log(c.dim("\n…stopping watch")); ac.abort(); };
+        process.once("SIGINT", stop);
+        process.once("SIGTERM", stop);
 
-      console.log(`${c.green("● watching")} ${c.bold(identity.did)}`);
-      console.log(`  ${c.dim(`notify: ${notifier.backend} · open: ${openMode}${aiCmd ? " (" + aiCmd + ")" : ""} · Ctrl-C to stop`)}`);
+        console.log(`${c.green("● watching")} ${c.bold(identity.did)}`);
+        console.log(`  ${c.dim(`notify: ${notifier.backend} · open: ${openMode}${aiCmd ? " (" + aiCmd + ")" : ""} · Ctrl-C to stop`)}`);
 
-      await watch({
-        signal: ac.signal, identity, notifier, openResolver,
-        onMessage: (m) => {
-          const who = m.contact ? m.contact : m.from;
-          const enc = m.encrypted ? "🔒" : "✉️ ";
-          const vrf = m.verified ? c.green("✓") : c.red("✗");
-          const txt = bodyText(m.body);
-          console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
-          console.log(`    ${txt}`);
-        },
-      }).catch((e) => { if (e?.name !== "AbortError") throw e; });
-      releaseConsumerLock();
+        await watch({
+          signal: ac.signal, identity, notifier, openResolver,
+          onMessage: (m) => {
+            const who = m.contact ? m.contact : m.from;
+            const enc = m.encrypted ? "🔒" : "✉️ ";
+            const vrf = m.verified ? c.green("✓") : c.red("✗");
+            const txt = bodyText(m.body);
+            console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
+            console.log(`    ${txt}`);
+          },
+        }).catch((e) => { if (e?.name !== "AbortError") throw e; });
+      } finally {
+        releaseConsumerLock();
+      }
       break;
     }
     case "bridge": {
@@ -267,55 +270,57 @@ async function main() {
         process.exit(1);
       }
       if (!acquireOrExit("bridge")) break;
+      try {
+        const identity = await ensureIdentity();
+        const bodyMode = process.env.AIRMSG_BRIDGE_BODY === "meta" ? "meta" : "full";
 
-      const identity = await ensureIdentity();
-      const bodyMode = process.env.AIRMSG_BRIDGE_BODY === "meta" ? "meta" : "full";
+        const ac = new AbortController();
+        const stop = () => { console.log(c.dim("\n…stopping bridge")); ac.abort(); };
+        process.once("SIGINT", stop);
+        process.once("SIGTERM", stop);
 
-      const ac = new AbortController();
-      const stop = () => { console.log(c.dim("\n…stopping bridge")); ac.abort(); releaseConsumerLock(); };
-      process.once("SIGINT", stop);
-      process.once("SIGTERM", stop);
+        const adapter = createTelegramAdapter({
+          token: cfg.telegram.bot_token,
+          chatId: Number(cfg.telegram.chat_id),
+          getOffset: () => getUpdateOffset({ platform: "telegram" }),
+          setOffset: (o) => setUpdateOffset({ platform: "telegram", offset: o }),
+          signal: ac.signal,
+        });
 
-      const adapter = createTelegramAdapter({
-        token: cfg.telegram.bot_token,
-        chatId: Number(cfg.telegram.chat_id),
-        getOffset: () => getUpdateOffset({ platform: "telegram" }),
-        setOffset: (o) => setUpdateOffset({ platform: "telegram", offset: o }),
-        signal: ac.signal,
-      });
+        // D6: the bridge is a superset of `watch` — fire the local OS banner too.
+        const openMode = process.env.AIRMSG_OPEN || "terminal-history";
+        const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
+        const openResolver = (peer, info) => resolveOpenCommand(peer, { mode: openMode, aiCmd, ...info });
+        const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
 
-      // D6: the bridge is a superset of `watch` — fire the local OS banner too.
-      const openMode = process.env.AIRMSG_OPEN || "terminal-history";
-      const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
-      const openResolver = (peer, info) => resolveOpenCommand(peer, { mode: openMode, aiCmd, ...info });
-      const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
+        const confirm = makeConfirmStore();
+        const outbound = makeBridgeOutbound({ adapter, bodyMode });
 
-      const confirm = makeConfirmStore();
-      const outbound = makeBridgeOutbound({ adapter, bodyMode });
+        pruneRoutes({ platform: "telegram", now: Date.now() });
+        console.log(`${c.green("● bridging")} ${c.bold(identity.did)} ${c.dim("→ Telegram")}`);
+        console.log(`  ${c.dim(`body: ${bodyMode} · notify: ${notifier.backend} · Ctrl-C to stop`)}`);
+        if (bodyMode === "full") {
+          console.log(c.yellow("  ⚠ full message text is sent to Telegram (outside E2E). Set AIRMSG_BRIDGE_BODY=meta for metadata-only."));
+        }
 
-      pruneRoutes({ platform: "telegram", now: Date.now() });
-      console.log(`${c.green("● bridging")} ${c.bold(identity.did)} ${c.dim("→ Telegram")}`);
-      console.log(`  ${c.dim(`body: ${bodyMode} · notify: ${notifier.backend} · Ctrl-C to stop`)}`);
-      if (bodyMode === "full") {
-        console.log(c.yellow("  ⚠ full message text is sent to Telegram (outside E2E). Set AIRMSG_BRIDGE_BODY=meta for metadata-only."));
+        // INBOUND loop (replies → AIR Notes) runs alongside the OUTBOUND watch loop.
+        const inbound = adapter
+          .listen({ signal: ac.signal, onReply: makeReplyHandler({ sendFn: core.send, confirm }) })
+          .catch((e) => { if (e?.name !== "AbortError") console.error("bridge inbound:", e.message ?? e); });
+
+        await watch({
+          signal: ac.signal, identity, notifier, openResolver,
+          onMessage: (m) => {
+            outbound(m); // push to Telegram + store the route
+            const vrf = (m.verified && !m.key_changed) ? c.green("✓") : c.red("⚠");
+            console.log(`  ↓→tg ${vrf} ${m.contact || m.from}`);
+          },
+        }).catch((e) => { if (e?.name !== "AbortError") throw e; });
+
+        await inbound;
+      } finally {
+        releaseConsumerLock();
       }
-
-      // INBOUND loop (replies → AIR Notes) runs alongside the OUTBOUND watch loop.
-      const inbound = adapter
-        .listen({ signal: ac.signal, onReply: makeReplyHandler({ sendFn: core.send, confirm }) })
-        .catch((e) => { if (e?.name !== "AbortError") console.error("bridge inbound:", e.message ?? e); });
-
-      await watch({
-        signal: ac.signal, identity, notifier, openResolver,
-        onMessage: (m) => {
-          outbound(m); // push to Telegram + store the route
-          const vrf = (m.verified && !m.key_changed) ? c.green("✓") : c.red("⚠");
-          console.log(`  ↓→tg ${vrf} ${m.contact || m.from}`);
-        },
-      }).catch((e) => { if (e?.name !== "AbortError") throw e; });
-
-      await inbound;
-      releaseConsumerLock();
       break;
     }
     case "add": {
