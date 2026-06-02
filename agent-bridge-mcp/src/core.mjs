@@ -29,6 +29,7 @@ import {
   getContactByDid,
   loadContacts,
 } from "./contacts.mjs";
+import { isBlocked, recordBlockedDrops } from "./moderation.mjs";
 
 export const CORE_VERSION = "0.3.0";
 
@@ -248,7 +249,12 @@ export async function receive({ since, limit } = {}) {
   const batch = await resp.json();
 
   const messages = [];
+  const drops = new Map(); // batched block drop-tally (one write after the loop)
   for (const m of batch.messages) {
+    if (isBlocked(m.sender_did)) {        // hard drop BEFORE decode/verify/archive (D2/D12)
+      drops.set(m.sender_did, (drops.get(m.sender_did) ?? 0) + 1);
+      continue;
+    }
     let envelope = null;
     let verified = false;
     let verify_note = null;
@@ -323,6 +329,7 @@ export async function receive({ since, limit } = {}) {
       console.error(`[archive] failed to persist received message ${m.envelope_id}: ${err.message ?? err}`);
     }
   }
+  if (drops.size) recordBlockedDrops(drops);
   // Advance the cursor past all delivered messages even if some archive writes failed:
   // the live batch was already returned to the caller; the diary is best-effort (see Task 2).
   // NOTE: only the first relay page is fetched per call — callers re-invoke receive() while
