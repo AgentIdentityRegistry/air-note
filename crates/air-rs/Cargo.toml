@@ -1,0 +1,75 @@
+[package]
+name = "air-rs"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Reference Rust implementation of the AIR Agent-to-Agent (A2A) protocol — see https://agentidentityregistry.org/specs/air/draft-1"
+homepage = "https://agentidentityregistry.org/specs/air/"
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+documentation = "https://docs.rs/air-rs"
+readme = "README.md"
+keywords = ["a2a", "did", "did-wba", "ed25519", "agent"]
+categories = ["cryptography", "network-programming"]
+
+# Pre-1.0 — API is subject to change until /specs/air/v1 promotion (target: Phase 3 Week 5)
+# Bump to 0.1.0 when v1 promotion lands.
+
+[dependencies]
+# Crypto + signing (PINNED for cross-language interop — see /specs/air/draft-1 §5)
+ed25519-dalek = "2.1"
+serde_jcs = "0.1.0"        # MUST stay at this pin; cross-lang test vectors validate against it
+multibase = "0.9"
+
+# Sealed-box body encryption (spec §10) — ephemeral-static X25519 → HKDF-SHA256
+# → ChaCha20-Poly1305. Byte-compatible with the JS reference in
+# `agent-bridge-mcp/src/crypto.mjs`. See `seal` module.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+hkdf = "0.12"
+sha2 = "0.10"             # also used by the conformance harness (dev-dep below)
+chacha20poly1305 = "0.10"
+# base64url encoding for the sealed-box `nonce`/`ct` fields. Previously only a
+# transport-gated optional dep; the `seal` module needs it unconditionally.
+base64 = "0.22"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# NFC normalization for all string values prior to JCS (spec §5).
+unicode-normalization = "0.1"
+
+# Time + IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Error handling
+thiserror = "1"
+
+# Transport (W3-2) — HTTP client + async + SSE parsing for relay communication.
+# `transport` feature gates these so that the core envelope/signing types stay
+# usable in no-std / embedded contexts that don't need network IO.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"], optional = true }
+futures = { version = "0.3", optional = true }
+async-stream = { version = "0.3", optional = true }
+eventsource-stream = { version = "0.2", optional = true }
+url = { version = "2.5", optional = true }
+
+[dev-dependencies]
+# For conformance harness (`sha2` is now a regular dependency above, used by the
+# `seal` module's Ed25519→X25519 conversion).
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+# For transport integration tests
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[[test]]
+name = "jcs_vectors"
+path = "tests/conformance/jcs_vectors.rs"
+required-features = ["conformance"]
+
+[features]
+default = ["transport"]
+conformance = []  # Enables tests/conformance/jcs_vectors.rs against /specs/air/draft-1/test-vectors.json
+transport = ["reqwest", "tokio", "futures", "async-stream", "eventsource-stream", "url"]

@@ -1,0 +1,474 @@
+// core.mjs — shared messaging operations for ALL front-ends.
+//
+// The "one store, many front-ends" design: both the MCP server (index.mjs)
+// and the CLI (cli.mjs) call these functions. They read/write the same
+// ~/.air-msg store (identity.json, contacts.json), sign with the same key,
+// and talk to the same relay. Each function returns plain data; the caller
+// formats it (MCP content block, or terminal text).
+
+import { randomUUID } from "node:crypto";
+import {
+  signEnvelope,
+  verifyEnvelope,
+  signRaw,
+  jcsCanonical,
+  pubKeyFromMultibase,
+  pubKeyMultibase,
+  sealBody,
+  openBody,
+  buildAad,
+} from "./crypto.mjs";
+import { ensureIdentity, loadIdentity, registerNewIdentity } from "./identity.mjs";
+import { archiveMessage, getCursor, setCursor, history as archiveHistory, recentForInbox } from "./archive.mjs";
+import {
+  addContact,
+  listContacts,
+  checkPin,
+  touchContact,
+  fingerprintOf,
+  getContactByDid,
+  loadContacts,
+} from "./contacts.mjs";
+
+export const CORE_VERSION = "0.3.0";
+
+export const VALID_ATTESTATION_TYPES = [
+  "identity_verification",
+  "operator_confirmation",
+  "dependency",
+  "safety_review",
+];
+
+// Resolved sender public keys, keyed by DID (TTL per spec §4.5 = 60s).
+const pubKeyCache = new Map();
+const PUBKEY_TTL_MS = 60_000;
+
+// --------------------------------------------------------------------------
+// Helpers
+// --------------------------------------------------------------------------
+
+/** Extract an AIR ID (AIR-XXXX-...) from a DID or accept a bare AIR ID. */
+export function airIdFromDid(didOrId) {
+  const m = String(didOrId).match(/AIR-[A-Za-z0-9-]+/);
+  return m ? m[0] : null;
+}
+
+/** Canonical AIR did:wba host — matches the DIDs AIR mints + every DID we construct. */
+const AIR_DID_HOST = "agentidentityregistry.org";
+
+/** Build the canonical did:wba DID for a bare AIR id. */
+export function didFromAirId(airId) {
+  return `did:wba:${AIR_DID_HOST}:agents:${airId}`;
+}
+
+/** Resolve "to" which may be a DID, AIR ID, or a saved contact alias. */
+export function resolveRecipient(to) {
+  if (/^did:/.test(to)) return to;
+  // A bare AIR id MUST be normalized to its canonical DID: the relay queues strictly by
+  // the exact recipient string, and every recipient pulls from /inbox/<full-did>. Sending
+  // to a bare AIR id would POST to a different queue and silently never be delivered.
+  if (/^AIR-/.test(to)) return didFromAirId(to);
+  // otherwise treat as a saved contact alias
+  const c = listContacts().find((x) => x.alias === to);
+  return c ? c.did : to;
+}
+
+/** Resolve an agent DID's raw Ed25519 public key via the AIR DID document. */
+async function resolveAgentPublicKey(airUrl, did) {
+  const cached = pubKeyCache.get(did);
+  if (cached && Date.now() - cached.at < PUBKEY_TTL_MS) return cached.key;
+  const airId = airIdFromDid(did);
+  if (!airId) return null;
+  const resp = await fetch(`${airUrl}/api/v1/agents/${airId}/did-document`);
+  if (!resp.ok) return null;
+  const doc = await resp.json();
+  const vm = (doc.verificationMethod || []).find((m) => m.publicKeyMultibase);
+  if (!vm) return null;
+  let key;
+  try {
+    key = pubKeyFromMultibase(vm.publicKeyMultibase);
+  } catch {
+    return null;
+  }
+  pubKeyCache.set(did, { key, at: Date.now() });
+  return key;
+}
+
+/** Normalize a body argument: a string becomes a {type:"text"} body; objects pass through. */
+export function wrapBody(body) {
+  return typeof body === "string" ? { type: "text", text: body } : body;
+}
+
+/** Build an outbound envelope; encrypts the body unless plaintext is requested. */
+export function buildOutboundEnvelope({
+  identity, recipientDid, recipientEd25519Pub, body, thread_id, in_reply_to, plaintext = false,
+}) {
+  const wrapped = wrapBody(body);
+  const envelope = {
+    id: randomUUID(),
+    from: identity.did,
+    to: recipientDid,
+    timestamp: new Date().toISOString(),
+    in_reply_to: in_reply_to ?? null,
+    thread_id: thread_id ?? randomUUID(),
+    nonce: randomUUID(),
+    body: wrapped,
+  };
+  if (!plaintext) {
+    if (!recipientEd25519Pub) {
+      throw new Error(
+        "cannot resolve recipient's key from AIR — refusing to send unencrypted. " +
+        "Pass plaintext:true to send in the clear on purpose.",
+      );
+    }
+    envelope.body = sealBody(wrapped, recipientEd25519Pub, buildAad(envelope));
+  }
+  return signEnvelope(envelope, identity.privateKey);
+}
+
+/** Given a received envelope, my seed, and whether its signature verified, surface
+ *  body + encryption status. Never decrypts an unverified message, and never surfaces
+ *  a raw ciphertext blob as the body (verify-before-decrypt). */
+export function decodeReceivedMessage(envelope, myEd25519SeedHex, verified = true) {
+  const isEncrypted = envelope?.body?.type === "encrypted";
+  if (!verified) {
+    return { encrypted: isEncrypted, body: isEncrypted ? undefined : envelope?.body };
+  }
+  if (isEncrypted) {
+    try {
+      const body = openBody(envelope.body, myEd25519SeedHex, buildAad(envelope));
+      return { encrypted: true, body };
+    } catch (e) {
+      return { encrypted: true, decrypt_error: String(e.message ?? e) };
+    }
+  }
+  return { encrypted: false, body: envelope.body };
+}
+
+// --------------------------------------------------------------------------
+// Operations
+// --------------------------------------------------------------------------
+
+export async function register({ name } = {}) {
+  const existing = loadIdentity();
+  if (existing) {
+    return { status: "already_registered", air_id: existing.air_id, did: existing.did, name: existing.name };
+  }
+  const id = await registerNewIdentity({ name });
+  return {
+    status: "registered",
+    air_id: id.air_id,
+    did: id.did,
+    name: id.name,
+    public_key_multibase: id.public_key_multibase,
+    service_endpoint_published: id.service_endpoint_published,
+  };
+}
+
+export async function myStatus() {
+  const identity = loadIdentity();
+  if (!identity) return { registered: false };
+  let air = null;
+  try {
+    const resp = await fetch(`${identity.air_url}/api/v1/agents/${identity.air_id}`);
+    if (resp.ok) air = await resp.json();
+  } catch {
+    /* offline */
+  }
+  return {
+    registered: true,
+    air_id: identity.air_id,
+    did: identity.did,
+    name: identity.name,
+    fingerprint: fingerprintOf(identity.rawPublicKey).short,
+    public_key_multibase: identity.public_key_multibase,
+    trust_score: air?.trust_score ?? null,
+    verification_status: air?.verification_status ?? null,
+    verified: air?.verification_status?.verified ?? air?.verified ?? false,
+  };
+}
+
+export async function send({ to, body, thread_id, in_reply_to, plaintext = false }) {
+  if (!to) throw new Error("recipient (DID, AIR ID, or contact alias) is required");
+  if (body === undefined || body === null) throw new Error("body is required");
+  const identity = await ensureIdentity();
+  const recipient = resolveRecipient(to);
+  const recipientEd25519Pub = plaintext
+    ? null
+    : await resolveAgentPublicKey(identity.air_url, recipient);
+  const envelope = buildOutboundEnvelope({
+    identity, recipientDid: recipient, recipientEd25519Pub, body, thread_id, in_reply_to, plaintext,
+  });
+  const resp = await fetch(`${identity.relay_url}/inbox/${encodeURIComponent(recipient)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(envelope),
+  });
+  if (!resp.ok) throw new Error(`relay ${resp.status}: ${await resp.text()}`);
+  const receipt = await resp.json();
+  try {
+    archiveMessage({
+      envelope_id: envelope.id,
+      direction: "sent",
+      thread_id: envelope.thread_id,
+      peer_did: recipient,
+      from_did: identity.did,
+      to_did: recipient,
+      timestamp: envelope.timestamp,
+      body: wrapBody(body),
+      encrypted: envelope.body.type === "encrypted",
+      verified: true,
+    });
+  } catch (err) {
+    // A local archive write must never shadow a successful send.
+    console.error(`[archive] failed to persist sent message: ${err.message ?? err}`);
+  }
+  return {
+    status: "sent",
+    signed: true,
+    encrypted: envelope.body.type === "encrypted",
+    envelope_id: receipt.envelope_id,
+    relay_seq: receipt.seq,
+    from: identity.did,
+    to: recipient,
+    thread_id: envelope.thread_id,
+  };
+}
+
+export async function receive({ since, limit } = {}) {
+  const identity = await ensureIdentity();
+  let from = since;
+  if (from == null) {
+    try { from = getCursor(); } catch { from = 0; } // archive unavailable → pull from the start
+  }
+  const params = new URLSearchParams({ since: String(from) });
+  if (limit) params.set("limit", String(limit));
+  const resp = await fetch(`${identity.relay_url}/pull/${encodeURIComponent(identity.did)}?${params}`);
+  if (!resp.ok) throw new Error(`relay ${resp.status}: ${await resp.text()}`);
+  const batch = await resp.json();
+
+  const messages = [];
+  for (const m of batch.messages) {
+    let envelope = null;
+    let verified = false;
+    let verify_note = null;
+    let key_changed = false;
+    let contact_alias = null;
+    try {
+      envelope = JSON.parse(Buffer.from(m.envelope_b64, "base64").toString("utf8"));
+      const pub = await resolveAgentPublicKey(identity.air_url, m.sender_did);
+      if (!pub) {
+        verify_note = "sender public key not resolvable from AIR";
+      } else if (envelope.from !== m.sender_did) {
+        verify_note = "envelope `from` does not match relay sender_did";
+      } else {
+        verified = verifyEnvelope(envelope, pub);
+        if (!verified) {
+          verify_note = "signature did NOT verify — possible forgery or tampering";
+        } else {
+          const pin = checkPin(m.sender_did, pubKeyMultibase(pub));
+          if (pin.known) {
+            contact_alias = pin.contact.alias;
+            if (!pin.pinned_matches) {
+              key_changed = true;
+              verify_note =
+                "⚠️ sender's key CHANGED since you pinned this contact — " +
+                "could be key rotation OR compromise/impersonation. " +
+                "Re-verify out-of-band before trusting (agent_add_contact to re-pin).";
+            } else {
+              touchContact(m.sender_did);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      verify_note = `decode/verify error: ${String(e.message ?? e)}`;
+    }
+    let decoded = { encrypted: false, body: undefined };
+    if (envelope) {
+      decoded = decodeReceivedMessage(envelope, identity.seed_hex, verified);
+      if (decoded.decrypt_error) {
+        const note = `decrypt failed: ${decoded.decrypt_error}`;
+        verify_note = verify_note ? `${verify_note}; ${note}` : note;
+      }
+    }
+    messages.push({
+      seq: m.seq,
+      from: m.sender_did,
+      ...(contact_alias ? { contact: contact_alias } : {}),
+      envelope_id: m.envelope_id,
+      received_at: new Date(m.queued_at * 1000).toISOString(),
+      verified,
+      encrypted: decoded.encrypted,
+      ...(key_changed ? { key_changed: true } : {}),
+      ...(verify_note ? { verify_note } : {}),
+      ...(decoded.body && envelope ? { body: decoded.body, thread_id: envelope.thread_id } : {}),
+    });
+    try {
+      archiveMessage({
+        envelope_id: m.envelope_id,
+        direction: "received",
+        thread_id: envelope?.thread_id ?? m.envelope_id,
+        peer_did: m.sender_did,
+        from_did: envelope?.from ?? m.sender_did,
+        to_did: identity.did,
+        timestamp: envelope?.timestamp ?? new Date(m.queued_at * 1000).toISOString(),
+        body: decoded.body ?? { type: "unavailable" },
+        encrypted: decoded.encrypted,
+        verified,
+        relay_seq: m.seq,
+      });
+    } catch (err) {
+      // A local archive write must never drop a live-delivered message.
+      console.error(`[archive] failed to persist received message ${m.envelope_id}: ${err.message ?? err}`);
+    }
+  }
+  // Advance the cursor past all delivered messages even if some archive writes failed:
+  // the live batch was already returned to the caller; the diary is best-effort (see Task 2).
+  // NOTE: only the first relay page is fetched per call — callers re-invoke receive() while
+  // `has_more` is true to drain a large backlog (full pagination is a later task).
+  if (batch.messages.length) {
+    try { setCursor(Math.max(...batch.messages.map((m) => m.seq))); }
+    catch (err) { console.error(`[archive] failed to advance cursor: ${err.message ?? err}`); }
+  }
+  return {
+    messages,
+    count: messages.length,
+    verified_count: messages.filter((x) => x.verified && !x.key_changed).length,
+    cursor: batch.cursor,
+    has_more: batch.has_more,
+    my_did: identity.did,
+  };
+}
+
+export async function attest({ subject, attestation_type, statement = "" }) {
+  if (!VALID_ATTESTATION_TYPES.includes(attestation_type)) {
+    throw new Error(`attestation_type must be one of: ${VALID_ATTESTATION_TYPES.join(", ")}`);
+  }
+  const identity = await ensureIdentity();
+  const subjectAirId = airIdFromDid(subject);
+  if (!subjectAirId) throw new Error("subject must be an AIR ID or DID containing one");
+  if (subjectAirId === identity.air_id) throw new Error("cannot attest yourself");
+
+  const signed_at = new Date().toISOString();
+  const canonical = jcsCanonical({
+    attester_air_id: identity.air_id,
+    attestation_type,
+    signed_at,
+    statement,
+    subject_air_id: subjectAirId,
+  });
+  const signature_multibase = signRaw(Buffer.from(canonical, "utf8"), identity.privateKey);
+  const resp = await fetch(`${identity.air_url}/api/v1/agents/${subjectAirId}/attestations`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-Agent-Secret": identity.agent_secret },
+    body: JSON.stringify({ attester_air_id: identity.air_id, attestation_type, signed_at, statement, signature_multibase }),
+  });
+  if (!resp.ok) throw new Error(`AIR attestation ${resp.status}: ${await resp.text()}`);
+  return { status: "attested", subject: subjectAirId, attestation_type, result: await resp.json() };
+}
+
+export async function addContactOp({ to, alias }) {
+  if (!to) throw new Error("contact DID or AIR ID is required");
+  const identity = await ensureIdentity();
+  const { contact, key_changed } = await addContact(identity.air_url, { to, alias });
+  return {
+    status: key_changed ? "re-pinned (KEY CHANGED)" : "added",
+    key_changed,
+    contact: {
+      alias: contact.alias,
+      air_id: contact.air_id,
+      did: contact.did,
+      name: contact.name,
+      fingerprint: contact.fingerprint,
+      air_verified: contact.verified_at_pin,
+    },
+  };
+}
+
+export async function search({ query, verified_only = false, limit = 20 }) {
+  if (!query) throw new Error("query is required");
+  const identity = loadIdentity();
+  const airUrl = identity?.air_url || "https://agentidentityregistry.org";
+  const q = query.toLowerCase();
+  const found = [];
+  for (let offset = 0; offset < 200 && found.length < limit; offset += 100) {
+    const resp = await fetch(`${airUrl}/api/v1/agents?limit=100&offset=${offset}`);
+    if (!resp.ok) break;
+    const page = await resp.json();
+    for (const a of page.agents || []) {
+      if (!a.name || !a.name.toLowerCase().includes(q)) continue;
+      if (verified_only && !a.verified) continue;
+      found.push({
+        air_id: a.air_id,
+        name: a.name,
+        air_verified: !!a.verified,
+        trust_score: a.trust_score,
+        did: didFromAirId(a.air_id),
+      });
+      if (found.length >= limit) break;
+    }
+    if ((page.agents || []).length < 100) break;
+  }
+  return { query, verified_only, count: found.length, results: found };
+}
+
+export function listContactsOp() {
+  const contacts = listContacts().map((c) => ({
+    alias: c.alias,
+    air_id: c.air_id,
+    did: c.did,
+    name: c.name,
+    fingerprint: c.fingerprint,
+    air_verified: c.verified_at_pin,
+    pinned_at: c.pinned_at,
+    last_seen: c.last_seen,
+    ...(c.previous_key_multibase ? { key_changed_since_first_pin: true } : {}),
+  }));
+  return { count: contacts.length, contacts };
+}
+
+export async function showInvite() {
+  const identity = await ensureIdentity();
+  const fp = fingerprintOf(identity.rawPublicKey);
+  return {
+    name: identity.name,
+    air_id: identity.air_id,
+    did: identity.did,
+    fingerprint: fp.short,
+    fingerprint_full: fp.sha256_b64,
+    share_line: `Add me on agent-bridge: ${identity.did} (fingerprint ${fp.short})`,
+  };
+}
+
+export async function health() {
+  const identity = loadIdentity();
+  const relayUrl = identity?.relay_url || process.env.AGENT_BRIDGE_RELAY_URL || "https://relay.agentidentityregistry.org";
+  let relay = null;
+  try {
+    const resp = await fetch(`${relayUrl}/health`);
+    relay = resp.ok ? await resp.json() : { error: `HTTP ${resp.status}` };
+  } catch (e) {
+    relay = { error: String(e.message ?? e) };
+  }
+  return {
+    bridge_version: CORE_VERSION,
+    registered: !!identity,
+    my_did: identity?.did ?? "(not registered)",
+    relay_url: relayUrl,
+    relay,
+  };
+}
+
+/** Read message history from the local archive. `peer` may be a DID, AIR id, or contact alias. */
+export function historyOp({ peer, thread, limit = 50, before } = {}) {
+  const resolvedPeer = peer ? resolveRecipient(peer) : undefined;
+  const messages = archiveHistory({ peer: resolvedPeer, thread, limit, before });
+  return { count: messages.length, messages, resolvedPeer };
+}
+
+/** Recent messages across all conversations (the inbox view), from the local archive. */
+export function recentInbox({ limit = 20 } = {}) {
+  const messages = recentForInbox(limit);
+  return { count: messages.length, messages };
+}

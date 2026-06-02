@@ -1,0 +1,517 @@
+{
+  "version": "draft-1",
+  "jcs_spec": "RFC 8785",
+  "signature_spec": "RFC 8032 EdDSA (Ed25519)",
+  "encoding": "multicodec 0xed01 + base58btc + 'z' prefix (public keys); raw 64 bytes + base58btc + 'z' prefix (signatures)",
+  "nfc_normalization": "All string values MUST be NFC-normalized before JCS canonicalization",
+  "no_floats": "All numeric values in envelopes are integers; implementations MUST NOT use floats",
+  "vectors": [
+    {
+      "id": "v01-ascii-offer",
+      "description": "Minimal ASCII Offer envelope, single integer cash amount (USD)",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:01Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000001",
+        "nonce": "nonce-0000000000000001",
+        "body": {
+          "type": "offer",
+          "item_id": "item-ascii-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 1000,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "2a258d6cf0918209807d004f7c9fa6ea95c12a6ca8bc6dc55a412266031d7e9c",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "zPym8ebm65jj7KTSm59yHMt9171nCcVoi8bttwDVaKbRZmREJFusaMGcuFmhS1AejrFsLVnt5H4Q4uDknxoqbJwH"
+    },
+    {
+      "id": "v02-ascii-counter",
+      "description": "ASCII Counter envelope replying to an offer",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000002",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "timestamp": "2026-05-28T00:00:02Z",
+        "in_reply_to": "00000000-0000-0000-0000-000000000001",
+        "thread_id": "thread-0000000000000001",
+        "nonce": "nonce-0000000000000002",
+        "body": {
+          "type": "counter",
+          "item_id": "item-ascii-001",
+          "counter_value": {
+            "type": "cash",
+            "amount_cents": 900,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "5f1a99cdd3a1c726c0b3c5416ae4acf6b8a66a27fb1ff6ae14579a6657532c4a",
+      "signing_key_seed_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signing_key_public_multibase": "z6MkntaQFR9zY9LjFFWSCVgKz66kj1oWKiGx3tZQta2UHuWH",
+      "expected_signature_multibase": "z59Rh66PkQgRLrcsFQQqNAbFcYCX54bYFPSWnRhHzkztaenjdhQoTLZjS3HPTW3WgmQFHCTP2MLvcexGBZu3HAHvS"
+    },
+    {
+      "id": "v03-ascii-accept",
+      "description": "ASCII Accept envelope",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000003",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:03Z",
+        "in_reply_to": "00000000-0000-0000-0000-000000000002",
+        "thread_id": "thread-0000000000000001",
+        "nonce": "nonce-0000000000000003",
+        "body": {
+          "type": "accept",
+          "item_id": "item-ascii-001"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "8fcc23d0c189122d2a28a3b99b2296c3c62992fc16de507cd0a1b0f94b77978d",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "z3yHb7y5UXuTL5iGZRWap6WBnWaaJYRLWS31tGWfBz9z87yfVnkagZ5LAqF19cG1tZLq5Uqp2htqkaNTfdtS1jKef"
+    },
+    {
+      "id": "v04-ascii-decline",
+      "description": "ASCII Decline envelope",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000004",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "timestamp": "2026-05-28T00:00:04Z",
+        "in_reply_to": "00000000-0000-0000-0000-000000000001",
+        "thread_id": "thread-0000000000000002",
+        "nonce": "nonce-0000000000000004",
+        "body": {
+          "type": "decline",
+          "item_id": "item-ascii-002",
+          "reason": "price too high"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "e37897fcd5b23a1ffb18a5797df10c0720e954514dc57deb624fc90d611cd024",
+      "signing_key_seed_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signing_key_public_multibase": "z6MkntaQFR9zY9LjFFWSCVgKz66kj1oWKiGx3tZQta2UHuWH",
+      "expected_signature_multibase": "z2ttGdutQXNfGondonsLzMDmJ4yscMG4zX9p1sjmoegBMZ8FP1J8ArLJ3aKeT41xpNmvmmArBthad1aXYyZdRUG8R"
+    },
+    {
+      "id": "v05-ascii-withdraw",
+      "description": "ASCII Withdraw envelope",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000005",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:05Z",
+        "in_reply_to": "00000000-0000-0000-0000-000000000001",
+        "thread_id": "thread-0000000000000002",
+        "nonce": "nonce-0000000000000005",
+        "body": {
+          "type": "withdraw",
+          "item_id": "item-ascii-002",
+          "reason": "no longer available"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "61bc7223bf7a99ab4aa0035f063873644f917fa0e42b83fc406e0592294fd993",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "z4C8NyypF1cU2CqSRQAMVwRtsPuk9PVtknMv5nqqjYz39akJ6yDjqr7FQbxV2CXx1Xn85m4pxmZTmXapsbdz13QkP"
+    },
+    {
+      "id": "v06-nonascii-korean",
+      "description": "Offer with Korean note field: 협상 시작 (negotiation start)",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000006",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:06Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000003",
+        "nonce": "nonce-0000000000000006",
+        "body": {
+          "type": "offer",
+          "item_id": "item-kr-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 50000,
+            "currency": "KRW"
+          },
+          "note": "협상 시작"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "4fc56079caf02d6a7b74a5f4820dbb15393ddebe85d459fa5448cf68d2bba76b",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "zgCmY6Nd8AUurEkuvVMDNc31MFdUPTDBN4PycGpaDFYqoWFgJeoMw8xiMLXzDKCyjMdgFbKsLumFchF6yRqoa6wL"
+    },
+    {
+      "id": "v07-nonascii-japanese",
+      "description": "Offer with Japanese note field: 交渉開始 (negotiation start)",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000007",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:07Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000004",
+        "nonce": "nonce-0000000000000007",
+        "body": {
+          "type": "offer",
+          "item_id": "item-jp-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 100000,
+            "currency": "JPY"
+          },
+          "note": "交渉開始"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "7d6faf209a4a6f1c18885a448feb451e2079501c7bbe49736df785694ad34b77",
+      "signing_key_seed_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signing_key_public_multibase": "z6MkntaQFR9zY9LjFFWSCVgKz66kj1oWKiGx3tZQta2UHuWH",
+      "expected_signature_multibase": "z628izaa8jatp7aRNnqDqBwY86yuy6fjYff9dGyL2vCJAnRfVM9xX6igEm7keqesRVz6RrfPypoQVFhf8V6d5q73v"
+    },
+    {
+      "id": "v08-nonascii-arabic",
+      "description": "Offer with Arabic note field: بدء التفاوض (start of negotiation)",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000008",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:08Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000005",
+        "nonce": "nonce-0000000000000008",
+        "body": {
+          "type": "offer",
+          "item_id": "item-ar-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 25000,
+            "currency": "USD"
+          },
+          "note": "بدء التفاوض"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "4c0a75b4b161df92c11ddb5e2a79a77839a29c3d3c4926fdecf6991c639e91a6",
+      "signing_key_seed_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "signing_key_public_multibase": "z6Mkt58AjtEZiQsGZTpBaP2u77qPRMCAG25vUyhSK7gMNMpE",
+      "expected_signature_multibase": "zyfJy6sAREpTcfp1LLwhhy9mu6oVzPBfv4MvvmNYvoHiP7c8qmh6YnTQ8HmVQa6A54D4D82CeCkK55bxKk6S3VFr"
+    },
+    {
+      "id": "v09-nfc-precomposed",
+      "description": "Note field with precomposed NFC 'café' (U+00E9) — canonical form",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000009",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:09Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000006",
+        "nonce": "nonce-0000000000000009",
+        "body": {
+          "type": "offer",
+          "item_id": "item-nfc-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 200,
+            "currency": "USD"
+          },
+          "note": "café"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "4dc14b84a527dc3bde3293f8784ef2af69312779eef8f6aa94a92c07baee05d8",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "zmdQTU1dpLwPcS64ntuesKMttWedX9Qe6dguFppwsNuTe4cLuaBrr7JiNFfxARN4MDoU81k3YKG2hwGCsWwCLxMW"
+    },
+    {
+      "id": "v10-nfc-decomposed",
+      "description": "Note field with NFD 'café' (e + U+0301 combining acute) — MUST normalize to same bytes as v09",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000009",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:09Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000006",
+        "nonce": "nonce-0000000000000009",
+        "body": {
+          "type": "offer",
+          "item_id": "item-nfc-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 200,
+            "currency": "USD"
+          },
+          "note": "café"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "4dc14b84a527dc3bde3293f8784ef2af69312779eef8f6aa94a92c07baee05d8",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "zmdQTU1dpLwPcS64ntuesKMttWedX9Qe6dguFppwsNuTe4cLuaBrr7JiNFfxARN4MDoU81k3YKG2hwGCsWwCLxMW"
+    },
+    {
+      "id": "v11-int-boundary-2pow53-minus1",
+      "description": "amount_cents = 2^53 - 1 (9007199254740991) — max safe JavaScript integer, no float coercion",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000011",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:11Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000007",
+        "nonce": "nonce-0000000000000011",
+        "body": {
+          "type": "offer",
+          "item_id": "item-big-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 9007199254740991,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "06a642afb1d7fd05a89df0240966556c1fcf31d96eeafb2ac4db236f1c87e612",
+      "signing_key_seed_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signing_key_public_multibase": "z6MkntaQFR9zY9LjFFWSCVgKz66kj1oWKiGx3tZQta2UHuWH",
+      "expected_signature_multibase": "z2cTjpwDxxdp9x2ra4iAT9By2246xhp5ZQuxoPRxgUQ1zNTTT9Cv5z3G88yCC3x7qguoUTLbT1EG8W2sr42gDSHcS"
+    },
+    {
+      "id": "v12-int-boundary-2pow53-plus1",
+      "description": "amount_cents = 2^53 + 1 (9007199254740993) — above safe JS integer, MUST stay exact integer",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000012",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:12Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000008",
+        "nonce": "nonce-0000000000000012",
+        "body": {
+          "type": "offer",
+          "item_id": "item-big-002",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 9007199254740993,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "70fb56c79bb8b1cdfdd7ec4b754b2c3d920b444579a41c407bb4ad13e27b9455",
+      "signing_key_seed_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signing_key_public_multibase": "z6MkntaQFR9zY9LjFFWSCVgKz66kj1oWKiGx3tZQta2UHuWH",
+      "expected_signature_multibase": "z33Tz6zXcxnwmQJnTLpyXtiFBq1ymQcVrHikvwMrvKxkGNQafQFPu1Ev7oqNno9B3LAhmBvuGQXkwa4T5CvjfRJaG"
+    },
+    {
+      "id": "v13-empty-options-offer",
+      "description": "Offer with note absent — canonical JSON must NOT include 'note' key",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000013",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:13Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000009",
+        "nonce": "nonce-0000000000000013",
+        "body": {
+          "type": "offer",
+          "item_id": "item-no-note-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 500,
+            "currency": "CAD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "51fecab94c001a3ec8502bc4e3cfdd3b8e17a9c2b1df68d14c591b1f017519a2",
+      "signing_key_seed_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "signing_key_public_multibase": "z6Mkt58AjtEZiQsGZTpBaP2u77qPRMCAG25vUyhSK7gMNMpE",
+      "expected_signature_multibase": "z3HFze5HrasYF14NCuPDNTpURASiGgy9W9xokdUzhrQSrEBUZRTJ3kAt8Lf3Xyb5VgfkEjVvfbA2XZZVDERq1fYUb"
+    },
+    {
+      "id": "v14-empty-options-decline",
+      "description": "Decline with reason absent — canonical JSON must NOT include 'reason' key",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000014",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "timestamp": "2026-05-28T00:00:14Z",
+        "in_reply_to": "00000000-0000-0000-0000-000000000013",
+        "thread_id": "thread-0000000000000009",
+        "nonce": "nonce-0000000000000014",
+        "body": {
+          "type": "decline",
+          "item_id": "item-no-note-001"
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "0c5942f09f59eceec4da3b21ade3abf46ddd7899150cd66cf059f9bc9b2d6e47",
+      "signing_key_seed_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "signing_key_public_multibase": "z6Mkt58AjtEZiQsGZTpBaP2u77qPRMCAG25vUyhSK7gMNMpE",
+      "expected_signature_multibase": "zH9n57yrGWzCB1cXCFL5vsbSZRcyHaELXhDgjGyQghmv3P1AFU7bnv8EQvH7FPjBbScR4HrsEeRg2HzN4zqg6wGN"
+    },
+    {
+      "id": "v15-thread-with-reply",
+      "description": "Offer with in_reply_to populated — thread continuation",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000015",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:15Z",
+        "in_reply_to": "00000000-0000-0000-0000-000000000099",
+        "thread_id": "thread-0000000000000010",
+        "nonce": "nonce-0000000000000015",
+        "body": {
+          "type": "counter",
+          "item_id": "item-thread-001",
+          "counter_value": {
+            "type": "cash",
+            "amount_cents": 750,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "0c08a16330f585117f623e857f06d8fa4a7ae1d57cd49c81e209d7b89f4419cb",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "z2qF5fa2KS7ceymqzRtccDffe1D3Gz8uaaB9FKbiXQ3CoPJBN6dbg716sNaAoXGh6b9Gk6QJrDRQ6ZjJ31dssEHV7"
+    },
+    {
+      "id": "v16-thread-no-reply",
+      "description": "Offer with in_reply_to absent — thread initiation",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000016",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:16Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000010",
+        "nonce": "nonce-0000000000000016",
+        "body": {
+          "type": "offer",
+          "item_id": "item-thread-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 800,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "35e864136f5ef8a7288f518cea1b1cc6a40aea85f4fe3c8c85dfef7fb71ed5ab",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "zoQJiBMXhG2NA3bnuCztYwB11RzaXsbyc6KaBz7CSMQBwbQM9L7DUins8pGnG2nfuvuUnH7QUwbb3PXxqWjbnGnH"
+    },
+    {
+      "id": "v17-currency-usd",
+      "description": "Offer denominated in USD",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000017",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:17Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000011",
+        "nonce": "nonce-0000000000000017",
+        "body": {
+          "type": "offer",
+          "item_id": "item-currency-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 12345,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "3ed5f305fd78619e2a5448af5b18b5777a6fe8656a986119849a0a3703018462",
+      "signing_key_seed_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signing_key_public_multibase": "z6MkntaQFR9zY9LjFFWSCVgKz66kj1oWKiGx3tZQta2UHuWH",
+      "expected_signature_multibase": "z2zq1oRem1H2akDSjLx6ZmTqqXFM9YTxLsXhQ3d88CYZL4z4TFpNUu8287dbFedftid8HEM3kFPeehFMsVo8wiPZA"
+    },
+    {
+      "id": "v18-currency-krw",
+      "description": "Offer denominated in KRW (Korean Won, no decimal subdivision)",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000018",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:18Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000012",
+        "nonce": "nonce-0000000000000018",
+        "body": {
+          "type": "offer",
+          "item_id": "item-currency-002",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 10000000,
+            "currency": "KRW"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "9aeeadefd45d67d247702aaa01c57ae296e92d76c011029d02e095883332dbf7",
+      "signing_key_seed_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "signing_key_public_multibase": "z6Mkt58AjtEZiQsGZTpBaP2u77qPRMCAG25vUyhSK7gMNMpE",
+      "expected_signature_multibase": "z2HGrKAgCBJqjh2fCGdd1gW1Gu1wvrCTUwhVqL6uKsttGiS6uAsizrrFVkg3gf6azCroULK5PytXE5CrfbuKWn7KB"
+    },
+    {
+      "id": "v19-same-input-key-seed-a",
+      "description": "Same envelope as v20, signed with seed A — proves key independence",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000019",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:19Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000013",
+        "nonce": "nonce-0000000000000019",
+        "body": {
+          "type": "offer",
+          "item_id": "item-keydemo-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 100,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "a48e819aa762f7cb2196c4a360724853a4fc9c97b5589a0fb69134e24e51fc0a",
+      "signing_key_seed_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "signing_key_public_multibase": "z6Mkv1o2GEgtXjFdEMfLtupcKhGRydM8V7VHzii7Uh4aHoqH",
+      "expected_signature_multibase": "z4noCvhbhJ4BcRjyvjLyxtd1M7V7y4YtBfeUQg2BAviwtcxYGP6T8TwVVz4cA448Hs6zdj5i3tPqJ1dZBeUZQBVuH"
+    },
+    {
+      "id": "v20-same-input-key-seed-b",
+      "description": "Same envelope as v19, signed with seed B — different signature, same canonical bytes",
+      "input_envelope": {
+        "id": "00000000-0000-0000-0000-000000000019",
+        "from": "did:wba:agentidentityregistry.org:AIR-WBA1-ALICE0",
+        "to": "did:wba:agentidentityregistry.org:AIR-WBA1-BOB000",
+        "timestamp": "2026-05-28T00:00:19Z",
+        "in_reply_to": null,
+        "thread_id": "thread-0000000000000013",
+        "nonce": "nonce-0000000000000019",
+        "body": {
+          "type": "offer",
+          "item_id": "item-keydemo-001",
+          "offered_value": {
+            "type": "cash",
+            "amount_cents": 100,
+            "currency": "USD"
+          }
+        }
+      },
+      "expected_canonical_bytes_sha256_hex": "a48e819aa762f7cb2196c4a360724853a4fc9c97b5589a0fb69134e24e51fc0a",
+      "signing_key_seed_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "signing_key_public_multibase": "z6MkntaQFR9zY9LjFFWSCVgKz66kj1oWKiGx3tZQta2UHuWH",
+      "expected_signature_multibase": "z2SNHBbVBXbWauFG5AMXjjU3nmEERZhGoV3WEpm6DLjoCYJaYAxqquYnvr4GNnps755oDPXLaFYf5xHWjg5urVSmU"
+    }
+  ]
+}

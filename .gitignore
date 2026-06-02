@@ -1,0 +1,14 @@
+# Rust
+/target
+crates/*/target
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Local agent identity / keys / archive — NEVER commit
+.air-msg/
+
+# OS / editor
+.DS_Store
+*.log

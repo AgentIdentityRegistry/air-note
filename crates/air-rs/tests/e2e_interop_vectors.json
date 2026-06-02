@@ -1,0 +1,50 @@
+{
+  "vectors": [
+    {
+      "recipient_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "env": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "from": "did:wba:example:agents:AIR-AAAA",
+        "to": "did:wba:example:agents:AIR-BBBB",
+        "thread_id": "22222222-2222-4222-8222-222222222222"
+      },
+      "eph_secret_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "nonce_hex": "000000000000000000000000",
+      "body": {
+        "type": "text",
+        "text": "hello 🔐"
+      },
+      "expected": {
+        "type": "encrypted",
+        "alg": "x25519-hkdf-sha256-chacha20poly1305",
+        "v": 1,
+        "epk": "z6LSd1FDxqS6PDoWwxco3fnM3DGEuXyse6pr7uRRYamJDqit",
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ct": "ObWXC6zMG9wzsDi3qsIEd27fWIqwiFpb8KDpXTTfEAuCuZEFRgpHhG9Al5jqNtzJRbHC"
+      }
+    },
+    {
+      "recipient_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "env": {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "from": "did:wba:example:agents:AIR-CCCC",
+        "to": "did:wba:example:agents:AIR-DDDD",
+        "thread_id": "44444444-4444-4444-8444-444444444444"
+      },
+      "eph_secret_hex": "0909090909090909090909090909090909090909090909090909090909090909",
+      "nonce_hex": "010101010101010101010101",
+      "body": {
+        "type": "text",
+        "text": "plain ascii body"
+      },
+      "expected": {
+        "type": "encrypted",
+        "alg": "x25519-hkdf-sha256-chacha20poly1305",
+        "v": 1,
+        "epk": "z6LShb8aYpQqeExHcgpdzSGRKMu73PtDGHtNP5jo8MRb9aRn",
+        "nonce": "AQEBAQEBAQEBAQEB",
+        "ct": "CPQtLO4BakeZvocncDd4LTgfyO2Ywd--yA3H5H-f5uUvMkh-ka6KmILk_6ent9ILwVy-9uC5GMeM"
+      }
+    }
+  ]
+}

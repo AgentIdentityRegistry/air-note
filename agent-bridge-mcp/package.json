@@ -1,0 +1,45 @@
+{
+  "name": "agent-bridge-mcp",
+  "version": "0.3.0",
+  "description": "Cryptographically-signed agent messaging for Claude Code / Codex / Gemini / Cursor (MCP server) and humans (air-msg CLI). Federated relay, AIR identity, fingerprint pinning.",
+  "type": "module",
+  "main": "src/index.mjs",
+  "bin": {
+    "agent-bridge-mcp": "src/index.mjs",
+    "air-msg": "src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "cli": "node src/cli.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@noble/curves": "^1.9.7",
+    "bs58": "^6.0.0",
+    "canonicalize": "^3.0.0",
+    "node-notifier": "^10.0.1"
+  },
+  "overrides": {
+    "node-notifier": {
+      "uuid": "^11.1.1"
+    }
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mcp",
+    "a2a",
+    "air",
+    "agent",
+    "messaging",
+    "relay",
+    "did"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AgentIdentityRegistry/air-note"
+  }
+}
