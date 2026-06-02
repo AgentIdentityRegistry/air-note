@@ -296,6 +296,9 @@ async function main() {
         const confirm = makeConfirmStore();
         const outbound = makeBridgeOutbound({ adapter, bodyMode });
 
+        // v1: prune on start only. The 30-day age bound + maxRows cap keep bridge_routes
+        // bounded, and a long-lived daemon re-prunes on each restart, so the spec's
+        // "+ periodically" (§12) is intentionally deferred — not an oversight.
         pruneRoutes({ platform: "telegram", now: Date.now() });
         console.log(`${c.green("● bridging")} ${c.bold(identity.did)} ${c.dim("→ Telegram")}`);
         console.log(`  ${c.dim(`body: ${bodyMode} · notify: ${notifier.backend} · Ctrl-C to stop`)}`);

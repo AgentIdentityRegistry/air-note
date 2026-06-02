@@ -95,6 +95,27 @@ Kenny (in Claude Code):
 You receive: "Tell Peter the relay is deployed and the demo works"
 ```
 
+## Telegram bridge (two-way)
+
+Forward incoming AIR Note mail out to **Telegram**, and reply from inside Telegram to send a real (signed + encrypted) AIR Note back — a universal "doorbell" that reaches you on any device, even away from your AI tools.
+
+```bash
+air-msg bridge setup    # one-time: paste a @BotFather bot token, then /start the bot
+air-msg bridge          # run the daemon (also raises the local OS banner, like `watch`)
+```
+
+**How replies work:** each incoming message arrives in Telegram as its own ping. To reply, use Telegram's *Reply* (swipe / long-press → Reply) on the specific ping — the bridge routes your text back to that exact sender, continuing the same thread. A bare message that isn't a reply is never sent (you'll be asked to reply to a specific ping, so you can't mis-send). Verified **and** pinned contacts get one-tap reply; an unverified sender requires a `/yes` confirmation first.
+
+> ⚠️ **Privacy:** by default the **full message text** is sent to Telegram's servers, which is **outside AIR Note's end-to-end encryption**. Set `AIRMSG_BRIDGE_BODY=meta` to send metadata-only pings (e.g. "📬 mail from Alice") and keep message bodies on your machine.
+
+**One live consumer per identity:** `air-msg bridge`, `air-msg watch`, and the channel-push server all share one relay read-cursor, so run only **one** at a time — the others refuse to start with a clear message. `bridge` is a superset of `watch`: it raises the local banner *and* forwards to Telegram.
+
+| Env var | Default | Description |
+|---|---|---|
+| `AIRMSG_BRIDGE_BODY` | `full` | `meta` = send metadata-only pings (no decrypted message text leaves your machine) |
+
+The bot token + your chat id live only in `~/.air-msg/bridge.json` (mode `0600`), never in the message database.
+
 ## Status of the stack underneath
 
 | Layer | What | Status |
