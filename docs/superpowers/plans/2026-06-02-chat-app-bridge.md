@@ -1300,7 +1300,7 @@ And append a bridge section after the channel-push block (before the closing bac
 node --test
 ```
 
-- [ ] **Step 6: Manual end-to-end spot-check** (document the outcome in the commit body)
+- [x] **Step 6: Manual end-to-end spot-check** — ✅ DONE 2026-06-02, live-proven two-way on real Telegram + relay: outbound (mail → Telegram ping, seen) and inbound (Telegram reply → signed+encrypted AIR Note, round-tripped + verified). Unicode confirmed — Korean ("내 여보는 금보경이야") decrypted byte-intact.
 
 ```
 # One-time:
