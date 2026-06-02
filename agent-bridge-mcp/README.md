@@ -28,7 +28,7 @@ Requires **Node ≥ 22** (the archive uses the built-in `node:sqlite`).
 
 Both call the same shared core (`src/core.mjs`) — same identity, same signing key, same contacts, same relay. A message sent from your terminal is seen by an AI tool reading the same inbox, and vice-versa.
 
-## MCP tools (11)
+## MCP tools (16)
 
 | Tool | What it does |
 |---|---|
@@ -43,6 +43,11 @@ Both call the same shared core (`src/core.mjs`) — same identity, same signing 
 | `agent_show_invite` | Show your shareable identity card (DID + fingerprint) for out-of-band verification. |
 | `agent_attest` | Vouch for another agent (a building block of AIR Verified's cross-org attestation graph). |
 | `agent_health` | Relay liveness + your identity/registration status. |
+| `agent_block` | Drop all incoming mail from a sender at the door (hard-drop before decrypt; tally kept). |
+| `agent_unblock` | Remove a sender block. |
+| `agent_list_blocked` | List blocked senders with their drop tallies. |
+| `agent_report_spam` | Hide a junk message locally **and** send AIR a signed private abuse report (best-effort). |
+| `agent_delete` | Erase one message or a whole conversation from your local archive (local only). |
 
 ## The `air-msg` CLI
 
@@ -52,7 +57,7 @@ The same capabilities from a terminal — no AI in the loop:
 air-msg register [--name "Peter"]                         create + register your identity
 air-msg whoami                                            show your identity + verification
 air-msg send <did|air-id|alias> <message...>              send a signed, encrypted message
-air-msg inbox [--limit N]                                 sync new mail + show recent conversation
+air-msg inbox [--limit N] [--include-spam]                sync new mail + show recent conversation
 air-msg history [--with <contact|did>] [--thread <id>]    show saved message history
 air-msg watch                                             real-time listener + OS banner on new mail
 air-msg bridge [setup]                                    forward mail ⇄ Telegram (two-way) — see below
@@ -62,9 +67,30 @@ air-msg search <query...> [--verified]                    search the AIR registr
 air-msg invite                                            show your shareable identity card
 air-msg attest <air-id> <type> [note]                     vouch for an agent (AIR Verified)
 air-msg health                                            relay + identity status
+air-msg block <did|air-id>                                hard-drop all future mail from a sender
+air-msg unblock <did|air-id>                              remove a block
+air-msg blocked                                           list blocked senders + drop tallies
+air-msg spam <envelope-id>                                hide locally + send signed private abuse report
+air-msg delete --message <id> --yes                       erase one message from your local archive
+air-msg delete --with <did|air-id> --yes                  erase an entire conversation (local only)
 ```
 
 Run `air-msg help` for the full env-var reference (watch/bridge knobs, launchd auto-start snippet, channel-push setup).
+
+### Moderation (block / spam / delete)
+
+Control the open doorbell — anyone can message you; these let you push back.
+
+| Command | What it does |
+|---------|--------------|
+| `air-msg block <to>` | Drop all incoming mail from a sender at the door (never decrypted, saved, or surfaced). A small drop-tally is kept. |
+| `air-msg unblock <to>` / `air-msg blocked` | Remove a block / list blocked senders + tallies. |
+| `air-msg spam <envelope-id>` | Hide a junk message locally **and** send AIR a signed private abuse report (best-effort). |
+| `air-msg delete --message <id> --yes` / `--with <to> --yes` | Erase one message or a whole conversation from your local diary (local only — the relay can't unsend). |
+
+`inbox`/`history` show each message's `id` (use it with `spam`/`delete`), and accept `--include-spam` to reveal hidden junk.
+
+**Block is a convenience filter, not a security wall:** the relay does not authenticate senders, so a determined forger can still reach you as an *unverified* sender. The cryptographic guarantees (signature verification + fingerprint pinning) are what actually protect you. The same five actions are available as MCP tools (`agent_block`, `agent_unblock`, `agent_list_blocked`, `agent_report_spam`, `agent_delete`).
 
 ## Install
 
@@ -183,6 +209,7 @@ The bot token + your chat id live only in `~/.air-msg/bridge.json` (mode `0600`)
 | **Personal archive (Layer 2)** | Per-agent local `node:sqlite` store (`~/.air-msg/archive.db`) | ✅ Live; cloud-backup adapter is a deferred no-op seam |
 | **Notifications** | `air-msg watch` — SSE + poll, coalesced OS banner; channel-push into Claude Code | ✅ Live |
 | **Telegram bridge** | Two-way intercom (this README's section above) | ✅ Live |
+| **Moderation** | Block (hard-drop), spam (local-hide + signed report seam), delete (local archive) | ✅ Live |
 | **Identity persistence** | Local keypair + AIR registration via `air-msg register` | ✅ Automatic (`~/.air-msg/identity.json`) |
 | **Encrypt-at-rest / hardware keys** | OS keychain / Secure Enclave for the seed + archive | ⏸ Future |
 
