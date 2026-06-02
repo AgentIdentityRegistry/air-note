@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   archiveMessage, history, threads, getCursor, setCursor, closeArchive,
+  markSpam, getReceived, recentForInbox, openArchive,
+  deleteMessage, deleteConversation,
 } from "../src/archive.mjs";
 
 let dir;
@@ -74,4 +76,64 @@ test("threads lists conversations with counts, newest activity first", () => {
   assert.equal(t.length, 2);
   assert.equal(t[0].thread_id, "tB");
   assert.equal(t.find((x) => x.thread_id === "tA").count, 2);
+});
+
+test("spam column migration is idempotent", () => {
+  openArchive(); // first open runs the migration
+  closeArchive();
+  openArchive(); // second open must not throw
+  const cols = openArchive().prepare(`PRAGMA table_info(messages)`).all().map((c) => c.name);
+  assert.ok(cols.includes("spam"));
+});
+
+test("markSpam flips only the received row; default reads hide it, includeSpam reveals", () => {
+  archiveMessage(rec({ envelope_id: "spam1", direction: "received" }));
+  assert.equal(history().length, 1);
+  assert.equal(markSpam("spam1").updated, 1);
+  assert.equal(history().length, 0);                       // hidden by default
+  assert.equal(history({ includeSpam: true }).length, 1);  // revealed
+  assert.equal(history({ includeSpam: true })[0].spam, true);
+  assert.equal(recentForInbox(20).length, 0);              // inbox hides spam
+});
+
+test("markSpam does not touch a 'sent' row of the same envelope_id", () => {
+  const base = rec({ envelope_id: "self9", peer_did: "did:me", from_did: "did:me", to_did: "did:me" });
+  archiveMessage({ ...base, direction: "sent" });
+  archiveMessage({ ...base, direction: "received", relay_seq: 9 });
+  markSpam("self9");
+  assert.equal(history({ includeSpam: true }).find((m) => m.direction === "sent").spam, false);
+  assert.equal(history({ includeSpam: true }).find((m) => m.direction === "received").spam, true);
+});
+
+test("getReceived returns the received row or null", () => {
+  archiveMessage(rec({ envelope_id: "g1", peer_did: "did:P" }));
+  assert.equal(getReceived("g1").peer_did, "did:P");
+  assert.equal(getReceived("nope"), null);
+});
+
+test("threads() excludes spam-flagged messages from counts and listing", () => {
+  archiveMessage(rec({ envelope_id: "tk1", thread_id: "tT", peer_did: "did:T", direction: "received" }));
+  archiveMessage(rec({ envelope_id: "tk2", thread_id: "tT", peer_did: "did:T", direction: "received", timestamp: "2026-06-01T00:00:05Z" }));
+  markSpam("tk2");
+  const t = threads().find((x) => x.thread_id === "tT");
+  assert.equal(t.count, 1); // the spam row is excluded from the count
+});
+
+test("deleteMessage removes all rows for an envelope_id and reports the count", () => {
+  const base = rec({ envelope_id: "d1", peer_did: "did:me", from_did: "did:me", to_did: "did:me" });
+  archiveMessage({ ...base, direction: "sent" });
+  archiveMessage({ ...base, direction: "received", relay_seq: 2 });
+  assert.equal(deleteMessage("d1").deleted, 2);
+  assert.equal(history({ includeSpam: true }).length, 0);
+  assert.equal(deleteMessage("d1").deleted, 0); // already gone
+});
+
+test("deleteConversation removes the whole two-way thread for a peer", () => {
+  archiveMessage(rec({ envelope_id: "r1", direction: "received", peer_did: "did:P" }));
+  archiveMessage(rec({ envelope_id: "s1", direction: "sent", peer_did: "did:P" }));
+  archiveMessage(rec({ envelope_id: "x1", direction: "received", peer_did: "did:OTHER" }));
+  assert.equal(deleteConversation("did:P").deleted, 2);
+  const left = history({ includeSpam: true });
+  assert.equal(left.length, 1);
+  assert.equal(left[0].peer_did, "did:OTHER");
 });

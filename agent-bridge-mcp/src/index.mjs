@@ -143,7 +143,41 @@ const TOOLS = [
         peer: { type: "string", description: "Filter to one conversation: a DID, AIR id, or contact alias." },
         thread: { type: "string", description: "Filter to one thread id." },
         limit: { type: "number", description: "Max messages to return (default 50)." },
+        include_spam: { type: "boolean", description: "Include messages you marked as spam (default false)." },
       },
+    },
+  },
+  {
+    name: "agent_block",
+    description: "Block a sender (by DID, AIR id, or alias): their mail is dropped on arrival, never surfaced. Convenience filter — a sender who forges a different identity still arrives unverified.",
+    inputSchema: { type: "object", properties: { peer: { type: "string", description: "DID, AIR id, or contact alias to block." } }, required: ["peer"] },
+  },
+  {
+    name: "agent_unblock",
+    description: "Remove a sender from your blocklist so their mail is delivered again. Cannot recover mail dropped while blocked.",
+    inputSchema: { type: "object", properties: { peer: { type: "string", description: "DID, AIR id, or contact alias to unblock." } }, required: ["peer"] },
+  },
+  {
+    name: "agent_list_blocked",
+    description: "List blocked senders with an advisory drop tally (count of dropped attempts; spoofable).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "agent_report_spam",
+    description: "Mark a received message as spam: hide it from your inbox AND send a signed private abuse report to AIR (best-effort; hides locally even if the report can't be sent). Needs the message's envelope_id (from agent_receive/agent_history).",
+    inputSchema: { type: "object", properties: { envelope_id: { type: "string", description: "envelope_id of the received message to report." } }, required: ["envelope_id"] },
+  },
+  {
+    name: "agent_delete",
+    description: "Delete from your LOCAL diary only (the relay cannot unsend). Pass exactly one of envelope_id (one message) or peer (a whole conversation). confirm must be true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        envelope_id: { type: "string", description: "Delete a single message by id." },
+        peer: { type: "string", description: "Delete a whole conversation (DID, AIR id, or alias)." },
+        confirm: { type: "boolean", description: "Must be true — guards against accidental deletion." },
+      },
+      required: ["confirm"],
     },
   },
 ];
@@ -160,7 +194,12 @@ const HANDLERS = {
   agent_list_contacts: () => core.listContactsOp(),
   agent_show_invite: () => core.showInvite(),
   agent_health: () => core.health(),
-  agent_history: (a) => core.historyOp(a),
+  agent_history: (a) => core.historyOp({ ...a, includeSpam: a.include_spam }),
+  agent_block: (a) => core.blockOp(a),
+  agent_unblock: (a) => core.unblockOp(a),
+  agent_list_blocked: () => core.listBlockedOp(),
+  agent_report_spam: (a) => core.reportSpamOp(a),
+  agent_delete: (a) => core.deleteOp(a),
 };
 
 const server = new Server(
