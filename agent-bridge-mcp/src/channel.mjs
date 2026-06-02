@@ -4,11 +4,7 @@
 // this is a prompt-injection surface: gate to verified + pinned only, and frame every
 // body as clearly-labeled untrusted data.
 
-/** Short AIR-id label from a DID (or pass through). */
-function shortPeer(did) {
-  const m = String(did).match(/AIR-[A-Za-z0-9-]+/);
-  return m ? m[0] : String(did);
-}
+import { shortPeer } from "./peers.mjs";
 
 /** May this received message be pushed into the AI session? Verified + pinned (has a
  *  contact alias) + key unchanged + not muted. Pure. `mute` is a Set of alias/DID/AIR-id. */

@@ -4,12 +4,7 @@
 
 import * as coreDefault from "./core.mjs";
 import { getCursor as getCursorDefault } from "./archive.mjs";
-
-/** Short, human label for a peer when there is no contact alias. */
-function shortPeer(did) {
-  const m = String(did).match(/AIR-[A-Za-z0-9-]+/);
-  return m ? m[0] : String(did);
-}
+import { shortPeer } from "./peers.mjs";
 
 /** Render a one-line preview of a message body for a notification. */
 function bodyText(body) {

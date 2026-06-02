@@ -24,6 +24,12 @@ import { ensureIdentity } from "./identity.mjs";
 import { createNotifier } from "./notifier.mjs";
 import { resolveOpenCommand, runOpenCommand, detectAiCmd } from "./open-conversation.mjs";
 import { watch } from "./watch.mjs";
+import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
+import { loadBridgeConfig, saveBridgeConfig } from "./bridge-config.mjs";
+import { createTelegramAdapter, captureFirstChat } from "./adapters/telegram.mjs";
+import { makeBridgeOutbound, makeReplyHandler, makeConfirmStore } from "./bridge.mjs";
+import { getUpdateOffset, setUpdateOffset, pruneRoutes } from "./bridge-routes.mjs";
+import { createInterface } from "node:readline/promises";
 
 const tty = process.stdout.isTTY;
 const c = {
@@ -75,6 +81,7 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
   air-msg inbox [--limit N]              sync new mail + show recent conversation
   air-msg history [--with <contact|did>] [--thread <id>] [--limit N]   show saved message history
   air-msg watch                          Listen for new mail + notify (Ctrl-C to stop)
+  air-msg bridge [setup]                 Forward mail ⇄ Telegram (two-way; setup configures the bot)
   air-msg add <to> [alias]               Add + pin a contact
   air-msg contacts                       List saved contacts
   air-msg search <query...> [--verified] Search the AIR registry
@@ -113,7 +120,39 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
        claude --mcp-config ./.mcp.json --dangerously-load-development-channels server:air-msg-channel
     Only verified + pinned senders push into the session; everyone else still rings via
     air-msg watch. Requires a claude.ai / Console API key. Run only ONE live consumer per
-    identity (the channel session OR air-msg watch, not both — they share the pull cursor).`;
+    identity (the channel session OR air-msg watch, not both — they share the pull cursor).
+
+  telegram bridge (two-way — mail → Telegram, reply in Telegram → AIR Note):
+    air-msg bridge setup    one-time: paste a @BotFather token, /start the bot
+    air-msg bridge          start the daemon (also fires the local banner like watch)
+    env: AIRMSG_BRIDGE_BODY=meta  send metadata-only (no message text leaves your machine)
+    Verified+pinned senders get one-tap reply; unverified replies need a /yes confirm.
+    Run only ONE live consumer per identity (bridge OR watch OR the channel session).`;
+
+async function bridgeSetup() {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    console.log(c.bold("AIR Note → Telegram bridge setup"));
+    console.log(c.yellow(
+      "⚠ PRIVACY: by default the FULL message text is sent to Telegram's servers, " +
+      "outside AIR Note's end-to-end encryption. Run the bridge with AIRMSG_BRIDGE_BODY=meta " +
+      "for metadata-only pings."));
+    console.log(c.dim("1) In Telegram, message @BotFather → /newbot → copy the token it gives you."));
+    const token = (await rl.question("Paste your bot token: ")).trim();
+    if (!token) { console.error("No token — aborting."); process.exit(1); }
+
+    console.log(c.dim("2) Now open your new bot in Telegram and send it /start (a bot can't message you first)."));
+    console.log(c.dim("   Waiting for your message…"));
+    const chatId = await captureFirstChat({ token });
+    if (chatId == null) { console.error("Timed out waiting for /start — run setup again."); process.exit(1); }
+
+    const path = saveBridgeConfig({ telegram: { bot_token: token, chat_id: chatId } });
+    console.log(`${c.green("✓ saved")} ${c.dim(path)} (chat ${chatId})`);
+    console.log(`${c.dim("Run")} ${c.bold("air-msg bridge")} ${c.dim("to start the doorbell.")}`);
+  } finally {
+    rl.close();
+  }
+}
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
@@ -189,32 +228,102 @@ async function main() {
     }
     case "watch": {
       const identity = await ensureIdentity();
-      const openMode = process.env.AIRMSG_OPEN || "terminal-history";
-      const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
-      const openResolver = (peer, info) =>
-        resolveOpenCommand(peer, { mode: openMode, aiCmd, ...info });
+      if (!acquireOrExit("watch")) break;
+      try {
+        const openMode = process.env.AIRMSG_OPEN || "terminal-history";
+        const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
+        const openResolver = (peer, info) =>
+          resolveOpenCommand(peer, { mode: openMode, aiCmd, ...info });
 
-      const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
+        const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
 
-      const ac = new AbortController();
-      const stop = () => { console.log(c.dim("\n…stopping watch")); ac.abort(); };
-      process.once("SIGINT", stop);
-      process.once("SIGTERM", stop);
+        const ac = new AbortController();
+        const stop = () => { console.log(c.dim("\n…stopping watch")); ac.abort(); };
+        process.once("SIGINT", stop);
+        process.once("SIGTERM", stop);
 
-      console.log(`${c.green("● watching")} ${c.bold(identity.did)}`);
-      console.log(`  ${c.dim(`notify: ${notifier.backend} · open: ${openMode}${aiCmd ? " (" + aiCmd + ")" : ""} · Ctrl-C to stop`)}`);
+        console.log(`${c.green("● watching")} ${c.bold(identity.did)}`);
+        console.log(`  ${c.dim(`notify: ${notifier.backend} · open: ${openMode}${aiCmd ? " (" + aiCmd + ")" : ""} · Ctrl-C to stop`)}`);
 
-      await watch({
-        signal: ac.signal, identity, notifier, openResolver,
-        onMessage: (m) => {
-          const who = m.contact ? m.contact : m.from;
-          const enc = m.encrypted ? "🔒" : "✉️ ";
-          const vrf = m.verified ? c.green("✓") : c.red("✗");
-          const txt = bodyText(m.body);
-          console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
-          console.log(`    ${txt}`);
-        },
-      }).catch((e) => { if (e?.name !== "AbortError") throw e; });
+        await watch({
+          signal: ac.signal, identity, notifier, openResolver,
+          onMessage: (m) => {
+            const who = m.contact ? m.contact : m.from;
+            const enc = m.encrypted ? "🔒" : "✉️ ";
+            const vrf = m.verified ? c.green("✓") : c.red("✗");
+            const txt = bodyText(m.body);
+            console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
+            console.log(`    ${txt}`);
+          },
+        }).catch((e) => { if (e?.name !== "AbortError") throw e; });
+      } finally {
+        releaseConsumerLock();
+      }
+      break;
+    }
+    case "bridge": {
+      if (positionals[0] === "setup") { await bridgeSetup(); break; }
+
+      const cfg = loadBridgeConfig();
+      if (!cfg?.telegram?.bot_token || cfg?.telegram?.chat_id == null) {
+        console.error("Bridge not configured. Run: air-msg bridge setup");
+        process.exit(1);
+      }
+      if (!acquireOrExit("bridge")) break;
+      try {
+        const identity = await ensureIdentity();
+        const bodyMode = process.env.AIRMSG_BRIDGE_BODY === "meta" ? "meta" : "full";
+
+        const ac = new AbortController();
+        const stop = () => { console.log(c.dim("\n…stopping bridge")); ac.abort(); };
+        process.once("SIGINT", stop);
+        process.once("SIGTERM", stop);
+
+        const adapter = createTelegramAdapter({
+          token: cfg.telegram.bot_token,
+          chatId: Number(cfg.telegram.chat_id),
+          getOffset: () => getUpdateOffset({ platform: "telegram" }),
+          setOffset: (o) => setUpdateOffset({ platform: "telegram", offset: o }),
+          signal: ac.signal,
+        });
+
+        // D6: the bridge is a superset of `watch` — fire the local OS banner too.
+        const openMode = process.env.AIRMSG_OPEN || "terminal-history";
+        const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
+        const openResolver = (peer, info) => resolveOpenCommand(peer, { mode: openMode, aiCmd, ...info });
+        const notifier = await createNotifier({ onClick: (argv) => runOpenCommand(argv) });
+
+        const confirm = makeConfirmStore();
+        const outbound = makeBridgeOutbound({ adapter, bodyMode });
+
+        // v1: prune on start only. The 30-day age bound + maxRows cap keep bridge_routes
+        // bounded, and a long-lived daemon re-prunes on each restart, so the spec's
+        // "+ periodically" (§12) is intentionally deferred — not an oversight.
+        pruneRoutes({ platform: "telegram", now: Date.now() });
+        console.log(`${c.green("● bridging")} ${c.bold(identity.did)} ${c.dim("→ Telegram")}`);
+        console.log(`  ${c.dim(`body: ${bodyMode} · notify: ${notifier.backend} · Ctrl-C to stop`)}`);
+        if (bodyMode === "full") {
+          console.log(c.yellow("  ⚠ full message text is sent to Telegram (outside E2E). Set AIRMSG_BRIDGE_BODY=meta for metadata-only."));
+        }
+
+        // INBOUND loop (replies → AIR Notes) runs alongside the OUTBOUND watch loop.
+        const inbound = adapter
+          .listen({ signal: ac.signal, onReply: makeReplyHandler({ sendFn: core.send, confirm }) })
+          .catch((e) => { if (e?.name !== "AbortError") console.error("bridge inbound:", e.message ?? e); });
+
+        await watch({
+          signal: ac.signal, identity, notifier, openResolver,
+          onMessage: (m) => {
+            outbound(m); // push to Telegram + store the route
+            const vrf = (m.verified && !m.key_changed) ? c.green("✓") : c.red("⚠");
+            console.log(`  ↓→tg ${vrf} ${m.contact || m.from}`);
+          },
+        }).catch((e) => { if (e?.name !== "AbortError") throw e; });
+
+        await inbound;
+      } finally {
+        releaseConsumerLock();
+      }
       break;
     }
     case "add": {
