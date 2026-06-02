@@ -162,8 +162,8 @@ Skipped messages are **not** pushed to `messages[]` and **not** archived; the cu
 
 `reportSpamOp({ envelope_id })`:
 1. Look up the **`received`** row by `(envelope_id, direction='received')` → get `peer_did` (the subject). Not found → error "no such *received* message in your diary". (You can't spam mail you sent.)
-2. `reportAbuse({ subject_did: peer_did })` — refuses if `subject_air_id === my air_id` (self-report guard, mirroring `attest`); otherwise build+sign+POST behind the seam (§7).
-3. `markSpam(envelope_id)` → `UPDATE messages SET spam = 1 WHERE envelope_id = ? AND direction = 'received'` (idempotent; received row only). The message immediately drops out of default inbox/history reads (§6.4).
+2. `markSpam(envelope_id)` → `UPDATE messages SET spam = 1 WHERE envelope_id = ? AND direction = 'received'` (idempotent; received row only). The message immediately drops out of default inbox/history reads (§6.4). **Guaranteed local hide happens first.**
+3. `reportAbuse({ subject_did: peer_did })` — refuses if `subject_air_id === my air_id` (self-report guard, mirroring `attest`); otherwise build+sign+POST behind the seam (§7). Best-effort: any failure degrades to local-hide-only (D9).
 - Return: `{ hidden: true, reported: <bool>, subject, reason? }`.
 
 ### 6.3 delete (cleanup)

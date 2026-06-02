@@ -511,8 +511,8 @@ export async function reportSpamOp({ envelope_id }) {
   const row = getReceived(envelope_id);
   if (!row) throw new Error(`no received message with envelope_id ${envelope_id} in your diary`);
   const identity = await ensureIdentity();
+  markSpam(envelope_id);                 // guaranteed local hide FIRST
   const report = await reportAbuse({ identity, subjectDid: row.peer_did });
-  markSpam(envelope_id);
   return {
     hidden: true,
     reported: report.reported,
