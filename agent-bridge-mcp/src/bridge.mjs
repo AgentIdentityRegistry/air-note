@@ -103,7 +103,7 @@ export function makeReplyHandler({ sendFn, getRouteFn = getRoute, confirm, platf
     if (replyTier(route) === "confirm") {
       if (!isYes) {
         confirm.put(replyToExternalId, text);
-        await reply("⚠️ This sender is UNVERIFIED. Reply /yes (to this message) within 2 min to send anyway.");
+        await reply("⚠️ UNVERIFIED sender — we couldn't confirm who sent this, so your reply would go to the identity it CLAIMS (which may be a stranger). Reply /yes (to this message) within 2 min to send anyway.");
         return;
       }
       const held = confirm.get(replyToExternalId);

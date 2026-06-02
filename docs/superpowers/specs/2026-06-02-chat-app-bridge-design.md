@@ -23,7 +23,7 @@ v1 targets **Telegram** only, behind a thin adapter seam so Slack/Discord/WhatsA
 The bridge is a new *consumer* of the existing pipeline, exactly like the #29 channel-server. It adds **no** crypto/relay/messaging logic of its own.
 
 - `core.receive({ since, limit })` — pull/verify/decrypt/archive/advance-cursor. Returns `{ messages, count, verified_count, cursor, has_more, my_did }`. Each message: `{ seq, from, contact?, envelope_id, received_at, verified, encrypted, key_changed?, verify_note?, body?, thread_id? }`.
-  - `from` = the **relay-verified `sender_did`** — the trusted identity (the code explicitly distrusts `envelope.from`, `core.mjs:262`). **This is the only safe routing key for a peer.**
+  - `from` = `m.sender_did`, which the relay sets straight from the sender-controlled `envelope.from` — the relay does **NOT** authenticate it (`air-site/relay/src/index.js:145`; its own comment, line 156: *"The relay can't verify the `from` field is real"*). It is the pipeline's routing key, but a **CLAIMED** identity, not relay-verified. Cryptographic trust comes ONLY from recipient-side `verifyEnvelope` + `checkPin` (`core.mjs:265-281`): a forged `from` lands `verified:false` (the forger can't sign as the DID they claim). The `core.mjs:262` `envelope.from !== m.sender_did` guard is a *consistency* check (the relay echoed the same value), NOT authentication.
   - `contact` = the pinned alias; present **only** for a known/pinned contact.
   - The verified badge predicate is `verified && !key_changed` (`core.mjs:337`).
 - `core.send({ to, body, thread_id, in_reply_to, plaintext })` — sign + encrypt + POST. Returns `{ ..., envelope_id, thread_id }`. Accepts `thread_id`/`in_reply_to` so a reply continues the **same** AIR thread.
@@ -145,7 +145,7 @@ The async `adapter.send` runs via the detached-promise pattern so a Telegram fai
 
 ## 9. Trust & abuse model
 
-- **Routing key integrity:** routes are keyed by Telegram's server-assigned `message_id` → the relay-verified `m.from`. Nothing the sender controls (body, display name, `envelope.from`) can influence *who a reply goes to* (closes route-hijack).
+- **Reply-target integrity (NOT from the relay):** routes are keyed by Telegram's server-assigned `message_id` → `m.sender_did` (= the sender-controlled `envelope.from`; the relay does NOT authenticate it). A sender CAN therefore steer where a reply goes — including forging `from` to an innocent third party's DID. The defense is **not** relay routing-key integrity; it is the **verify+pin gate**: a forged/unverifiable sender arrives `verified:false` → its route is stored non-one-tap → any reply is gated behind the explicit `/yes` confirm (D5) with an UNVERIFIED warning that names the misroute risk. Only a **verified + pinned** sender (one-tap) is cryptographically who they claim, so only a one-tap reply is safe to auto-route. (Body, display name, and Markdown still can't influence routing or forge the badge — those remain closed.)
 - **Badge integrity:** badge derived solely from `verified && !key_changed`, placed where a sender's name cannot reach (closes badge spoof).
 - **Injection:** plain-text sends (no `parse_mode`) neutralize Markdown/HTML/link injection from body or name.
 - **Bot exposure:** Telegram bots are world-discoverable. Hard-filter every update to `savedChatId`; in BotFather disable group joins (`/setjoingroups` off) and enable privacy mode. The saved `chat_id` is the one authenticated principal.

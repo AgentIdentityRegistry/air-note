@@ -88,6 +88,16 @@ test("outbound: a verified but UNPINNED sender (no contact) is stored as NOT one
   assert.equal(routes[0].verified, false); // signature-verified but not pinned → confirm tier
 });
 
+test("outbound: a forged/UNVERIFIED message (verified:false) is stored NOT one-tap — even if a contact alias is present", async () => {
+  const adapter = fakeAdapter();
+  const routes = [];
+  // A forged `from` lands verified:false at receive(); even a (spoofed) contact alias must not promote it to one-tap.
+  makeBridgeOutbound({ adapter, putRouteFn: (r) => routes.push(r) })(
+    { from: "did:wba:x:agents:AIR-FORGED", contact: "alice", verified: false, body: { type: "text", text: "hi" } });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(routes[0].verified, false); // unverified ⇒ confirm tier, never auto-routed
+});
+
 test("outbound: a failed send (null id) stores no route", async () => {
   const adapter = { name: "telegram", async send() { return null; } };
   const routes = [];
@@ -150,6 +160,7 @@ test("reply (unverified): first reply is HELD pending /yes; nothing sent yet", a
   assert.equal(sends.length, 0);
   assert.ok(acks[0].includes("UNVERIFIED"));
   assert.ok(acks[0].includes("/yes"));
+  assert.match(acks[0], /claims|stranger/i); // warns the reply target itself is unverifiable (misroute risk)
 });
 
 test("reply (unverified): /yes releases the HELD text to core.send", async () => {
