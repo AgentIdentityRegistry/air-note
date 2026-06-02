@@ -87,6 +87,13 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
   air-msg search <query...> [--verified] Search the AIR registry
   air-msg invite                         Show your shareable identity card
   air-msg attest <air-id> <type> [note]  Vouch for an agent (AIR Verified)
+  air-msg block <to>                     Drop all mail from a sender (convenience filter)
+  air-msg unblock <to>                   Remove a sender from the blocklist
+  air-msg blocked                        List blocked senders + drop tallies
+  air-msg spam <envelope-id>             Hide a junk message + report it to AIR (private)
+  air-msg delete --message <id> --yes    Delete one message from your local diary
+  air-msg delete --with <to> --yes       Delete a whole conversation from your local diary
+  inbox/history also accept --include-spam to reveal hidden spam.
   air-msg health                         Relay + identity status
 
   <to> may be a DID, an AIR ID, or a saved contact alias.
@@ -196,7 +203,10 @@ async function main() {
     }
     case "inbox": {
       const synced = await core.receive();
-      const { messages } = core.recentInbox({ limit: flags.limit ? Number(flags.limit) : 20 });
+      const { messages } = core.recentInbox({
+        limit: flags.limit ? Number(flags.limit) : 20,
+        includeSpam: !!flags["include-spam"],
+      });
       console.log(`${messages.length} in archive${synced.count ? `  (${synced.count} new)` : ""}`);
       console.log("");
       for (const m of messages) {
@@ -214,6 +224,7 @@ async function main() {
       const result = core.historyOp({
         peer: flags.with, thread: flags.thread,
         limit: flags.limit ? Number(flags.limit) : 50,
+        includeSpam: !!flags["include-spam"],
       });
       const scope = flags.with ? ` with ${result.resolvedPeer}` : "";
       console.log(`${result.count} message(s)${scope}`);
@@ -372,6 +383,53 @@ async function main() {
       if (!subject || !type) { console.error("usage: air-msg attest <air-id> <type> [statement...]"); process.exit(1); }
       const r = await core.attest({ subject, attestation_type: type, statement: note.join(" ") });
       console.log(`${c.green("✓ attested")} ${subject} ${c.dim("(" + type + ")")}`);
+      break;
+    }
+    case "block": {
+      const [peer] = positionals;
+      if (!peer) { console.error("usage: air-msg block <did|air-id|alias>"); process.exit(1); }
+      const r = await core.blockOp({ peer });
+      console.log(`${c.green("✓ " + r.status)} ${c.bold(r.alias || r.air_id || r.did)}`);
+      console.log(c.dim("  their mail is now dropped on arrival. NOTE: unblocking later cannot recover messages dropped while blocked, and a sender who forges a different identity can still get through (block is a convenience filter, not a security wall)."));
+      break;
+    }
+    case "unblock": {
+      const [peer] = positionals;
+      if (!peer) { console.error("usage: air-msg unblock <did|air-id|alias>"); process.exit(1); }
+      const r = await core.unblockOp({ peer });
+      console.log(`${c.green("✓ " + r.status)} ${c.dim(r.did)}`);
+      break;
+    }
+    case "blocked": {
+      const r = core.listBlockedOp();
+      if (r.count === 0) { console.log(c.dim("(no blocked senders)")); break; }
+      for (const b of r.blocked) {
+        const tally = b.drop_count
+          ? c.dim(`  ${b.drop_count} dropped${b.last_drop_at ? ", last " + b.last_drop_at : ""}`)
+          : "";
+        console.log(`${c.red("⊘")} ${c.bold(b.alias || b.air_id)}  ${c.dim(b.did)}${tally}`);
+      }
+      console.log(c.dim("  (tallies are advisory — a forged sender can evade or inflate them)"));
+      break;
+    }
+    case "spam": {
+      const [envelope_id] = positionals;
+      if (!envelope_id) { console.error("usage: air-msg spam <envelope-id>   (copy the id from inbox/history)"); process.exit(1); }
+      const r = await core.reportSpamOp({ envelope_id });
+      const report = r.reported
+        ? c.green("reported")
+        : c.yellow("local-only" + (r.reason ? ` (${r.reason})` : ""));
+      console.log(`${c.green("✓ hidden")} ${c.dim("from " + r.subject)} · ${report}`);
+      break;
+    }
+    case "delete": {
+      if (!flags.yes) { console.error("refusing to delete without --yes (this permanently erases local diary rows)"); process.exit(1); }
+      let r;
+      if (flags.message) r = await core.deleteOp({ envelope_id: flags.message, confirm: true });
+      else if (flags.with) r = await core.deleteOp({ peer: flags.with, confirm: true });
+      else { console.error("usage: air-msg delete --message <envelope-id> | --with <peer>  --yes"); process.exit(1); }
+      const tgt = r.scope === "message" ? r.envelope_id : "conversation with " + r.peer;
+      console.log(`${c.green("✓ deleted")} ${r.deleted} row(s)  ${c.dim(tgt)}`);
       break;
     }
     case "health": {
