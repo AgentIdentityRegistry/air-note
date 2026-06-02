@@ -46,6 +46,12 @@ export function openArchive() {
   const path = archivePath();
   const db = new DatabaseSync(path);
   for (const stmt of SCHEMA) db.prepare(stmt).run();
+  // Migration: add the moderation `spam` flag if an older DB predates it. Guarded by
+  // PRAGMA so it runs at most once; ADD COLUMN ... NOT NULL DEFAULT 0 is legal in node:sqlite.
+  const cols = db.prepare(`PRAGMA table_info(messages)`).all().map((col) => col.name);
+  if (!cols.includes("spam")) {
+    db.prepare(`ALTER TABLE messages ADD COLUMN spam INTEGER NOT NULL DEFAULT 0`).run();
+  }
   try { chmodSync(path, 0o600); } catch { /* best effort on non-POSIX */ }
   _db = db;
   return db;
@@ -72,18 +78,20 @@ function parseRow(r) {
     envelope_id: r.envelope_id, direction: r.direction, thread_id: r.thread_id,
     peer_did: r.peer_did, from: r.from_did, to: r.to_did, timestamp: r.timestamp,
     body: JSON.parse(r.body_json), encrypted: !!r.encrypted, verified: !!r.verified,
+    spam: !!r.spam,
     relay_seq: r.relay_seq ?? undefined, archived_at: r.archived_at,
   };
 }
 
-/** Query history newest-first. Filters: peer (DID), thread (id), before (ISO ts), limit. */
-export function history({ peer, thread, before, limit = 50 } = {}) {
+/** Query history newest-first. Filters: peer (DID), thread (id), before (ISO ts), limit, includeSpam. */
+export function history({ peer, thread, before, limit = 50, includeSpam = false } = {}) {
   const db = openArchive();
   const where = [];
   const params = [];
   if (peer)   { where.push("peer_did = ?"); params.push(peer); }
   if (thread) { where.push("thread_id = ?"); params.push(thread); }
   if (before) { where.push("timestamp < ?"); params.push(before); }
+  if (!includeSpam) { where.push("spam = 0"); }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
   params.push(limit);
   return db.prepare(
@@ -92,8 +100,8 @@ export function history({ peer, thread, before, limit = 50 } = {}) {
 }
 
 /** Recent messages across all peers, newest-first (the inbox view). */
-export function recentForInbox(limit = 20) {
-  return history({ limit });
+export function recentForInbox(limit = 20, { includeSpam = false } = {}) {
+  return history({ limit, includeSpam });
 }
 
 /** Distinct conversations with last activity + message count. */
@@ -101,7 +109,7 @@ export function threads() {
   const db = openArchive();
   return db.prepare(`
     SELECT thread_id, peer_did, MAX(timestamp) AS last_timestamp, COUNT(*) AS count
-    FROM messages GROUP BY thread_id ORDER BY last_timestamp DESC
+    FROM messages WHERE spam = 0 GROUP BY thread_id ORDER BY last_timestamp DESC
   `).all().map((r) => ({
     thread_id: r.thread_id, peer_did: r.peer_did,
     last_timestamp: r.last_timestamp, count: Number(r.count),
@@ -122,6 +130,24 @@ export function setCursor(seq) {
   db.prepare(
     "INSERT INTO meta (key, value) VALUES ('pull_cursor', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
   ).run(String(next));
+}
+
+/** Flag a RECEIVED message as spam (hidden from default reads). Idempotent. */
+export function markSpam(envelope_id) {
+  const db = openArchive();
+  const res = db.prepare(
+    `UPDATE messages SET spam = 1 WHERE envelope_id = ? AND direction = 'received'`
+  ).run(envelope_id);
+  return { updated: res.changes };
+}
+
+/** Fetch the received row for an envelope_id (used to find the spam subject), or null. */
+export function getReceived(envelope_id) {
+  const db = openArchive();
+  const r = db.prepare(
+    `SELECT * FROM messages WHERE envelope_id = ? AND direction = 'received'`
+  ).get(envelope_id);
+  return r ? parseRow(r) : null;
 }
 
 /** Close the DB (used by tests to reset between cases). */
