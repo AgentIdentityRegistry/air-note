@@ -206,6 +206,7 @@ async function main() {
         const who = m.direction === "sent" ? `to ${m.to}` : `from ${m.from}`;
         console.log(`  ${arrow} ${encBadge} ${vrf} ${who}  ${c.dim(m.timestamp)}`);
         console.log(`    ${bodyText(m.body)}`);
+        console.log(`    ${c.dim("id " + m.envelope_id)}`);
       }
       break;
     }
@@ -223,6 +224,7 @@ async function main() {
         const who = m.direction === "sent" ? `to ${m.to}` : `from ${m.from}`;
         console.log(`  ${arrow} ${encBadge} ${who}  ${c.dim(m.timestamp)}`);
         console.log(`    ${bodyText(m.body)}`);
+        console.log(`    ${c.dim("id " + m.envelope_id)}`);
       }
       break;
     }
