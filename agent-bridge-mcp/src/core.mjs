@@ -41,6 +41,8 @@ import { verifyOp } from "./room-ops.mjs";
 
 export const CORE_VERSION = "0.3.0";
 
+const ROOM_OP_MAX_AGE_MS = 48 * 60 * 60 * 1000; // 48h replay/skew horizon (spec §9.1)
+
 export const VALID_ATTESTATION_TYPES = [
   "identity_verification",
   "operator_confirmation",
@@ -185,6 +187,17 @@ async function ingestControlOp({ op, identity }) {
   if (!roomId) { console.error("[rooms] control op missing room_id — dropping"); return; }
 
   if (op.type === "room/create") {
+    // Idempotency FIRST: a replayed create for a room we already have must not pay a network
+    // round-trip. Surface a key-rotation/confused-state anomaly if the founder key disagrees.
+    const store = loadRooms();
+    const existing = store.rooms[roomId];
+    if (existing) {
+      const storedCreate = (existing.ops || []).find((o) => o.type === "room/create");
+      if (storedCreate && storedCreate.founder_pubkey !== op.founder_pubkey) {
+        console.error(`[rooms] existing room ${roomId} received a room/create with a DIFFERENT founder_pubkey — ignoring (possible confused state / key rotation)`);
+      }
+      return; // idempotent — no network call, no state change
+    }
     if (!verifyOp(op, pubKeyFromMultibase(op.founder_pubkey))) {
       console.error(`[rooms] room/create op_sig did NOT verify for ${roomId} — dropping`);
       return;
@@ -197,18 +210,15 @@ async function ingestControlOp({ op, identity }) {
       console.error(`[rooms] room/create founder_pubkey does NOT match ${op.founder_did}'s AIR key — dropping (possible key-substitution attack)`);
       return;
     }
-    const store = loadRooms();
-    if (!store.rooms[roomId]) {
-      store.rooms[roomId] = {
-        name: op.name, thread_id: op.thread_id, founder_did: op.founder_did, ops: [op],
-        founder_seq_next: "1", send_seq_next: "0", muted: false, joined_via: "invite",
-      };
-      saveRooms(store);
-      try {
-        await addContact(identity.air_url, { to: op.founder_did });
-      } catch (err) {
-        console.error(`[rooms] auto-pin founder ${op.founder_did} failed (best-effort): ${err.message ?? err}`);
-      }
+    store.rooms[roomId] = {
+      name: op.name, thread_id: op.thread_id, founder_did: op.founder_did, ops: [op],
+      founder_seq_next: "1", send_seq_next: "0", muted: false, joined_via: "invite",
+    };
+    saveRooms(store);
+    try {
+      await addContact(identity.air_url, { to: op.founder_did });
+    } catch (err) {
+      console.error(`[rooms] auto-pin founder ${op.founder_did} failed (best-effort): ${err.message ?? err}`);
     }
     return;
   }
@@ -414,7 +424,8 @@ export async function receive({ since, limit } = {}) {
       if (isArchived(m.envelope_id, "received")) continue;
       // Skew guard (spec §9.1): refuse envelopes older than 48h.
       const ts = Date.parse(envelope.timestamp);
-      if (!Number.isNaN(ts) && Date.now() - ts > 48 * 3600 * 1000) continue;
+      // absent/malformed timestamp intentionally bypasses (safe failure mode)
+      if (!Number.isNaN(ts) && Date.now() - ts > ROOM_OP_MAX_AGE_MS) continue;
 
       const body = decoded.body;
       if (body.type === "room/msg") {
@@ -442,6 +453,7 @@ export async function receive({ since, limit } = {}) {
           body, thread_id: envelope.thread_id,
         });
         try {
+          // replay-guard (isArchived) already passed above
           archiveMessage({
             envelope_id: m.envelope_id, direction: "received",
             thread_id: envelope.thread_id ?? m.envelope_id,

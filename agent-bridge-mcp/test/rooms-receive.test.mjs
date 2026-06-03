@@ -16,6 +16,18 @@ test("flags drift when recipients/digest mismatch local derivation", () => {
   assert.equal(r.accept, true);
   assert.equal(r.drift, true);
 });
+test("drift when self IS in recipients but roster_digest mismatches localDigest", () => {
+  const r = roomReceiveCheck({ senderDid: "did:wba:s", selfDid: "did:wba:me",
+    body: { type: "room/msg", recipients: ["did:wba:s", "did:wba:me"], roster_digest: "WRONG" }, state, localDigest: "x" });
+  assert.equal(r.accept, true);
+  assert.equal(r.drift, true); // digest mismatch alone flags drift
+});
+test("drift when self NOT in recipients even though the digest matches", () => {
+  const r = roomReceiveCheck({ senderDid: "did:wba:s", selfDid: "did:wba:me",
+    body: { type: "room/msg", recipients: ["did:wba:s"], roster_digest: "x" }, state, localDigest: "x" });
+  assert.equal(r.accept, true);
+  assert.equal(r.drift, true); // not addressed to me alone flags drift
+});
 test("accepts a clean room/msg from a member addressed to me", () => {
   const r = roomReceiveCheck({ senderDid: "did:wba:s", selfDid: "did:wba:me",
     body: { type: "room/msg", recipients: ["did:wba:s", "did:wba:me"], roster_digest: "x" }, state, localDigest: "x" });
@@ -32,3 +44,8 @@ test("createFounderBindingOk: a substituted attacker key does NOT bind (key-subs
   assert.equal(createFounderBindingOk(op, "zRealFounderKey"), false); // op claims founder_did but pins attacker's key
   assert.equal(createFounderBindingOk(op, null), false);              // founder DID unresolvable from AIR ⇒ drop
 });
+
+// Visible gaps: the receive()-level guards are exercised by the in-repo end-to-end probe today;
+// these mark the still-missing standalone unit coverage (need network/Date stubs).
+test.todo("replay-guard drops a duplicate room/msg (needs relay/isArchived stub)");
+test.todo("48h skew guard drops a stale room/msg (needs Date stub)");

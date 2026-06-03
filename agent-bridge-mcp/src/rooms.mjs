@@ -121,6 +121,8 @@ export function deriveRoom(room_id) {
 }
 
 /** Append a vetted op (op_sig already verified by the caller) to a room; dedup by opId; persist. */
+// Combined cost: O(n) opId-dedup + O(n²) deriveState per call — fine for small rooms (≤15, §3);
+// do not call in a tight loop.
 export function appendOp(room_id, op) {
   const store = loadRooms();
   const room = store.rooms[room_id];
