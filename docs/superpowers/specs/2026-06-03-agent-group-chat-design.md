@@ -1,7 +1,7 @@
 # Autonomous Agent Group Chat (Rooms v1) — Design
 
 **Date:** 2026-06-03
-**Status:** Draft **v2** — review-hardened; pending user re-review, then plan.
+**Status:** Draft **v2.1** — review-hardened + re-verified by both reviewers (clear-to-plan); pending user approval, then plan.
 **Repo:** `~/air-note` (canonical). Code under `agent-bridge-mcp/`; Rust reference under `crates/air-rs/`.
 **Tracks:** AIR Note messaging issue #34 (group chat). Folds in the first concrete slice of the **Mandate** primitive (scoped, revocable delegation).
 
@@ -21,6 +21,8 @@ v2 closes 5 load-bearing holes the architecture + security reviews found (the fo
 - **(a)** Revoking an admin now **voids that admin's adds** (was "past adds stand"). §6.2.
 - **(b)** We **openly state perfect delivery is not guaranteed**; eclipse is only eventually detectable. §11.
 - **(c)** Reply rules tightened: **≤1 auto-reply per human turn**, anchored to founder/human-`kind` members; never auto-reply to a bot. §10.
+
+**v2.1 (re-verification fold-in):** both reviewers confirmed all v1 blockers CLOSED and v2 *clear-to-plan*. Folded their three follow-ups: `kind:"human"` is now **founder-only** (admin-adds ⇒ `kind:"agent"`) so a compromised admin can't forge a reply-budget turn-anchor; `room/req-*` is **rate+size-capped** (anti-DoS); `op_id` is defined; plus notes on revoke-rescue batching, missed-turn under-reply, and `sender_seq` poisoning. §6.1, §6.2, §6.4, §7, §11.10, §14, §17.
 
 ---
 
@@ -130,7 +132,7 @@ All ops carry an in-body `op_sig` over their canonical bytes. **Founder ops** ad
 - `room/create` — `{room_id, name, thread_id, founder_did, founder_pubkey, founder_seq:"0"}`; founder-signed. Root of trust; carries the founder key so members can pin it.
 - `room/admin-grant` — `{room_id, mandate_id, holder_did, holder_pubkey, scope:"member:add", founder_seq, expires_at?}`; founder-signed. **This is an admin Mandate.** Carries the holder's pubkey so members verify the admin's op_sigs without a separate pin.
 - `room/admin-revoke` — `{room_id, mandate_id, founder_seq}`; founder-signed.
-- `room/add` — `{room_id, member_did, member_pubkey, kind:"human"|"agent", mandate_id?}`; founder-signed, **or** admin-signed citing `mandate_id`. (`kind` is founder/admin-asserted; used by the reply budget, §10.)
+- `room/add` — `{room_id, member_did, member_pubkey, kind:"human"|"agent", mandate_id?}`; founder-signed, **or** admin-signed citing `mandate_id`. **`kind:"human"` is founder-only** — an **admin-signed add is forced to `kind:"agent"`** (only the founder confers human-turn-anchor status, §10), so a compromised admin can't forge a turn-anchor to reopen the reply budget (§11.4/§11.10).
 - `room/remove` — `{room_id, member_did, founder_seq}`; **founder-only.**
 - `room/snapshot` — `{room_id, founder_seq, members[], admins[], halted}`; founder-signed bootstrap/heal.
 - `room/halt` / `room/resume` — `{room_id, founder_seq}`; founder-only (control; §10).
@@ -142,7 +144,7 @@ Founder ops share one signer and a strictly increasing `founder_seq`, so they ar
 
 1. **Admins** = each `holder_did` whose **latest founder op (by `founder_seq`) about its `mandate_id` is a `grant`** (not a `revoke`) and not past `expires_at`.
 2. **A `room/add` for `member_did` counts** iff it is founder-signed, **or** it is admin-signed and **its cited `mandate_id` is a currently-valid admin Mandate** per (1). _No reliance on any admin-asserted timestamp._
-   > **⚑ DECISION (a) — changed from v1:** because validity is evaluated against *current* mandate status, **revoking an admin retroactively drops the members that admin added.** This kills the backdated-add exploit (security H2). A founder who wants to keep a good member after revoking a bad admin re-adds them with a **founder** `room/add` (which never depends on a mandate). Safer default; founder can always rescue.
+   > **⚑ DECISION (a) — changed from v1:** because validity is evaluated against *current* mandate status, **revoking an admin retroactively drops the members that admin added.** This kills the backdated-add exploit (security H2). A founder who wants to keep a good member after revoking a bad admin re-adds them with a **founder** `room/add` (which never depends on a mandate). Safer default; founder can always rescue. **Operational note:** a revoke *without* rescue is a **mass-removal** of that admin's adds — batch the revoke and any founder-add rescues at adjacent `founder_seq` so honest members merge them together and avoid mid-conversation churn (the transient is self-healing via §9.5).
 3. **`member_did` is a MEMBER** iff (a) ≥1 counting `room/add` exists, **and** (b) the **latest founder op about `member_did` is not a `room/remove`**. Founder `room/remove` is **sticky** (overrides admin adds) until a later founder `room/add`.
 4. **`halted`** = the latest founder `room/halt`/`room/resume` by `founder_seq` is a `halt`.
 
@@ -157,7 +159,7 @@ Convergence: every clause depends only on the op-set and the totally-ordered fou
 A member that detects drift (digest mismatch) or is newly added pulls state via the **request channel**:
 - `room/req-ops {have:[op_ids]}` → recipient forwards every op the requester lacks (each with its original `op_sig`), via the normal 1:1 send path.
 - `room/req-snapshot` → founder (or any member holding a founder snapshot) returns a `room/snapshot`.
-Requests are ordinary sealed+signed 1:1 messages (relay stays dumb). Responders rate-limit and only answer room members (anti-amplification). New members **auto-pin `founder_did`** from the (founder-signed, key-bearing) invite/snapshot before trusting further ops.
+Requests are ordinary sealed+signed 1:1 messages (relay stays dumb). **Anti-DoS (concrete):** a responder answers at most **R=3** `room/req-*` per requester per minute and caps any single response at **C** ops (paginate larger diffs via `have`); an empty `have:[]` is allowed but still C-capped; only **current room members** are answered. New members **auto-pin `founder_did`** from the (founder-signed, key-bearing) invite/snapshot before trusting further ops.
 
 ---
 
@@ -181,6 +183,8 @@ Requests are ordinary sealed+signed 1:1 messages (relay stays dumb). Responders 
 Control ops use the same sealed+signed envelopes with `body.type = "room/<op>"` + §6.1 fields + an in-body **`op_sig`**.
 
 **Trust rule (N2):** for control ops, membership trust is decided by **`op_sig`** verified against the issuer key — `founder_pubkey` (pinned at join) for founder ops, `holder_pubkey` (from the founder-signed grant) for admin ops. The **envelope** signature only proves the *last forwarding hop*; it is **not** used for control-op authority. This lets any member forward an op to a member who's missing it (§6.4) without being able to forge it.
+
+**Op identity:** `op_id = sha256(canonical(op-body including op_sig))` — the stable id that `room/req-ops {have:[op_id,…]}` diffs against (§6.4).
 
 ---
 
@@ -241,6 +245,7 @@ Agent members run `air-msg-channel`. On a gated room `room/msg`:
 7. **Prompt injection into autonomous agents:** body **and** room-context strings are fenced (M3); the autonomy trigger is hardened (forged `in_reply_to` ignored; mentions gated; one-reply-per-human-turn; no bot→bot) (C2/M4); control ops are **signed**, never inferred from text.
 8. **Replay:** persistent dedup on `envelope_id` + skew horizon (H3) — a replayed envelope no longer re-fires the agent.
 9. **Founder key = single root (L2, honest):** loss/compromise = **total room loss with no remediation**; **no founder-key rotation or room recovery in v1**. (#19 hardware custody lowers likelihood, not blast radius.) No forward secrecy (unchanged; MLS #35/#36).
+10. **v2 follow-up surfaces (now bounded):** `room/req-*` is rate+size-capped per requester (§6.4) to stop in-room request flooding; `kind:"human"` is **founder-only** so a compromised admin (§11.4) can't forge a reply-budget turn-anchor; `sender_seq` is tied to the sender's pinned **key-epoch** so a peer can't poison the counter (§17.5).
 
 ---
 
@@ -285,6 +290,8 @@ Derived `{members, admins, halted, roster_digest}` are computed on read (single 
 - **Halt race:** in-flight replies may land; agents stop *initiating* on receipt; immediate brake = local mute.
 - **Replay:** duplicate `envelope_id` ⇒ skip push+archive; stale `timestamp` ⇒ reject.
 - **Migration:** additive + abort-safe.
+- **Missed human turn:** an agent that never received a human/founder message (eclipse/lag, §11.6) won't open a reply turn ⇒ may stay silent even when @mentioned; recovers on the next human turn or a manual `room sync`.
+- **Request flood:** `room/req-*` beyond the per-requester budget (§6.4) ⇒ dropped (in-room DoS guard).
 
 ---
 
@@ -323,9 +330,9 @@ Target: current 88 JS tests stay green + the above added.
 
 1. **Mention syntax:** `@AIR-id`, `@alias`, or both; who fills `mentions` for an agent's reply (model vs parser)? Lean: parse `@alias`/`@AIR-id` **and** allow an explicit arg.
 2. **Quiet-timer / K defaults:** 60s / K=3 hard-coded for v1, exposed later? Lean: hard-code v1.
-3. **`kind` (human/agent) source:** founder/admin-asserted at add time — enough for the reply budget, or do we need a stronger signal? Lean: founder-asserted is fine for v1 (the founder owns the room).
+3. **`kind` (human/agent) source — RESOLVED (v2.1):** `kind:"human"` is **founder-only**; admin-added members are forced `kind:"agent"` (§6.1), so the reply-budget turn-anchor (§10 ⚑c) can't be forged by a compromised admin (§11.4/§11.10).
 4. **Snapshot trigger:** on join + on drift-request only (lazy)? Lean: yes.
-5. **`sender_seq` persistence + reset semantics** across re-join/key-rotate. Lean: persist per (identity, room); never lower.
+5. **`sender_seq` persistence + reset semantics** across re-join/key-rotate. Lean: persist per (identity, room), **keyed to the sender's pinned key-epoch** and never lowered *within* an epoch — so a malicious sender setting `sender_seq` artificially high can't poison a later honest (re-keyed) message into looking like a gap/replay (§11.10).
 
 ---
 
