@@ -36,7 +36,7 @@ import {
   isBlocked, recordBlockedDrops,
   block as blockDid, unblock as unblockDid, listBlocked, reportAbuse,
 } from "./moderation.mjs";
-import { deriveRoom, getRoom, rosterDigest, nextSendSeq } from "./rooms.mjs";
+import { getRoom, deriveState, rosterDigest, nextSendSeq } from "./rooms.mjs";
 
 export const CORE_VERSION = "0.3.0";
 
@@ -557,33 +557,41 @@ export function buildRoomMsgBody({ room_id, members, roster_digest, sender_seq, 
 export async function sendRoom({ room_id, text, in_reply_to, mentions } = {}) {
   if (!room_id) throw new Error("room_id is required");
   const identity = await ensureIdentity();
-  const state = deriveRoom(room_id);
-  if (!state) throw new Error(`unknown room ${room_id}`);
+  const rawRoom = getRoom(room_id);
+  if (!rawRoom) throw new Error(`unknown room ${room_id}`);
+  const state = deriveState(rawRoom.ops || []);
   if (state.halted) throw new Error("room is halted — /resume before sending");
+  const thread_id = rawRoom.thread_id;
   const memberDids = state.members.map((m) => m.did);
   const recipients = memberDids.filter((d) => d !== identity.did);
   const digest = rosterDigest(state);
   const sender_seq = nextSendSeq(room_id);
   const body = buildRoomMsgBody({ room_id, members: memberDids, roster_digest: digest, sender_seq, mentions, text, in_reply_to });
-  const thread_id = getRoom(room_id).thread_id;
 
   const report = [];
   for (const did of recipients) {
     try {
       const pub = await resolveAgentPublicKey(identity.air_url, did);
-      const envelope = buildOutboundEnvelope({ identity, recipientDid: did, recipientEd25519Pub: pub, body, thread_id, in_reply_to });
+      // Room reply-threading lives in the sealed body (consumed by raise-your-hand in Task 6),
+      // not the envelope layer — so we pass thread_id but NOT in_reply_to to buildOutboundEnvelope.
+      const envelope = buildOutboundEnvelope({ identity, recipientDid: did, recipientEd25519Pub: pub, body, thread_id });
       await postEnvelope(identity, did, envelope);
-      try {
-        archiveMessage({
-          envelope_id: envelope.id, direction: "sent", thread_id, peer_did: room_id,
-          from_did: identity.did, to_did: did, timestamp: envelope.timestamp,
-          body, encrypted: envelope.body.type === "encrypted", verified: true, room_id,
-        });
-      } catch (err) { console.error(`[archive] room send copy: ${err.message ?? err}`); }
       report.push({ did, ok: true });
     } catch (e) {
       report.push({ did, ok: false, error: String(e.message ?? e) });
     }
   }
+
+  // One representative sent row per fan-out (stable synthetic id), regardless of partial
+  // per-member delivery failures — the sender's history({room}) shows the message exactly once.
+  try {
+    archiveMessage({
+      envelope_id: `${room_id}:sent:${sender_seq}`,   // stable, one row per fan-out
+      direction: "sent", thread_id, peer_did: room_id, to_did: room_id,
+      from_did: identity.did, timestamp: new Date().toISOString(),
+      body, encrypted: true, verified: true, room_id,
+    });
+  } catch (err) { console.error(`[archive] room send copy: ${err.message ?? err}`); }
+
   return { status: "sent", room_id, sender_seq: String(sender_seq), delivered: report.filter((r) => r.ok).length, report };
 }
