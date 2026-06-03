@@ -36,6 +36,7 @@ import {
   isBlocked, recordBlockedDrops,
   block as blockDid, unblock as unblockDid, listBlocked, reportAbuse,
 } from "./moderation.mjs";
+import { deriveRoom, getRoom, rosterDigest, nextSendSeq } from "./rooms.mjs";
 
 export const CORE_VERSION = "0.3.0";
 
@@ -195,6 +196,15 @@ export async function myStatus() {
   };
 }
 
+/** POST a signed envelope to a single recipient's relay inbox. Returns the relay receipt. */
+async function postEnvelope(identity, recipient, envelope) {
+  const resp = await fetch(`${identity.relay_url}/inbox/${encodeURIComponent(recipient)}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope),
+  });
+  if (!resp.ok) throw new Error(`relay ${resp.status}: ${await resp.text()}`);
+  return resp.json();
+}
+
 export async function send({ to, body, thread_id, in_reply_to, plaintext = false }) {
   if (!to) throw new Error("recipient (DID, AIR ID, or contact alias) is required");
   if (body === undefined || body === null) throw new Error("body is required");
@@ -206,13 +216,7 @@ export async function send({ to, body, thread_id, in_reply_to, plaintext = false
   const envelope = buildOutboundEnvelope({
     identity, recipientDid: recipient, recipientEd25519Pub, body, thread_id, in_reply_to, plaintext,
   });
-  const resp = await fetch(`${identity.relay_url}/inbox/${encodeURIComponent(recipient)}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(envelope),
-  });
-  if (!resp.ok) throw new Error(`relay ${resp.status}: ${await resp.text()}`);
-  const receipt = await resp.json();
+  const receipt = await postEnvelope(identity, recipient, envelope);
   try {
     archiveMessage({
       envelope_id: envelope.id,
@@ -533,4 +537,53 @@ export async function deleteOp({ envelope_id, peer, confirm = false } = {}) {
   const did = resolveRecipient(peer);
   const { deleted } = deleteConversation(did);
   return { deleted, scope: "conversation", peer: did };
+}
+
+/** Build the single room/msg body shared (identical bytes) across the whole fan-out (spec §7/§8). */
+export function buildRoomMsgBody({ room_id, members, roster_digest, sender_seq, mentions, text, in_reply_to }) {
+  return {
+    type: "room/msg",
+    room_id,
+    sender_seq: String(sender_seq),
+    recipients: [...members].sort(),
+    roster_digest,
+    mentions: mentions ?? [],
+    text,
+    ...(in_reply_to ? { in_reply_to } : {}),
+  };
+}
+
+/** Fan-out a message to every other member of a room (spec §8). Returns a per-member report. */
+export async function sendRoom({ room_id, text, in_reply_to, mentions } = {}) {
+  if (!room_id) throw new Error("room_id is required");
+  const identity = await ensureIdentity();
+  const state = deriveRoom(room_id);
+  if (!state) throw new Error(`unknown room ${room_id}`);
+  if (state.halted) throw new Error("room is halted — /resume before sending");
+  const memberDids = state.members.map((m) => m.did);
+  const recipients = memberDids.filter((d) => d !== identity.did);
+  const digest = rosterDigest(state);
+  const sender_seq = nextSendSeq(room_id);
+  const body = buildRoomMsgBody({ room_id, members: memberDids, roster_digest: digest, sender_seq, mentions, text, in_reply_to });
+  const thread_id = getRoom(room_id).thread_id;
+
+  const report = [];
+  for (const did of recipients) {
+    try {
+      const pub = await resolveAgentPublicKey(identity.air_url, did);
+      const envelope = buildOutboundEnvelope({ identity, recipientDid: did, recipientEd25519Pub: pub, body, thread_id, in_reply_to });
+      await postEnvelope(identity, did, envelope);
+      try {
+        archiveMessage({
+          envelope_id: envelope.id, direction: "sent", thread_id, peer_did: room_id,
+          from_did: identity.did, to_did: did, timestamp: envelope.timestamp,
+          body, encrypted: envelope.body.type === "encrypted", verified: true, room_id,
+        });
+      } catch (err) { console.error(`[archive] room send copy: ${err.message ?? err}`); }
+      report.push({ did, ok: true });
+    } catch (e) {
+      report.push({ did, ok: false, error: String(e.message ?? e) });
+    }
+  }
+  return { status: "sent", room_id, sender_seq: String(sender_seq), delivered: report.filter((r) => r.ok).length, report };
 }

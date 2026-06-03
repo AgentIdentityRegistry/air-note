@@ -102,6 +102,17 @@ export function saveRooms(store) {
 export function getRoom(room_id) { return loadRooms().rooms[room_id] || null; }
 export function listRooms() { return Object.values(loadRooms().rooms); }
 
+/** Next per-room outbound sequence (decimal string), persisted; never lowered. */
+export function nextSendSeq(room_id) {
+  const store = loadRooms();
+  const room = store.rooms[room_id];
+  if (!room) throw new Error(`unknown room ${room_id}`);
+  const cur = Number(room.send_seq_next ?? "0");
+  room.send_seq_next = String(cur + 1);
+  saveRooms(store);
+  return String(cur);
+}
+
 /** Derive the live state for a stored room. */
 export function deriveRoom(room_id) {
   const room = getRoom(room_id);
