@@ -200,6 +200,7 @@ const TOOLS = [
         room_id: { type: "string", description: "Room UUID." },
         to: { type: "string", description: "Invitee DID or AIR ID." },
         mandate_id: { type: "string", description: "Admin mandate_id (required if you are an admin, not the founder)." },
+        kind: { type: "string", enum: ["human", "agent"], description: "founder-only; human or agent; default agent." },
       },
       required: ["room_id", "to"],
     },

@@ -458,10 +458,11 @@ async function main() {
         }
         case "invite": {
           const [room_id, to] = rPos;
-          if (!room_id || !to) { console.error("usage: air-msg room invite <room_id> <did|air-id> [--mandate <id>]"); process.exit(1); }
-          const r = await core.roomInviteOp({ room_id, to, mandate_id: rFlags.mandate });
+          if (!room_id || !to) { console.error("usage: air-msg room invite <room_id> <did|air-id> [--mandate <id>] [--kind human|agent]"); process.exit(1); }
+          const r = await core.roomInviteOp({ room_id, to, mandate_id: rFlags.mandate, kind: rFlags.kind });
           const ok = r.fanout.filter((x) => x.ok).length;
-          console.log(`${c.green("✓ invited")} ${r.member_did}  ${c.dim(`fanout: ${ok}/${r.fanout.length} ok`)}`);
+          const boot = r.bootstrap_ok ? "" : c.red(` (bootstrap failed: ${r.bootstrap_error})`);
+          console.log(`${c.green("✓ invited")} ${r.member_did}  ${c.dim(`fanout: ${ok}/${r.fanout.length} ok`)}${boot}`);
           break;
         }
         case "kick": {

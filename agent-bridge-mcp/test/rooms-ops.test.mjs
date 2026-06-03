@@ -22,3 +22,11 @@ test("founder invite can confer kind:human", () => {
   roomInviteLocal({ identity: founder, room_id, member_did: "did:wba:p", member_pubkey: "zP", kind: "human", signer: stubSigner });
   assert.equal(deriveRoom(room_id).members.find((x) => x.did === "did:wba:p").kind, "human");
 });
+
+test("founder is a first-class member after create (so they receive room mail)", () => {
+  const founder = { did: "did:wba:f3", public_key_multibase: "zF3", privateKey: null };
+  const { room_id } = roomCreateLocal({ identity: founder, name: "Solo", signer: stubSigner });
+  const s = deriveRoom(room_id);
+  assert.equal(s.members.some((m) => m.did === founder.did), true);
+  assert.equal(s.members.find((m) => m.did === founder.did).kind, "human");
+});

@@ -36,7 +36,7 @@ import {
   isBlocked, recordBlockedDrops,
   block as blockDid, unblock as unblockDid, listBlocked, reportAbuse,
 } from "./moderation.mjs";
-import { getRoom, deriveState, deriveRoom, rosterDigest, nextSendSeq, nextFounderSeq, appendOp, loadRooms, saveRooms, listRooms } from "./rooms.mjs";
+import { getRoom, deriveState, deriveRoom, rosterDigest, nextSendSeq, nextFounderSeq, appendOp, loadRooms, saveRooms } from "./rooms.mjs";
 import * as roomOps from "./room-ops.mjs";
 import { verifyOp } from "./room-ops.mjs";
 import { resolveAgent } from "./contacts.mjs";
@@ -716,13 +716,18 @@ export async function deleteOp({ envelope_id, peer, confirm = false } = {}) {
 
 export function roomCreateLocal({ identity, name, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
   const room_id = randomUUID(), thread_id = randomUUID();
-  const op = signer(roomOps.buildCreate({ room_id, name, thread_id,
+  const createOp = signer(roomOps.buildCreate({ room_id, name, thread_id,
     founder_did: identity.did, founder_pubkey: identity.public_key_multibase, founder_seq: "0" }));
+  // Founder self-add so the founder is a first-class member and RECEIVES room mail:
+  // sendRoom/fanOutOp deliver to members∖{self}, so without this a reply to the whole
+  // room never reaches the founder (spec §1 scene).
+  const selfAdd = signer(roomOps.buildAdd({ room_id, issuer_did: identity.did, member_did: identity.did,
+    member_pubkey: identity.public_key_multibase, kind: "human", founder_seq: "1" }));
   const store = loadRooms();
-  store.rooms[room_id] = { name, thread_id, founder_did: identity.did, ops: [op],
-    founder_seq_next: "1", send_seq_next: "0", muted: false, joined_via: "create" };
+  store.rooms[room_id] = { name, thread_id, founder_did: identity.did, ops: [createOp, selfAdd],
+    founder_seq_next: "2", send_seq_next: "0", muted: false, joined_via: "create" };
   saveRooms(store);
-  return { room_id, thread_id, op };
+  return { room_id, thread_id, op: createOp };
 }
 
 export function roomGrantAdminLocal({ identity, room_id, holder_did, holder_pubkey, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
@@ -806,7 +811,7 @@ export async function roomGrantAdminOp({ room_id, to }) {
   return { status: "admin-granted", mandate_id, fanout };
 }
 
-export async function roomInviteOp({ room_id, to, mandate_id }) {
+export async function roomInviteOp({ room_id, to, mandate_id, kind }) {
   const identity = await ensureIdentity();
   const resolved = await resolveAgent(identity.air_url, to);
   if (!resolved) throw new Error(`could not resolve ${to} from AIR`);
@@ -822,12 +827,22 @@ export async function roomInviteOp({ room_id, to, mandate_id }) {
     resolvedMandateId = adminEntry.mandate_id;
   }
 
+  // `kind` is honored only on the founder path (roomInviteLocal forces "agent" for admin adds).
   const { op } = roomInviteLocal({ identity, room_id, member_did: resolved.did, member_pubkey: resolved.publicKeyMultibase,
-    kind: "agent", mandate_id: resolvedMandateId });
-  // Bootstrap the new member with the full op-set, then fan-out the add op to existing members.
-  await bootstrapMember(identity, room_id, resolved.did);
+    kind: kind || "agent", mandate_id: resolvedMandateId });
+  // Bootstrap the new member with the full op-set. A bootstrap failure must NOT abort the
+  // invite (the add op is already appended + signed) — report it instead of throwing.
+  let bootstrap_ok = true, bootstrap_error;
+  try {
+    await bootstrapMember(identity, room_id, resolved.did);
+  } catch (e) {
+    bootstrap_ok = false;
+    bootstrap_error = String(e.message ?? e);
+    console.error(`[rooms] bootstrap of new member ${resolved.did} for ${room_id} failed: ${bootstrap_error}`);
+  }
+  // Fan-out the add op to existing members.
   const fanout = await fanOutOp(identity, room_id, op, []);
-  return { status: "invited", member_did: resolved.did, fanout };
+  return { status: "invited", member_did: resolved.did, bootstrap_ok, ...(bootstrap_error ? { bootstrap_error } : {}), fanout };
 }
 
 export async function roomKickOp({ room_id, member }) {
