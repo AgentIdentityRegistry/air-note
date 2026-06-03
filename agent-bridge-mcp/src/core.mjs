@@ -237,6 +237,15 @@ async function ingestControlOp({ op, identity }) {
       return;
     }
     appendOp(roomId, op);
+    // Auto-pin a newly-added member so member-to-member room messages pass the pinned gate.
+    // Self-adds are skipped (no value in pinning yourself).
+    if (op.type === "room/add" && op.member_did !== identity.did) {
+      try {
+        await addContact(identity.air_url, { to: op.member_did });
+      } catch (err) {
+        console.error(`[rooms] auto-pin member ${op.member_did} failed (best-effort): ${err.message ?? err}`);
+      }
+    }
     return;
   }
 
@@ -253,6 +262,14 @@ async function ingestControlOp({ op, identity }) {
       return;
     }
     appendOp(roomId, op);
+    // Auto-pin the newly-added member (admin path).
+    if (op.member_did !== identity.did) {
+      try {
+        await addContact(identity.air_url, { to: op.member_did });
+      } catch (err) {
+        console.error(`[rooms] auto-pin member ${op.member_did} failed (best-effort): ${err.message ?? err}`);
+      }
+    }
     return;
   }
 
@@ -839,6 +856,12 @@ export async function roomInviteOp({ room_id, to, mandate_id, kind }) {
     bootstrap_ok = false;
     bootstrap_error = String(e.message ?? e);
     console.error(`[rooms] bootstrap of new member ${resolved.did} for ${room_id} failed: ${bootstrap_error}`);
+  }
+  // Auto-pin the invitee so the inviter can receive their room messages (pinned gate).
+  try {
+    await addContact(identity.air_url, { to: resolved.did });
+  } catch (err) {
+    console.error(`[rooms] auto-pin invitee ${resolved.did} failed (best-effort): ${err.message ?? err}`);
   }
   // Fan-out the add op to existing members.
   const fanout = await fanOutOp(identity, room_id, op, []);
