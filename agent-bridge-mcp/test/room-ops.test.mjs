@@ -21,4 +21,12 @@ test("opId is stable and includes op_sig", () => {
     member_pubkey: "z6MkM", kind: "agent" }), id.privateKey);
   assert.equal(opId(a), opId({ ...a }));
   assert.notEqual(opId(a), opId({ ...a, op_sig: "zDIFFERENT" }));
+  assert.notEqual(opId(a), opId({ ...a, room_id: "DIFFERENT" }));
+});
+
+test("verifyOp returns false for a wrong-length rawPub (guard)", () => {
+  const id = generateIdentity();
+  const signed = signOp(buildAdd({ room_id: "r1", issuer_did: "did:wba:f", member_did: "did:wba:m",
+    member_pubkey: "z6MkM", kind: "agent" }), id.privateKey);
+  assert.equal(verifyOp(signed, Buffer.alloc(16)), false);
 });

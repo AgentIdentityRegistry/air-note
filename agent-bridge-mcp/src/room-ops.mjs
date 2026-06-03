@@ -19,7 +19,9 @@ export function signOp(op, privateKey) {
 }
 
 /** Verify an op's `op_sig` against a raw 32-byte Ed25519 public key (Buffer). */
+// Soft-fail predicate: returns false (never throws) on ANY malformed input.
 export function verifyOp(op, rawPub) {
+  if (!rawPub || rawPub.length !== 32) return false;
   if (!op.op_sig || !op.op_sig.startsWith("z")) return false;
   let sig;
   try { sig = bs58.decode(op.op_sig.slice(1)); } catch { return false; }
@@ -37,6 +39,8 @@ export function opId(op) {
 }
 
 // ---- typed builders (field lists per spec §6.1). issuer_did = the signer. ----
+// NOTE: `founder_seq` MUST be a decimal STRING (spec §6.1/L1), never a number —
+// builders pass it through verbatim; callers are responsible for the string form.
 export const buildCreate = (f) => ({ type: "room/create", room_id: f.room_id, issuer_did: f.founder_did,
   name: f.name, thread_id: f.thread_id, founder_did: f.founder_did, founder_pubkey: f.founder_pubkey, founder_seq: f.founder_seq });
 export const buildAdminGrant = (f) => ({ type: "room/admin-grant", room_id: f.room_id, issuer_did: f.founder_did,
