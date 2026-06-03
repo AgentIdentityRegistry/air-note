@@ -21,7 +21,7 @@ import {
 import { ensureIdentity, loadIdentity, registerNewIdentity } from "./identity.mjs";
 import {
   archiveMessage, getCursor, setCursor, history as archiveHistory, recentForInbox,
-  markSpam, getReceived, deleteMessage, deleteConversation,
+  markSpam, getReceived, deleteMessage, deleteConversation, isArchived,
 } from "./archive.mjs";
 import {
   addContact,
@@ -36,7 +36,8 @@ import {
   isBlocked, recordBlockedDrops,
   block as blockDid, unblock as unblockDid, listBlocked, reportAbuse,
 } from "./moderation.mjs";
-import { getRoom, deriveState, rosterDigest, nextSendSeq } from "./rooms.mjs";
+import { getRoom, deriveState, deriveRoom, rosterDigest, nextSendSeq, appendOp, loadRooms, saveRooms } from "./rooms.mjs";
+import { verifyOp } from "./room-ops.mjs";
 
 export const CORE_VERSION = "0.3.0";
 
@@ -151,6 +152,86 @@ export function decodeReceivedMessage(envelope, myEd25519SeedHex, verified = tru
     }
   }
   return { encrypted: false, body: envelope.body };
+}
+
+/** Roster gate + eclipse cross-check for a decrypted room/msg (spec §9.3/§9.5). Pure. */
+export function roomReceiveCheck({ senderDid, selfDid, body, state, localDigest }) {
+  const isMember = state.members.some((m) => m.did === senderDid);
+  if (!isMember) return { accept: false, reason: "sender-not-in-roster" };
+  const recipients = Array.isArray(body.recipients) ? body.recipients : [];
+  const selfListed = recipients.includes(selfDid);
+  const digestOk = body.roster_digest === localDigest;
+  const drift = !selfListed || !digestOk;
+  return { accept: true, drift };
+}
+
+/**
+ * Ingest one received control op (spec §9, §6.4). The envelope signature is already
+ * verified by the caller; here we verify the op's OWN `op_sig` against the authoritative
+ * key for its type, then merge it into rooms.json. NEVER appends an unverified op.
+ *  - room/create: trust `op.founder_pubkey`; create the room locally + auto-pin the founder.
+ *  - other founder ops (issuer === founder): key from the stored room/create's founder_pubkey.
+ *  - admin room/add (issuer !== founder): key from the matching room/admin-grant's holder_pubkey.
+ *    If that grant isn't present yet (prerequisite missing), skip — request/heal is Task 7.
+ */
+async function ingestControlOp({ op, identity }) {
+  const roomId = op.room_id;
+  if (!roomId) { console.error("[rooms] control op missing room_id — dropping"); return; }
+
+  if (op.type === "room/create") {
+    if (!verifyOp(op, pubKeyFromMultibase(op.founder_pubkey))) {
+      console.error(`[rooms] room/create op_sig did NOT verify for ${roomId} — dropping`);
+      return;
+    }
+    const store = loadRooms();
+    if (!store.rooms[roomId]) {
+      store.rooms[roomId] = {
+        name: op.name, thread_id: op.thread_id, founder_did: op.founder_did, ops: [op],
+        founder_seq_next: "1", send_seq_next: "0", muted: false, joined_via: "invite",
+      };
+      saveRooms(store);
+      try {
+        await addContact(identity.air_url, { to: op.founder_did });
+      } catch (err) {
+        console.error(`[rooms] auto-pin founder ${op.founder_did} failed (best-effort): ${err.message ?? err}`);
+      }
+    }
+    return;
+  }
+
+  const room = getRoom(roomId);
+  if (!room) { console.error(`[rooms] ${op.type} for unknown room ${roomId} — dropping (no local room/create)`); return; }
+
+  // Founder op: authoritative key is the founder_pubkey pinned in the stored room/create.
+  if (op.issuer_did === room.founder_did) {
+    const createOp = (room.ops || []).find((o) => o.type === "room/create");
+    if (!createOp) { console.error(`[rooms] ${roomId} has no stored room/create — cannot verify founder op`); return; }
+    if (!verifyOp(op, pubKeyFromMultibase(createOp.founder_pubkey))) {
+      console.error(`[rooms] founder op ${op.type} op_sig did NOT verify for ${roomId} — dropping`);
+      return;
+    }
+    appendOp(roomId, op);
+    return;
+  }
+
+  // Admin op (delegated room/add): authoritative key is the grant holder's pubkey.
+  if (op.type === "room/add") {
+    const grant = (room.ops || []).find((o) => o.type === "room/admin-grant" && o.mandate_id === op.mandate_id);
+    if (!grant) {
+      // Prerequisite grant not yet replicated locally; request/heal is Task 7 — skip, don't crash.
+      console.error(`[rooms] admin room/add for ${roomId} references grant ${op.mandate_id} not yet present — skipping (Task 7)`);
+      return;
+    }
+    if (!verifyOp(op, pubKeyFromMultibase(grant.holder_pubkey))) {
+      console.error(`[rooms] admin room/add op_sig did NOT verify for ${roomId} — dropping`);
+      return;
+    }
+    appendOp(roomId, op);
+    return;
+  }
+
+  // Any other non-founder control op type is not authorized in v1 — drop.
+  console.error(`[rooms] unauthorized non-founder op ${op.type} for ${roomId} (issuer ${op.issuer_did}) — dropping`);
 }
 
 // --------------------------------------------------------------------------
@@ -308,6 +389,68 @@ export async function receive({ since, limit } = {}) {
         verify_note = verify_note ? `${verify_note}; ${note}` : note;
       }
     }
+
+    // --- Room handling (spec §9). Branches BEFORE the 1:1 push/archive below, then
+    //     `continue`s, so non-room messages stay on the existing path byte-for-byte. ---
+    if (decoded.body?.type?.startsWith("room/")) {
+      // The envelope signature is already verified (`verified`); an unverified room
+      // body is never trusted — drop it (and never surface room state as 1:1 chat).
+      if (!verified) continue;
+      // Persistent replay guard (spec §9.1): a redelivered envelope is a no-op.
+      if (isArchived(m.envelope_id, "received")) continue;
+      // Skew guard (spec §9.1): refuse envelopes older than 48h.
+      const ts = Date.parse(envelope.timestamp);
+      if (!Number.isNaN(ts) && Date.now() - ts > 48 * 3600 * 1000) continue;
+
+      const body = decoded.body;
+      if (body.type === "room/msg") {
+        const roomId = body.room_id;
+        const state = deriveRoom(roomId);
+        if (!state) continue; // unknown room → treat as non-member drop
+        const chk = roomReceiveCheck({
+          senderDid: m.sender_did, selfDid: identity.did, body, state, localDigest: rosterDigest(state),
+        });
+        if (!chk.accept) continue; // roster gate: drop a room/msg from a non-member
+        messages.push({
+          seq: m.seq,
+          from: m.sender_did,
+          ...(contact_alias ? { contact: contact_alias } : {}),
+          envelope_id: m.envelope_id,
+          received_at: new Date(m.queued_at * 1000).toISOString(),
+          verified,
+          encrypted: decoded.encrypted,
+          room_id: roomId,
+          in_reply_to: body.in_reply_to ?? null, // sealed-body value is authoritative for rooms (Task 6)
+          to: envelope.to,
+          ...(chk.drift ? { drift: true } : {}),
+          ...(key_changed ? { key_changed: true } : {}),
+          ...(verify_note ? { verify_note } : {}),
+          body, thread_id: envelope.thread_id,
+        });
+        try {
+          archiveMessage({
+            envelope_id: m.envelope_id, direction: "received",
+            thread_id: envelope.thread_id ?? m.envelope_id,
+            peer_did: m.sender_did, from_did: envelope.from ?? m.sender_did, to_did: identity.did,
+            timestamp: envelope.timestamp ?? new Date(m.queued_at * 1000).toISOString(),
+            body, encrypted: decoded.encrypted, verified, relay_seq: m.seq, room_id: roomId,
+          });
+        } catch (err) {
+          console.error(`[archive] failed to persist room message ${m.envelope_id}: ${err.message ?? err}`);
+        }
+        continue;
+      }
+
+      // Control op (room/create|add|remove|admin-grant|admin-revoke|halt|resume|snapshot).
+      // Ingest state changes; never push to the channel as chat (state, not a message).
+      try {
+        await ingestControlOp({ op: body, identity });
+      } catch (err) {
+        console.error(`[rooms] failed to ingest control op ${body.type} for ${body.room_id}: ${err.message ?? err}`);
+      }
+      continue;
+    }
+
     messages.push({
       seq: m.seq,
       from: m.sender_did,

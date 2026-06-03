@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { bridgeHome } from "./identity.mjs";
 import { jcsCanonical } from "./crypto.mjs";
+import { opId } from "./room-ops.mjs";
 
 const ROOMS_VERSION = 1;
 const roomsPath = () => join(bridgeHome(), "rooms.json");
@@ -117,4 +118,16 @@ export function nextSendSeq(room_id) {
 export function deriveRoom(room_id) {
   const room = getRoom(room_id);
   return room ? deriveState(room.ops || []) : null;
+}
+
+/** Append a vetted op (op_sig already verified by the caller) to a room; dedup by opId; persist. */
+export function appendOp(room_id, op) {
+  const store = loadRooms();
+  const room = store.rooms[room_id];
+  if (!room) throw new Error(`unknown room ${room_id}`);
+  room.ops = room.ops || [];
+  if (!room.ops.some((o) => opId(o) === opId(op))) room.ops.push(op);
+  store.rooms[room_id] = room;
+  saveRooms(store);
+  return deriveState(room.ops);
 }
