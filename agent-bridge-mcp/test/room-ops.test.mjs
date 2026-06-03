@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { generateIdentity, pubKeyMultibase } from "../src/crypto.mjs";
+import { generateIdentity } from "../src/crypto.mjs";
 import { signOp, verifyOp, opId, buildCreate, buildAdd } from "../src/room-ops.mjs";
 
 test("signOp/verifyOp round-trips and detects tamper", () => {
