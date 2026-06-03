@@ -154,6 +154,11 @@ export function decodeReceivedMessage(envelope, myEd25519SeedHex, verified = tru
   return { encrypted: false, body: envelope.body };
 }
 
+/** True iff a room/create's self-asserted founder key matches the founder's real AIR key. */
+export function createFounderBindingOk(op, resolvedFounderMultibase) {
+  return !!resolvedFounderMultibase && op.founder_pubkey === resolvedFounderMultibase;
+}
+
 /** Roster gate + eclipse cross-check for a decrypted room/msg (spec §9.3/§9.5). Pure. */
 export function roomReceiveCheck({ senderDid, selfDid, body, state, localDigest }) {
   const isMember = state.members.some((m) => m.did === senderDid);
@@ -169,7 +174,8 @@ export function roomReceiveCheck({ senderDid, selfDid, body, state, localDigest 
  * Ingest one received control op (spec §9, §6.4). The envelope signature is already
  * verified by the caller; here we verify the op's OWN `op_sig` against the authoritative
  * key for its type, then merge it into rooms.json. NEVER appends an unverified op.
- *  - room/create: trust `op.founder_pubkey`; create the room locally + auto-pin the founder.
+ *  - room/create: bind `op.founder_pubkey` to the founder's REAL AIR key (anti key-substitution),
+ *    then create the room locally + auto-pin the founder.
  *  - other founder ops (issuer === founder): key from the stored room/create's founder_pubkey.
  *  - admin room/add (issuer !== founder): key from the matching room/admin-grant's holder_pubkey.
  *    If that grant isn't present yet (prerequisite missing), skip — request/heal is Task 7.
@@ -181,6 +187,14 @@ async function ingestControlOp({ op, identity }) {
   if (op.type === "room/create") {
     if (!verifyOp(op, pubKeyFromMultibase(op.founder_pubkey))) {
       console.error(`[rooms] room/create op_sig did NOT verify for ${roomId} — dropping`);
+      return;
+    }
+    // Root-of-trust binding: `op.founder_pubkey` is self-asserted inside the op. Bind it to the
+    // founder's REAL AIR key, or a malicious inviter could plant the ATTACKER's key as the room's
+    // permanent root of trust under the victim's DID (then forge remove/halt/admin-grant as founder).
+    const resolvedRaw = await resolveAgentPublicKey(identity.air_url, op.founder_did);
+    if (!createFounderBindingOk(op, resolvedRaw ? pubKeyMultibase(resolvedRaw) : null)) {
+      console.error(`[rooms] room/create founder_pubkey does NOT match ${op.founder_did}'s AIR key — dropping (possible key-substitution attack)`);
       return;
     }
     const store = loadRooms();

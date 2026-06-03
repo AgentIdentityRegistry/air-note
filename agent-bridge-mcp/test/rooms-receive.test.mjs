@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { roomReceiveCheck } from "../src/core.mjs";
+import { roomReceiveCheck, createFounderBindingOk } from "../src/core.mjs";
 
 const state = { members: [{ did: "did:wba:s" }, { did: "did:wba:me" }], admins: [], halted: false };
 
@@ -21,4 +21,14 @@ test("accepts a clean room/msg from a member addressed to me", () => {
     body: { type: "room/msg", recipients: ["did:wba:s", "did:wba:me"], roster_digest: "x" }, state, localDigest: "x" });
   assert.equal(r.accept, true);
   assert.equal(r.drift, false);
+});
+
+test("createFounderBindingOk: self-asserted founder key matching the real AIR key binds OK", () => {
+  const op = { type: "room/create", founder_did: "did:wba:f", founder_pubkey: "zRealFounderKey" };
+  assert.equal(createFounderBindingOk(op, "zRealFounderKey"), true);
+});
+test("createFounderBindingOk: a substituted attacker key does NOT bind (key-substitution attack)", () => {
+  const op = { type: "room/create", founder_did: "did:wba:f", founder_pubkey: "zAttackerKey" };
+  assert.equal(createFounderBindingOk(op, "zRealFounderKey"), false); // op claims founder_did but pins attacker's key
+  assert.equal(createFounderBindingOk(op, null), false);              // founder DID unresolvable from AIR ⇒ drop
 });
