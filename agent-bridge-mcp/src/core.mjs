@@ -36,8 +36,10 @@ import {
   isBlocked, recordBlockedDrops,
   block as blockDid, unblock as unblockDid, listBlocked, reportAbuse,
 } from "./moderation.mjs";
-import { getRoom, deriveState, deriveRoom, rosterDigest, nextSendSeq, appendOp, loadRooms, saveRooms } from "./rooms.mjs";
+import { getRoom, deriveState, deriveRoom, rosterDigest, nextSendSeq, nextFounderSeq, appendOp, loadRooms, saveRooms, listRooms } from "./rooms.mjs";
+import * as roomOps from "./room-ops.mjs";
 import { verifyOp } from "./room-ops.mjs";
+import { resolveAgent } from "./contacts.mjs";
 
 export const CORE_VERSION = "0.3.0";
 
@@ -706,6 +708,207 @@ export async function deleteOp({ envelope_id, peer, confirm = false } = {}) {
   const did = resolveRecipient(peer);
   const { deleted } = deleteConversation(did);
   return { deleted, scope: "conversation", peer: did };
+}
+
+// --------------------------------------------------------------------------
+// Room op local builders (network-free, injectable signer)
+// --------------------------------------------------------------------------
+
+export function roomCreateLocal({ identity, name, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const room_id = randomUUID(), thread_id = randomUUID();
+  const op = signer(roomOps.buildCreate({ room_id, name, thread_id,
+    founder_did: identity.did, founder_pubkey: identity.public_key_multibase, founder_seq: "0" }));
+  const store = loadRooms();
+  store.rooms[room_id] = { name, thread_id, founder_did: identity.did, ops: [op],
+    founder_seq_next: "1", send_seq_next: "0", muted: false, joined_via: "create" };
+  saveRooms(store);
+  return { room_id, thread_id, op };
+}
+
+export function roomGrantAdminLocal({ identity, room_id, holder_did, holder_pubkey, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const mandate_id = randomUUID();
+  const op = signer(roomOps.buildAdminGrant({ room_id, founder_did: identity.did, mandate_id, holder_did, holder_pubkey, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op);
+  return { mandate_id, op };
+}
+
+export function roomInviteLocal({ identity, room_id, member_did, member_pubkey, kind, mandate_id, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const room = getRoom(room_id);
+  const isFounder = room && room.founder_did === identity.did;
+  const fields = { room_id, issuer_did: identity.did, member_did, member_pubkey };
+  if (isFounder) { fields.kind = kind || "agent"; fields.founder_seq = nextFounderSeq(room_id); }
+  else { fields.kind = "agent"; fields.mandate_id = mandate_id; } // admin add (deriveState forces agent regardless)
+  const op = signer(roomOps.buildAdd(fields));
+  appendOp(room_id, op);
+  return { op };
+}
+
+export function roomKickLocal({ identity, room_id, member_did, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const op = signer(roomOps.buildRemove({ room_id, founder_did: identity.did, member_did, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op); return { op };
+}
+
+export function roomRevokeAdminLocal({ identity, room_id, mandate_id, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const op = signer(roomOps.buildAdminRevoke({ room_id, founder_did: identity.did, mandate_id, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op); return { op };
+}
+
+export function roomHaltLocal({ identity, room_id, resume = false, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const build = resume ? roomOps.buildResume : roomOps.buildHalt;
+  const op = signer(build({ room_id, founder_did: identity.did, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op); return { op };
+}
+
+// --------------------------------------------------------------------------
+// Room op network wrappers (fan-out)
+// --------------------------------------------------------------------------
+
+/** POST a control op (as a sealed envelope body) to a set of recipient DIDs (best-effort). */
+async function fanOutOp(identity, room_id, op, extraRecipients = []) {
+  const state = deriveRoom(room_id);
+  const recipients = new Set([...((state?.members ?? []).map((m) => m.did)), ...extraRecipients]);
+  recipients.delete(identity.did);
+  const thread_id = getRoom(room_id).thread_id;
+  const report = [];
+  for (const did of recipients) {
+    try {
+      const pub = await resolveAgentPublicKey(identity.air_url, did);
+      const env = buildOutboundEnvelope({ identity, recipientDid: did, recipientEd25519Pub: pub, body: op, thread_id });
+      await postEnvelope(identity, did, env);
+      report.push({ did, ok: true });
+    } catch (e) { report.push({ did, ok: false, error: String(e.message ?? e) }); }
+  }
+  return report;
+}
+
+/** Send a NEW member the full current op-set so they can bootstrap the room locally. */
+async function bootstrapMember(identity, room_id, member_did) {
+  const room = getRoom(room_id);
+  const pub = await resolveAgentPublicKey(identity.air_url, member_did);
+  for (const op of room.ops) {
+    const env = buildOutboundEnvelope({ identity, recipientDid: member_did, recipientEd25519Pub: pub, body: op, thread_id: room.thread_id });
+    await postEnvelope(identity, member_did, env);
+  }
+}
+
+export async function roomCreateOp({ name }) {
+  const identity = await ensureIdentity();
+  const { room_id, thread_id } = roomCreateLocal({ identity, name });
+  return { status: "created", room_id, thread_id };
+}
+
+export async function roomGrantAdminOp({ room_id, to }) {
+  const identity = await ensureIdentity();
+  const resolved = await resolveAgent(identity.air_url, to);
+  if (!resolved) throw new Error(`could not resolve ${to} from AIR`);
+  const { mandate_id, op } = roomGrantAdminLocal({ identity, room_id, holder_did: resolved.did, holder_pubkey: resolved.publicKeyMultibase });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "admin-granted", mandate_id, fanout };
+}
+
+export async function roomInviteOp({ room_id, to, mandate_id }) {
+  const identity = await ensureIdentity();
+  const resolved = await resolveAgent(identity.air_url, to);
+  if (!resolved) throw new Error(`could not resolve ${to} from AIR`);
+
+  // If admin inviter, resolve their active mandate_id from the derived state.
+  let resolvedMandateId = mandate_id;
+  const state = deriveRoom(room_id);
+  const room = getRoom(room_id);
+  const isFounder = room && room.founder_did === identity.did;
+  if (!isFounder && !resolvedMandateId) {
+    const adminEntry = state?.admins?.find((a) => a.holder_did === identity.did);
+    if (!adminEntry) throw new Error("you are not an admin of this room");
+    resolvedMandateId = adminEntry.mandate_id;
+  }
+
+  const { op } = roomInviteLocal({ identity, room_id, member_did: resolved.did, member_pubkey: resolved.publicKeyMultibase,
+    kind: "agent", mandate_id: resolvedMandateId });
+  // Bootstrap the new member with the full op-set, then fan-out the add op to existing members.
+  await bootstrapMember(identity, room_id, resolved.did);
+  const fanout = await fanOutOp(identity, room_id, op, []);
+  return { status: "invited", member_did: resolved.did, fanout };
+}
+
+export async function roomKickOp({ room_id, member }) {
+  const identity = await ensureIdentity();
+  const resolved = await resolveAgent(identity.air_url, member);
+  if (!resolved) throw new Error(`could not resolve ${member} from AIR`);
+  const { op } = roomKickLocal({ identity, room_id, member_did: resolved.did });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "kicked", member_did: resolved.did, fanout };
+}
+
+export async function roomRevokeAdminOp({ room_id, mandate_id }) {
+  const identity = await ensureIdentity();
+  const { op } = roomRevokeAdminLocal({ identity, room_id, mandate_id });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "admin-revoked", mandate_id, fanout };
+}
+
+export async function roomHaltOp({ room_id }) {
+  const identity = await ensureIdentity();
+  const { op } = roomHaltLocal({ identity, room_id, resume: false });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "halted", room_id, fanout };
+}
+
+export async function roomResumeOp({ room_id }) {
+  const identity = await ensureIdentity();
+  const { op } = roomHaltLocal({ identity, room_id, resume: true });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "resumed", room_id, fanout };
+}
+
+export function roomListOp() {
+  const identity = loadIdentity();
+  const myDid = identity?.did;
+  const store = loadRooms();
+  const entries = Object.entries(store.rooms);
+  return {
+    count: entries.length,
+    rooms: entries.map(([room_id, r]) => {
+      const state = deriveState(r.ops || []);
+      return {
+        room_id,
+        name: r.name,
+        thread_id: r.thread_id,
+        member_count: state.members.length,
+        halted: state.halted,
+        am_founder: r.founder_did === myDid,
+        joined_via: r.joined_via,
+        muted: r.muted,
+      };
+    }),
+  };
+}
+
+export function roomHistoryOp({ room_id, limit = 50 } = {}) {
+  const messages = archiveHistory({ room: room_id, limit });
+  return { room_id, count: messages.length, messages };
+}
+
+export async function roomRequestOp({ room_id }) {
+  const identity = await ensureIdentity();
+  const room = getRoom(room_id);
+  if (!room) throw new Error(`unknown room ${room_id}`);
+  const payload = {
+    type: "room/req-ops",
+    room_id,
+    issuer_did: identity.did,
+    have: (room.ops || []).map((o) => roomOps.opId(o)),
+  };
+  const op = roomOps.signOp(payload, identity.privateKey);
+  // TODO(spec §6.4): responder-side req-ops handler + rate-limit
+  const founderDid = room.founder_did;
+  try {
+    const pub = await resolveAgentPublicKey(identity.air_url, founderDid);
+    const env = buildOutboundEnvelope({ identity, recipientDid: founderDid, recipientEd25519Pub: pub, body: op, thread_id: room.thread_id });
+    await postEnvelope(identity, founderDid, env);
+    return { status: "sent", to: founderDid };
+  } catch (e) {
+    return { status: "failed", to: founderDid, error: String(e.message ?? e) };
+  }
 }
 
 /** Build the single room/msg body shared (identical bytes) across the whole fan-out (spec §7/§8). */

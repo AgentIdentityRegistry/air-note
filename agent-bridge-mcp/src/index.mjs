@@ -180,6 +180,130 @@ const TOOLS = [
       required: ["confirm"],
     },
   },
+  {
+    name: "agent_room_create",
+    description: "Create a new group chat room. You become the founder and sole initial member.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Human-readable room name." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "agent_room_invite",
+    description: "Invite an agent to a room (founder or admin). The invitee receives the full op-set bootstrap; existing members get the add op.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+        to: { type: "string", description: "Invitee DID or AIR ID." },
+        mandate_id: { type: "string", description: "Admin mandate_id (required if you are an admin, not the founder)." },
+      },
+      required: ["room_id", "to"],
+    },
+  },
+  {
+    name: "agent_room_kick",
+    description: "Remove a member from a room (founder only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+        member: { type: "string", description: "Member DID or AIR ID to remove." },
+      },
+      required: ["room_id", "member"],
+    },
+  },
+  {
+    name: "agent_room_grant_admin",
+    description: "Grant admin (member:add) rights to an agent in a room (founder only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+        to: { type: "string", description: "Agent DID or AIR ID to grant admin to." },
+      },
+      required: ["room_id", "to"],
+    },
+  },
+  {
+    name: "agent_room_revoke_admin",
+    description: "Revoke an admin mandate in a room (founder only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+        mandate_id: { type: "string", description: "The mandate_id to revoke." },
+      },
+      required: ["room_id", "mandate_id"],
+    },
+  },
+  {
+    name: "agent_room_send",
+    description: "Send a message to all members of a room.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+        text: { type: "string", description: "Message text." },
+        in_reply_to: { type: "string", description: "Optional sender_seq of the message being replied to." },
+        mentions: { type: "array", items: { type: "string" }, description: "Optional list of mentioned DIDs." },
+      },
+      required: ["room_id", "text"],
+    },
+  },
+  {
+    name: "agent_room_list",
+    description: "List all local rooms with their name, member count, halted status, and your role.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "agent_room_history",
+    description: "Read message history for a room from the local archive.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+        limit: { type: "number", description: "Max messages to return (default 50)." },
+      },
+      required: ["room_id"],
+    },
+  },
+  {
+    name: "agent_room_halt",
+    description: "Halt a room: no messages may be sent while halted (founder only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+      },
+      required: ["room_id"],
+    },
+  },
+  {
+    name: "agent_room_resume",
+    description: "Resume a halted room so messages can flow again (founder only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+      },
+      required: ["room_id"],
+    },
+  },
+  {
+    name: "agent_room_sync",
+    description: "Request the op-set from the room founder to catch up on missed control ops (best-effort).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        room_id: { type: "string", description: "Room UUID." },
+      },
+      required: ["room_id"],
+    },
+  },
 ];
 
 // Map each tool to a core operation.
@@ -200,6 +324,17 @@ const HANDLERS = {
   agent_list_blocked: () => core.listBlockedOp(),
   agent_report_spam: (a) => core.reportSpamOp(a),
   agent_delete: (a) => core.deleteOp(a),
+  agent_room_create: (a) => core.roomCreateOp(a),
+  agent_room_invite: (a) => core.roomInviteOp(a),
+  agent_room_kick: (a) => core.roomKickOp(a),
+  agent_room_grant_admin: (a) => core.roomGrantAdminOp(a),
+  agent_room_revoke_admin: (a) => core.roomRevokeAdminOp(a),
+  agent_room_send: (a) => core.sendRoom(a),
+  agent_room_list: () => core.roomListOp(),
+  agent_room_history: (a) => core.roomHistoryOp(a),
+  agent_room_halt: (a) => core.roomHaltOp(a),
+  agent_room_resume: (a) => core.roomResumeOp(a),
+  agent_room_sync: (a) => core.roomRequestOp(a),
 };
 
 const server = new Server(
