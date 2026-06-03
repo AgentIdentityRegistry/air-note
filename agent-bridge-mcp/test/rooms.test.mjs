@@ -64,3 +64,28 @@ test("halt derives from latest founder halt/resume by seq", () => {
   assert.equal(deriveState([create, resume6, halt7]).halted, true);
   assert.equal(deriveState([create, halt7, resume6]).halted, true);
 });
+
+test("last founder add wins on duplicate add", () => {
+  const addOld = { type:"room/add", room_id:"r", issuer_did:F, member_did:M, member_pubkey:"zOLD", kind:"agent", founder_seq:"1" };
+  const addNew = { type:"room/add", room_id:"r", issuer_did:F, member_did:M, member_pubkey:"zNEW", kind:"human", founder_seq:"3" };
+  const s = deriveState([create, addOld, addNew]);
+  const m = s.members.find((x) => x.did === M);
+  assert.equal(m.member_pubkey, "zNEW");
+  assert.equal(m.kind, "human");
+});
+
+test("founder op supersedes an admin add (admin cannot override the founder)", () => {
+  const founderAddM = { type:"room/add", room_id:"r", issuer_did:F, member_did:M, member_pubkey:"zFOUNDER", kind:"human", founder_seq:"2" };
+  const adminAddEvil = { type:"room/add", room_id:"r", issuer_did:A, member_did:M, member_pubkey:"zEVIL", kind:"human", mandate_id:"g1" };
+  const s = deriveState([create, grant, founderAddM, adminAddEvil]);
+  const m = s.members.find((x) => x.did === M);
+  assert.equal(m.member_pubkey, "zFOUNDER");
+  assert.equal(m.kind, "human");
+  assert.notEqual(m.member_pubkey, "zEVIL");
+});
+
+test("expired mandate voids the admin's adds", () => {
+  const grantExpired = { ...grant, expires_at:"2000-01-01T00:00:00Z" };
+  const s = deriveState([create, grantExpired, adminAddM]);
+  assert.equal(s.members.some((x) => x.did === M), false);
+});

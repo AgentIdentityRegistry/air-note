@@ -29,6 +29,8 @@ export function deriveState(ops) {
   const founderOps = ops.filter((o) => o.issuer_did === founderDid).sort(founderSeqCmp);
 
   // --- admins: latest founder op per mandate_id wins (grant vs revoke); honor expiry ---
+  // Relies on founderOps being sorted ASCENDING by founder_seq: Map.set overwrites,
+  // so the final assignment per mandate_id is the latest grant-vs-revoke decision.
   const mandateLatest = new Map();
   for (const o of founderOps) {
     if (o.type === "room/admin-grant" || o.type === "room/admin-revoke") mandateLatest.set(o.mandate_id, o);
@@ -50,6 +52,8 @@ export function deriveState(ops) {
   for (const did of candidates) {
     const founderAboutMember = founderOps
       .filter((o) => (o.type === "room/add" || o.type === "room/remove") && o.member_did === did)
+      // Intentional defensive redundancy: founderOps is already sorted, but this is the
+      // security heart, so re-sorting is a cheap correctness guard. Do NOT remove.
       .sort(founderSeqCmp);
     const latestF = founderAboutMember[founderAboutMember.length - 1];
     if (latestF) {
@@ -57,6 +61,8 @@ export function deriveState(ops) {
       members.push({ did, kind: latestF.kind, member_pubkey: latestF.member_pubkey });
       continue;
     }
+    // O(n) scan over the raw op-set per candidate. Fine for small rooms (≤15 members,
+    // spec §3); callers MUST cache deriveState() and never run it inside a hot receive loop.
     const validAdminAdd = ops.find((o) =>
       o.type === "room/add" && o.member_did === did && o.issuer_did !== founderDid &&
       o.mandate_id && activeMandates.has(o.mandate_id) &&
