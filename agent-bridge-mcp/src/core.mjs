@@ -21,7 +21,7 @@ import {
 import { ensureIdentity, loadIdentity, registerNewIdentity } from "./identity.mjs";
 import {
   archiveMessage, getCursor, setCursor, history as archiveHistory, recentForInbox,
-  markSpam, getReceived, deleteMessage, deleteConversation,
+  markSpam, getReceived, deleteMessage, deleteConversation, isArchived,
 } from "./archive.mjs";
 import {
   addContact,
@@ -36,8 +36,14 @@ import {
   isBlocked, recordBlockedDrops,
   block as blockDid, unblock as unblockDid, listBlocked, reportAbuse,
 } from "./moderation.mjs";
+import { getRoom, deriveState, deriveRoom, rosterDigest, nextSendSeq, nextFounderSeq, appendOp, loadRooms, saveRooms } from "./rooms.mjs";
+import * as roomOps from "./room-ops.mjs";
+import { verifyOp } from "./room-ops.mjs";
+import { resolveAgent } from "./contacts.mjs";
 
 export const CORE_VERSION = "0.3.0";
+
+const ROOM_OP_MAX_AGE_MS = 48 * 60 * 60 * 1000; // 48h replay/skew horizon (spec §9.1)
 
 export const VALID_ATTESTATION_TYPES = [
   "identity_verification",
@@ -152,6 +158,125 @@ export function decodeReceivedMessage(envelope, myEd25519SeedHex, verified = tru
   return { encrypted: false, body: envelope.body };
 }
 
+/** True iff a room/create's self-asserted founder key matches the founder's real AIR key. */
+export function createFounderBindingOk(op, resolvedFounderMultibase) {
+  return !!resolvedFounderMultibase && op.founder_pubkey === resolvedFounderMultibase;
+}
+
+/** Roster gate + eclipse cross-check for a decrypted room/msg (spec §9.3/§9.5). Pure. */
+export function roomReceiveCheck({ senderDid, selfDid, body, state, localDigest }) {
+  const isMember = state.members.some((m) => m.did === senderDid);
+  if (!isMember) return { accept: false, reason: "sender-not-in-roster" };
+  const recipients = Array.isArray(body.recipients) ? body.recipients : [];
+  const selfListed = recipients.includes(selfDid);
+  const digestOk = body.roster_digest === localDigest;
+  const drift = !selfListed || !digestOk;
+  return { accept: true, drift };
+}
+
+/**
+ * Ingest one received control op (spec §9, §6.4). The envelope signature is already
+ * verified by the caller; here we verify the op's OWN `op_sig` against the authoritative
+ * key for its type, then merge it into rooms.json. NEVER appends an unverified op.
+ *  - room/create: bind `op.founder_pubkey` to the founder's REAL AIR key (anti key-substitution),
+ *    then create the room locally + auto-pin the founder.
+ *  - other founder ops (issuer === founder): key from the stored room/create's founder_pubkey.
+ *  - admin room/add (issuer !== founder): key from the matching room/admin-grant's holder_pubkey.
+ *    If that grant isn't present yet (prerequisite missing), skip — request/heal is Task 7.
+ */
+async function ingestControlOp({ op, identity }) {
+  const roomId = op.room_id;
+  if (!roomId) { console.error("[rooms] control op missing room_id — dropping"); return; }
+
+  if (op.type === "room/create") {
+    // Idempotency FIRST: a replayed create for a room we already have must not pay a network
+    // round-trip. Surface a key-rotation/confused-state anomaly if the founder key disagrees.
+    const store = loadRooms();
+    const existing = store.rooms[roomId];
+    if (existing) {
+      const storedCreate = (existing.ops || []).find((o) => o.type === "room/create");
+      if (storedCreate && storedCreate.founder_pubkey !== op.founder_pubkey) {
+        console.error(`[rooms] existing room ${roomId} received a room/create with a DIFFERENT founder_pubkey — ignoring (possible confused state / key rotation)`);
+      }
+      return; // idempotent — no network call, no state change
+    }
+    if (!verifyOp(op, pubKeyFromMultibase(op.founder_pubkey))) {
+      console.error(`[rooms] room/create op_sig did NOT verify for ${roomId} — dropping`);
+      return;
+    }
+    // Root-of-trust binding: `op.founder_pubkey` is self-asserted inside the op. Bind it to the
+    // founder's REAL AIR key, or a malicious inviter could plant the ATTACKER's key as the room's
+    // permanent root of trust under the victim's DID (then forge remove/halt/admin-grant as founder).
+    const resolvedRaw = await resolveAgentPublicKey(identity.air_url, op.founder_did);
+    if (!createFounderBindingOk(op, resolvedRaw ? pubKeyMultibase(resolvedRaw) : null)) {
+      console.error(`[rooms] room/create founder_pubkey does NOT match ${op.founder_did}'s AIR key — dropping (possible key-substitution attack)`);
+      return;
+    }
+    store.rooms[roomId] = {
+      name: op.name, thread_id: op.thread_id, founder_did: op.founder_did, ops: [op],
+      founder_seq_next: "1", send_seq_next: "0", muted: false, joined_via: "invite",
+    };
+    saveRooms(store);
+    try {
+      await addContact(identity.air_url, { to: op.founder_did });
+    } catch (err) {
+      console.error(`[rooms] auto-pin founder ${op.founder_did} failed (best-effort): ${err.message ?? err}`);
+    }
+    return;
+  }
+
+  const room = getRoom(roomId);
+  if (!room) { console.error(`[rooms] ${op.type} for unknown room ${roomId} — dropping (no local room/create)`); return; }
+
+  // Founder op: authoritative key is the founder_pubkey pinned in the stored room/create.
+  if (op.issuer_did === room.founder_did) {
+    const createOp = (room.ops || []).find((o) => o.type === "room/create");
+    if (!createOp) { console.error(`[rooms] ${roomId} has no stored room/create — cannot verify founder op`); return; }
+    if (!verifyOp(op, pubKeyFromMultibase(createOp.founder_pubkey))) {
+      console.error(`[rooms] founder op ${op.type} op_sig did NOT verify for ${roomId} — dropping`);
+      return;
+    }
+    appendOp(roomId, op);
+    // Auto-pin a newly-added member so member-to-member room messages pass the pinned gate.
+    // Self-adds are skipped (no value in pinning yourself).
+    if (op.type === "room/add" && op.member_did !== identity.did) {
+      try {
+        await addContact(identity.air_url, { to: op.member_did });
+      } catch (err) {
+        console.error(`[rooms] auto-pin member ${op.member_did} failed (best-effort): ${err.message ?? err}`);
+      }
+    }
+    return;
+  }
+
+  // Admin op (delegated room/add): authoritative key is the grant holder's pubkey.
+  if (op.type === "room/add") {
+    const grant = (room.ops || []).find((o) => o.type === "room/admin-grant" && o.mandate_id === op.mandate_id);
+    if (!grant) {
+      // Prerequisite grant not yet replicated locally; request/heal is Task 7 — skip, don't crash.
+      console.error(`[rooms] admin room/add for ${roomId} references grant ${op.mandate_id} not yet present — skipping (Task 7)`);
+      return;
+    }
+    if (!verifyOp(op, pubKeyFromMultibase(grant.holder_pubkey))) {
+      console.error(`[rooms] admin room/add op_sig did NOT verify for ${roomId} — dropping`);
+      return;
+    }
+    appendOp(roomId, op);
+    // Auto-pin the newly-added member (admin path).
+    if (op.member_did !== identity.did) {
+      try {
+        await addContact(identity.air_url, { to: op.member_did });
+      } catch (err) {
+        console.error(`[rooms] auto-pin member ${op.member_did} failed (best-effort): ${err.message ?? err}`);
+      }
+    }
+    return;
+  }
+
+  // Any other non-founder control op type is not authorized in v1 — drop.
+  console.error(`[rooms] unauthorized non-founder op ${op.type} for ${roomId} (issuer ${op.issuer_did}) — dropping`);
+}
+
 // --------------------------------------------------------------------------
 // Operations
 // --------------------------------------------------------------------------
@@ -195,6 +320,15 @@ export async function myStatus() {
   };
 }
 
+/** POST a signed envelope to a single recipient's relay inbox. Returns the relay receipt. */
+async function postEnvelope(identity, recipient, envelope) {
+  const resp = await fetch(`${identity.relay_url}/inbox/${encodeURIComponent(recipient)}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope),
+  });
+  if (!resp.ok) throw new Error(`relay ${resp.status}: ${await resp.text()}`);
+  return resp.json();
+}
+
 export async function send({ to, body, thread_id, in_reply_to, plaintext = false }) {
   if (!to) throw new Error("recipient (DID, AIR ID, or contact alias) is required");
   if (body === undefined || body === null) throw new Error("body is required");
@@ -206,13 +340,7 @@ export async function send({ to, body, thread_id, in_reply_to, plaintext = false
   const envelope = buildOutboundEnvelope({
     identity, recipientDid: recipient, recipientEd25519Pub, body, thread_id, in_reply_to, plaintext,
   });
-  const resp = await fetch(`${identity.relay_url}/inbox/${encodeURIComponent(recipient)}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(envelope),
-  });
-  if (!resp.ok) throw new Error(`relay ${resp.status}: ${await resp.text()}`);
-  const receipt = await resp.json();
+  const receipt = await postEnvelope(identity, recipient, envelope);
   try {
     archiveMessage({
       envelope_id: envelope.id,
@@ -304,6 +432,70 @@ export async function receive({ since, limit } = {}) {
         verify_note = verify_note ? `${verify_note}; ${note}` : note;
       }
     }
+
+    // --- Room handling (spec §9). Branches BEFORE the 1:1 push/archive below, then
+    //     `continue`s, so non-room messages stay on the existing path byte-for-byte. ---
+    if (decoded.body?.type?.startsWith("room/")) {
+      // The envelope signature is already verified (`verified`); an unverified room
+      // body is never trusted — drop it (and never surface room state as 1:1 chat).
+      if (!verified) continue;
+      // Persistent replay guard (spec §9.1): a redelivered envelope is a no-op.
+      if (isArchived(m.envelope_id, "received")) continue;
+      // Skew guard (spec §9.1): refuse envelopes older than 48h.
+      const ts = Date.parse(envelope.timestamp);
+      // absent/malformed timestamp intentionally bypasses (safe failure mode)
+      if (!Number.isNaN(ts) && Date.now() - ts > ROOM_OP_MAX_AGE_MS) continue;
+
+      const body = decoded.body;
+      if (body.type === "room/msg") {
+        const roomId = body.room_id;
+        const state = deriveRoom(roomId);
+        if (!state) continue; // unknown room → treat as non-member drop
+        const chk = roomReceiveCheck({
+          senderDid: m.sender_did, selfDid: identity.did, body, state, localDigest: rosterDigest(state),
+        });
+        if (!chk.accept) continue; // roster gate: drop a room/msg from a non-member
+        messages.push({
+          seq: m.seq,
+          from: m.sender_did,
+          ...(contact_alias ? { contact: contact_alias } : {}),
+          envelope_id: m.envelope_id,
+          received_at: new Date(m.queued_at * 1000).toISOString(),
+          verified,
+          encrypted: decoded.encrypted,
+          room_id: roomId,
+          in_reply_to: body.in_reply_to ?? null, // sealed-body value is authoritative for rooms (Task 6)
+          to: envelope.to,
+          ...(chk.drift ? { drift: true } : {}),
+          ...(key_changed ? { key_changed: true } : {}),
+          ...(verify_note ? { verify_note } : {}),
+          body, thread_id: envelope.thread_id,
+        });
+        try {
+          // replay-guard (isArchived) already passed above
+          archiveMessage({
+            envelope_id: m.envelope_id, direction: "received",
+            thread_id: envelope.thread_id ?? m.envelope_id,
+            peer_did: m.sender_did, from_did: envelope.from ?? m.sender_did, to_did: identity.did,
+            timestamp: envelope.timestamp ?? new Date(m.queued_at * 1000).toISOString(),
+            body, encrypted: decoded.encrypted, verified, relay_seq: m.seq, room_id: roomId,
+          });
+        } catch (err) {
+          console.error(`[archive] failed to persist room message ${m.envelope_id}: ${err.message ?? err}`);
+        }
+        continue;
+      }
+
+      // Control op (room/create|add|remove|admin-grant|admin-revoke|halt|resume|snapshot).
+      // Ingest state changes; never push to the channel as chat (state, not a message).
+      try {
+        await ingestControlOp({ op: body, identity });
+      } catch (err) {
+        console.error(`[rooms] failed to ingest control op ${body.type} for ${body.room_id}: ${err.message ?? err}`);
+      }
+      continue;
+    }
+
     messages.push({
       seq: m.seq,
       from: m.sender_did,
@@ -533,4 +725,283 @@ export async function deleteOp({ envelope_id, peer, confirm = false } = {}) {
   const did = resolveRecipient(peer);
   const { deleted } = deleteConversation(did);
   return { deleted, scope: "conversation", peer: did };
+}
+
+// --------------------------------------------------------------------------
+// Room op local builders (network-free, injectable signer)
+// --------------------------------------------------------------------------
+
+export function roomCreateLocal({ identity, name, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const room_id = randomUUID(), thread_id = randomUUID();
+  const createOp = signer(roomOps.buildCreate({ room_id, name, thread_id,
+    founder_did: identity.did, founder_pubkey: identity.public_key_multibase, founder_seq: "0" }));
+  // Founder self-add so the founder is a first-class member and RECEIVES room mail:
+  // sendRoom/fanOutOp deliver to members∖{self}, so without this a reply to the whole
+  // room never reaches the founder (spec §1 scene).
+  const selfAdd = signer(roomOps.buildAdd({ room_id, issuer_did: identity.did, member_did: identity.did,
+    member_pubkey: identity.public_key_multibase, kind: "human", founder_seq: "1" }));
+  const store = loadRooms();
+  store.rooms[room_id] = { name, thread_id, founder_did: identity.did, ops: [createOp, selfAdd],
+    founder_seq_next: "2", send_seq_next: "0", muted: false, joined_via: "create" };
+  saveRooms(store);
+  return { room_id, thread_id, op: createOp };
+}
+
+export function roomGrantAdminLocal({ identity, room_id, holder_did, holder_pubkey, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const mandate_id = randomUUID();
+  const op = signer(roomOps.buildAdminGrant({ room_id, founder_did: identity.did, mandate_id, holder_did, holder_pubkey, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op);
+  return { mandate_id, op };
+}
+
+export function roomInviteLocal({ identity, room_id, member_did, member_pubkey, kind, mandate_id, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const room = getRoom(room_id);
+  const isFounder = room && room.founder_did === identity.did;
+  const fields = { room_id, issuer_did: identity.did, member_did, member_pubkey };
+  if (isFounder) { fields.kind = kind || "agent"; fields.founder_seq = nextFounderSeq(room_id); }
+  else { fields.kind = "agent"; fields.mandate_id = mandate_id; } // admin add (deriveState forces agent regardless)
+  const op = signer(roomOps.buildAdd(fields));
+  appendOp(room_id, op);
+  return { op };
+}
+
+export function roomKickLocal({ identity, room_id, member_did, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const op = signer(roomOps.buildRemove({ room_id, founder_did: identity.did, member_did, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op); return { op };
+}
+
+export function roomRevokeAdminLocal({ identity, room_id, mandate_id, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const op = signer(roomOps.buildAdminRevoke({ room_id, founder_did: identity.did, mandate_id, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op); return { op };
+}
+
+export function roomHaltLocal({ identity, room_id, resume = false, signer = (b) => roomOps.signOp(b, identity.privateKey) }) {
+  const build = resume ? roomOps.buildResume : roomOps.buildHalt;
+  const op = signer(build({ room_id, founder_did: identity.did, founder_seq: nextFounderSeq(room_id) }));
+  appendOp(room_id, op); return { op };
+}
+
+// --------------------------------------------------------------------------
+// Room op network wrappers (fan-out)
+// --------------------------------------------------------------------------
+
+/** POST a control op (as a sealed envelope body) to a set of recipient DIDs (best-effort). */
+async function fanOutOp(identity, room_id, op, extraRecipients = []) {
+  const state = deriveRoom(room_id);
+  const recipients = new Set([...((state?.members ?? []).map((m) => m.did)), ...extraRecipients]);
+  recipients.delete(identity.did);
+  const thread_id = getRoom(room_id).thread_id;
+  const report = [];
+  for (const did of recipients) {
+    try {
+      const pub = await resolveAgentPublicKey(identity.air_url, did);
+      const env = buildOutboundEnvelope({ identity, recipientDid: did, recipientEd25519Pub: pub, body: op, thread_id });
+      await postEnvelope(identity, did, env);
+      report.push({ did, ok: true });
+    } catch (e) { report.push({ did, ok: false, error: String(e.message ?? e) }); }
+  }
+  return report;
+}
+
+/** Send a NEW member the full current op-set so they can bootstrap the room locally. */
+async function bootstrapMember(identity, room_id, member_did) {
+  const room = getRoom(room_id);
+  const pub = await resolveAgentPublicKey(identity.air_url, member_did);
+  for (const op of room.ops) {
+    const env = buildOutboundEnvelope({ identity, recipientDid: member_did, recipientEd25519Pub: pub, body: op, thread_id: room.thread_id });
+    await postEnvelope(identity, member_did, env);
+  }
+}
+
+export async function roomCreateOp({ name }) {
+  const identity = await ensureIdentity();
+  const { room_id, thread_id } = roomCreateLocal({ identity, name });
+  return { status: "created", room_id, thread_id };
+}
+
+export async function roomGrantAdminOp({ room_id, to }) {
+  const identity = await ensureIdentity();
+  const resolved = await resolveAgent(identity.air_url, to);
+  if (!resolved) throw new Error(`could not resolve ${to} from AIR`);
+  const { mandate_id, op } = roomGrantAdminLocal({ identity, room_id, holder_did: resolved.did, holder_pubkey: resolved.publicKeyMultibase });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "admin-granted", mandate_id, fanout };
+}
+
+export async function roomInviteOp({ room_id, to, mandate_id, kind }) {
+  const identity = await ensureIdentity();
+  const resolved = await resolveAgent(identity.air_url, to);
+  if (!resolved) throw new Error(`could not resolve ${to} from AIR`);
+
+  // If admin inviter, resolve their active mandate_id from the derived state.
+  let resolvedMandateId = mandate_id;
+  const state = deriveRoom(room_id);
+  const room = getRoom(room_id);
+  const isFounder = room && room.founder_did === identity.did;
+  if (!isFounder && !resolvedMandateId) {
+    const adminEntry = state?.admins?.find((a) => a.holder_did === identity.did);
+    if (!adminEntry) throw new Error("you are not an admin of this room");
+    resolvedMandateId = adminEntry.mandate_id;
+  }
+
+  // `kind` is honored only on the founder path (roomInviteLocal forces "agent" for admin adds).
+  const { op } = roomInviteLocal({ identity, room_id, member_did: resolved.did, member_pubkey: resolved.publicKeyMultibase,
+    kind: kind || "agent", mandate_id: resolvedMandateId });
+  // Bootstrap the new member with the full op-set. A bootstrap failure must NOT abort the
+  // invite (the add op is already appended + signed) — report it instead of throwing.
+  let bootstrap_ok = true, bootstrap_error;
+  try {
+    await bootstrapMember(identity, room_id, resolved.did);
+  } catch (e) {
+    bootstrap_ok = false;
+    bootstrap_error = String(e.message ?? e);
+    console.error(`[rooms] bootstrap of new member ${resolved.did} for ${room_id} failed: ${bootstrap_error}`);
+  }
+  // Auto-pin the invitee so the inviter can receive their room messages (pinned gate).
+  try {
+    await addContact(identity.air_url, { to: resolved.did });
+  } catch (err) {
+    console.error(`[rooms] auto-pin invitee ${resolved.did} failed (best-effort): ${err.message ?? err}`);
+  }
+  // Fan-out the add op to existing members.
+  const fanout = await fanOutOp(identity, room_id, op, []);
+  return { status: "invited", member_did: resolved.did, bootstrap_ok, ...(bootstrap_error ? { bootstrap_error } : {}), fanout };
+}
+
+export async function roomKickOp({ room_id, member }) {
+  const identity = await ensureIdentity();
+  const resolved = await resolveAgent(identity.air_url, member);
+  if (!resolved) throw new Error(`could not resolve ${member} from AIR`);
+  const { op } = roomKickLocal({ identity, room_id, member_did: resolved.did });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "kicked", member_did: resolved.did, fanout };
+}
+
+export async function roomRevokeAdminOp({ room_id, mandate_id }) {
+  const identity = await ensureIdentity();
+  const { op } = roomRevokeAdminLocal({ identity, room_id, mandate_id });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "admin-revoked", mandate_id, fanout };
+}
+
+export async function roomHaltOp({ room_id }) {
+  const identity = await ensureIdentity();
+  const { op } = roomHaltLocal({ identity, room_id, resume: false });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "halted", room_id, fanout };
+}
+
+export async function roomResumeOp({ room_id }) {
+  const identity = await ensureIdentity();
+  const { op } = roomHaltLocal({ identity, room_id, resume: true });
+  const fanout = await fanOutOp(identity, room_id, op);
+  return { status: "resumed", room_id, fanout };
+}
+
+export function roomListOp() {
+  const identity = loadIdentity();
+  const myDid = identity?.did;
+  const store = loadRooms();
+  const entries = Object.entries(store.rooms);
+  return {
+    count: entries.length,
+    rooms: entries.map(([room_id, r]) => {
+      const state = deriveState(r.ops || []);
+      return {
+        room_id,
+        name: r.name,
+        thread_id: r.thread_id,
+        member_count: state.members.length,
+        halted: state.halted,
+        am_founder: r.founder_did === myDid,
+        joined_via: r.joined_via,
+        muted: r.muted,
+      };
+    }),
+  };
+}
+
+export function roomHistoryOp({ room_id, limit = 50 } = {}) {
+  const messages = archiveHistory({ room: room_id, limit });
+  return { room_id, count: messages.length, messages };
+}
+
+export async function roomRequestOp({ room_id }) {
+  const identity = await ensureIdentity();
+  const room = getRoom(room_id);
+  if (!room) throw new Error(`unknown room ${room_id}`);
+  const payload = {
+    type: "room/req-ops",
+    room_id,
+    issuer_did: identity.did,
+    have: (room.ops || []).map((o) => roomOps.opId(o)),
+  };
+  const op = roomOps.signOp(payload, identity.privateKey);
+  // TODO(spec §6.4): responder-side req-ops handler + rate-limit
+  const founderDid = room.founder_did;
+  try {
+    const pub = await resolveAgentPublicKey(identity.air_url, founderDid);
+    const env = buildOutboundEnvelope({ identity, recipientDid: founderDid, recipientEd25519Pub: pub, body: op, thread_id: room.thread_id });
+    await postEnvelope(identity, founderDid, env);
+    return { status: "sent", to: founderDid };
+  } catch (e) {
+    return { status: "failed", to: founderDid, error: String(e.message ?? e) };
+  }
+}
+
+/** Build the single room/msg body shared (identical bytes) across the whole fan-out (spec §7/§8). */
+export function buildRoomMsgBody({ room_id, members, roster_digest, sender_seq, mentions, text, in_reply_to }) {
+  return {
+    type: "room/msg",
+    room_id,
+    sender_seq: String(sender_seq),
+    recipients: [...members].sort(),
+    roster_digest,
+    mentions: mentions ?? [],
+    text,
+    ...(in_reply_to ? { in_reply_to } : {}),
+  };
+}
+
+/** Fan-out a message to every other member of a room (spec §8). Returns a per-member report. */
+export async function sendRoom({ room_id, text, in_reply_to, mentions } = {}) {
+  if (!room_id) throw new Error("room_id is required");
+  const identity = await ensureIdentity();
+  const rawRoom = getRoom(room_id);
+  if (!rawRoom) throw new Error(`unknown room ${room_id}`);
+  const state = deriveState(rawRoom.ops || []);
+  if (state.halted) throw new Error("room is halted — /resume before sending");
+  const thread_id = rawRoom.thread_id;
+  const memberDids = state.members.map((m) => m.did);
+  const recipients = memberDids.filter((d) => d !== identity.did);
+  const digest = rosterDigest(state);
+  const sender_seq = nextSendSeq(room_id);
+  const body = buildRoomMsgBody({ room_id, members: memberDids, roster_digest: digest, sender_seq, mentions, text, in_reply_to });
+
+  const report = [];
+  for (const did of recipients) {
+    try {
+      const pub = await resolveAgentPublicKey(identity.air_url, did);
+      // Room reply-threading lives in the sealed body (consumed by raise-your-hand in Task 6),
+      // not the envelope layer — so we pass thread_id but NOT in_reply_to to buildOutboundEnvelope.
+      const envelope = buildOutboundEnvelope({ identity, recipientDid: did, recipientEd25519Pub: pub, body, thread_id });
+      await postEnvelope(identity, did, envelope);
+      report.push({ did, ok: true });
+    } catch (e) {
+      report.push({ did, ok: false, error: String(e.message ?? e) });
+    }
+  }
+
+  // One representative sent row per fan-out (stable synthetic id), regardless of partial
+  // per-member delivery failures — the sender's history({room}) shows the message exactly once.
+  try {
+    archiveMessage({
+      envelope_id: `${room_id}:sent:${sender_seq}`,   // stable, one row per fan-out
+      direction: "sent", thread_id, peer_did: room_id, to_did: room_id,
+      from_did: identity.did, timestamp: new Date().toISOString(),
+      body, encrypted: true, verified: true, room_id,
+    });
+  } catch (err) { console.error(`[archive] room send copy: ${err.message ?? err}`); }
+
+  return { status: "sent", room_id, sender_seq: String(sender_seq), delivered: report.filter((r) => r.ok).length, report };
 }

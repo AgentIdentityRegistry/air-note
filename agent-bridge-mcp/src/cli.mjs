@@ -87,6 +87,17 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
   air-msg search <query...> [--verified] Search the AIR registry
   air-msg invite                         Show your shareable identity card
   air-msg attest <air-id> <type> [note]  Vouch for an agent (AIR Verified)
+  air-msg room create --name <name>      Create a group chat room (you become founder)
+  air-msg room invite <room> <to>        Invite an agent to a room (founder or admin)
+  air-msg room kick <room> <member>      Remove a member from a room (founder only)
+  air-msg room grant-admin <room> <to>   Grant admin rights (founder only)
+  air-msg room revoke-admin <room> <id>  Revoke an admin mandate (founder only)
+  air-msg room send <room> <text...>     Send a message to all room members
+  air-msg room list                      List all rooms you are a member of
+  air-msg room history <room> [--limit N] Show archived messages for a room
+  air-msg room halt <room>               Halt a room (no messages while halted; founder only)
+  air-msg room resume <room>             Resume a halted room (founder only)
+  air-msg room sync <room>               Request op-set catch-up from the founder (best-effort)
   air-msg block <to>                     Drop all mail from a sender (convenience filter)
   air-msg unblock <to>                   Remove a sender from the blocklist
   air-msg blocked                        List blocked senders + drop tallies
@@ -430,6 +441,111 @@ async function main() {
       else { console.error("usage: air-msg delete --message <envelope-id> | --with <peer>  --yes"); process.exit(1); }
       const tgt = r.scope === "message" ? r.envelope_id : "conversation with " + r.peer;
       console.log(`${c.green("✓ deleted")} ${r.deleted} row(s)  ${c.dim(tgt)}`);
+      break;
+    }
+    case "room": {
+      const [sub, ...roomRest] = positionals;
+      const { positionals: rPos, flags: rFlags } = parseArgs(roomRest);
+      switch (sub) {
+        case "create": {
+          const name = rFlags.name || rPos.join(" ");
+          if (!name) { console.error("usage: air-msg room create --name <name>"); process.exit(1); }
+          const r = await core.roomCreateOp({ name });
+          console.log(`${c.green("✓ created")} ${c.bold(name)}`);
+          console.log(`  room_id:   ${r.room_id}`);
+          console.log(`  thread_id: ${r.thread_id}`);
+          break;
+        }
+        case "invite": {
+          const [room_id, to] = rPos;
+          if (!room_id || !to) { console.error("usage: air-msg room invite <room_id> <did|air-id> [--mandate <id>] [--kind human|agent]"); process.exit(1); }
+          const r = await core.roomInviteOp({ room_id, to, mandate_id: rFlags.mandate, kind: rFlags.kind });
+          const ok = r.fanout.filter((x) => x.ok).length;
+          const boot = r.bootstrap_ok ? "" : c.red(` (bootstrap failed: ${r.bootstrap_error})`);
+          console.log(`${c.green("✓ invited")} ${r.member_did}  ${c.dim(`fanout: ${ok}/${r.fanout.length} ok`)}${boot}`);
+          break;
+        }
+        case "kick": {
+          const [room_id, member] = rPos;
+          if (!room_id || !member) { console.error("usage: air-msg room kick <room_id> <did|air-id>"); process.exit(1); }
+          const r = await core.roomKickOp({ room_id, member });
+          const ok = r.fanout.filter((x) => x.ok).length;
+          console.log(`${c.green("✓ kicked")} ${r.member_did}  ${c.dim(`fanout: ${ok}/${r.fanout.length} ok`)}`);
+          break;
+        }
+        case "grant-admin": {
+          const [room_id, to] = rPos;
+          if (!room_id || !to) { console.error("usage: air-msg room grant-admin <room_id> <did|air-id>"); process.exit(1); }
+          const r = await core.roomGrantAdminOp({ room_id, to });
+          console.log(`${c.green("✓ admin granted")}  mandate_id: ${r.mandate_id}`);
+          break;
+        }
+        case "revoke-admin": {
+          const [room_id, mandate_id] = rPos;
+          if (!room_id || !mandate_id) { console.error("usage: air-msg room revoke-admin <room_id> <mandate_id>"); process.exit(1); }
+          const r = await core.roomRevokeAdminOp({ room_id, mandate_id });
+          console.log(`${c.green("✓ admin revoked")}  mandate_id: ${r.mandate_id}`);
+          break;
+        }
+        case "send": {
+          const [room_id, ...words] = rPos;
+          if (!room_id || words.length === 0) { console.error("usage: air-msg room send <room_id> <text...>"); process.exit(1); }
+          const r = await core.sendRoom({ room_id, text: words.join(" ") });
+          const ok = r.report.filter((x) => x.ok).length;
+          console.log(`${c.green("✓ sent")} seq ${r.sender_seq}  ${c.dim(`${ok}/${r.report.length} delivered`)}`);
+          break;
+        }
+        case "list": {
+          const r = core.roomListOp();
+          if (r.count === 0) { console.log(c.dim("(no rooms)")); break; }
+          for (const rm of r.rooms) {
+            const role = rm.am_founder ? c.cyan("founder") : c.dim("member");
+            const halted = rm.halted ? c.red(" [halted]") : "";
+            console.log(`${c.bold(rm.name)}  ${role}${halted}  ${c.dim(rm.room_id)}`);
+            console.log(`  ${rm.member_count} member(s)  thread: ${c.dim(rm.thread_id)}`);
+          }
+          break;
+        }
+        case "history": {
+          const [room_id] = rPos;
+          if (!room_id) { console.error("usage: air-msg room history <room_id> [--limit N]"); process.exit(1); }
+          const r = core.roomHistoryOp({ room_id, limit: rFlags.limit ? Number(rFlags.limit) : 50 });
+          console.log(`${r.count} message(s) in room ${room_id}`);
+          for (const m of [...r.messages].reverse()) {
+            const arrow = m.direction === "sent" ? "↑" : "↓";
+            console.log(`  ${arrow} ${m.from}  ${c.dim(m.timestamp)}`);
+            console.log(`    ${m.body?.text ?? JSON.stringify(m.body)}`);
+          }
+          break;
+        }
+        case "halt": {
+          const [room_id] = rPos;
+          if (!room_id) { console.error("usage: air-msg room halt <room_id>"); process.exit(1); }
+          const r = await core.roomHaltOp({ room_id });
+          console.log(`${c.green("✓ halted")} ${room_id}`);
+          break;
+        }
+        case "resume": {
+          const [room_id] = rPos;
+          if (!room_id) { console.error("usage: air-msg room resume <room_id>"); process.exit(1); }
+          const r = await core.roomResumeOp({ room_id });
+          console.log(`${c.green("✓ resumed")} ${room_id}`);
+          break;
+        }
+        case "sync": {
+          const [room_id] = rPos;
+          if (!room_id) { console.error("usage: air-msg room sync <room_id>"); process.exit(1); }
+          const r = await core.roomRequestOp({ room_id });
+          console.log(`${r.status === "sent" ? c.green("✓ sync request sent") : c.yellow("⚠ sync request failed")} → ${r.to}`);
+          if (r.error) console.log(`  ${c.dim(r.error)}`);
+          break;
+        }
+        default: {
+          console.error(`unknown room subcommand: ${sub || "(none)"}`);
+          console.log(`  room subcommands: create | invite | kick | grant-admin | revoke-admin | send | list | history | halt | resume | sync`);
+          process.exit(1);
+        }
+      }
       break;
     }
     case "health": {

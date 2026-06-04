@@ -43,7 +43,7 @@ async function main() {
     identity,
     notifier: { notify: async () => {} },          // no OS banner — the channel IS the delivery
     openResolver: () => null,                        // unused on the channel path
-    onMessage: makeChannelPush(server, { mute }),
+    onMessage: makeChannelPush(server, { mute, me: { airId: identity.air_id, did: identity.did } }),
   }).catch((e) => { if (e?.name !== "AbortError") throw e; });   // clean signal shutdown
   releaseConsumerLock();
 }

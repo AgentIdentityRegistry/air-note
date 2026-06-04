@@ -52,6 +52,10 @@ export function openArchive() {
   if (!cols.includes("spam")) {
     db.prepare(`ALTER TABLE messages ADD COLUMN spam INTEGER NOT NULL DEFAULT 0`).run();
   }
+  if (!cols.includes("room_id")) {
+    db.prepare(`ALTER TABLE messages ADD COLUMN room_id TEXT`).run(); // NULL for 1:1 rows (back-compat)
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, timestamp)`).run();
+  }
   try { chmodSync(path, 0o600); } catch { /* best effort on non-POSIX */ }
   _db = db;
   return db;
@@ -63,12 +67,12 @@ export function archiveMessage(rec) {
   const res = db.prepare(`
     INSERT OR IGNORE INTO messages
       (envelope_id, direction, thread_id, peer_did, from_did, to_did, timestamp,
-       body_json, encrypted, verified, relay_seq, archived_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       body_json, encrypted, verified, relay_seq, room_id, archived_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     rec.envelope_id, rec.direction, rec.thread_id, rec.peer_did, rec.from_did, rec.to_did,
     rec.timestamp, JSON.stringify(rec.body), rec.encrypted ? 1 : 0, rec.verified ? 1 : 0,
-    rec.relay_seq ?? null, new Date().toISOString(),
+    rec.relay_seq ?? null, rec.room_id ?? null, new Date().toISOString(),
   );
   return { inserted: res.changes > 0 };
 }
@@ -79,17 +83,18 @@ function parseRow(r) {
     peer_did: r.peer_did, from: r.from_did, to: r.to_did, timestamp: r.timestamp,
     body: JSON.parse(r.body_json), encrypted: !!r.encrypted, verified: !!r.verified,
     spam: !!r.spam,
-    relay_seq: r.relay_seq ?? undefined, archived_at: r.archived_at,
+    relay_seq: r.relay_seq ?? undefined, room_id: r.room_id ?? undefined, archived_at: r.archived_at,
   };
 }
 
-/** Query history newest-first. Filters: peer (DID), thread (id), before (ISO ts), limit, includeSpam. */
-export function history({ peer, thread, before, limit = 50, includeSpam = false } = {}) {
+/** Query history newest-first. Filters: peer (DID), thread (id), room (id), before (ISO ts), limit, includeSpam. */
+export function history({ peer, thread, room, before, limit = 50, includeSpam = false } = {}) {
   const db = openArchive();
   const where = [];
   const params = [];
   if (peer)   { where.push("peer_did = ?"); params.push(peer); }
   if (thread) { where.push("thread_id = ?"); params.push(thread); }
+  if (room)   { where.push("room_id = ?"); params.push(room); }
   if (before) { where.push("timestamp < ?"); params.push(before); }
   if (!includeSpam) { where.push("spam = 0"); }
   const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
@@ -162,6 +167,15 @@ export function getReceived(envelope_id) {
     `SELECT * FROM messages WHERE envelope_id = ? AND direction = 'received'`
   ).get(envelope_id);
   return r ? parseRow(r) : null;
+}
+
+/** Has this (envelope_id, direction) already been archived? Persistent replay guard (spec §9.1). */
+export function isArchived(envelope_id, direction = "received") {
+  const db = openArchive();
+  const r = db.prepare(
+    `SELECT 1 FROM messages WHERE envelope_id = ? AND direction = ? LIMIT 1`
+  ).get(envelope_id, direction);
+  return !!r;
 }
 
 /** Close the DB (used by tests to reset between cases). */
