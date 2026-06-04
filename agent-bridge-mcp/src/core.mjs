@@ -174,6 +174,15 @@ export function roomReceiveCheck({ senderDid, selfDid, body, state, localDigest 
   return { accept: true, drift };
 }
 
+/** If this control op adds ME to a room, build a synthetic "you were added" inbox notice
+ *  (else null). Pure — the receive() consumer persists + surfaces it. Without this, a
+ *  bootstrapped member gets ZERO inbox signal that they joined a room (they'd have to know
+ *  to run `room list`); the create/add control ops are ingested silently as state. */
+export function roomJoinNotice({ op, selfDid, roomName }) {
+  if (op?.type !== "room/add" || op.member_did !== selfDid) return null;
+  return { type: "room/joined", room_id: op.room_id, room_name: roomName ?? op.room_id };
+}
+
 /**
  * Ingest one received control op (spec §9, §6.4). The envelope signature is already
  * verified by the caller; here we verify the op's OWN `op_sig` against the authoritative
@@ -492,6 +501,35 @@ export async function receive({ since, limit } = {}) {
         await ingestControlOp({ op: body, identity });
       } catch (err) {
         console.error(`[rooms] failed to ingest control op ${body.type} for ${body.room_id}: ${err.message ?? err}`);
+      }
+      // If THIS op added me, surface a one-time "you were added to room X" inbox notice so a
+      // bootstrapped member isn't left with a silent inbox. Stable id ⇒ idempotent across
+      // re-syncs (INSERT OR IGNORE + isArchived guard); archived so the inbox list shows it.
+      // SECURITY: gate on ACTUAL membership after ingest — a forged/dropped room/add (bad
+      // op_sig, missing admin grant, unknown room) is rejected by ingestControlOp and so
+      // never lands in the derived roster, so it must not spawn a spurious join notice.
+      const joinNotice = roomJoinNotice({ op: body, selfDid: identity.did, roomName: getRoom(body.room_id)?.name });
+      const joinedState = joinNotice ? deriveRoom(body.room_id) : null;
+      const nowMember = !!joinedState && joinedState.members.some((mm) => mm.did === identity.did);
+      const joinId = `${body.room_id}:joined`;
+      if (joinNotice && nowMember && !isArchived(joinId, "received")) {
+        const joinedRoom = getRoom(body.room_id);
+        messages.push({
+          seq: m.seq, from: m.sender_did, envelope_id: joinId,
+          received_at: new Date(m.queued_at * 1000).toISOString(),
+          verified, encrypted: false, room_id: body.room_id, system: "room_join", body: joinNotice,
+        });
+        try {
+          archiveMessage({
+            envelope_id: joinId, direction: "received",
+            thread_id: joinedRoom?.thread_id ?? body.room_id,
+            peer_did: body.room_id, from_did: body.issuer_did ?? m.sender_did, to_did: identity.did,
+            timestamp: envelope.timestamp ?? new Date(m.queued_at * 1000).toISOString(),
+            body: joinNotice, encrypted: false, verified, relay_seq: m.seq, room_id: body.room_id,
+          });
+        } catch (err) {
+          console.error(`[rooms] failed to persist room-join notice for ${body.room_id}: ${err.message ?? err}`);
+        }
       }
       continue;
     }

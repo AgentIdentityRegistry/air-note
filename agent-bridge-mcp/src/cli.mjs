@@ -19,6 +19,7 @@
 //   air-msg health
 
 import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
 import * as core from "./core.mjs";
 import { ensureIdentity } from "./identity.mjs";
 import { createNotifier } from "./notifier.mjs";
@@ -42,7 +43,7 @@ const c = {
 };
 
 /** Split argv into positionals + flags (--flag or --flag value). */
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const positionals = [];
   const flags = {};
   for (let i = 0; i < argv.length; i++) {
@@ -63,9 +64,21 @@ function parseArgs(argv) {
   return { positionals, flags };
 }
 
-function bodyText(body) {
+/** Parse a `room` subcommand's OWN argv (the tokens after "room"): the leading token is the
+ *  sub-command name, the remainder is parsed for positionals + flags. Parsing the sub-argv
+ *  DIRECTLY is what keeps flags like --name/--kind/--mandate/--limit from being swallowed by
+ *  the top-level parse (which strips them before the room handler ever sees them). */
+export function parseRoomArgs(roomArgv) {
+  const [sub, ...subArgv] = roomArgv;
+  const { positionals, flags } = parseArgs(subArgv);
+  return { sub, positionals, flags };
+}
+
+export function bodyText(body) {
   if (!body) return "";
   if (body.type === "text") return body.text;
+  if (body.type === "room/msg") return body.text ?? "";
+  if (body.type === "room/joined") return `📥 You were added to room "${body.room_name}"`;
   return JSON.stringify(body);
 }
 
@@ -221,12 +234,18 @@ async function main() {
       console.log(`${messages.length} in archive${synced.count ? `  (${synced.count} new)` : ""}`);
       console.log("");
       for (const m of messages) {
+        // Room-join is a system event, not a 1:1 letter — render it as a one-line marker.
+        if (m.body?.type === "room/joined") {
+          console.log(`  ★ ${c.cyan(bodyText(m.body))}  ${c.dim(m.timestamp)}`);
+          continue;
+        }
         const arrow = m.direction === "sent" ? "↑" : "↓";
         const encBadge = m.encrypted ? "🔒" : "✉️ ";
         const vrf = m.verified ? c.green("✓") : c.red("✗");
         const who = m.direction === "sent" ? `to ${m.to}` : `from ${m.from}`;
+        const roomTag = m.room_id ? c.cyan("[room] ") : "";
         console.log(`  ${arrow} ${encBadge} ${vrf} ${who}  ${c.dim(m.timestamp)}`);
-        console.log(`    ${bodyText(m.body)}`);
+        console.log(`    ${roomTag}${bodyText(m.body)}`);
         console.log(`    ${c.dim("id " + m.envelope_id)}`);
       }
       break;
@@ -444,8 +463,10 @@ async function main() {
       break;
     }
     case "room": {
-      const [sub, ...roomRest] = positionals;
-      const { positionals: rPos, flags: rFlags } = parseArgs(roomRest);
+      // Parse the room sub-argv straight from `rest` (the tokens after "room"). The
+      // top-level parse already stripped --name/--kind/--mandate/--limit into the
+      // top-level `flags`, so re-parsing those leftovers would lose every room flag.
+      const { sub, positionals: rPos, flags: rFlags } = parseRoomArgs(rest);
       switch (sub) {
         case "create": {
           const name = rFlags.name || rPos.join(" ");
@@ -514,7 +535,7 @@ async function main() {
           for (const m of [...r.messages].reverse()) {
             const arrow = m.direction === "sent" ? "↑" : "↓";
             console.log(`  ${arrow} ${m.from}  ${c.dim(m.timestamp)}`);
-            console.log(`    ${m.body?.text ?? JSON.stringify(m.body)}`);
+            console.log(`    ${bodyText(m.body)}`);
           }
           break;
         }
@@ -568,7 +589,18 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error(c.red("error: ") + String(e.message ?? e));
-  process.exit(1);
-});
+// Run the CLI only when invoked directly (`node cli.mjs …` or the `air-msg` bin) — NOT when a
+// test imports this module for its exported helpers (parseArgs/parseRoomArgs/bodyText).
+// realpathSync resolves the `air-msg` bin symlink to this file so both entry points match;
+// an unresolvable argv[1] (pathological) is treated as "not a direct invocation" rather than
+// crashing the process at startup.
+let invokedDirectly = false;
+try {
+  invokedDirectly = !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+} catch { /* argv[1] unresolvable — do not run main() */ }
+if (invokedDirectly) {
+  main().catch((e) => {
+    console.error(c.red("error: ") + String(e.message ?? e));
+    process.exit(1);
+  });
+}
