@@ -60,3 +60,31 @@ export function daemonStatus(isAlive = isPidAlive) {
     cursor,
   };
 }
+
+import { ensureIdentity } from "./identity.mjs";
+import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
+import { createNotifier } from "./notifier.mjs";
+import { bannerSink } from "./daemon-sinks.mjs";
+
+/** Foreground daemon entrypoint: take the lock, build sinks, run until SIGINT/SIGTERM. */
+export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") } = {}) {
+  const identity = await ensureIdentity();
+  if (!acquireOrExit("daemon")) return;            // another live consumer holds the cursor
+  const startTime = new Date().toISOString();
+  writeDaemonPid({ pid: process.pid, startTime });
+
+  const mute = new Set((process.env.AIRMSG_MUTE || "").split(",").map((s) => s.trim()).filter(Boolean));
+  const notifier = await createNotifier({ onClick: () => {} });
+  const sinks = [bannerSink({ notifier, mute })];  // Phase 1: banner only
+
+  const ac = new AbortController();
+  const stop = () => ac.abort();
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    await runDaemon({ identity, sinks, signal: ac.signal, log });
+  } finally {
+    clearDaemonPid();
+    releaseConsumerLock();
+  }
+}

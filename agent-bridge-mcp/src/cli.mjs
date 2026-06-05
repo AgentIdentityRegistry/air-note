@@ -575,6 +575,19 @@ async function main() {
     case "daemon": {
       const { sub } = parseRoomArgs(rest); // reuse the sub-arg splitter
       switch (sub) {
+        case "start": {
+          const { startDaemon } = await import("./daemon.mjs");
+          await startDaemon();
+          break;
+        }
+        case "stop": {
+          const { readDaemonPid, clearDaemonPid } = await import("./daemon.mjs");
+          const rec = readDaemonPid();
+          if (!rec) { console.log(c.dim("daemon not running")); break; }
+          try { process.kill(rec.pid, "SIGTERM"); console.log(`${c.green("✓ stopped")} ${c.dim("pid " + rec.pid)}`); }
+          catch (e) { console.error(`could not signal pid ${rec.pid}: ${e.message}`); clearDaemonPid(); }
+          break;
+        }
         case "status": {
           const { daemonStatus } = await import("./daemon.mjs");
           const s = daemonStatus();
