@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { roomReceiveCheck, createFounderBindingOk } from "../src/core.mjs";
+import { roomReceiveCheck, createFounderBindingOk, roomJoinNotice } from "../src/core.mjs";
 
 const state = { members: [{ did: "did:wba:s" }, { did: "did:wba:me" }], admins: [], halted: false };
 
@@ -45,7 +45,29 @@ test("createFounderBindingOk: a substituted attacker key does NOT bind (key-subs
   assert.equal(createFounderBindingOk(op, null), false);              // founder DID unresolvable from AIR ⇒ drop
 });
 
+// roomJoinNotice: the pure decision behind the "you were added to room X" inbox signal.
+// (receive() persists + surfaces it; the live two-party dry-run is the integration proof.)
+test("roomJoinNotice fires only for MY own room/add", () => {
+  const mk = (member_did) => ({ type: "room/add", room_id: "r", member_did, issuer_did: "did:wba:f" });
+  const n = roomJoinNotice({ op: mk("did:wba:me"), selfDid: "did:wba:me", roomName: "dryrun" });
+  assert.equal(n.type, "room/joined");
+  assert.equal(n.room_id, "r");
+  assert.equal(n.room_name, "dryrun");
+  // an add of someone ELSE is not my join (the inviter must not self-notify)
+  assert.equal(roomJoinNotice({ op: mk("did:wba:other"), selfDid: "did:wba:me", roomName: "dryrun" }), null);
+});
+test("roomJoinNotice ignores non-add ops + falls back to room_id when the name is unknown", () => {
+  assert.equal(roomJoinNotice({ op: { type: "room/create", room_id: "r", member_did: "did:wba:me" }, selfDid: "did:wba:me" }), null);
+  assert.equal(roomJoinNotice({ op: null, selfDid: "did:wba:me" }), null);
+  const n = roomJoinNotice({ op: { type: "room/add", room_id: "r", member_did: "did:wba:me" }, selfDid: "did:wba:me" });
+  assert.equal(n.room_name, "r"); // no roomName passed ⇒ fall back to room_id
+});
+
 // Visible gaps: the receive()-level guards are exercised by the in-repo end-to-end probe today;
 // these mark the still-missing standalone unit coverage (need network/Date stubs).
 test.todo("replay-guard drops a duplicate room/msg (needs relay/isArchived stub)");
 test.todo("48h skew guard drops a stale room/msg (needs Date stub)");
+// The receive()-level membership gate (a join notice fires ONLY when ingestControlOp actually
+// added me, never on a forged/dropped room/add) is proven today by the live two-party dry-run;
+// a standalone unit needs the same network/Date stubs as the two above.
+test.todo("join notice fires only on verified membership, not a forged/dropped room/add (needs receive() stub)");
