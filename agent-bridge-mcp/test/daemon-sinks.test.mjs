@@ -26,3 +26,13 @@ test("bannerSink falls back to a short AIR-id when there is no alias", async () 
   await sink.deliver({ from: "did:wba:agentidentityregistry.org:agents:AIR-3C33-M64E-KQKJ", body: { type: "text", text: "yo" } });
   assert.match(calls[0].title, /AIR-3C33/);
 });
+
+test("bannerSink renders an un-decryptable body via the shared bodyText renderer", async () => {
+  // Single source of truth with standalone watch: {type:"unavailable"} → "(could not decrypt)",
+  // NOT the old inline "(message)" fallback.
+  const calls = [];
+  const sink = bannerSink({ notifier: { notify: async (n) => calls.push(n) } });
+  await sink.deliver({ from: "did:x:AIR-XY", contact: "kenny", body: { type: "unavailable" } });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].message, "(could not decrypt)");
+});

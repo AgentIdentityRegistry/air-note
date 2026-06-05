@@ -1,7 +1,7 @@
 // test/daemon-pid.test.mjs
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeDaemonPid, readDaemonPid, isDaemonRunning, clearDaemonPid, daemonStatus } from "../src/daemon.mjs";
@@ -40,4 +40,10 @@ test("daemonStatus reports not-running when no PID file", () => {
   const s = daemonStatus(() => true);
   assert.equal(s.running, false);
   assert.equal(s.pid, null);
+});
+
+test("daemonStatus on a fresh home reports cursor: null and does NOT create archive.db", () => {
+  const s = daemonStatus(() => true);
+  assert.equal(s.cursor, null);                       // no archive yet → null, not an ambiguous 0
+  assert.equal(existsSync(join(dir, "archive.db")), false); // a read-only probe must not materialize the DB
 });

@@ -1,12 +1,16 @@
 // src/daemon.mjs — the always-on receiver daemon. Owns the single consumer lock, runs ONE
 // watch() loop, and fans every received message out to its in-process sinks. The Phase 2 socket
 // layer attaches additional dynamic sinks to the same fanOut; this phase wires in-process only.
-import { watch } from "./watch.mjs";
-import { fanOut } from "./fanout.mjs";
 import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { bridgeHome } from "./identity.mjs";
-import { isPidAlive } from "./consumer-lock.mjs";
+import { watch } from "./watch.mjs";
+import { fanOut } from "./fanout.mjs";
+import { bridgeHome, ensureIdentity } from "./identity.mjs";
+import { isPidAlive, acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
+import { getCursor, archiveExists } from "./archive.mjs";
+import { createNotifier } from "./notifier.mjs";
+import { bannerSink } from "./daemon-sinks.mjs";
+import { parseMuteSet } from "./peers.mjs";
 
 /** Run the daemon: drive watch() with an onMessage that fans out to `sinks`. Injectable for tests. */
 export async function runDaemon({ identity, sinks, signal, watchFn = watch, log = (s) => process.stderr.write(s + "\n") }) {
@@ -46,13 +50,15 @@ export function clearDaemonPid() {
   try { rmSync(pidPath(), { force: true }); } catch { /* best effort */ }
 }
 
-import { getCursor } from "./archive.mjs";
-
-/** Structured daemon status for `air-msg daemon status` (spec §8). Cursor is best-effort. */
+/** Structured daemon status for `air-msg daemon status` (spec §8). Cursor is best-effort and
+ *  read-only: it is only probed when an archive DB already exists, so a status check never
+ *  materializes a fresh DB (a non-existent archive reports cursor: null, not an ambiguous 0). */
 export function daemonStatus(isAlive = isPidAlive) {
   const rec = readDaemonPid();
   let cursor = null;
-  try { cursor = getCursor(); } catch { cursor = null; }
+  if (archiveExists()) {
+    try { cursor = getCursor(); } catch { cursor = null; }
+  }
   return {
     running: !!rec && isAlive(rec.pid),
     pid: rec?.pid ?? null,
@@ -61,11 +67,6 @@ export function daemonStatus(isAlive = isPidAlive) {
   };
 }
 
-import { ensureIdentity } from "./identity.mjs";
-import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
-import { createNotifier } from "./notifier.mjs";
-import { bannerSink } from "./daemon-sinks.mjs";
-
 /** Foreground daemon entrypoint: take the lock, build sinks, run until SIGINT/SIGTERM. */
 export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") } = {}) {
   const identity = await ensureIdentity();
@@ -73,8 +74,8 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
   const startTime = new Date().toISOString();
   writeDaemonPid({ pid: process.pid, startTime });
 
-  const mute = new Set((process.env.AIRMSG_MUTE || "").split(",").map((s) => s.trim()).filter(Boolean));
-  const notifier = await createNotifier({ onClick: () => {} });
+  const mute = parseMuteSet();
+  const notifier = await createNotifier();         // click-to-open is a later-phase item (see bannerSink)
   const sinks = [bannerSink({ notifier, mute })];  // Phase 1: banner only
 
   const ac = new AbortController();
