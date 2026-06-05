@@ -568,8 +568,8 @@ export async function receive({ since, limit } = {}) {
   if (drops.size) recordBlockedDrops(drops);
   // Advance the cursor past all delivered messages even if some archive writes failed:
   // the live batch was already returned to the caller; the diary is best-effort (see Task 2).
-  // NOTE: only the first relay page is fetched per call — callers re-invoke receive() while
-  // `has_more` is true to drain a large backlog (full pagination is a later task).
+  // NOTE: receive() fetches ONE relay page per call + reports `has_more`; receiveAll() loops
+  // this to completion so a backlog larger than one page is fully drained per wake.
   if (batch.messages.length) {
     try { setCursor(Math.max(...batch.messages.map((m) => m.seq))); }
     catch (err) { console.error(`[archive] failed to advance cursor: ${err.message ?? err}`); }
@@ -581,6 +581,38 @@ export async function receive({ since, limit } = {}) {
     cursor: batch.cursor,
     has_more: batch.has_more,
     my_did: identity.did,
+  };
+}
+
+/**
+ * Drain the relay pull to completion (bounded). `receive()` returns ONE page + a `has_more`
+ * flag; on its own no caller loops on it, so a backlog larger than one page would sit unpulled
+ * until the next unrelated wake — and the local archive (inbox/agent_receive/history) would
+ * silently lag the relay. receiveAll() repeats receive() while `has_more`, returning the union
+ * of every page. Bounded by `maxPages` AND by an empty page, so a misbehaving relay that keeps
+ * returning `has_more: true` cannot spin forever. Each page's archive write + cursor advance
+ * already happened inside receive(), so even a partial drain persists what it pulled.
+ * `receiveFn` is injectable for tests.
+ */
+export async function receiveAll({ since, limit, maxPages = 100 } = {}, receiveFn = receive) {
+  const all = [];
+  let last = { messages: [], has_more: false, cursor: undefined, my_did: undefined };
+  let cursorArg = since;   // first pull may use an explicit `since`; later pulls follow the cursor
+  let pages = 0;
+  do {
+    last = await receiveFn({ since: cursorArg, limit });
+    all.push(...(last.messages ?? []));
+    cursorArg = undefined;  // subsequent pulls read the now-advanced persisted cursor
+    pages += 1;
+  } while (last.has_more && (last.messages?.length ?? 0) > 0 && pages < maxPages);
+  return {
+    ...last,
+    messages: all,
+    count: all.length,
+    verified_count: all.filter((x) => x.verified && !x.key_changed).length,
+    pages,
+    // has_more stays true ONLY if we stopped at the page bound with a backlog still remaining.
+    has_more: !!last.has_more && pages >= maxPages,
   };
 }
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { send, receive, buildOutboundEnvelope, historyOp, recentInbox } from "../src/core.mjs";
+import { send, receive, receiveAll, buildOutboundEnvelope, historyOp, recentInbox } from "../src/core.mjs";
 import { history, closeArchive, getCursor, archiveMessage } from "../src/archive.mjs";
 import { generateIdentity, pubKeyMultibase } from "../src/crypto.mjs";
 
@@ -163,4 +163,52 @@ test("receive advances the cursor to max(seq) across a multi-message batch", asy
   };
   await receive();
   assert.equal(getCursor(), 7); // max(seq), NOT batch.cursor (99)
+});
+
+test("receiveAll drains has_more across pages: both pages returned + cursor past BOTH", async () => {
+  const me = generateIdentity(ME_SEED);
+  const peer = generateIdentity(PEER_SEED);
+  const mkEnv = (text) => {
+    const env = buildOutboundEnvelope({
+      identity: { did: PEER_DID, privateKey: peer.privateKey },
+      recipientDid: ME_DID, recipientEd25519Pub: me.rawPublicKey, body: text,
+    });
+    return { env, b64: Buffer.from(JSON.stringify(env)).toString("base64") };
+  };
+  const p1 = mkEnv("page one"), p2 = mkEnv("page two");
+
+  global.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("/pull/")) {
+      const since = Number(new URL(u).searchParams.get("since"));
+      if (since < 1) return { ok: true, json: async () => ({ messages: [{ envelope_b64: p1.b64, sender_did: PEER_DID, envelope_id: p1.env.id, seq: 1, queued_at: 1717200000 }], cursor: 1, has_more: true }) };
+      if (since < 2) return { ok: true, json: async () => ({ messages: [{ envelope_b64: p2.b64, sender_did: PEER_DID, envelope_id: p2.env.id, seq: 2, queued_at: 1717200001 }], cursor: 2, has_more: false }) };
+      return { ok: true, json: async () => ({ messages: [], cursor: 2, has_more: false }) };
+    }
+    if (u.includes("/did-document")) return { ok: true, json: async () => ({ verificationMethod: [{ publicKeyMultibase: pubKeyMultibase(peer.rawPublicKey) }] }) };
+    throw new Error(`unexpected fetch: ${u}`);
+  };
+
+  const r = await receiveAll();
+  assert.equal(r.count, 2, "both pages' messages returned in one drain (the bug left this at 1)");
+  assert.equal(r.has_more, false, "drained to completion → has_more cleared");
+  assert.equal(history({ peer: PEER_DID }).length, 2, "both pages archived");
+  assert.equal(getCursor(), 2, "cursor advanced past BOTH pages, not just the first");
+});
+
+test("receiveAll is bounded by maxPages (a relay stuck on has_more:true cannot spin)", async () => {
+  let calls = 0;
+  const fakeReceive = async () => { calls += 1; return { messages: [{ from: "did:x", verified: true }], has_more: true }; };
+  const r = await receiveAll({ maxPages: 3 }, fakeReceive);
+  assert.equal(calls, 3, "stopped exactly at the page bound");
+  assert.equal(r.count, 3);
+  assert.equal(r.has_more, true, "has_more stays true when stopped by the bound (backlog remains)");
+});
+
+test("receiveAll stops on an empty page even if the relay still claims has_more", async () => {
+  let calls = 0;
+  const fakeReceive = async () => { calls += 1; return { messages: [], has_more: true }; };
+  const r = await receiveAll({ maxPages: 99 }, fakeReceive);
+  assert.equal(calls, 1, "an empty page ends the drain — no progress is possible");
+  assert.equal(r.count, 0);
 });

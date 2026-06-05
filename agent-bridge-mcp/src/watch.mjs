@@ -113,7 +113,7 @@ async function readSse(response, onEnvelope, signal) {
 export async function watch({
   signal,
   identity,
-  receiveFn = coreDefault.receive,
+  receiveFn = coreDefault.receiveAll, // drain has_more to completion each wake (watch/bridge/channel)
   notifier,
   openResolver,
   getCursorFn = getCursorDefault,
