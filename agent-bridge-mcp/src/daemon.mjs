@@ -45,3 +45,18 @@ export function isDaemonRunning(isAlive = isPidAlive) {
 export function clearDaemonPid() {
   try { rmSync(pidPath(), { force: true }); } catch { /* best effort */ }
 }
+
+import { getCursor } from "./archive.mjs";
+
+/** Structured daemon status for `air-msg daemon status` (spec §8). Cursor is best-effort. */
+export function daemonStatus(isAlive = isPidAlive) {
+  const rec = readDaemonPid();
+  let cursor = null;
+  try { cursor = getCursor(); } catch { cursor = null; }
+  return {
+    running: !!rec && isAlive(rec.pid),
+    pid: rec?.pid ?? null,
+    start_time: rec?.start_time ?? null,
+    cursor,
+  };
+}
