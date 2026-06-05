@@ -226,7 +226,7 @@ async function main() {
       break;
     }
     case "inbox": {
-      const synced = await core.receive();
+      const synced = await core.receiveAll();
       const { messages } = core.recentInbox({
         limit: flags.limit ? Number(flags.limit) : 20,
         includeSpam: !!flags["include-spam"],
