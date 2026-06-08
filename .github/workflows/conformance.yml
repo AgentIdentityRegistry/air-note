@@ -24,7 +24,7 @@ jobs:
       - name: Checkout air-site (vectors source)
         uses: actions/checkout@v4
         with:
-          repository: ahnkwangwook-oss/air-site
+          repository: AgentIdentityRegistry/agent-identity-registry
           path: air-site
 
       - name: Install Rust stable
