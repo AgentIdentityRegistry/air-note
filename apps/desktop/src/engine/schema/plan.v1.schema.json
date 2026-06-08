@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "bossclaw.plan.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "goal", "mode", "steps"],
+  "properties": {
+    "schema": {
+      "const": "bossclaw.plan.v1"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["autopilot", "fsd"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "estimatedCostUsd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "permissionExpansions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "tool"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tool": {
+            "type": "string",
+            "minLength": 1
+          },
+          "instruction": {
+            "type": "string"
+          },
+          "input": {
+            "type": "string"
+          },
+          "expectedOutput": {
+            "type": "string"
+          },
+          "safe": {
+            "type": "boolean"
+          },
+          "retry": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "maxAttempts": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5
+              },
+              "backoffMs": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 10000
+              }
+            }
+          }
+        }
+      }
+    },
+    "configProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object", "summary", "after"],
+      "properties": {
+        "object": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "id"],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": ["workspace", "agent", "mission", "skill_install"]
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "applyMode": {
+          "type": "string",
+          "enum": ["autopilot", "fsd"]
+        },
+        "after": {
+          "type": "object"
+        }
+      }
+    },
+    "missionProposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "title", "goal", "schedule", "autonomy"],
+      "properties": {
+        "type": {
+          "const": "create_mission"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "goal": {
+          "type": "string",
+          "minLength": 1
+        },
+        "autonomy": {
+          "type": "string",
+          "enum": ["autopilot", "fsd"]
+        },
+        "schedule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": ["daily", "weekdays", "every_minutes", "weekly"]
+            },
+            "time": {
+              "type": "string",
+              "pattern": "^([01]?\\d|2[0-3]):([0-5]\\d)$"
+            },
+            "intervalMinutes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1440
+            },
+            "weekday": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 6
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "kind": { "const": "daily" } },
+                "required": ["kind"]
+              },
+              "then": {
+                "required": ["time"]
+              }
+            },
+            {
+              "if": {
+                "properties": { "kind": { "const": "weekdays" } },
+                "required": ["kind"]
+              },
+              "then": {
+                "required": ["time"]
+              }
+            },
+            {
+              "if": {
+                "properties": { "kind": { "const": "weekly" } },
+                "required": ["kind"]
+              },
+              "then": {
+                "required": ["weekday", "time"]
+              }
+            },
+            {
+              "if": {
+                "properties": { "kind": { "const": "every_minutes" } },
+                "required": ["kind"]
+              },
+              "then": {
+                "required": ["intervalMinutes"]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

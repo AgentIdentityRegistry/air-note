@@ -1,0 +1,20 @@
+{
+  "channel": "verified",
+  "skills": [
+    {
+      "id": "bossclaw.skill.document_converter_markitdown",
+      "path": "skills/verified/document_converter_markitdown",
+      "featured": true
+    },
+    {
+      "id": "bossclaw.skill.research_assistant",
+      "path": "skills/verified/research_assistant",
+      "featured": true
+    },
+    {
+      "id": "bossclaw.skill.daily_briefing_framework",
+      "path": "skills/verified/daily_briefing_framework",
+      "featured": true
+    }
+  ]
+}

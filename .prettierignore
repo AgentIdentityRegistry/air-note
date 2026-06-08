@@ -1,0 +1,11 @@
+node_modules
+.next
+dist
+target
+apps/web/.vercel
+
+# air-note code owned outside the BossClaw workspace — do not reformat
+agent-bridge-mcp/
+crates/
+docs/
+target/

@@ -1,0 +1,116 @@
+// Tests added per-feature in subsequent tasks.
+
+use super::client_trait::{AirClient, AirError};
+use super::did_wba::{build_did, build_did_document, generate_keypair};
+use super::identity::*;
+use super::mock_client::MockAirClient;
+use super::types::*;
+
+// Compile-time check that the trait can be used as a trait object
+fn _trait_object_compiles(_client: &dyn AirClient) {}
+
+#[tokio::test]
+async fn mock_register_then_lookup() {
+    let client = MockAirClient::new();
+    let did = Did("did:wba:example.com:test-agent".to_string());
+    let manifest = AgentManifest {
+        name: "Test Agent".to_string(),
+        description: "for unit tests".to_string(),
+        capabilities: vec!["a2a-negotiate-marketplace".to_string()],
+        owner_hint: Some("human-controlled".to_string()),
+    };
+
+    let resp = client.register(&did, &manifest).await.unwrap();
+    assert_eq!(resp.did, did);
+    assert!(!resp.agent_secret.is_empty());
+
+    let record = client.lookup(&did).await.unwrap();
+    assert_eq!(record.did, did);
+    assert_eq!(record.name, "Test Agent");
+}
+
+#[tokio::test]
+async fn mock_update_requires_secret() {
+    let client = MockAirClient::new();
+    let did = Did("did:wba:example.com:test-update".to_string());
+    let manifest = AgentManifest {
+        name: "v1".to_string(),
+        description: "".to_string(),
+        capabilities: vec![],
+        owner_hint: None,
+    };
+    let resp = client.register(&did, &manifest).await.unwrap();
+
+    let updated = AgentManifest {
+        name: "v2".to_string(),
+        description: "".to_string(),
+        capabilities: vec![],
+        owner_hint: None,
+    };
+
+    // Wrong secret
+    let bad = client.update(&did, "wrong-secret", &updated).await;
+    assert!(matches!(bad, Err(AirError::Unauthorized)));
+
+    // Right secret
+    let good = client.update(&did, &resp.agent_secret, &updated).await;
+    assert!(good.is_ok());
+    let record = client.lookup(&did).await.unwrap();
+    assert_eq!(record.name, "v2");
+}
+
+#[tokio::test]
+async fn mock_lookup_missing_returns_not_found() {
+    let client = MockAirClient::new();
+    let did = Did("did:wba:example.com:does-not-exist".to_string());
+    let r = client.lookup(&did).await;
+    assert!(matches!(r, Err(AirError::NotFound(_))));
+}
+
+#[test]
+fn keypair_round_trip() {
+    let kp = generate_keypair();
+    assert_eq!(kp.public_key_bytes().len(), 32);
+    assert_eq!(kp.secret_key_bytes().len(), 32);
+}
+
+#[test]
+fn did_is_did_wba_format() {
+    let kp = generate_keypair();
+    let did = build_did(&kp, "bossclaw.ai", Some("agent-1"));
+    assert!(did.0.starts_with("did:wba:bossclaw.ai:"));
+}
+
+#[test]
+fn did_document_has_expected_shape() {
+    let kp = generate_keypair();
+    let did = build_did(&kp, "bossclaw.ai", Some("agent-1"));
+    let doc = build_did_document(&did, &kp);
+
+    assert_eq!(doc["id"], did.0.clone());
+    assert!(doc["verificationMethod"].is_array());
+    assert!(doc["authentication"].is_array());
+}
+
+#[tokio::test]
+#[ignore] // Run manually with: cargo test air::tests::live_health_check -- --ignored
+async fn live_health_check() {
+    use super::http_client::HttpAirClient;
+    let client = HttpAirClient::production();
+    let r = client.health().await;
+    // Just confirms we can reach AIR. May fail if AIR is down — that's expected info.
+    println!("AIR health: {:?}", r);
+}
+
+#[test]
+fn identity_serde_round_trip() {
+    let id = IdentityMetadata {
+        did: Did("did:wba:bossclaw.ai:abc123".to_string()),
+        name: "My Agent".to_string(),
+        created_at: "2026-05-18T12:00:00Z".to_string(),
+    };
+    let json = serde_json::to_string(&id).unwrap();
+    let back: IdentityMetadata = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.did, id.did);
+    assert_eq!(back.name, id.name);
+}
