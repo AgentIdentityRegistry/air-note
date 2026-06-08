@@ -118,6 +118,9 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
   air-msg delete --message <id> --yes    Delete one message from your local diary
   air-msg delete --with <to> --yes       Delete a whole conversation from your local diary
   inbox/history also accept --include-spam to reveal hidden spam.
+  air-msg daemon status                  Show whether the receiver daemon is running
+  air-msg daemon start                   Start the receiver daemon (banner sink, lock-guarded)
+  air-msg daemon stop                    Stop the running daemon
   air-msg health                         Relay + identity status
 
   <to> may be a DID, an AIR ID, or a saved contact alias.
@@ -566,6 +569,37 @@ async function main() {
           console.log(`  room subcommands: create | invite | kick | grant-admin | revoke-admin | send | list | history | halt | resume | sync`);
           process.exit(1);
         }
+      }
+      break;
+    }
+    case "daemon": {
+      const { sub } = parseRoomArgs(rest); // reuse the sub-arg splitter
+      switch (sub) {
+        case "start": {
+          const { startDaemon } = await import("./daemon.mjs");
+          await startDaemon();
+          break;
+        }
+        case "stop": {
+          const { readDaemonPid, clearDaemonPid } = await import("./daemon.mjs");
+          const rec = readDaemonPid();
+          if (!rec) { console.log(c.dim("daemon not running")); break; }
+          try { process.kill(rec.pid, "SIGTERM"); console.log(`${c.green("✓ stopped")} ${c.dim("pid " + rec.pid)}`); }
+          catch (e) { console.error(`could not signal pid ${rec.pid}: ${e.message}`); clearDaemonPid(); }
+          break;
+        }
+        case "status": {
+          const { daemonStatus } = await import("./daemon.mjs");
+          const s = daemonStatus();
+          console.log(`daemon: ${s.running ? c.green("running") : c.dim("stopped")}` +
+            (s.pid ? `  ${c.dim("pid " + s.pid + (s.start_time ? " since " + s.start_time : ""))}` : ""));
+          console.log(`cursor: ${s.cursor ?? "?"}`);
+          break;
+        }
+        default:
+          console.error(`unknown daemon subcommand: ${sub || "(none)"}`);
+          console.log(`  daemon subcommands: start | stop | status`);
+          process.exit(1);
       }
       break;
     }

@@ -8,13 +8,19 @@
 // SECURITY (decision #1): plaintext at rest in the 0600 store; encrypt-at-rest awaits #19.
 
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, chmodSync } from "node:fs";
+import { mkdirSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { bridgeHome } from "./identity.mjs";
 
 let _db = null;
 
 const archivePath = () => join(bridgeHome(), "archive.db");
+
+/** Does the archive DB file already exist? Lets read-only probes (e.g. `daemon status`)
+ *  avoid materializing a fresh DB just to read a cursor that wouldn't exist yet. */
+export function archiveExists() {
+  return existsSync(archivePath());
+}
 
 // DDL run one statement at a time via prepare().run() (the repo hook forbids db.exec).
 const SCHEMA = [

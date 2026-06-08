@@ -13,6 +13,7 @@ import { ensureIdentity } from "./identity.mjs";
 import { watch } from "./watch.mjs";
 import { makeChannelPush } from "./channel.mjs";
 import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
+import { parseMuteSet } from "./peers.mjs";
 
 const server = new Server(
   { name: "air-msg-channel", version: CORE_VERSION },
@@ -31,7 +32,7 @@ async function main() {
   if (!acquireOrExit("channel-server")) return;
   // mute feeds the push gate (channelGate inside makeChannelPush). watch() builds its
   // own mute from AIRMSG_MUTE for the (here no-op) notifier path, so we construct ours here.
-  const mute = new Set((process.env.AIRMSG_MUTE || "").split(",").map((s) => s.trim()).filter(Boolean));
+  const mute = parseMuteSet();
   const ac = new AbortController();
   process.once("SIGINT", () => { ac.abort(); releaseConsumerLock(); });
   process.once("SIGTERM", () => { ac.abort(); releaseConsumerLock(); });

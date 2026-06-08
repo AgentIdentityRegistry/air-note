@@ -4,10 +4,10 @@
 
 import * as coreDefault from "./core.mjs";
 import { getCursor as getCursorDefault } from "./archive.mjs";
-import { shortPeer } from "./peers.mjs";
+import { shortPeer, parseMuteSet } from "./peers.mjs";
 
 /** Render a one-line preview of a message body for a notification. */
-function bodyText(body) {
+export function bodyText(body) {
   if (!body) return "(no content)";
   if (body.type === "text") return body.text;
   if (body.type === "unavailable") return "(could not decrypt)";
@@ -121,7 +121,7 @@ export async function watch({
   intervalMs = Number(process.env.AIRMSG_WATCH_INTERVAL_MS) || 5000,
   coalesceMs = Number(process.env.AIRMSG_COALESCE_MS) || 8000, // interface-only (design §8): bursts coalesce per receive() batch; no timer debounce
   backoffCapMs = 5000,
-  mute = new Set((process.env.AIRMSG_MUTE || "").split(",").map((s) => s.trim()).filter(Boolean)),
+  mute = parseMuteSet(),
   onIdle,                       // test hook: called when a poll cycle finds nothing
   onMessage,                    // optional per-message hook (live feed)
   log = (s) => process.stderr.write(s + "\n"),
