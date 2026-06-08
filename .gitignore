@@ -12,3 +12,21 @@ npm-debug.log*
 # OS / editor
 .DS_Store
 *.log
+
+# BossClaw desktop app build output
+dist
+build
+*.tsbuildinfo
+
+# Env files — NEVER commit (only .env.example is tracked)
+.env
+.env.*
+.env.local
+!.env.example
+!**/.env.example
+
+# Local agent tooling state (machine-specific; GBrain is canonical for handoffs)
+.claude/
+.omc/
+.gstack/
+NEXT-SESSION.md

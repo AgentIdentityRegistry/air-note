@@ -1,0 +1,63 @@
+{
+  "id": "bossclaw.skill.research_assistant",
+  "name": "Research Assistant",
+  "version": "1.0.0",
+  "description": "Guides structured web research with clear citations and notes.",
+  "author": "BossClaw",
+  "minBossClawVersion": "0.1.0",
+  "category": ["research", "analysis"],
+  "tags": ["web", "research", "citations"],
+  "runtime": {
+    "type": "native",
+    "toolId": "web.research"
+  },
+  "credentials": [
+    {
+      "id": "llm.primary",
+      "kind": "llm",
+      "providers": ["openai", "anthropic", "google"],
+      "required": true
+    }
+  ],
+  "permissions": {
+    "network": {
+      "default": "deny",
+      "allowDomains": [],
+      "allowUserAddDomains": true,
+      "approval": "once_then_remember"
+    },
+    "files": {
+      "default": "deny",
+      "allowPaths": [],
+      "approval": "once_then_remember"
+    },
+    "clipboard": {
+      "default": "deny",
+      "approval": "once_then_remember"
+    },
+    "notifications": {
+      "default": "allow"
+    }
+  },
+  "automation": {
+    "supportsSchedule": false,
+    "supportsTriggers": ["manual"]
+  },
+  "ui": {
+    "entrypoints": [
+      {
+        "id": "start_research",
+        "label": "Start research",
+        "type": "command"
+      }
+    ],
+    "showInStore": true
+  },
+  "trust": {
+    "channel": "verified",
+    "signed": false,
+    "source": {
+      "type": "local"
+    }
+  }
+}

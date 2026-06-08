@@ -1,0 +1,55 @@
+{
+  "id": "bossclaw.skill.document_converter_markitdown",
+  "name": "Document Converter (MarkItDown)",
+  "version": "1.0.0",
+  "description": "Converts local documents into clean Markdown outputs.",
+  "author": "BossClaw",
+  "minBossClawVersion": "0.1.0",
+  "category": ["productivity", "files"],
+  "tags": ["markdown", "converter", "documents"],
+  "runtime": {
+    "type": "native",
+    "toolId": "doc.to_markdown"
+  },
+  "permissions": {
+    "network": {
+      "default": "deny",
+      "allowDomains": [],
+      "allowUserAddDomains": false,
+      "approval": "always_confirm"
+    },
+    "files": {
+      "default": "deny",
+      "allowPaths": [],
+      "approval": "always_confirm_destructive"
+    },
+    "clipboard": {
+      "default": "deny",
+      "approval": "always_confirm"
+    },
+    "notifications": {
+      "default": "allow"
+    }
+  },
+  "automation": {
+    "supportsSchedule": false,
+    "supportsTriggers": ["manual"]
+  },
+  "ui": {
+    "entrypoints": [
+      {
+        "id": "convert_document",
+        "label": "Convert document",
+        "type": "command"
+      }
+    ],
+    "showInStore": true
+  },
+  "trust": {
+    "channel": "verified",
+    "signed": false,
+    "source": {
+      "type": "local"
+    }
+  }
+}

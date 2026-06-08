@@ -1,0 +1,47 @@
+name: AIR Conformance — Rust
+
+on:
+  pull_request:
+    paths:
+      - "specs/air/draft-1/**"
+      - "crates/air-rs/**"
+      - ".github/workflows/conformance.yml"
+  push:
+    branches:
+      - "main"
+
+jobs:
+  rust-conformance:
+    name: Rust cross-language conformance vectors
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout air-note
+        uses: actions/checkout@v4
+        with:
+          path: air-note
+
+      - name: Checkout air-site (vectors source)
+        uses: actions/checkout@v4
+        with:
+          repository: AgentIdentityRegistry/agent-identity-registry
+          path: air-site
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            air-note/target
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('air-note/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-conformance-
+
+      - name: Run Rust conformance tests
+        working-directory: air-note
+        env:
+          VECTORS_PATH: ${{ github.workspace }}/air-site/specs/air/draft-1/test-vectors.json
+        run: cargo test --features conformance -p air-rs -- --nocapture

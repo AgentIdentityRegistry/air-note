@@ -1,0 +1,40 @@
+[package]
+name = "bossclaw_desktop"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "BossClaw desktop agent"
+repository = "https://github.com/ahnkwangwook-oss/bossclaw"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+air-rs = { path = "../../../crates/air-rs" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+rand_core = { version = "0.6", features = ["std"] }
+multibase = "0.9"
+unsigned-varint = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "1.0"
+urlencoding = "2.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "2.3", features = ["linux-secret-service", "linux-keyutils"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+keyring = "2.3"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

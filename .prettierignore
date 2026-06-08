@@ -1,0 +1,9 @@
+node_modules
+.next
+dist
+target
+
+# air-note code owned outside the BossClaw workspace — do not reformat
+agent-bridge-mcp/
+crates/
+docs/
