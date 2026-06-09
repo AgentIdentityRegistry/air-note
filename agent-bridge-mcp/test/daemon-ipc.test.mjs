@@ -253,3 +253,38 @@ test("ipc server: a silent connection that never says hello is reaped", async ()
     assert.equal(ipc.clientCount(), 0);
   } finally { await ipc.close(); }
 });
+
+import { connectDaemon } from "../src/daemon-ipc.mjs";
+
+test("connectDaemon: handshakes, then delivers admitted messages to onMessage", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const got = [];
+    const handle = await connectDaemon({ role: "viewer", onMessage: (m) => got.push(m.envelope_id), log: () => {} });
+    await ipc.sink.deliver({ envelope_id: "e9", from: "did:wba:x", verified: false, body: { type: "text", text: "yo" } });
+    await until(() => got.length === 1);
+    assert.deepEqual(got, ["e9"]);
+    handle.close();
+  } finally { await ipc.close(); }
+});
+
+test("connectDaemon: no daemon → rejects with code DAEMON_DOWN", async () => {
+  chmodSync(dir, 0o700);   // no server listening in this temp home
+  await assert.rejects(
+    connectDaemon({ role: "viewer", onMessage: () => {}, log: () => {} }),
+    (e) => e.code === "DAEMON_DOWN",
+  );
+});
+
+test("connectDaemon: onClose fires when the daemon goes away", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  let closed = false;
+  const handle = await connectDaemon({ role: "viewer", onMessage: () => {}, onClose: () => { closed = true; }, log: () => {} });
+  await ipc.close();
+  await until(() => closed);
+  handle.close();
+});

@@ -4,7 +4,7 @@
 // a client never chooses its own filter (the dumb-fan-out confidentiality hole, spec §5).
 import { join } from "node:path";
 import { statSync, rmSync, chmodSync, lstatSync } from "node:fs";
-import { createServer } from "node:net";
+import { createServer, createConnection } from "node:net";
 import { bridgeHome } from "./identity.mjs";
 import { channelGate, roomChannelGate } from "./channel.mjs";
 import { deriveRoom } from "./rooms.mjs";
@@ -170,4 +170,40 @@ export function createIpcServer({
       try { rmSync(socketPath(), { force: true }); } catch { /* best effort */ }
     },
   };
+}
+
+/** Connect to the local daemon socket as `role`. Resolves AFTER hello-ok with a {close()}
+ *  handle; gated messages stream to onMessage(m). Rejects with {code:"DAEMON_DOWN"} when no
+ *  daemon is reachable (callers use that to fall back to legacy standalone — spec §7).
+ *  Reconnect/backoff is Phase 4; Phase 2 surfaces onClose and lets the caller decide. */
+export function connectDaemon({ role, onMessage, onClose = () => {}, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection(socketPath());
+    const fail = (reason, cause) => {
+      sock.destroy();
+      reject(Object.assign(new Error(reason), { code: "DAEMON_DOWN", cause }));
+    };
+    const timer = setTimeout(() => fail("daemon handshake timed out"), handshakeMs);
+    let ready = false;
+
+    sock.once("error", (e) => { if (!ready) { clearTimeout(timer); fail(`no daemon: ${e.code}`, e); } });
+    sock.once("connect", () => sock.write(encodeFrame({ type: "hello", role })));
+    const feed = makeLineParser((frame) => {
+      if (!ready) {
+        clearTimeout(timer);
+        if (frame.type === "hello-ok") {
+          ready = true;
+          log(`[client] attached to air-msgd pid=${frame.pid} as ${role}`);
+          resolve({ close: () => sock.destroy() });
+        } else {
+          fail(`daemon refused: ${frame.reason ?? frame.type}`);
+        }
+        return;
+      }
+      if (frame.type === "message") onMessage(frame.message);
+      // pong + unknown server frames: ignored.
+    }, { onError: (e) => log(`[client] bad frame from daemon: ${e.message}`) });
+    sock.on("data", feed);
+    sock.on("close", () => { if (ready) onClose(); });
+  });
 }
