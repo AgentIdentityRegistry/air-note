@@ -288,3 +288,31 @@ test("connectDaemon: onClose fires when the daemon goes away", async () => {
   await until(() => closed);
   handle.close();
 });
+
+import { runDaemon } from "../src/daemon.mjs";
+
+test("composition: runDaemon fans one watch() message to banner sink AND gated socket subscribers", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const bannered = [];
+    const bannerStub = { name: "banner", deliver: (m) => bannered.push(m.envelope_id) };
+    const viewer = await rawClient("viewer");
+    const channel = await rawClient("channel");
+
+    const verified = { envelope_id: "eOK", from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "hi" } };
+    const unverified = { envelope_id: "eNO", from: "did:wba:x", verified: false, body: { type: "text", text: "??" } };
+    // watchFn stub: emit two messages then resolve (daemon loop ends). Same shape as daemon.test.mjs:13.
+    const watchFn = async ({ onMessage }) => { await onMessage(verified); await onMessage(unverified); };
+
+    await runDaemon({ identity: { did: "did:wba:me" }, sinks: [bannerStub, ipc.sink], watchFn, log: () => {} });
+    const got = (c) => c.frames.filter((f) => f.type === "message").map((f) => f.message.envelope_id);
+    await until(() => got(viewer).length === 2 && got(channel).length === 1);
+
+    assert.deepEqual(bannered, ["eOK", "eNO"]);   // in-process banner saw both (its own mute logic is separate)
+    assert.deepEqual(got(viewer), ["eOK", "eNO"]);
+    assert.deepEqual(got(channel), ["eOK"]);
+    viewer.sock.destroy(); channel.sock.destroy();
+  } finally { await ipc.close(); }
+});

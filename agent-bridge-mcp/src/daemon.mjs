@@ -11,6 +11,7 @@ import { getCursor, archiveExists } from "./archive.mjs";
 import { createNotifier } from "./notifier.mjs";
 import { bannerSink } from "./daemon-sinks.mjs";
 import { parseMuteSet } from "./peers.mjs";
+import { createIpcServer } from "./daemon-ipc.mjs";
 
 /** Run the daemon: drive watch() with an onMessage that fans out to `sinks`. Injectable for tests. */
 export async function runDaemon({ identity, sinks, signal, watchFn = watch, log = (s) => process.stderr.write(s + "\n") }) {
@@ -76,7 +77,13 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
 
   const mute = parseMuteSet();
   const notifier = await createNotifier();         // click-to-open is a later-phase item (see bannerSink)
-  const sinks = [bannerSink({ notifier, mute })];  // Phase 1: banner only
+  const ipc = createIpcServer({
+    mute,
+    daemonInfo: { pid: process.pid, start_time: startTime, did: identity.did },
+    log,
+  });
+  await ipc.listen();                              // safe: we hold the consumer lock (single-daemon mutex)
+  const sinks = [bannerSink({ notifier, mute }), ipc.sink];
 
   const ac = new AbortController();
   const stop = () => ac.abort();
@@ -85,6 +92,7 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
   try {
     await runDaemon({ identity, sinks, signal: ac.signal, log });
   } finally {
+    await ipc.close();                             // unlinks the socket
     clearDaemonPid();
     releaseConsumerLock();
   }
