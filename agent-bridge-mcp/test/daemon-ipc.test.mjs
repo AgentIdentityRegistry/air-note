@@ -112,3 +112,23 @@ test("admitForRole(channel): room messages route through the ROOM gate (member a
   assert.equal(admitForRole("channel", member), true);
   assert.equal(admitForRole("channel", stranger), false);
 });
+
+import { chmodSync, mkdirSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { assertSafeHome, prepareSocketPath, socketPath } from "../src/daemon-ipc.mjs";
+
+test("assertSafeHome: 0700 home passes; group- or other-writable home refuses", () => {
+  const home = join(dir, "h1"); mkdirSync(home, { mode: 0o700 });
+  assert.doesNotThrow(() => assertSafeHome(home));
+  chmodSync(home, 0o770);
+  assert.throws(() => assertSafeHome(home), /writable/);
+  chmodSync(home, 0o707);
+  assert.throws(() => assertSafeHome(home), /writable/);
+});
+
+test("prepareSocketPath: unlinks a stale socket file (caller holds the consumer lock)", () => {
+  // bridgeHome() === dir in these tests; plant a stale file at the real socket path.
+  chmodSync(dir, 0o700);
+  writeFileSync(socketPath(), "");
+  prepareSocketPath();
+  assert.equal(existsSync(socketPath()), false);
+});
