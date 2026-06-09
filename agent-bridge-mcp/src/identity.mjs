@@ -29,8 +29,18 @@ const IDENTITY_VERSION = 1;
 const DEFAULT_AIR_URL = "https://agentidentityregistry.org";
 const DEFAULT_RELAY_URL = "https://relay.agentidentityregistry.org";
 
-export const bridgeHome = () =>
-  process.env.AGENT_BRIDGE_HOME || join(homedir(), ".air-msg");
+export const bridgeHome = () => {
+  if (process.env.AGENT_BRIDGE_HOME) return process.env.AGENT_BRIDGE_HOME;
+  // Under the node test runner, falling through to the real home would write
+  // fixture data into the user's live ~/.air-msg store — force tests to opt
+  // into a home explicitly (temp-dir idiom: test/archive.test.mjs).
+  if (process.env.NODE_TEST_CONTEXT) {
+    throw new Error(
+      "Refusing the real ~/.air-msg under the test runner — set AGENT_BRIDGE_HOME to a temp dir.",
+    );
+  }
+  return join(homedir(), ".air-msg");
+};
 const dir = bridgeHome;
 const identityPath = () => join(dir(), "identity.json");
 

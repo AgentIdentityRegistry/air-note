@@ -1,7 +1,19 @@
-import { test } from "node:test";
+import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { roomCreateLocal, roomGrantAdminLocal, roomInviteLocal } from "../src/core.mjs";
 import { deriveRoom } from "../src/rooms.mjs";
+
+let dir;
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "air-msg-rooms-ops-"));
+  process.env.AGENT_BRIDGE_HOME = dir;
+});
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
 
 const stubSigner = (b) => ({ ...b, op_sig: "zSIG" });
 
