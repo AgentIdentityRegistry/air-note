@@ -68,3 +68,47 @@ test("default maxLine is 1 MiB (matches watch.mjs MAX_SSE_BUF)", () => {
   feed(Buffer.from("y".repeat((1 << 20) + 1)));   // one over the ceiling, no newline
   assert.equal(errs.length, 1);
 });
+
+import { admitForRole, ROLES } from "../src/daemon-ipc.mjs";
+import { roomCreateLocal, roomInviteLocal } from "../src/core.mjs";
+
+const M = (over = {}) => ({
+  envelope_id: "e1", from: "did:wba:agentidentityregistry.org:agents:AIR-AAAA-BBBB-CCCC",
+  contact: "alice", verified: true, key_changed: false,
+  body: { type: "text", text: "hi" }, ...over,
+});
+
+test("ROLES: exactly channel and viewer in Phase 2 (bridge is an in-process sink until Phase 4)", () => {
+  assert.deepEqual([...ROLES].sort(), ["channel", "viewer"]);
+});
+
+test("admitForRole(channel): verified+pinned+key-unchanged admits; each violation denies", () => {
+  assert.equal(admitForRole("channel", M()), true);
+  assert.equal(admitForRole("channel", M({ verified: false })), false);
+  assert.equal(admitForRole("channel", M({ contact: undefined })), false);
+  assert.equal(admitForRole("channel", M({ key_changed: true })), false);
+  assert.equal(admitForRole("channel", M(), { mute: new Set(["alice"]) }), false);
+});
+
+test("admitForRole(viewer): mute-only — unverified still visible, muted (alias/did/short-id) not", () => {
+  assert.equal(admitForRole("viewer", M({ verified: false, contact: undefined })), true);
+  assert.equal(admitForRole("viewer", M(), { mute: new Set(["alice"]) }), false);
+  assert.equal(admitForRole("viewer", M(), { mute: new Set([M().from]) }), false);
+  assert.equal(admitForRole("viewer", M(), { mute: new Set(["AIR-AAAA-BBBB-CCCC"]) }), false);
+});
+
+test("admitForRole: unknown role admits nothing", () => {
+  assert.equal(admitForRole("root", M()), false);
+  assert.equal(admitForRole(undefined, M()), false);
+});
+
+test("admitForRole(channel): room messages route through the ROOM gate (member admits, non-member denies)", () => {
+  const stubSigner = (b) => ({ ...b, op_sig: "zSIG" });
+  const founder = { did: "did:wba:f", public_key_multibase: "zF", privateKey: null };
+  const { room_id } = roomCreateLocal({ identity: founder, name: "GateTest", signer: stubSigner });
+  roomInviteLocal({ identity: founder, room_id, member_did: "did:wba:m", member_pubkey: "zM", signer: stubSigner });
+  const member = M({ room_id, from: "did:wba:m", contact: "mate" });
+  const stranger = M({ room_id, from: "did:wba:stranger", contact: "sus" });
+  assert.equal(admitForRole("channel", member), true);
+  assert.equal(admitForRole("channel", stranger), false);
+});
