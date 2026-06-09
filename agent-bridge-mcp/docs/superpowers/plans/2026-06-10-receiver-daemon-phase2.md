@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** v2 — reworked 2026-06-10 after an independent critic review (verdict REWORK → all 7 findings + gaps addressed: `relay_seq` stamped at the socket boundary; backpressure floor; channel-client lifecycle made graceful + symmetric; condition-polled tests; 1 MiB frame ceiling; pre-hello reaper; lock⇒unlink⇒bind invariant test; `bridge`-role deferral documented; live smoke marked MANUAL).
+
 **Goal:** Add the Unix-domain-socket layer to the receiver daemon so N local clients can subscribe to the one relay pull simultaneously — with the **daemon** (never the client) enforcing each subscriber's role gate — and refactor `channel-server.mjs` into a lock-free thin client of that socket.
 
 **Architecture:** Phase 1 (shipped, PR #8) runs ONE `watch()` loop in `daemon.mjs` and fans each message to in-process sinks (`fanout.mjs`, sink = `{name, deliver(m)}`). Phase 2 adds `src/daemon-ipc.mjs`: a socket server registered as one more sink, which internally fans to connected subscribers **after applying that subscriber's role filter** (spec §5 — the Critical fix from review: a "dumb fan-out" would leak all decrypted plaintext to any local process). `channel-server.mjs` becomes daemon-first: attach as a `channel` client (no consumer lock), fall back to today's standalone mode when no daemon runs.
 
 **Tech Stack:** Node ≥22 stdlib only (`node:net` Unix socket, line-delimited JSON). No new dependencies.
 
-**Spec:** `agent-bridge-mcp/docs/superpowers/specs/2026-06-05-receiver-daemon-design.md` (§3 components, §5 gate, §7 row semantics, §9 testing). Phase 3 (buffers/gap/replay) and Phase 4 (decision table, reconnect, installers) are explicitly OUT of this plan.
+**Spec:** `agent-bridge-mcp/docs/superpowers/specs/2026-06-05-receiver-daemon-design.md` (§3 components, §5 gate, §7 row semantics, §9 testing). Phase 3 (rich delivery semantics: per-role buffers, gap/replay, at-least-once) and Phase 4 (decision table, reconnect, installers) are OUT of this plan — but Phase 2 ships a minimal backpressure FLOOR (drop a stuck client) because "zero flow control on an always-on process" is not the same thing as "rich semantics deferred."
 
 **Repo rules that bind every task:**
 - Tests MUST set `AGENT_BRIDGE_HOME` to a temp dir — `bridgeHome()` **throws** under the test runner without it (the 2026-06-10 guard). Use the `mkdtempSync` + `beforeEach/afterEach` idiom from `test/archive.test.mjs`.
@@ -19,9 +21,11 @@
 **Resolved spec question (record in Task 8):** §11-Q1 — relay `/pull` filters `acked_at IS NULL` AND is cursor-driven (`since=N`); daemon+legacy share one home → one cursor + archive PK `(envelope_id, direction)` dedup, so a brief handoff overlap is at-least-once, never lossy (verified in `~/air-site/relay/src/index.js` L193–237).
 
 **Protocol (line-delimited JSON, one object per `\n`-terminated line):**
-- client→daemon: `{"type":"hello","role":"channel"|"viewer"}` (first frame, mandatory) · `{"type":"ping"}`
-- daemon→client: `{"type":"hello-ok","pid","start_time","did"}` · `{"type":"error","reason"}` then close · `{"type":"message","message":<m>}` · `{"type":"pong"}`
-- Unknown frame types from a client are ignored (forward compatibility — Phase 3 adds `gap`/`since_seq`). `message.relay_seq` already rides on `m` (core.mjs:490), so Phase 3 needs no frame change.
+- client→daemon: `{"type":"hello","role":"channel"|"viewer"}` (first frame, mandatory, within 5 s or the server reaps the connection) · `{"type":"ping"}`
+- daemon→client: `{"type":"hello-ok","pid","start_time","did"}` · `{"type":"error","reason"}` then close · `{"type":"message","message":<wire>}` · `{"type":"pong"}`
+- **`wire` = the pushed message with `relay_seq` stamped from `m.seq` at the socket boundary.** The object `core.receive()` hands to `onMessage` carries `seq` (core.mjs:467 room / :537 1:1) — `relay_seq` exists only on the archive row. The daemon normalizes on the way out so Phase 3's gap/replay can key on `message.relay_seq` with no frame change.
+- Frame ceiling: **1 MiB** default (`maxLine`), matching `watch.mjs`'s `MAX_SSE_BUF` (1<<20). Real bodies today are ~300 B, but no upstream cap exists; an over-ceiling frame must fail LOUDLY (onError), never silently wedge. Unknown frame types from a subscribed client are ignored (forward compatibility).
+- `bridge` is **deliberately not a socket role in Phase 2** — the bridge runs as an in-process daemon sink (spec §3); a socket `bridge` role arrives in Phase 4 when the bridge becomes detachable. `ROLES` hard-rejects it until then.
 
 ---
 
@@ -52,6 +56,16 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** Poll a condition instead of sleeping a fixed interval — socket tests must not
+ *  bet on wall-clock (flaky on loaded runners). Same ceiling for a true hang. */
+const until = async (cond, ms = 2000) => {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > ms) throw new Error("until: timed out");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+};
+
 test("encodeFrame: one JSON object per newline-terminated line", () => {
   assert.equal(encodeFrame({ type: "ping" }), '{"type":"ping"}\n');
 });
@@ -73,10 +87,27 @@ test("makeLineParser: invalid JSON reports onError and keeps parsing later lines
   assert.deepEqual(got, [{ type: "ping" }]);
 });
 
-test("makeLineParser: a line beyond maxLine reports onError and resets the buffer", () => {
+test("makeLineParser: a line beyond maxLine reports onError LOUDLY and resets the buffer", () => {
   const errs = [];
   const feed = makeLineParser(() => {}, { maxLine: 16, onError: (e) => errs.push(e) });
   feed(Buffer.from("x".repeat(64)));
+  assert.equal(errs.length, 1);
+  assert.match(errs[0].message, /exceeds/);
+});
+
+test("makeLineParser: a realistic large frame (~100 KB body) round-trips intact under the default ceiling", () => {
+  const big = { type: "message", message: { envelope_id: "eBig", body: { type: "text", text: "x".repeat(100_000) } } };
+  const got = [];
+  const feed = makeLineParser((f) => got.push(f));
+  feed(Buffer.from(encodeFrame(big)));
+  assert.equal(got.length, 1);
+  assert.equal(got[0].message.body.text.length, 100_000);
+});
+
+test("default maxLine is 1 MiB (matches watch.mjs MAX_SSE_BUF)", () => {
+  const errs = [];
+  const feed = makeLineParser(() => {}, { onError: (e) => errs.push(e) });
+  feed(Buffer.from("y".repeat((1 << 20) + 1)));   // one over the ceiling, no newline
   assert.equal(errs.length, 1);
 });
 ```
@@ -100,6 +131,11 @@ import { bridgeHome } from "./identity.mjs";
 
 export const socketPath = () => join(bridgeHome(), "daemon.sock");
 
+// Frame ceiling: 1 MiB, matching watch.mjs's MAX_SSE_BUF. Bodies have no upstream size cap,
+// so the ceiling must clear any plausible message; an over-ceiling line fails LOUDLY via
+// onError (a silent drop here would be invisible mail loss for a channel client).
+export const MAX_FRAME = 1 << 20;
+
 /** One JSON object per newline-terminated line. */
 export function encodeFrame(obj) {
   return JSON.stringify(obj) + "\n";
@@ -108,7 +144,7 @@ export function encodeFrame(obj) {
 /** Incremental line parser: feed(chunk); emits parsed frames via onFrame.
  *  A malformed line or an over-long line is reported to onError and skipped —
  *  one bad frame must never kill the connection handler loop. */
-export function makeLineParser(onFrame, { maxLine = 65536, onError = () => {} } = {}) {
+export function makeLineParser(onFrame, { maxLine = MAX_FRAME, onError = () => {} } = {}) {
   let buf = "";
   return (chunk) => {
     buf += chunk.toString("utf8");
@@ -135,13 +171,13 @@ export function makeLineParser(onFrame, { maxLine = 65536, onError = () => {} } 
 - [ ] **Step 4: Run to verify pass**
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: PASS (4/4).
+Expected: PASS (6/6).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/daemon-ipc.mjs test/daemon-ipc.test.mjs
-git commit -m "feat(daemon): line-delimited JSON frame codec for the socket layer"
+git commit -m "feat(daemon): frame codec — 1MiB ceiling, loud over-cap failure, chunk-safe parser"
 ```
 
 ---
@@ -164,7 +200,7 @@ const M = (over = {}) => ({
   body: { type: "text", text: "hi" }, ...over,
 });
 
-test("ROLES: exactly channel and viewer in Phase 2", () => {
+test("ROLES: exactly channel and viewer in Phase 2 (bridge is an in-process sink until Phase 4)", () => {
   assert.deepEqual([...ROLES].sort(), ["channel", "viewer"]);
 });
 
@@ -212,6 +248,8 @@ import { channelGate, roomChannelGate } from "./channel.mjs";
 import { deriveRoom } from "./rooms.mjs";
 import { shortPeer } from "./peers.mjs";
 
+// Phase 2 socket roles. `bridge` is deliberately ABSENT: the bridge runs as an in-process
+// daemon sink (spec §3); a socket bridge role arrives in Phase 4 when it becomes detachable.
 export const ROLES = new Set(["channel", "viewer"]);
 
 /** May `m` cross the socket to a subscriber with `role`? (spec §5 — confidentiality boundary.)
@@ -232,7 +270,7 @@ export function admitForRole(role, m, { mute = new Set() } = {}) {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: PASS (9/9).
+Expected: PASS (11/11).
 
 - [ ] **Step 5: Commit**
 
@@ -302,7 +340,7 @@ export function prepareSocketPath() {
 - [ ] **Step 4: Run to verify pass**
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: PASS (11/11).
+Expected: PASS (13/13).
 
 - [ ] **Step 5: Commit**
 
@@ -313,7 +351,7 @@ git commit -m "feat(daemon): home-safety assertion + lock-guarded stale-socket c
 
 ---
 
-### Task 4: The IPC server (handshake, registry, gated broadcast)
+### Task 4: The IPC server (handshake, registry, gated broadcast, flow-control floor)
 
 **Files:**
 - Modify: `src/daemon-ipc.mjs` (append)
@@ -341,10 +379,12 @@ function rawClient(role) {
 }
 
 const DAEMON_INFO = { pid: 4242, start_time: "2026-06-10T00:00:00.000Z", did: "did:wba:me" };
+const ipcFor = (over = {}) =>
+  createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {}, ...over });
 
 test("ipc server: hello → hello-ok with daemon info; socket file is 0600", async () => {
   chmodSync(dir, 0o700);
-  const ipc = createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {} });
+  const ipc = ipcFor();
   await ipc.listen();
   try {
     const { sock, frames } = await rawClient("viewer");
@@ -355,9 +395,21 @@ test("ipc server: hello → hello-ok with daemon info; socket file is 0600", asy
   } finally { await ipc.close(); }
 });
 
+test("ipc server: listen succeeds over a planted stale socket file (lock ⇒ unlink ⇒ bind invariant)", async () => {
+  chmodSync(dir, 0o700);
+  writeFileSync(socketPath(), "");            // stale leftover from a crashed daemon
+  const ipc = ipcFor();
+  await ipc.listen();                          // must NOT throw EADDRINUSE
+  try {
+    const { sock, frames } = await rawClient("viewer");
+    assert.equal(frames[0].type, "hello-ok");
+    sock.destroy();
+  } finally { await ipc.close(); }
+});
+
 test("ipc server: a bad role gets an error frame and is disconnected", async () => {
   chmodSync(dir, 0o700);
-  const ipc = createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {} });
+  const ipc = ipcFor();
   await ipc.listen();
   try {
     const { sock, frames } = await rawClient("root");
@@ -367,36 +419,64 @@ test("ipc server: a bad role gets an error frame and is disconnected", async () 
   } finally { await ipc.close(); }
 });
 
-test("ipc sink: per-subscriber gating — viewer sees unverified mail, channel does not", async () => {
+test("ipc sink: per-subscriber gating — viewer sees unverified mail, channel does not; relay_seq stamped from seq", async () => {
   chmodSync(dir, 0o700);
-  const ipc = createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {} });
+  const ipc = ipcFor();
   await ipc.listen();
   try {
     const viewer = await rawClient("viewer");
     const channel = await rawClient("channel");
-    const unverified = { envelope_id: "eU", from: "did:wba:x", verified: false, body: { type: "text", text: "spam?" } };
-    const verified = { envelope_id: "eV", from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "real" } };
+    const unverified = { envelope_id: "eU", seq: 7, from: "did:wba:x", verified: false, body: { type: "text", text: "spam?" } };
+    const verified = { envelope_id: "eV", seq: 8, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "real" } };
     await ipc.sink.deliver(unverified);
     await ipc.sink.deliver(verified);
-    await new Promise((res) => setTimeout(res, 50));        // let writes flush
     const got = (c) => c.frames.filter((f) => f.type === "message").map((f) => f.message.envelope_id);
+    await until(() => got(viewer).length === 2 && got(channel).length === 1);
     assert.deepEqual(got(viewer), ["eU", "eV"]);            // viewer: mute-only
     assert.deepEqual(got(channel), ["eV"]);                 // channel: gate enforced BY THE DAEMON
+    const wire = viewer.frames.find((f) => f.type === "message" && f.message.envelope_id === "eU").message;
+    assert.equal(wire.relay_seq, 7);                        // Phase-3 readiness: stamped at the boundary
     viewer.sock.destroy(); channel.sock.destroy();
   } finally { await ipc.close(); }
 });
 
-test("ipc server: ping → pong; disconnect deregisters", async () => {
+test("ipc server: ping → pong; a second hello is ignored (still functional); disconnect deregisters", async () => {
   chmodSync(dir, 0o700);
-  const ipc = createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {} });
+  const ipc = ipcFor();
   await ipc.listen();
   try {
     const { sock, frames } = await rawClient("viewer");
+    sock.write(encodeFrame({ type: "hello", role: "viewer" }));   // duplicate hello: ignored
     sock.write(encodeFrame({ type: "ping" }));
-    await new Promise((res) => setTimeout(res, 50));
-    assert.equal(frames.some((f) => f.type === "pong"), true);
+    await until(() => frames.some((f) => f.type === "pong"));
+    assert.equal(frames.filter((f) => f.type === "error").length, 0);
     sock.destroy();
-    await new Promise((res) => setTimeout(res, 50));
+    await until(() => ipc.clientCount() === 0);
+  } finally { await ipc.close(); }
+});
+
+test("ipc server: a stuck (non-reading) client is dropped once its queue passes the high-water mark", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 1024 });   // tiny HWM so the test stays light
+  await ipc.listen();
+  try {
+    const { sock } = await rawClient("viewer");
+    sock.pause();                                // simulate a wedged local client
+    const fat = { envelope_id: "eFat", from: "did:wba:x", verified: false, body: { type: "text", text: "x".repeat(65536) } };
+    // Push until node-side queueing exceeds the HWM (kernel buffer absorbs the first writes).
+    for (let i = 0; i < 64 && ipc.clientCount() > 0; i++) await ipc.sink.deliver({ ...fat, envelope_id: `eFat${i}` });
+    await until(() => ipc.clientCount() === 0);  // daemon protected itself: stuck client dropped
+  } finally { await ipc.close(); }
+});
+
+test("ipc server: a silent connection that never says hello is reaped", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ helloTimeoutMs: 50 });
+  await ipc.listen();
+  try {
+    const sock = createConnection(socketPath());
+    await new Promise((res) => sock.once("connect", res));
+    await new Promise((res) => sock.once("close", res));   // server reaps the pre-hello idler
     assert.equal(ipc.clientCount(), 0);
   } finally { await ipc.close(); }
 });
@@ -407,7 +487,7 @@ test("ipc server: ping → pong; disconnect deregisters", async () => {
 Run: `node --test test/daemon-ipc.test.mjs`
 Expected: FAIL — `createIpcServer` not exported.
 
-- [ ] **Step 3: Implement** (append to `src/daemon-ipc.mjs`; add `createServer` to a `node:net` import, `chmodSync`/`lstatSync` to `node:fs`, `getuid` via `process`)
+- [ ] **Step 3: Implement** (append to `src/daemon-ipc.mjs`; add `createServer` to a `node:net` import, `chmodSync`/`lstatSync` to `node:fs`)
 
 ```js
 import { createServer } from "node:net";
@@ -416,12 +496,23 @@ import { chmodSync, lstatSync } from "node:fs";
 /** The daemon's socket server. Returned `sink` plugs into fanOut ({name, deliver}).
  *  Each subscriber declared a role at hello; deliver() applies admitForRole per subscriber
  *  BEFORE writing — the daemon enforces, the client never chooses (spec §5).
- *  Backpressure: Phase 2 writes raw; per-role buffers + gap/replay are Phase 3 (spec §6). */
-export function createIpcServer({ mute = new Set(), daemonInfo = {}, log = (s) => process.stderr.write(s + "\n") } = {}) {
+ *
+ *  Flow control (Phase-2 FLOOR, not the Phase-3 §6 semantics): a subscriber whose unflushed
+ *  node-side queue (`socket.writableLength`) exceeds `highWaterMark` is DROPPED with a log —
+ *  an always-on daemon must never let one wedged local client balloon its memory. Phase 3
+ *  replaces drop-the-client with per-role buffers + gap/replay for `channel`. */
+export function createIpcServer({
+  mute = new Set(),
+  daemonInfo = {},
+  highWaterMark = 1 << 20,                    // 1 MiB queued per client, matches MAX_FRAME
+  helloTimeoutMs = 5000,                      // pre-hello idlers are reaped (fd-pin guard)
+  log = (s) => process.stderr.write(s + "\n"),
+} = {}) {
   const subscribers = new Set();   // { socket, role }
 
   const server = createServer((socket) => {
     let sub = null;
+    const reaper = setTimeout(() => { if (!sub) socket.destroy(); }, helloTimeoutMs);
     const feed = makeLineParser((frame) => {
       if (!sub) {
         if (frame.type !== "hello" || !ROLES.has(frame.role)) {
@@ -429,6 +520,7 @@ export function createIpcServer({ mute = new Set(), daemonInfo = {}, log = (s) =
           socket.destroy();
           return;
         }
+        clearTimeout(reaper);
         sub = { socket, role: frame.role };
         subscribers.add(sub);
         socket.write(encodeFrame({ type: "hello-ok", ...daemonInfo }));
@@ -436,11 +528,14 @@ export function createIpcServer({ mute = new Set(), daemonInfo = {}, log = (s) =
         return;
       }
       if (frame.type === "ping") socket.write(encodeFrame({ type: "pong" }));
-      // Unknown frames from a subscribed client are ignored (forward compatibility).
+      // Duplicate hello and unknown frames from a subscribed client: ignored (forward compat).
     }, { onError: () => { socket.write(encodeFrame({ type: "error", reason: "bad frame" })); socket.destroy(); } });
 
     socket.on("data", feed);
-    const drop = () => { if (sub) { subscribers.delete(sub); log(`[daemon] client detached (${subscribers.size} connected)`); sub = null; } };
+    const drop = () => {
+      clearTimeout(reaper);
+      if (sub) { subscribers.delete(sub); log(`[daemon] client detached (${subscribers.size} connected)`); sub = null; }
+    };
     socket.on("close", drop);
     socket.on("error", drop);
   });
@@ -450,10 +545,18 @@ export function createIpcServer({ mute = new Set(), daemonInfo = {}, log = (s) =
     sink: {
       name: "socket",
       deliver: (m) => {
+        // Stamp relay_seq at the boundary: onMessage objects carry `seq` (core.mjs:467/:537);
+        // `relay_seq` otherwise exists only on the archive row. Phase 3 keys gap/replay on this.
+        const wire = m && m.seq !== undefined && m.relay_seq === undefined ? { ...m, relay_seq: m.seq } : m;
         for (const sub of subscribers) {
           if (!admitForRole(sub.role, m, { mute })) continue;
-          try { sub.socket.write(encodeFrame({ type: "message", message: m })); }
-          catch { sub.socket.destroy(); }   // a dead client must never stall the loop
+          if (sub.socket.writableLength > highWaterMark) {
+            log(`[daemon] dropping slow ${sub.role} client (writableLength=${sub.socket.writableLength})`);
+            sub.socket.destroy();               // 'close' handler deregisters it
+            continue;
+          }
+          // Best-effort write; real dead-socket reclamation is the close/error handler above.
+          sub.socket.write(encodeFrame({ type: "message", message: wire }));
         }
       },
     },
@@ -485,13 +588,13 @@ export function createIpcServer({ mute = new Set(), daemonInfo = {}, log = (s) =
 - [ ] **Step 4: Run to verify pass**
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: PASS (15/15).
+Expected: PASS (20/20).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/daemon-ipc.mjs test/daemon-ipc.test.mjs
-git commit -m "feat(daemon): unix-socket IPC server — handshake, registry, daemon-enforced gated broadcast"
+git commit -m "feat(daemon): IPC server — gated broadcast, relay_seq stamping, HWM drop floor, pre-hello reaper"
 ```
 
 ---
@@ -509,13 +612,13 @@ import { connectDaemon } from "../src/daemon-ipc.mjs";
 
 test("connectDaemon: handshakes, then delivers admitted messages to onMessage", async () => {
   chmodSync(dir, 0o700);
-  const ipc = createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {} });
+  const ipc = ipcFor();
   await ipc.listen();
   try {
     const got = [];
     const handle = await connectDaemon({ role: "viewer", onMessage: (m) => got.push(m.envelope_id), log: () => {} });
     await ipc.sink.deliver({ envelope_id: "e9", from: "did:wba:x", verified: false, body: { type: "text", text: "yo" } });
-    await new Promise((res) => setTimeout(res, 50));
+    await until(() => got.length === 1);
     assert.deepEqual(got, ["e9"]);
     handle.close();
   } finally { await ipc.close(); }
@@ -531,13 +634,12 @@ test("connectDaemon: no daemon → rejects with code DAEMON_DOWN", async () => {
 
 test("connectDaemon: onClose fires when the daemon goes away", async () => {
   chmodSync(dir, 0o700);
-  const ipc = createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {} });
+  const ipc = ipcFor();
   await ipc.listen();
   let closed = false;
   const handle = await connectDaemon({ role: "viewer", onMessage: () => {}, onClose: () => { closed = true; }, log: () => {} });
   await ipc.close();
-  await new Promise((res) => setTimeout(res, 50));
-  assert.equal(closed, true);
+  await until(() => closed);
   handle.close();
 });
 ```
@@ -592,7 +694,7 @@ export function connectDaemon({ role, onMessage, onClose = () => {}, handshakeMs
 - [ ] **Step 4: Run to verify pass**
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: PASS (18/18).
+Expected: PASS (23/23).
 
 - [ ] **Step 5: Commit**
 
@@ -616,7 +718,7 @@ import { runDaemon } from "../src/daemon.mjs";
 
 test("composition: runDaemon fans one watch() message to banner sink AND gated socket subscribers", async () => {
   chmodSync(dir, 0o700);
-  const ipc = createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {} });
+  const ipc = ipcFor();
   await ipc.listen();
   try {
     const bannered = [];
@@ -626,14 +728,14 @@ test("composition: runDaemon fans one watch() message to banner sink AND gated s
 
     const verified = { envelope_id: "eOK", from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "hi" } };
     const unverified = { envelope_id: "eNO", from: "did:wba:x", verified: false, body: { type: "text", text: "??" } };
-    // watchFn stub: emit two messages then resolve (daemon loop ends).
+    // watchFn stub: emit two messages then resolve (daemon loop ends). Same shape as daemon.test.mjs:13.
     const watchFn = async ({ onMessage }) => { await onMessage(verified); await onMessage(unverified); };
 
     await runDaemon({ identity: { did: "did:wba:me" }, sinks: [bannerStub, ipc.sink], watchFn, log: () => {} });
-    await new Promise((res) => setTimeout(res, 50));
+    const got = (c) => c.frames.filter((f) => f.type === "message").map((f) => f.message.envelope_id);
+    await until(() => got(viewer).length === 2 && got(channel).length === 1);
 
     assert.deepEqual(bannered, ["eOK", "eNO"]);   // in-process banner saw both (its own mute logic is separate)
-    const got = (c) => c.frames.filter((f) => f.type === "message").map((f) => f.message.envelope_id);
     assert.deepEqual(got(viewer), ["eOK", "eNO"]);
     assert.deepEqual(got(channel), ["eOK"]);
     viewer.sock.destroy(); channel.sock.destroy();
@@ -644,15 +746,20 @@ test("composition: runDaemon fans one watch() message to banner sink AND gated s
 - [ ] **Step 2: Run to verify it passes already** (this is a composition proof, not new logic)
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: PASS — `runDaemon` + `ipc.sink` compose with zero changes. (If it fails, fix before proceeding.)
+Expected: PASS (24/24) — `runDaemon` + `ipc.sink` compose with zero changes. (If it fails, fix before proceeding.)
 
-- [ ] **Step 3: Wire `startDaemon`** — in `src/daemon.mjs`, add the import and edit `startDaemon`:
+- [ ] **Step 3: Wire `startDaemon`** — in `src/daemon.mjs`, add the import:
 
 ```js
 import { createIpcServer } from "./daemon-ipc.mjs";
 ```
 
-Replace the body of `startDaemon` from `const mute = parseMuteSet();` through the `try/finally` with:
+**Edit boundary (exact):** the lines
+```js
+  const startTime = new Date().toISOString();
+  writeDaemonPid({ pid: process.pid, startTime });
+```
+**stay untouched** — the new block references `startTime`. Replace ONLY from `const mute = parseMuteSet();` through the end of the existing `try/finally` with:
 
 ```js
   const mute = parseMuteSet();
@@ -697,6 +804,8 @@ git commit -m "feat(daemon): socket sink wired into startDaemon — N gated subs
 **Files:**
 - Modify: `src/channel-server.mjs`
 
+**Lifecycle decision (explicit, per review):** on daemon disconnect the attached client **exits 0** — a clean "daemon went away" shutdown, NOT a crash. Whether the MCP host auto-relaunches on exit is unverified (open question recorded in the spec §11 by Task 8); Phase 4's reconnect/backoff supersedes this stopgap either way. Both branches get symmetric SIGINT/SIGTERM handling so the asymmetry can't be misread as an oversight.
+
 - [ ] **Step 1: Refactor `main()`** — replace the current `main()` with:
 
 ```js
@@ -715,13 +824,17 @@ async function main() {
       role: "channel",
       onMessage: push,
       onClose: () => {
-        log("air-msg-channel: daemon connection closed — exiting (Phase 4 adds reconnect)");
-        process.exit(1);
+        // Deliberate Phase-2 stopgap: clean exit on daemon restart/stop. Mail push pauses
+        // until this server is relaunched; Phase 4 replaces this with reconnect/backoff.
+        log("air-msg-channel: daemon connection closed — exiting cleanly (Phase 4 adds reconnect)");
+        process.exit(0);
       },
       log,
     });
     log(`air-msg-channel v${CORE_VERSION} attached to air-msgd for ${identity.did} (gate enforced by daemon)`);
-    await new Promise(() => {});                   // stay alive until killed or daemon closes
+    process.once("SIGINT", () => process.exit(0));   // no lock held on this path — plain clean exit
+    process.once("SIGTERM", () => process.exit(0));
+    await new Promise(() => {});                     // stay alive until a signal or daemon close
   } catch (e) {
     if (e.code !== "DAEMON_DOWN") throw e;
     log("air-msg-channel: no daemon — running standalone (legacy)");
@@ -739,7 +852,7 @@ async function main() {
     notifier: { notify: async () => {} },
     openResolver: () => null,
     onMessage: push,
-  }).catch((e) => { if (e?.name !== "AbortError") throw e; });
+  }).catch((e) => { if (e?.name !== "AbortError") throw e; });   // clean signal shutdown
   releaseConsumerLock();
 }
 ```
@@ -756,17 +869,17 @@ Expected: clean check; ALL PASS (channel.mjs logic untouched — only the server
 
 ```bash
 git add src/channel-server.mjs
-git commit -m "refactor(channel): daemon-first thin client — attach via socket, lock-free; legacy fallback intact"
+git commit -m "refactor(channel): daemon-first thin client — lock-free attach, clean exit-0 stopgap, legacy fallback"
 ```
 
 ---
 
-### Task 8: Spec note (§11-Q1 resolved) + full verification + live smoke
+### Task 8: Spec notes (§11) + full verification + live smoke
 
 **Files:**
 - Modify: `agent-bridge-mcp/docs/superpowers/specs/2026-06-05-receiver-daemon-design.md` (§11)
 
-- [ ] **Step 1: Record the resolved open question** — in the spec's §11, replace the first bullet with:
+- [ ] **Step 1: Record the resolved + new open questions** — in the spec's §11, replace the first bullet with:
 
 ```markdown
 - ~~Does the relay's `/pull` SSE `since` guarantee no gap if two consumers briefly overlap…~~
@@ -774,6 +887,16 @@ git commit -m "refactor(channel): daemon-first thin client — attach via socket
   (`since=N`) — see `~/air-site/relay/src/index.js` L193–237. Daemon and legacy share one
   `AGENT_BRIDGE_HOME` → one cursor + the archive's `(envelope_id, direction)` PK dedup, so a brief
   handoff overlap is at-least-once, never lossy.
+```
+
+and append two bullets:
+
+```markdown
+- Phase 2 note: the wire protocol stamps `relay_seq` from the pushed object's `seq` at the socket
+  boundary (`core.receive()`'s onMessage objects carry `seq`; `relay_seq` exists only on archive
+  rows) — Phase 3's gap/replay keys on `message.relay_seq` with no frame change.
+- Open (Phase 4): does the MCP host auto-relaunch a channel server that exits 0 when the daemon
+  goes away? Phase 2 ships clean-exit-on-disconnect as a stopgap; reconnect/backoff supersedes it.
 ```
 
 - [ ] **Step 2: Full suite + hermeticity proof**
@@ -785,12 +908,12 @@ node --test 2>&1 | grep -E "^ℹ (tests|pass|fail|todo)"
 after=$(sqlite3 -readonly ~/.air-msg/archive.db "SELECT COUNT(*) FROM messages")
 echo "real-archive delta: $((after-before)) (must be 0)"
 ```
-Expected: `fail 0`, delta 0. (Baseline before this plan: 236 tests / 233 pass / 3 todo; Phase 2 adds ~19.)
+Expected: `fail 0`, delta 0. (Baseline before this plan: 236 tests / 233 pass / 3 todo; Phase 2 adds 24.)
 
-- [ ] **Step 3: Live smoke (one throwaway identity — clean up after)**
+- [ ] **Step 3: ⚠️ MANUAL — do not run unattended.** Live smoke (registers ONE throwaway agent against production AIR — a human runs this, then cleans up):
 
 ```bash
-# Terminal A — daemon on a throwaway home (registers ONE throwaway agent with AIR):
+# Terminal A — daemon on a throwaway home (short /tmp path: unix sockets cap at ~104 chars):
 export AGENT_BRIDGE_HOME=$(mktemp -d /tmp/airsmoke.XXXX)
 node src/cli.mjs register --name "phase2-smoke" && node src/cli.mjs daemon start
 # Terminal B — attach a viewer through the real socket:
@@ -802,6 +925,8 @@ node -e 'import("./src/daemon-ipc.mjs").then(async ({ connectDaemon }) => {
 node src/cli.mjs send <own-AIR-id-from-register> "phase2 smoke"
 # EXPECT: Terminal A logs the banner sink firing; Terminal B prints "VIEWER: phase2 smoke".
 # Ctrl-C the daemon → clean exit, daemon.sock + daemon.pid + consumer.lock all gone.
+# Kill the backgrounded viewer (kill %1) — note: a backgrounded-and-forgotten viewer is exactly
+# the stuck-client case the HWM drop floor exists for.
 ```
 Cleanup: demote the throwaway agent —
 `cd ~/air-site/api && npx wrangler d1 execute air-registry --remote --command "UPDATE agents SET is_demo=1 WHERE name='phase2-smoke'"`
@@ -810,21 +935,22 @@ Cleanup: demote the throwaway agent —
 
 ```bash
 git add agent-bridge-mcp/docs/superpowers/specs/2026-06-05-receiver-daemon-design.md
-git commit -m "docs(daemon): spec §11-Q1 resolved — relay overlap is at-least-once (cursor+ack+archive dedup)"
+git commit -m "docs(daemon): spec §11 — Q1 resolved (overlap at-least-once); relay_seq stamping + exit-0 stopgap noted"
 git push -u origin feat/daemon-phase2-socket
 gh pr create --repo AgentIdentityRegistry/air-note --base main \
   --title "feat(daemon): Phase 2 — socket + daemon-enforced per-subscriber gate + channel thin-client"
 ```
-PR body: summarize spec §5 enforcement, test counts, hermeticity delta-0, smoke result. Merge on green CI.
+PR body: summarize spec §5 enforcement, the critic-review hardening (relay_seq stamping, HWM floor, pre-hello reaper, exit-0 lifecycle), test counts, hermeticity delta-0. The live smoke (Step 3) is run by a human BEFORE merge; paste its output in the PR. Merge on green CI.
 
 ---
 
-## Self-Review (against spec §5/§7/§9)
+## Self-Review (against spec §5/§7/§9 + the 2026-06-10 critic review)
 
 - **§3 components:** `daemon-ipc.mjs` (Tasks 1–5), `channel-server` thin client (Task 7), daemon wiring (Task 6). `service/*.mjs` is Phase 4. ✓
-- **§5 gate:** admission lives in the DAEMON (Task 2 + Task 4's per-subscriber deliver); the explicit invariant test is Task 4 Step 1 test 3 + Task 6's composition test. 0600 socket + unsafe-home refusal + post-listen re-stat: Tasks 3–4. Untrusted-body fence: untouched (`channel.mjs` formatting unchanged). ✓
-- **§6 delivery:** deliberately Phase 3 (raw writes; noted in `createIpcServer` doc comment). `relay_seq` already rides on `m`, so the Phase 3 protocol needs no frame change. ✓
-- **§7 resolution:** Phase 2 ships the two rows that matter for the channel (socket live → attach; no daemon → standalone fallback via `DAEMON_DOWN`); stale-socket unlink happens daemon-side under the lock (Task 3). Full decision table + reconnect + `EADDRINUSE` bind-loser = Phase 4 (per the Phase-1 plan's mapping). Client disconnect → loud exit, documented. ✓
-- **§9 testing:** framing unit tests (T1), gate admit/deny matrix incl. a real room (T2), socket lifecycle over a real Unix socket (T4–T5), stubbed-relay-equivalent composition through `runDaemon` (T6), live smoke (T8). ✓
-- **Placeholder scan:** none — every step has complete code/commands. Names used consistently: `encodeFrame`, `makeLineParser`, `ROLES`, `admitForRole`, `assertSafeHome`, `prepareSocketPath`, `socketPath`, `createIpcServer` (`sink`/`listen`/`close`/`clientCount`), `connectDaemon` (`DAEMON_DOWN`). ✓
-- **Known risk:** Unix-socket path length (~104-byte cap) — temp homes under `tmpdir()` are short; the live smoke uses `/tmp/airsmoke.XXXX` deliberately. If a user's `AGENT_BRIDGE_HOME` is very deep, `listen()` throws cleanly (acceptable; documented behavior).
+- **§5 gate:** admission lives in the DAEMON (Task 2 + Task 4's per-subscriber deliver); the explicit invariant test is Task 4's gating test + Task 6's composition test. 0600 socket + unsafe-home refusal + post-listen re-stat: Tasks 3–4. The lock⇒unlink⇒bind invariant now has its own test (Task 4 test 2). Untrusted-body fence: untouched. **Critic confirmed the gate sound — preserved unchanged through rework.** ✓
+- **§5 `bridge` role:** deliberately deferred — the bridge is an in-process sink (spec §3); a socket `bridge` role lands in Phase 4 when the bridge becomes detachable. `ROLES` intentionally rejects it until then (documented in code + protocol section). ✓
+- **§6 delivery:** rich semantics (buffers, gap/replay, at-least-once) remain Phase 3 — but Phase 2 ships the **flow-control floor** (HWM drop + log + test) because zero backpressure on an always-on process is a regression, not a deferral. `relay_seq` is stamped at the boundary so Phase 3 needs no frame change (the v1 plan's claim was factually wrong — fixed). ✓
+- **§7 resolution:** Phase 2 ships the two rows that matter for the channel (socket live → attach; no daemon → standalone fallback via `DAEMON_DOWN`); stale-socket unlink happens daemon-side under the lock (tested). Disconnect → **exit 0** (deliberate stopgap, documented in code + spec §11); full decision table + reconnect + `EADDRINUSE` bind-loser = Phase 4. ✓
+- **§9 testing:** framing unit tests incl. ~100 KB round-trip + loud over-cap (T1), gate admit/deny matrix incl. a real room (T2), socket lifecycle over a real Unix socket incl. stale-file bind, stuck-client drop, pre-hello reap, duplicate-hello pin (T4–T5), stubbed-relay-equivalent composition through `runDaemon` (T6), MANUAL live smoke (T8). All waits are condition-polled (`until()`), never fixed sleeps. ✓
+- **Placeholder scan:** none — every step has complete code/commands. Names consistent: `encodeFrame`, `makeLineParser`, `MAX_FRAME`, `ROLES`, `admitForRole`, `assertSafeHome`, `prepareSocketPath`, `socketPath`, `createIpcServer` (`sink`/`listen`/`close`/`clientCount`, opts `highWaterMark`/`helloTimeoutMs`), `connectDaemon` (`DAEMON_DOWN`), `ipcFor`/`rawClient`/`until` test helpers. ✓
+- **Known risks:** Unix-socket path length (~104-byte cap) — temp homes are short; a very deep `AGENT_BRIDGE_HOME` makes `listen()` throw cleanly. The HWM drop floor means a wedged `channel` client silently loses its stream until relaunch — acceptable ONLY because Phase 3's gap/replay is the designed remedy; the drop is logged loudly daemon-side.
