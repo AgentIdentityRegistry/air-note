@@ -132,3 +132,124 @@ test("prepareSocketPath: unlinks a stale socket file (caller holds the consumer 
   prepareSocketPath();
   assert.equal(existsSync(socketPath()), false);
 });
+
+import { createConnection } from "node:net";
+import { createIpcServer } from "../src/daemon-ipc.mjs";
+
+/** Minimal raw test client: connect, send hello, collect frames. */
+function rawClient(role) {
+  return new Promise((resolve, reject) => {
+    const frames = [];
+    const sock = createConnection(socketPath());
+    const feed = makeLineParser((f) => {
+      frames.push(f);
+      if (f.type === "hello-ok" || f.type === "error") resolve({ sock, frames });
+    });
+    sock.on("data", feed);
+    sock.once("error", reject);
+    sock.once("connect", () => sock.write(encodeFrame({ type: "hello", role })));
+  });
+}
+
+const DAEMON_INFO = { pid: 4242, start_time: "2026-06-10T00:00:00.000Z", did: "did:wba:me" };
+const ipcFor = (over = {}) =>
+  createIpcServer({ mute: new Set(), daemonInfo: DAEMON_INFO, log: () => {}, ...over });
+
+test("ipc server: hello → hello-ok with daemon info; socket file is 0600", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const { sock, frames } = await rawClient("viewer");
+    assert.deepEqual(frames[0], { type: "hello-ok", ...DAEMON_INFO });
+    assert.equal(ipc.clientCount(), 1);
+    assert.equal(statSync(socketPath()).mode & 0o777, 0o600);
+    sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("ipc server: listen succeeds over a planted stale socket file (lock ⇒ unlink ⇒ bind invariant)", async () => {
+  chmodSync(dir, 0o700);
+  writeFileSync(socketPath(), "");            // stale leftover from a crashed daemon
+  const ipc = ipcFor();
+  await ipc.listen();                          // must NOT throw EADDRINUSE
+  try {
+    const { sock, frames } = await rawClient("viewer");
+    assert.equal(frames[0].type, "hello-ok");
+    sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("ipc server: a bad role gets an error frame and is disconnected", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const { sock, frames } = await rawClient("root");
+    assert.equal(frames[0].type, "error");
+    await new Promise((res) => sock.once("close", res));   // server closed it
+    assert.equal(ipc.clientCount(), 0);
+  } finally { await ipc.close(); }
+});
+
+test("ipc sink: per-subscriber gating — viewer sees unverified mail, channel does not; relay_seq stamped from seq", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const viewer = await rawClient("viewer");
+    const channel = await rawClient("channel");
+    const unverified = { envelope_id: "eU", seq: 7, from: "did:wba:x", verified: false, body: { type: "text", text: "spam?" } };
+    const verified = { envelope_id: "eV", seq: 8, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "real" } };
+    await ipc.sink.deliver(unverified);
+    await ipc.sink.deliver(verified);
+    const got = (c) => c.frames.filter((f) => f.type === "message").map((f) => f.message.envelope_id);
+    await until(() => got(viewer).length === 2 && got(channel).length === 1);
+    assert.deepEqual(got(viewer), ["eU", "eV"]);            // viewer: mute-only
+    assert.deepEqual(got(channel), ["eV"]);                 // channel: gate enforced BY THE DAEMON
+    const wire = viewer.frames.find((f) => f.type === "message" && f.message.envelope_id === "eU").message;
+    assert.equal(wire.relay_seq, 7);                        // Phase-3 readiness: stamped at the boundary
+    viewer.sock.destroy(); channel.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("ipc server: ping → pong; a second hello is ignored (still functional); disconnect deregisters", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const { sock, frames } = await rawClient("viewer");
+    sock.write(encodeFrame({ type: "hello", role: "viewer" }));   // duplicate hello: ignored
+    sock.write(encodeFrame({ type: "ping" }));
+    await until(() => frames.some((f) => f.type === "pong"));
+    assert.equal(frames.filter((f) => f.type === "error").length, 0);
+    sock.destroy();
+    await until(() => ipc.clientCount() === 0);
+  } finally { await ipc.close(); }
+});
+
+test("ipc server: a stuck (non-reading) client is dropped once its queue passes the high-water mark", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 1024 });   // tiny HWM so the test stays light
+  await ipc.listen();
+  try {
+    const { sock } = await rawClient("viewer");
+    sock.pause();                                // simulate a wedged local client
+    const fat = { envelope_id: "eFat", from: "did:wba:x", verified: false, body: { type: "text", text: "x".repeat(65536) } };
+    // Push until node-side queueing exceeds the HWM (kernel buffer absorbs the first writes).
+    for (let i = 0; i < 64 && ipc.clientCount() > 0; i++) await ipc.sink.deliver({ ...fat, envelope_id: `eFat${i}` });
+    await until(() => ipc.clientCount() === 0);  // daemon protected itself: stuck client dropped
+  } finally { await ipc.close(); }
+});
+
+test("ipc server: a silent connection that never says hello is reaped", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ helloTimeoutMs: 50 });
+  await ipc.listen();
+  try {
+    const sock = createConnection(socketPath());
+    await new Promise((res) => sock.once("connect", res));
+    await new Promise((res) => sock.once("close", res));   // server reaps the pre-hello idler
+    assert.equal(ipc.clientCount(), 0);
+  } finally { await ipc.close(); }
+});

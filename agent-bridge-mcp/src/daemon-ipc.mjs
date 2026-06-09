@@ -3,7 +3,8 @@
 // THE DAEMON ENFORCES EACH SUBSCRIBER'S ROLE GATE before writing to that subscriber —
 // a client never chooses its own filter (the dumb-fan-out confidentiality hole, spec §5).
 import { join } from "node:path";
-import { statSync, rmSync } from "node:fs";
+import { statSync, rmSync, chmodSync, lstatSync } from "node:fs";
+import { createServer } from "node:net";
 import { bridgeHome } from "./identity.mjs";
 import { channelGate, roomChannelGate } from "./channel.mjs";
 import { deriveRoom } from "./rooms.mjs";
@@ -78,4 +79,95 @@ export function assertSafeHome(home = bridgeHome()) {
  *  consumer lock — the lock is the single-daemon mutex, so nothing live owns this path. */
 export function prepareSocketPath() {
   try { rmSync(socketPath(), { force: true }); } catch { /* best effort */ }
+}
+
+/** The daemon's socket server. Returned `sink` plugs into fanOut ({name, deliver}).
+ *  Each subscriber declared a role at hello; deliver() applies admitForRole per subscriber
+ *  BEFORE writing — the daemon enforces, the client never chooses (spec §5).
+ *
+ *  Flow control (Phase-2 FLOOR, not the Phase-3 §6 semantics): a subscriber whose unflushed
+ *  node-side queue (`socket.writableLength`) exceeds `highWaterMark` is DROPPED with a log —
+ *  an always-on daemon must never let one wedged local client balloon its memory. Phase 3
+ *  replaces drop-the-client with per-role buffers + gap/replay for `channel`. */
+export function createIpcServer({
+  mute = new Set(),
+  daemonInfo = {},
+  highWaterMark = 1 << 20,                    // 1 MiB queued per client, matches MAX_FRAME
+  helloTimeoutMs = 5000,                      // pre-hello idlers are reaped (fd-pin guard)
+  log = (s) => process.stderr.write(s + "\n"),
+} = {}) {
+  const subscribers = new Set();   // { socket, role }
+
+  const server = createServer((socket) => {
+    let sub = null;
+    const reaper = setTimeout(() => { if (!sub) socket.destroy(); }, helloTimeoutMs);
+    const feed = makeLineParser((frame) => {
+      if (!sub) {
+        if (frame.type !== "hello" || !ROLES.has(frame.role)) {
+          socket.write(encodeFrame({ type: "error", reason: "first frame must be hello with role channel|viewer" }));
+          socket.destroy();
+          return;
+        }
+        clearTimeout(reaper);
+        sub = { socket, role: frame.role };
+        subscribers.add(sub);
+        socket.write(encodeFrame({ type: "hello-ok", ...daemonInfo }));
+        log(`[daemon] client attached: role=${frame.role} (${subscribers.size} connected)`);
+        return;
+      }
+      if (frame.type === "ping") socket.write(encodeFrame({ type: "pong" }));
+      // Duplicate hello and unknown frames from a subscribed client: ignored (forward compat).
+    }, { onError: () => { socket.write(encodeFrame({ type: "error", reason: "bad frame" })); socket.destroy(); } });
+
+    socket.on("data", feed);
+    const drop = () => {
+      clearTimeout(reaper);
+      if (sub) { subscribers.delete(sub); log(`[daemon] client detached (${subscribers.size} connected)`); sub = null; }
+    };
+    socket.on("close", drop);
+    socket.on("error", drop);
+  });
+
+  return {
+    /** fanOut-compatible sink: write `m` to every subscriber whose role admits it. */
+    sink: {
+      name: "socket",
+      deliver: (m) => {
+        // Stamp relay_seq at the boundary: onMessage objects carry `seq` (core.mjs:467/:537);
+        // `relay_seq` otherwise exists only on the archive row. Phase 3 keys gap/replay on this.
+        const wire = m && m.seq !== undefined && m.relay_seq === undefined ? { ...m, relay_seq: m.seq } : m;
+        for (const sub of subscribers) {
+          if (!admitForRole(sub.role, m, { mute })) continue;
+          if (sub.socket.writableLength > highWaterMark) {
+            log(`[daemon] dropping slow ${sub.role} client (writableLength=${sub.socket.writableLength})`);
+            sub.socket.destroy();               // 'close' handler deregisters it
+            continue;
+          }
+          // Best-effort write; real dead-socket reclamation is the close/error handler above.
+          sub.socket.write(encodeFrame({ type: "message", message: wire }));
+        }
+      },
+    },
+    clientCount: () => subscribers.size,
+    listen: async () => {
+      assertSafeHome();
+      prepareSocketPath();                  // caller (startDaemon) holds the consumer lock
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(socketPath(), resolve);
+      });
+      chmodSync(socketPath(), 0o600);
+      const st = lstatSync(socketPath());   // re-stat after listen: TOCTOU bind-hijack guard (spec §5)
+      if (!st.isSocket() || (st.mode & 0o777) !== 0o600 || (process.getuid && st.uid !== process.getuid())) {
+        await new Promise((res) => server.close(res));
+        throw new Error("socket failed post-listen owner/mode verification");
+      }
+    },
+    close: async () => {
+      for (const sub of subscribers) sub.socket.destroy();
+      subscribers.clear();
+      await new Promise((res) => server.close(res));
+      try { rmSync(socketPath(), { force: true }); } catch { /* best effort */ }
+    },
+  };
 }
