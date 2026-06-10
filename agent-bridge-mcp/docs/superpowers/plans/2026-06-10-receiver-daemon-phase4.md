@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected. Task 5 amendment: watch viewer holds a ref'd keepAlive (unref'd backoff timer cannot pin the loop — probed exit-0 mid-outage); `log: () => {}` silences raw transport lines from the curated stdout feed; spawn harness waits exits via a consumed-event-safe `waitExit` helper; survival test added as C1 regression guard. Task 7 amendment: queryDaemonStatus guards the timeout-vs-handshake race (same undead-socket class as 2a59f75) with a connectFn seam test; writeDaemonPid moved after listen (no stranded PID on failed bind; kills a benign split-brain warning window). Task 8 amendment: systemd `Environment=` quoted (a space in the home path would silently split the assignment — wrong-data, not an error); servicePlan now exposes `logPath` on both returned plan objects; Task 9 must `mkdirSync(dirname(plan.logPath), { recursive: true })` because launchd opens StandardOutPath pre-spawn and will not create missing parent directories.
+**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected. Task 5 amendment: watch viewer holds a ref'd keepAlive (unref'd backoff timer cannot pin the loop — probed exit-0 mid-outage); `log: () => {}` silences raw transport lines from the curated stdout feed; spawn harness waits exits via a consumed-event-safe `waitExit` helper; survival test added as C1 regression guard. Task 7 amendment: queryDaemonStatus guards the timeout-vs-handshake race (same undead-socket class as 2a59f75) with a connectFn seam test; writeDaemonPid moved after listen (no stranded PID on failed bind; kills a benign split-brain warning window). Task 8 amendment: systemd `Environment=` quoted (a space in the home path would silently split the assignment — wrong-data, not an error); servicePlan now exposes `logPath` on both returned plan objects; Task 9 must `mkdirSync(dirname(plan.logPath), { recursive: true })` because launchd opens StandardOutPath pre-spawn and will not create missing parent directories. Task 9 amendments (review): HELP bridge claim corrected (bridge refuses, not attaches); --detach hoists ensureIdentity into the parent (first-run registration raced the 3s poll into an orphan daemon); honest uninstall/already-running messages; ENOENT surfaced.
 
 **Goal:** Complete the daemon's roadmap-Phase-1 plumbing (spec §7 + §8): clients auto-reconnect with backoff and resume via `since_seq` in hello (closing the at-least-once "OR reconnect" trigger from §6); `air-msg watch` and `air-msg bridge` get their §7 decision-table rows; `air-msg daemon status` reports live socket state over IPC; `air-msg daemon install|uninstall` generates + loads launchd/systemd-user units; `daemon start --detach` backgrounds the process.
 
@@ -1221,7 +1221,7 @@ Expected: new cases FAIL (subcommands unknown).
           if (isDaemonRunning()) {
             // A manually-started daemon holds the consumer lock; the service's daemon would
             // exit(1) on acquireOrExit and launchd/systemd would relaunch-loop against it.
-            console.error("a daemon is already running — stop it first: air-msg daemon stop");
+            console.error("a daemon is already running — stop it first: air-msg daemon stop (if it was installed as a service, use: air-msg daemon uninstall)");
             process.exit(1);
           }
           const plan = servicePlan({
@@ -1236,7 +1236,7 @@ Expected: new cases FAIL (subcommands unknown).
           mkdirSync(dirname(plan.logPath), { recursive: true });   // launchd opens StandardOutPath pre-spawn and won't create parent dirs
           writeFileSync(plan.file, plan.content, { mode: 0o644 });
           const r = spawnSync(plan.loadCmd[0], plan.loadCmd.slice(1), { stdio: "inherit" });
-          if (r.status !== 0) { console.error(`${plan.loadCmd[0]} failed (exit ${r.status}) — unit written to ${plan.file}; load it manually or clean up with: air-msg daemon uninstall`); process.exit(1); }
+          if (r.status !== 0) { console.error(`${plan.loadCmd[0]} failed (exit ${r.status}${r.error ? `, ${r.error.message}` : ""}) — unit written to ${plan.file}; load it manually or clean up with: air-msg daemon uninstall`); process.exit(1); }
           console.log(`${c.green("✓ installed")} ${plan.kind} unit ${c.dim(plan.file)}`);
           console.log(c.dim("the daemon now starts at login and stays alive; check: air-msg daemon status"));
           break;
@@ -1249,7 +1249,12 @@ Expected: new cases FAIL (subcommands unknown).
             home: process.env.AGENT_BRIDGE_HOME,
           });
           if (!plan) { console.error(`nothing to uninstall on ${process.platform}`); process.exit(1); }
-          spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload
+          spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload (attempt even if file is missing — may still be loaded)
+          const { existsSync } = await import("node:fs");
+          if (!existsSync(plan.file)) {
+            console.log(`nothing installed at ${c.dim(plan.file)}`);
+            break;
+          }
           try { rmSync(plan.file, { force: true }); } catch { /* best effort */ }
           console.log(`${c.green("✓ uninstalled")} ${c.dim(plan.file)}`);
           break;
@@ -1258,16 +1263,29 @@ Expected: new cases FAIL (subcommands unknown).
 Extend `case "start":` for `--detach` (check the raw args; verify wire-fact (b) — adjust if `rest` is pre-split by `parseRoomArgs`):
 ```js
         case "start": {
-          // rest = the RAW argv tail (["daemon","start","--detach"]) — verified in scope; don't
-          // refactor to the parseRoomArgs output (critic v1 ambiguity note).
+          // rest = the argv tail after the top-level command (["start","--detach"]) — verified in
+          // scope; don't refactor to the parseRoomArgs output (critic v1 ambiguity note).
           if (rest.includes("--detach")) {
-            const { isDaemonRunning } = await import("./daemon.mjs");
+            const { isDaemonRunning, readDaemonPid } = await import("./daemon.mjs");
+            if (isDaemonRunning()) {
+              console.log(`daemon already running ${c.dim("pid " + readDaemonPid()?.pid)}`);
+              break;
+            }
+            // First-run registration is network-bound; do it in the parent so the child's call
+            // returns from disk and the 3s poll covers only bind+PID-write — also keeps
+            // registration output visible (the child's stdio is discarded).
+            await ensureIdentity();
             const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "daemon", "start"], { detached: true, stdio: "ignore" });
             child.unref();
             const t0 = Date.now();
             while (!isDaemonRunning() && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 100));
-            if (isDaemonRunning()) console.log(`${c.green("✓ daemon detached")} ${c.dim("pid " + (await import("./daemon.mjs")).readDaemonPid()?.pid)}`);
-            else { console.error("daemon did not come up within 3s — run `air-msg daemon start` in the foreground to see why"); process.exit(1); }
+            if (isDaemonRunning()) {
+              console.log(`${c.green("✓ daemon detached")} ${c.dim("pid " + readDaemonPid()?.pid)}`);
+              console.log(c.dim("note: detached logs are discarded — air-msg daemon install gives you a log file"));
+            } else {
+              console.error("daemon did not come up within 3s — it may still be starting (check: air-msg daemon status) or run `air-msg daemon start` in the foreground to see why");
+              process.exit(1);
+            }
             break;
           }
           const { startDaemon } = await import("./daemon.mjs");
@@ -1286,8 +1304,9 @@ HELP text: replace the daemon lines (cli.mjs:121-123) with:
 ```
 and REPLACE the manual plist block (cli.mjs:135-144) with:
 ```
-  always-on (recommended): air-msg daemon install — one always-on pull; watch/channel/bridge
-  attach to it as clients (run `air-msg watch` in any terminal for a live feed).
+  always-on (recommended): air-msg daemon install — one always-on pull; watch/channel attach to it
+  as clients (run `air-msg watch` in any terminal for a live feed); the standalone bridge needs the
+  daemon stopped — in-daemon Telegram is on the roadmap.
   (service-managed daemons relaunch on stop — use air-msg daemon uninstall to remove the auto-start)
 ```
 (The old snippet's `/usr/bin/env air-msg` does not work under launchd anyway — no user PATH.)

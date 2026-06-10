@@ -137,8 +137,9 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
     AIRMSG_NOTIFY   node-notifier | osascript | bell | none   (auto if unset)
     AIRMSG_MUTE     comma-separated peers (alias/DID/AIR-id) to silence
 
-  always-on (recommended): air-msg daemon install — one always-on pull; watch/channel/bridge
-  attach to it as clients (run \`air-msg watch\` in any terminal for a live feed).
+  always-on (recommended): air-msg daemon install — one always-on pull; watch/channel attach to it
+  as clients (run \`air-msg watch\` in any terminal for a live feed); the standalone bridge needs the
+  daemon stopped — in-daemon Telegram is on the roadmap.
   (service-managed daemons relaunch on stop — use air-msg daemon uninstall to remove the auto-start)
 
   channel push (experimental — incoming mail into a live Claude Code session):
@@ -608,16 +609,29 @@ async function main() {
       const { sub } = parseRoomArgs(rest); // reuse the sub-arg splitter
       switch (sub) {
         case "start": {
-          // rest = the RAW argv tail (["daemon","start","--detach"]) — verified in scope; don't
-          // refactor to the parseRoomArgs output (critic v1 ambiguity note).
+          // rest = the argv tail after the top-level command (["start","--detach"]) — verified in
+          // scope; don't refactor to the parseRoomArgs output (critic v1 ambiguity note).
           if (rest.includes("--detach")) {
-            const { isDaemonRunning } = await import("./daemon.mjs");
+            const { isDaemonRunning, readDaemonPid } = await import("./daemon.mjs");
+            if (isDaemonRunning()) {
+              console.log(`daemon already running ${c.dim("pid " + readDaemonPid()?.pid)}`);
+              break;
+            }
+            // First-run registration is network-bound; do it in the parent so the child's call
+            // returns from disk and the 3s poll covers only bind+PID-write — also keeps
+            // registration output visible (the child's stdio is discarded).
+            await ensureIdentity();
             const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "daemon", "start"], { detached: true, stdio: "ignore" });
             child.unref();
             const t0 = Date.now();
             while (!isDaemonRunning() && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 100));
-            if (isDaemonRunning()) console.log(`${c.green("✓ daemon detached")} ${c.dim("pid " + (await import("./daemon.mjs")).readDaemonPid()?.pid)}`);
-            else { console.error("daemon did not come up within 3s — run `air-msg daemon start` in the foreground to see why"); process.exit(1); }
+            if (isDaemonRunning()) {
+              console.log(`${c.green("✓ daemon detached")} ${c.dim("pid " + readDaemonPid()?.pid)}`);
+              console.log(c.dim("note: detached logs are discarded — air-msg daemon install gives you a log file"));
+            } else {
+              console.error("daemon did not come up within 3s — it may still be starting (check: air-msg daemon status) or run `air-msg daemon start` in the foreground to see why");
+              process.exit(1);
+            }
             break;
           }
           const { startDaemon } = await import("./daemon.mjs");
@@ -663,7 +677,7 @@ async function main() {
           if (isDaemonRunning()) {
             // A manually-started daemon holds the consumer lock; the service's daemon would
             // exit(1) on acquireOrExit and launchd/systemd would relaunch-loop against it.
-            console.error("a daemon is already running — stop it first: air-msg daemon stop");
+            console.error("a daemon is already running — stop it first: air-msg daemon stop (if it was installed as a service, use: air-msg daemon uninstall)");
             process.exit(1);
           }
           const plan = servicePlan({
@@ -678,7 +692,7 @@ async function main() {
           mkdirSync(dirname(plan.logPath), { recursive: true });   // launchd opens StandardOutPath pre-spawn and won't create parent dirs
           writeFileSync(plan.file, plan.content, { mode: 0o644 });
           const r = spawnSync(plan.loadCmd[0], plan.loadCmd.slice(1), { stdio: "inherit" });
-          if (r.status !== 0) { console.error(`${plan.loadCmd[0]} failed (exit ${r.status}) — unit written to ${plan.file}; load it manually or clean up with: air-msg daemon uninstall`); process.exit(1); }
+          if (r.status !== 0) { console.error(`${plan.loadCmd[0]} failed (exit ${r.status}${r.error ? `, ${r.error.message}` : ""}) — unit written to ${plan.file}; load it manually or clean up with: air-msg daemon uninstall`); process.exit(1); }
           console.log(`${c.green("✓ installed")} ${plan.kind} unit ${c.dim(plan.file)}`);
           console.log(c.dim("the daemon now starts at login and stays alive; check: air-msg daemon status"));
           break;
@@ -691,7 +705,12 @@ async function main() {
             home: process.env.AGENT_BRIDGE_HOME,
           });
           if (!plan) { console.error(`nothing to uninstall on ${process.platform}`); process.exit(1); }
-          spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload
+          spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload (attempt even if file is missing — may still be loaded)
+          const { existsSync } = await import("node:fs");
+          if (!existsSync(plan.file)) {
+            console.log(`nothing installed at ${c.dim(plan.file)}`);
+            break;
+          }
           try { rmSync(plan.file, { force: true }); } catch { /* best effort */ }
           console.log(`${c.green("✓ uninstalled")} ${c.dim(plan.file)}`);
           break;
