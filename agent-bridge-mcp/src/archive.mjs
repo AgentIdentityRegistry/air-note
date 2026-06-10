@@ -35,6 +35,7 @@ const SCHEMA = [
       body_json    TEXT NOT NULL,
       encrypted    INTEGER NOT NULL,
       verified     INTEGER NOT NULL,
+      key_changed  INTEGER NOT NULL DEFAULT 0,
       relay_seq    INTEGER,
       archived_at  TEXT NOT NULL,
       PRIMARY KEY (envelope_id, direction)
@@ -62,6 +63,11 @@ export function openArchive() {
     db.prepare(`ALTER TABLE messages ADD COLUMN room_id TEXT`).run(); // NULL for 1:1 rows (back-compat)
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room_id, timestamp)`).run();
   }
+  if (!cols.includes("key_changed")) {
+    // Replay fidelity (spec §6): the live channel gate withholds key-changed senders; the
+    // archive must record that bit or a replay would push what live deliberately withheld.
+    db.prepare(`ALTER TABLE messages ADD COLUMN key_changed INTEGER NOT NULL DEFAULT 0`).run();
+  }
   try { chmodSync(path, 0o600); } catch { /* best effort on non-POSIX */ }
   _db = db;
   return db;
@@ -73,12 +79,12 @@ export function archiveMessage(rec) {
   const res = db.prepare(`
     INSERT OR IGNORE INTO messages
       (envelope_id, direction, thread_id, peer_did, from_did, to_did, timestamp,
-       body_json, encrypted, verified, relay_seq, room_id, archived_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       body_json, encrypted, verified, key_changed, relay_seq, room_id, archived_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     rec.envelope_id, rec.direction, rec.thread_id, rec.peer_did, rec.from_did, rec.to_did,
     rec.timestamp, JSON.stringify(rec.body), rec.encrypted ? 1 : 0, rec.verified ? 1 : 0,
-    rec.relay_seq ?? null, rec.room_id ?? null, new Date().toISOString(),
+    rec.key_changed ? 1 : 0, rec.relay_seq ?? null, rec.room_id ?? null, new Date().toISOString(),
   );
   return { inserted: res.changes > 0 };
 }
@@ -88,6 +94,7 @@ function parseRow(r) {
     envelope_id: r.envelope_id, direction: r.direction, thread_id: r.thread_id,
     peer_did: r.peer_did, from: r.from_did, to: r.to_did, timestamp: r.timestamp,
     body: JSON.parse(r.body_json), encrypted: !!r.encrypted, verified: !!r.verified,
+    key_changed: !!r.key_changed,
     spam: !!r.spam,
     relay_seq: r.relay_seq ?? undefined, room_id: r.room_id ?? undefined, archived_at: r.archived_at,
   };

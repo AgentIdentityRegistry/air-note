@@ -559,6 +559,7 @@ export async function receive({ since, limit } = {}) {
         encrypted: decoded.encrypted,
         verified,
         relay_seq: m.seq,
+        key_changed: !!key_changed,
       });
     } catch (err) {
       // A local archive write must never drop a live-delivered message.

@@ -137,3 +137,11 @@ test("deleteConversation removes the whole two-way thread for a peer", () => {
   assert.equal(left.length, 1);
   assert.equal(left[0].peer_did, "did:OTHER");
 });
+
+test("key_changed round-trips through the archive (and defaults false for old writers)", () => {
+  archiveMessage(rec({ envelope_id: "ekc", key_changed: true }));
+  archiveMessage(rec({ envelope_id: "ekc0" }));                       // writer omits the field
+  const rows = history({ limit: 10 });
+  assert.equal(rows.find((r) => r.envelope_id === "ekc").key_changed, true);
+  assert.equal(rows.find((r) => r.envelope_id === "ekc0").key_changed, false);
+});
