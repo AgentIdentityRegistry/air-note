@@ -12,7 +12,10 @@ const xmlEscape = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").
 /** macOS LaunchAgent: run the daemon at login and keep it alive. `home` (optional) pins
  *  AGENT_BRIDGE_HOME for non-default homes; `logPath` is computed by servicePlan so the log
  *  always sits beside the REAL store (~/.air-msg by default — never /tmp, which is world-readable
- *  and cleared on reboot; critic v1 note). */
+ *  and cleared on reboot; critic v1 note).
+ *  PRECONDITION: launchd opens StandardOutPath/StandardErrorPath BEFORE spawning the process and
+ *  does NOT create missing parent directories — the installer must mkdir the log directory first
+ *  (Task 9 does this via `mkdirSync(dirname(plan.logPath), { recursive: true })`). */
 export function launchdPlist({ nodePath, cliPath, home, logPath }) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -41,14 +44,17 @@ export function launchdPlist({ nodePath, cliPath, home, logPath }) {
  *  QUOTING BOUNDARY (critic v1 H1): systemd does its own word-splitting — double quotes group
  *  tokens per systemd.service(5) — but this generator is content-tested only; no systemd exists
  *  in the dev environment, so the actual enable/--now load is a REQUIRED manual smoke on a real
- *  Linux box before the systemd path is trusted. */
+ *  Linux box before the systemd path is trusted. Additional pathological-input caveats behind
+ *  that same manual-smoke boundary: `%` is a systemd specifier prefix in unit values (a literal
+ *  % needs %% doubling); a literal `"` or `\` inside quoted ExecStart tokens would also break
+ *  C-style quoting — not fixed here, noted as a known boundary. */
 export function systemdUnit({ nodePath, cliPath, home }) {
   return `[Unit]
 Description=AIR Note receiver daemon (air-msg daemon start)
 
 [Service]
 ExecStart="${nodePath}" "${cliPath}" daemon start${home ? `
-Environment=AGENT_BRIDGE_HOME=${home}` : ""}
+Environment="AGENT_BRIDGE_HOME=${home}"` : ""}
 Restart=always
 RestartSec=2
 
@@ -67,6 +73,7 @@ export function servicePlan({ platform, homedir, nodePath, cliPath, home }) {
     return {
       kind: "launchd",
       file,
+      logPath,
       content: launchdPlist({ nodePath, cliPath, home, logPath }),
       loadCmd: ["launchctl", "load", "-w", file],
       unloadCmd: ["launchctl", "unload", "-w", file],
@@ -74,9 +81,12 @@ export function servicePlan({ platform, homedir, nodePath, cliPath, home }) {
   }
   if (platform === "linux") {
     const file = join(homedir, ".config", "systemd", "user", SYSTEMD_UNIT_NAME);
+    // stdout goes to journald by default on systemd; logPath is returned for API symmetry
+    // and any future use — no daemon.log is written by systemd itself.
     return {
       kind: "systemd",
       file,
+      logPath,
       content: systemdUnit({ nodePath, cliPath, home }),
       loadCmd: ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME],
       unloadCmd: ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME],

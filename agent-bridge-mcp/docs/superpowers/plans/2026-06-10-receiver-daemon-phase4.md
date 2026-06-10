@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected. Task 5 amendment: watch viewer holds a ref'd keepAlive (unref'd backoff timer cannot pin the loop — probed exit-0 mid-outage); `log: () => {}` silences raw transport lines from the curated stdout feed; spawn harness waits exits via a consumed-event-safe `waitExit` helper; survival test added as C1 regression guard. Task 7 amendment: queryDaemonStatus guards the timeout-vs-handshake race (same undead-socket class as 2a59f75) with a connectFn seam test; writeDaemonPid moved after listen (no stranded PID on failed bind; kills a benign split-brain warning window).
+**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected. Task 5 amendment: watch viewer holds a ref'd keepAlive (unref'd backoff timer cannot pin the loop — probed exit-0 mid-outage); `log: () => {}` silences raw transport lines from the curated stdout feed; spawn harness waits exits via a consumed-event-safe `waitExit` helper; survival test added as C1 regression guard. Task 7 amendment: queryDaemonStatus guards the timeout-vs-handshake race (same undead-socket class as 2a59f75) with a connectFn seam test; writeDaemonPid moved after listen (no stranded PID on failed bind; kills a benign split-brain warning window). Task 8 amendment: systemd `Environment=` quoted (a space in the home path would silently split the assignment — wrong-data, not an error); servicePlan now exposes `logPath` on both returned plan objects; Task 9 must `mkdirSync(dirname(plan.logPath), { recursive: true })` because launchd opens StandardOutPath pre-spawn and will not create missing parent directories.
 
 **Goal:** Complete the daemon's roadmap-Phase-1 plumbing (spec §7 + §8): clients auto-reconnect with backoff and resume via `since_seq` in hello (closing the at-least-once "OR reconnect" trigger from §6); `air-msg watch` and `air-msg bridge` get their §7 decision-table rows; `air-msg daemon status` reports live socket state over IPC; `air-msg daemon install|uninstall` generates + loads launchd/systemd-user units; `daemon start --detach` backgrounds the process.
 
@@ -1055,7 +1055,7 @@ test("systemdUnit: quoted ExecStart, Restart=always, default.target", () => {
   const unit = systemdUnit(ARGS);
   assert.match(unit, /ExecStart="\/opt\/node 22\/bin\/node" "\/Users\/me\/air-note\/agent-bridge-mcp\/src\/cli\.mjs" daemon start/);
   assert.match(unit, /Restart=always/);
-  assert.match(unit, /Environment=AGENT_BRIDGE_HOME=/);
+  assert.match(unit, /Environment="AGENT_BRIDGE_HOME=/);
   assert.match(unit, /WantedBy=default\.target/);
   assert.doesNotMatch(systemdUnit({ ...ARGS, home: undefined }), /Environment=AGENT_BRIDGE_HOME/);
 });
@@ -1068,11 +1068,13 @@ test("servicePlan: darwin → launchd plist under LaunchAgents; linux → system
   assert.deepEqual(mac.unloadCmd, ["launchctl", "unload", "-w", mac.file]);
   assert.match(mac.content, /<plist/);
   assert.match(mac.content, /\/Users\/me\/\.air-msg\/daemon\.log/);   // default home → log beside the real store, never /tmp
+  assert.equal(mac.logPath, "/Users/me/.air-msg/daemon.log");          // installer uses this to mkdir the log directory
   const lin = servicePlan({ platform: "linux", homedir: "/home/me", nodePath: ARGS.nodePath, cliPath: ARGS.cliPath });
   assert.equal(lin.kind, "systemd");
   assert.equal(lin.file, "/home/me/.config/systemd/user/air-msg-daemon.service");
   assert.deepEqual(lin.loadCmd, ["systemctl", "--user", "enable", "--now", "air-msg-daemon.service"]);
   assert.deepEqual(lin.unloadCmd, ["systemctl", "--user", "disable", "--now", "air-msg-daemon.service"]);
+  assert.equal(lin.logPath, "/home/me/.air-msg/daemon.log");           // returned for API symmetry; journald owns stdout on linux
   assert.equal(servicePlan({ platform: "win32", homedir: "C:\\u", nodePath: "n", cliPath: "c" }), null);   // spec §2: Windows is v2
 });
 ```
@@ -1099,7 +1101,10 @@ const xmlEscape = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").
 /** macOS LaunchAgent: run the daemon at login and keep it alive. `home` (optional) pins
  *  AGENT_BRIDGE_HOME for non-default homes; `logPath` is computed by servicePlan so the log
  *  always sits beside the REAL store (~/.air-msg by default — never /tmp, which is world-readable
- *  and cleared on reboot; critic v1 note). */
+ *  and cleared on reboot; critic v1 note).
+ *  PRECONDITION: launchd opens StandardOutPath/StandardErrorPath BEFORE spawning the process and
+ *  does NOT create missing parent directories — the installer must mkdir the log directory first
+ *  (Task 9 does this via `mkdirSync(dirname(plan.logPath), { recursive: true })`). */
 export function launchdPlist({ nodePath, cliPath, home, logPath }) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1128,14 +1133,17 @@ export function launchdPlist({ nodePath, cliPath, home, logPath }) {
  *  QUOTING BOUNDARY (critic v1 H1): systemd does its own word-splitting — double quotes group
  *  tokens per systemd.service(5) — but this generator is content-tested only; no systemd exists
  *  in the dev environment, so the actual enable/--now load is a REQUIRED manual smoke on a real
- *  Linux box before the systemd path is trusted. */
+ *  Linux box before the systemd path is trusted. Additional pathological-input caveats behind
+ *  that same manual-smoke boundary: `%` is a systemd specifier prefix in unit values (a literal
+ *  % needs %% doubling); a literal `"` or `\` inside quoted ExecStart tokens would also break
+ *  C-style quoting — not fixed here, noted as a known boundary. */
 export function systemdUnit({ nodePath, cliPath, home }) {
   return `[Unit]
 Description=AIR Note receiver daemon (air-msg daemon start)
 
 [Service]
 ExecStart="${nodePath}" "${cliPath}" daemon start${home ? `
-Environment=AGENT_BRIDGE_HOME=${home}` : ""}
+Environment="AGENT_BRIDGE_HOME=${home}"` : ""}
 Restart=always
 RestartSec=2
 
@@ -1154,6 +1162,7 @@ export function servicePlan({ platform, homedir, nodePath, cliPath, home }) {
     return {
       kind: "launchd",
       file,
+      logPath,
       content: launchdPlist({ nodePath, cliPath, home, logPath }),
       loadCmd: ["launchctl", "load", "-w", file],
       unloadCmd: ["launchctl", "unload", "-w", file],
@@ -1161,9 +1170,12 @@ export function servicePlan({ platform, homedir, nodePath, cliPath, home }) {
   }
   if (platform === "linux") {
     const file = join(homedir, ".config", "systemd", "user", SYSTEMD_UNIT_NAME);
+    // stdout goes to journald by default on systemd; logPath is returned for API symmetry
+    // and any future use — no daemon.log is written by systemd itself.
     return {
       kind: "systemd",
       file,
+      logPath,
       content: systemdUnit({ nodePath, cliPath, home }),
       loadCmd: ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME],
       unloadCmd: ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME],
@@ -1221,6 +1233,7 @@ Expected: new cases FAIL (subcommands unknown).
           });
           if (!plan) { console.error(`auto-start install is not supported on ${process.platform} (spec: POSIX-only in v1)`); process.exit(1); }
           mkdirSync(dirname(plan.file), { recursive: true });
+          mkdirSync(dirname(plan.logPath), { recursive: true });   // launchd opens StandardOutPath pre-spawn and won't create parent dirs
           writeFileSync(plan.file, plan.content, { mode: 0o644 });
           const r = spawnSync(plan.loadCmd[0], plan.loadCmd.slice(1), { stdio: "inherit" });
           if (r.status !== 0) { console.error(`${plan.loadCmd[0]} failed (exit ${r.status}) — unit written to ${plan.file}; load it manually or clean up with: air-msg daemon uninstall`); process.exit(1); }
@@ -1275,6 +1288,7 @@ and REPLACE the manual plist block (cli.mjs:135-144) with:
 ```
   always-on (recommended): air-msg daemon install — one always-on pull; watch/channel/bridge
   attach to it as clients (run `air-msg watch` in any terminal for a live feed).
+  (service-managed daemons relaunch on stop — use air-msg daemon uninstall to remove the auto-start)
 ```
 (The old snippet's `/usr/bin/env air-msg` does not work under launchd anyway — no user PATH.)
 

@@ -27,7 +27,7 @@ test("systemdUnit: quoted ExecStart, Restart=always, default.target", () => {
   const unit = systemdUnit(ARGS);
   assert.match(unit, /ExecStart="\/opt\/node 22\/bin\/node" "\/Users\/me\/air-note\/agent-bridge-mcp\/src\/cli\.mjs" daemon start/);
   assert.match(unit, /Restart=always/);
-  assert.match(unit, /Environment=AGENT_BRIDGE_HOME=/);
+  assert.match(unit, /Environment="AGENT_BRIDGE_HOME=/);
   assert.match(unit, /WantedBy=default\.target/);
   assert.doesNotMatch(systemdUnit({ ...ARGS, home: undefined }), /Environment=AGENT_BRIDGE_HOME/);
 });
@@ -40,10 +40,12 @@ test("servicePlan: darwin → launchd plist under LaunchAgents; linux → system
   assert.deepEqual(mac.unloadCmd, ["launchctl", "unload", "-w", mac.file]);
   assert.match(mac.content, /<plist/);
   assert.match(mac.content, /\/Users\/me\/\.air-msg\/daemon\.log/);   // default home → log beside the real store, never /tmp
+  assert.equal(mac.logPath, "/Users/me/.air-msg/daemon.log");          // installer uses this to mkdir the log directory
   const lin = servicePlan({ platform: "linux", homedir: "/home/me", nodePath: ARGS.nodePath, cliPath: ARGS.cliPath });
   assert.equal(lin.kind, "systemd");
   assert.equal(lin.file, "/home/me/.config/systemd/user/air-msg-daemon.service");
   assert.deepEqual(lin.loadCmd, ["systemctl", "--user", "enable", "--now", "air-msg-daemon.service"]);
   assert.deepEqual(lin.unloadCmd, ["systemctl", "--user", "disable", "--now", "air-msg-daemon.service"]);
+  assert.equal(lin.logPath, "/home/me/.air-msg/daemon.log");           // returned for API symmetry; journald owns stdout on linux
   assert.equal(servicePlan({ platform: "win32", homedir: "C:\\u", nodePath: "n", cliPath: "c" }), null);   // spec §2: Windows is v2
 });
