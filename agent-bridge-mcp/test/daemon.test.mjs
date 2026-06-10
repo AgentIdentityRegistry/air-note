@@ -22,3 +22,14 @@ test("runDaemon passes the abort signal through to watch", async () => {
   await runDaemon({ identity: { did: "did:x:AIR-ME" }, sinks: [], signal: ac.signal, watchFn, log: () => {} });
   assert.equal(sawSignal, true);
 });
+
+test("runDaemon: drives watch with a STRICT receiveFn (archive is the replay source)", async () => {
+  let sawOpts = null;
+  const watchFn = async ({ receiveFn }) => { sawOpts = await receiveFn({ since: 1 }); };
+  await runDaemon({
+    identity: { did: "did:wba:me" }, sinks: [], watchFn, log: () => {},
+    receiveAllFn: async (opts) => opts,            // injectable seam: echo what receive would get
+  });
+  assert.equal(sawOpts.strict, true);
+  assert.equal(sawOpts.since, 1);
+});

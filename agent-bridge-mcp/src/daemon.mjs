@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { watch } from "./watch.mjs";
 import { fanOut } from "./fanout.mjs";
+import { receiveAll } from "./core.mjs";
 import { bridgeHome, ensureIdentity } from "./identity.mjs";
 import { isPidAlive, acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 import { getCursor, archiveExists } from "./archive.mjs";
@@ -14,13 +15,14 @@ import { parseMuteSet } from "./peers.mjs";
 import { createIpcServer } from "./daemon-ipc.mjs";
 
 /** Run the daemon: drive watch() with an onMessage that fans out to `sinks`. Injectable for tests. */
-export async function runDaemon({ identity, sinks, signal, watchFn = watch, log = (s) => process.stderr.write(s + "\n") }) {
+export async function runDaemon({ identity, sinks, signal, watchFn = watch, receiveAllFn = receiveAll, log = (s) => process.stderr.write(s + "\n") }) {
   log(`[daemon] up: ${identity.did} · sinks: ${sinks.map((s) => s.name).join(", ") || "(none)"}`);
   await watchFn({
     signal,
     identity,
     notifier: { notify: async () => {} }, // the banner is a SINK now, not watch's own notifier
     openResolver: () => null,
+    receiveFn: (opts = {}) => receiveAllFn({ ...opts, strict: true }),   // spec §6: archive-precondition cursor
     onMessage: (m) => fanOut(m, sinks, log),
   });
 }

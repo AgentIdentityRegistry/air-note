@@ -15,6 +15,7 @@ import { makeChannelPush } from "./channel.mjs";
 import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 import { parseMuteSet } from "./peers.mjs";
 import { connectDaemon } from "./daemon-ipc.mjs";
+import { makeReplayer } from "./channel-replay.mjs";
 
 const server = new Server(
   { name: "air-msg-channel", version: CORE_VERSION },
@@ -38,9 +39,11 @@ async function main() {
 
   // Daemon-first (spec §7): attach as a gated channel client — NO consumer lock held.
   try {
+    const replayer = makeReplayer({ push, log });
     await connectDaemon({
       role: "channel",
-      onMessage: push,
+      onMessage: (m) => replayer.live(m),
+      onGap: (after_seq) => { replayer.gap(after_seq).catch((e) => log(`[channel] replay failed: ${e.message ?? e}`)); },
       onClose: () => {
         // Deliberate Phase-2 stopgap: clean exit on daemon restart/stop. Mail push pauses
         // until this server is relaunched; Phase 4 replaces this with reconnect/backoff.

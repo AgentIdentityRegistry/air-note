@@ -6,7 +6,7 @@ import { join } from "node:path";
 import {
   archiveMessage, history, threads, getCursor, setCursor, closeArchive,
   markSpam, getReceived, recentForInbox, openArchive,
-  deleteMessage, deleteConversation,
+  deleteMessage, deleteConversation, replaySince,
 } from "../src/archive.mjs";
 
 let dir;
@@ -136,4 +136,26 @@ test("deleteConversation removes the whole two-way thread for a peer", () => {
   const left = history({ includeSpam: true });
   assert.equal(left.length, 1);
   assert.equal(left[0].peer_did, "did:OTHER");
+});
+
+test("key_changed round-trips through the archive (and defaults false for old writers)", () => {
+  archiveMessage(rec({ envelope_id: "ekc", key_changed: true }));
+  archiveMessage(rec({ envelope_id: "ekc0" }));                       // writer omits the field
+  const rows = history({ limit: 10 });
+  assert.equal(rows.find((r) => r.envelope_id === "ekc").key_changed, true);
+  assert.equal(rows.find((r) => r.envelope_id === "ekc0").key_changed, false);
+});
+
+test("replaySince: received-only, spam-excluded, relay_seq ascending, strictly after since_seq", () => {
+  archiveMessage(rec({ envelope_id: "r1", direction: "received", relay_seq: 10 }));
+  archiveMessage(rec({ envelope_id: "r2", direction: "received", relay_seq: 11 }));
+  archiveMessage(rec({ envelope_id: "r3", direction: "received", relay_seq: 12 }));
+  archiveMessage(rec({ envelope_id: "s1", direction: "sent", relay_seq: 13 }));      // not replayed
+  archiveMessage(rec({ envelope_id: "r4", direction: "received", relay_seq: null }));  // no relay_seq → not replayed
+  archiveMessage(rec({ envelope_id: "room9:joined", direction: "received", relay_seq: 14, room_id: "room9" })); // synthetic join notice → never replayed (H2)
+  markSpam("r3");
+  const rows = replaySince(10);
+  assert.deepEqual(rows.map((r) => r.envelope_id), ["r2"]);   // >10, received, non-spam, has seq, not a join notice
+  assert.deepEqual(replaySince(0).map((r) => r.envelope_id), ["r1", "r2"]);   // ascending
+  assert.equal(replaySince(0, { limit: 1 }).length, 1);
 });

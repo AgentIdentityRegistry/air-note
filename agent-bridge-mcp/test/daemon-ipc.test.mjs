@@ -228,7 +228,7 @@ test("ipc server: ping → pong; a second hello is ignored (still functional); d
   } finally { await ipc.close(); }
 });
 
-test("ipc server: a stuck (non-reading) client is dropped once its queue passes the high-water mark", async () => {
+test("ipc server: a stuck (non-reading) client is destroyed once its queue passes the 4×HWM backstop", async () => {
   chmodSync(dir, 0o700);
   const ipc = ipcFor({ highWaterMark: 1024 });   // tiny HWM so the test stays light
   await ipc.listen();
@@ -236,7 +236,8 @@ test("ipc server: a stuck (non-reading) client is dropped once its queue passes 
     const { sock } = await rawClient("viewer");
     sock.pause();                                // simulate a wedged local client
     const fat = { envelope_id: "eFat", from: "did:wba:x", verified: false, body: { type: "text", text: "x".repeat(65536) } };
-    // Push until node-side queueing exceeds the HWM (kernel buffer absorbs the first writes).
+    // Push until node-side queueing exceeds 4×HWM (one 64KiB frame overshoots the whole
+    // (HWM, 4×HWM] skip band, so this lands straight in destroy — Phase-3 backstop semantics).
     for (let i = 0; i < 64 && ipc.clientCount() > 0; i++) await ipc.sink.deliver({ ...fat, envelope_id: `eFat${i}` });
     await until(() => ipc.clientCount() === 0);  // daemon protected itself: stuck client dropped
   } finally { await ipc.close(); }
@@ -314,5 +315,119 @@ test("composition: runDaemon fans one watch() message to banner sink AND gated s
     assert.deepEqual(got(viewer), ["eOK", "eNO"]);
     assert.deepEqual(got(channel), ["eOK"]);
     viewer.sock.destroy(); channel.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("overflow(channel): writes are skipped over the HWM, then ONE gap frame arrives on drain", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 2048 });
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel");
+    // Body sizing (critic H-A, empirically derived): a single frame must land writableLength
+    // INSIDE the skip band (HWM, 4×HWM] = (2048, 8192] — 16KiB frames overshoot the whole band
+    // into destroy. ~3KiB frames are in-band; the send count must saturate the kernel send
+    // buffer (SO_SNDBUF varies by platform), so send far more than any plausible buffer holds.
+    const mk = (i) => ({ envelope_id: `eC${i}`, seq: 100 + i, from: "did:wba:x", contact: "al",
+      verified: true, key_changed: false, body: { type: "text", text: "y".repeat(3000) } });
+    ch.sock.pause();                                  // wedge the client
+    for (let i = 0; i < 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(mk(i));
+    assert.equal(ipc.clientCount(), 1);               // skip band — never destroyed (guarded mid-burst)
+    assert.ok(ipc.clientStats()[0].dropped > 0, "skip path must have engaged");   // positive proof (critic M-A)
+    ch.sock.resume();                                 // drain
+    await until(() => ch.frames.some((f) => f.type === "gap"));
+    const gap = ch.frames.find((f) => f.type === "gap");
+    assert.equal(typeof gap.after_seq, "number");     // last successfully WRITTEN seq
+    const delivered = ch.frames.filter((f) => f.type === "message").map((f) => f.message.relay_seq);
+    assert.equal(gap.after_seq, Math.max(...delivered));   // gap starts exactly after the last write
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("overflow(channel): SLOW-STEADY reader — gap arrives via flush-on-progress (no reliance on 'drain')", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 2048 });
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel");
+    const mk = (i, size) => ({ envelope_id: `eS${i}`, seq: 200 + i, from: "did:wba:x", contact: "al",
+      verified: true, key_changed: false, body: { type: "text", text: "y".repeat(size) } });
+    ch.sock.pause();
+    for (let i = 0; i < 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(mk(i, 3000));   // in-band frames (critic H-A)
+    assert.equal(ipc.clientCount(), 1);                                   // never destroyed (guarded mid-burst)
+    assert.ok(ipc.clientStats()[0].dropped > 0, "skip path must have engaged");   // critic M-A
+    // Slow-steady regime: partial reads free the queue gradually; the gap must arrive on the
+    // next successful WRITE below the threshold — NOT only when the buffer fully empties.
+    let gotGap = false;
+    const tick = setInterval(() => { ch.sock.read(); }, 10);   // read() = all available (read(n) returns null when n > buffered)
+    try {
+      for (let i = 0; i < 200 && !gotGap; i++) {
+        await ipc.sink.deliver(mk(1000 + i, 64));                         // small follow-ups (ids past the burst range)
+        gotGap = ch.frames.some((f) => f.type === "gap");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally { clearInterval(tick); }
+    assert.equal(gotGap, true);                                           // C1: no silent starvation
+    assert.equal(ipc.clientCount(), 1);                                   // and never destroyed
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("overflow(viewer): messages are dropped with a count, no gap frame, client stays", async () => {
+  chmodSync(dir, 0o700);
+  const logs = [];
+  const ipc = ipcFor({ highWaterMark: 2048, log: (s) => logs.push(s) });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.pause();
+    const fat = (i) => ({ envelope_id: `eV${i}`, seq: i, from: "did:wba:x", verified: false,
+      body: { type: "text", text: "z".repeat(3000) } });                   // in-band (critic H-A)
+    for (let i = 0; i < 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(fat(i));
+    assert.equal(ipc.clientCount(), 1);               // stays connected (guarded mid-burst)
+    assert.ok(ipc.clientStats()[0].dropped > 0, "skip path must have engaged");   // critic M-A
+    v.sock.resume();
+    await until(() => logs.some((l) => /dropped \d+ msgs to viewer/.test(l)));
+    assert.equal(v.frames.some((f) => f.type === "gap"), false);   // gap is channel-only
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("overflow backstop: a socket wedged past 4×HWM is destroyed", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 512 });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.pause();
+    // One frame far larger than 4×HWM lands in the queue, then the next deliver sees it wedged.
+    const huge = { envelope_id: "eHuge", seq: 1, from: "did:wba:x", verified: false,
+      body: { type: "text", text: "w".repeat(262144) } };
+    await ipc.sink.deliver(huge);
+    await ipc.sink.deliver({ ...huge, envelope_id: "eHuge2", seq: 2 });
+    await until(() => ipc.clientCount() === 0);       // backstop fired
+  } finally { await ipc.close(); }
+});
+
+test("connectDaemon: real gap round-trip — wedge beneath the client, progress, onGap fires", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 2048 });
+  await ipc.listen();
+  try {
+    const got = []; let gapAt = null;
+    const handle = await connectDaemon({ role: "channel", onMessage: (m) => got.push(m.relay_seq),
+      onGap: (seq) => { gapAt = seq; }, log: () => {} });
+    const mk = (i, size) => ({ envelope_id: `eG${i}`, seq: 300 + i, from: "did:wba:x", contact: "al",
+      verified: true, key_changed: false, body: { type: "text", text: "g".repeat(size) } });
+    await ipc.sink.deliver(mk(0, 64));                       // one clean write → lastSeq ≥ 300
+    await until(() => got.length === 1);
+    handle._sock.pause();                                     // wedge beneath the client parser
+    for (let i = 1; i <= 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(mk(i, 3000));   // in-band skips (critic H-A)
+    assert.equal(ipc.clientCount(), 1);                       // never destroyed during the wedge
+    handle._sock.resume();                                    // progress
+    await ipc.sink.deliver(mk(99, 64));                       // flush-on-progress emits the gap
+    await until(() => gapAt !== null);
+    assert.ok(gapAt >= 300 && gapAt < 901, `after_seq=${gapAt} must be the last WRITTEN seq`);
+    handle.close();
   } finally { await ipc.close(); }
 });
