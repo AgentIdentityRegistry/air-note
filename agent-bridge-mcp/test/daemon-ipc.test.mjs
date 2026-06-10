@@ -255,7 +255,7 @@ test("ipc server: a silent connection that never says hello is reaped", async ()
   } finally { await ipc.close(); }
 });
 
-import { connectDaemon, connectDaemonPersistent, probeDaemon } from "../src/daemon-ipc.mjs";
+import { connectDaemon, connectDaemonPersistent, probeDaemon, queryDaemonStatus } from "../src/daemon-ipc.mjs";
 
 test("connectDaemon: handshakes, then delivers admitted messages to onMessage", async () => {
   chmodSync(dir, 0o700);
@@ -715,5 +715,38 @@ test("probeDaemon: true against a live daemon socket, false when nothing listens
   try {
     assert.equal(await probeDaemon(), true);
     await until(() => ipc.clientCount() === 0);                 // probe detached cleanly
+  } finally { await ipc.close(); }
+});
+
+test("status frame: reply carries the OTHER clients (requester excluded), last_seq, and statusExtraFn fields", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ statusExtraFn: () => ({ sinks: ["banner", "socket"] }) });
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel");
+    const v = await rawClient("viewer");
+    await ipc.sink.deliver({ envelope_id: "st1", seq: 9, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "s" } });
+    await until(() => ch.frames.some((f) => f.type === "message"));
+    ch.sock.write(encodeFrame({ type: "status" }));
+    await until(() => ch.frames.some((f) => f.type === "status"));
+    const st = ch.frames.find((f) => f.type === "status");
+    assert.equal(st.last_seq, 9);
+    // The requesting channel client is EXCLUDED (critic v1 M3); the viewer saw the delivery too.
+    assert.deepEqual(st.clients, [{ role: "viewer", dropped: 0, lastSeq: 9 }]);
+    assert.deepEqual(st.sinks, ["banner", "socket"]);
+    assert.equal(st.socket, socketPath());
+    ch.sock.destroy(); v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("queryDaemonStatus: round-trips the status; null when no daemon", async () => {
+  chmodSync(dir, 0o700);
+  assert.equal(await queryDaemonStatus({ timeoutMs: 300 }), null);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const st = await queryDaemonStatus();
+    assert.equal(st.last_seq, null);                   // nothing delivered yet
+    assert.deepEqual(st.clients, []);                  // idle daemon: the probe itself is excluded
   } finally { await ipc.close(); }
 });

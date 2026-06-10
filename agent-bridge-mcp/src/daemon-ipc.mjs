@@ -103,9 +103,11 @@ export function createIpcServer({
   daemonInfo = {},
   highWaterMark = 1 << 20,                    // 1 MiB queued per client, matches MAX_FRAME
   helloTimeoutMs = 5000,                      // pre-hello idlers are reaped (fd-pin guard)
+  statusExtraFn = () => ({}),
   log = (s) => process.stderr.write(s + "\n"),
 } = {}) {
   const subscribers = new Set();   // { socket, role, lastSeq, dropped, flushPending }
+  let lastDeliveredSeq = null;
 
   // Socket-stream HWM = policy HWM: 'drain' only fires after a write() returned FALSE, and
   // write() only returns false once writableLength crosses the STREAM's writableHighWaterMark
@@ -160,6 +162,19 @@ export function createIpcServer({
         return;
       }
       if (frame.type === "ping") socket.write(encodeFrame({ type: "pong" }));
+      // Status probes appear in the attach/detach log lines — accepted noise for interactive use;
+      // revisit (e.g. a probe:true hello hint) only if status polling becomes a pattern.
+      if (frame.type === "status") {
+        socket.write(encodeFrame({
+          type: "status",
+          socket: socketPath(),
+          last_seq: lastDeliveredSeq,
+          // Exclude the ASKING subscriber: `daemon status` attaches a throwaway viewer probe, and
+          // counting it would make an idle daemon always report one client (critic v1 M3).
+          clients: [...subscribers].filter((s) => s !== sub).map((s) => ({ role: s.role, lastSeq: s.lastSeq, dropped: s.dropped })),
+          ...statusExtraFn(),
+        }));
+      }
       // Duplicate hello and unknown frames from a subscribed client: ignored (forward compat).
     }, { onError: () => { socket.write(encodeFrame({ type: "error", reason: "bad frame" })); socket.destroy(); } });
 
@@ -179,6 +194,7 @@ export function createIpcServer({
       deliver: (m) => {
         // Stamp relay_seq at the boundary (Phase 2): onMessage objects carry `seq`.
         const wire = m && m.seq !== undefined && m.relay_seq === undefined ? { ...m, relay_seq: m.seq } : m;
+        if (wire && Number.isFinite(wire.relay_seq)) lastDeliveredSeq = wire.relay_seq;
         for (const sub of subscribers) {
           if (!admitForRole(sub.role, m, { mute })) continue;
           const queued = sub.socket.writableLength;
@@ -235,7 +251,7 @@ export function createIpcServer({
  *  `sinceSeq`: pass the max-seen relay_seq; the daemon answers a channel hello bearing it with
  *  an immediate gap into `onGap` so the Phase-3 replayer can fill the outage window.
  *  For persistent reconnect with backoff, use `connectDaemonPersistent` instead. */
-export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () => {}, sinceSeq, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
+export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () => {}, onStatus = () => {}, sinceSeq, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
   return new Promise((resolve, reject) => {
     const sock = createConnection(socketPath());
     const fail = (reason, cause) => {
@@ -263,6 +279,7 @@ export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () 
       }
       if (frame.type === "message") onMessage(frame.message);
       if (frame.type === "gap") onGap(frame.after_seq);
+      if (frame.type === "status") onStatus(frame);
       // pong + unknown server frames: ignored.
     }, { onError: (e) => log(`[client] bad frame from daemon: ${e.message}`) });
     sock.on("data", feed);
@@ -368,4 +385,23 @@ export async function probeDaemon({ timeoutMs = 1500 } = {}) {
   } catch {
     return false;
   }
+}
+
+/** One-shot live status query for `air-msg daemon status` (spec §8): the CLI runs in a separate
+ *  process, so connected-clients/last_seq state must cross the socket. Returns null if no daemon. */
+export async function queryDaemonStatus({ timeoutMs = 1500 } = {}) {
+  return new Promise((resolve) => {
+    let handle = null;
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; handle?.close(); resolve(v); } };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    connectDaemon({
+      role: "viewer",
+      onMessage: () => {},                             // live frames during the query: ignored
+      onStatus: (st) => { clearTimeout(timer); finish(st); },
+      handshakeMs: timeoutMs,
+      log: () => {},
+    }).then((h) => { handle = h; h._sock.write(encodeFrame({ type: "status" })); })
+      .catch(() => { clearTimeout(timer); finish(null); });
+  });
 }

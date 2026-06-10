@@ -629,6 +629,18 @@ async function main() {
           console.log(`daemon: ${s.running ? c.green("running") : c.dim("stopped")}` +
             (s.pid ? `  ${c.dim("pid " + s.pid + (s.start_time ? " since " + s.start_time : ""))}` : ""));
           console.log(`cursor: ${s.cursor ?? "?"}`);
+          if (s.running) {
+            const { queryDaemonStatus, socketPath } = await import("./daemon-ipc.mjs");
+            const live = await queryDaemonStatus();
+            if (live) {
+              const roles = live.clients.map((cl) => cl.role).join(", ") || "none";
+              console.log(`socket: ${socketPath()}`);
+              console.log(`clients: ${live.clients.length} (${roles})  ·  last relay_seq: ${live.last_seq ?? "—"}`);
+              console.log(`sinks: ${(live.sinks ?? []).join(", ") || "?"}`);
+            } else {
+              console.log(c.yellow("socket: unreachable (PID alive but not answering — split-brain? check daemon logs)"));
+            }
+          }
           break;
         }
         default:

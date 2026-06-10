@@ -79,13 +79,15 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
 
   const mute = parseMuteSet();
   const notifier = await createNotifier();         // click-to-open is a later-phase item (see bannerSink)
+  let sinks = [];
   const ipc = createIpcServer({
     mute,
     daemonInfo: { pid: process.pid, start_time: startTime, did: identity.did },
+    statusExtraFn: () => ({ sinks: sinks.map((s) => s.name) }),
     log,
   });
   await ipc.listen();                              // safe: we hold the consumer lock (single-daemon mutex)
-  const sinks = [bannerSink({ notifier, mute }), ipc.sink];
+  sinks = [bannerSink({ notifier, mute }), ipc.sink];
 
   const ac = new AbortController();
   const stop = () => ac.abort();
