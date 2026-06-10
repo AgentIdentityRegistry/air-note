@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v2 — reworked 2026-06-10 after independent critic review (verdict REWORK: C1 gap starvation under slow-steady readers — empirically reproduced; H1 blocklist bypass on replay; H2 join-notice replayed as room chat; M1–M3, L1–L2). All findings addressed below; gap emission is now flush-on-progress, replay is blocklist-aware and excludes synthetic join notices, and the connectDaemon gap round-trip test is real.
+**Status:** v3 — v2's re-review returned APPROVE-WITH-FIXES (production logic verified correct, incl. an empirical proof of the C1 fix); v3 applies the remaining test-parameter fixes: overflow bodies sized INTO the skip band (H-A), positive skip-path assertions via clientStats() (M-A), corrected RED/GREEN determinism claims (H-B), producer-side join-id coupling comment (L-A). v2 history: reworked after independent critic review (verdict REWORK: C1 gap starvation under slow-steady readers — empirically reproduced; H1 blocklist bypass on replay; H2 join-notice replayed as room chat; M1–M3, L1–L2). All findings addressed below; gap emission is now flush-on-progress, replay is blocklist-aware and excludes synthetic join notices, and the connectDaemon gap round-trip test is real.
 
 **Goal:** Give the `channel` role at-least-once delivery (spec §6): a slow/stuck channel subscriber gets a `{type:"gap"}` marker instead of silent loss and replays the hole from the local archive; the daemon's pull makes the archive write a precondition for advancing the cursor so the archive is a complete replay source; `viewer` overflow becomes drop-messages-with-a-count instead of drop-the-client.
 
@@ -137,15 +137,21 @@ export function replaySince(since_seq, { limit = 500 } = {}) {
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [ ] **Step 4: Producer-side coupling guard (critic L-A).** In `src/core.mjs`, directly above the joinId construction (`const joinId = \`${body.room_id}:joined\`;`), add:
+```js
+      // NOTE: replaySince() (archive.mjs) excludes these synthetic ids via NOT LIKE '%:joined' —
+      // keep this suffix in sync with that query or replayed join notices re-enter as room chat.
+```
+
+- [ ] **Step 5: Run to verify pass**
 
 Run: `node --test test/archive.test.mjs`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/archive.mjs test/archive.test.mjs
+git add src/archive.mjs src/core.mjs test/archive.test.mjs
 git commit -m "feat(archive): replaySince() — ordered post-gap replay source for the channel"
 ```
 
@@ -310,11 +316,16 @@ test("overflow(channel): writes are skipped over the HWM, then ONE gap frame arr
   await ipc.listen();
   try {
     const ch = await rawClient("channel");
+    // Body sizing (critic H-A, empirically derived): a single frame must land writableLength
+    // INSIDE the skip band (HWM, 4×HWM] = (2048, 8192] — 16KiB frames overshoot the whole band
+    // into destroy. ~3KiB frames are in-band; the send count must saturate the kernel send
+    // buffer (SO_SNDBUF varies by platform), so send far more than any plausible buffer holds.
     const mk = (i) => ({ envelope_id: `eC${i}`, seq: 100 + i, from: "did:wba:x", contact: "al",
-      verified: true, key_changed: false, body: { type: "text", text: "y".repeat(16384) } });
+      verified: true, key_changed: false, body: { type: "text", text: "y".repeat(3000) } });
     ch.sock.pause();                                  // wedge the client
-    for (let i = 0; i < 24; i++) await ipc.sink.deliver(mk(i));
-    assert.equal(ipc.clientCount(), 1);               // NOT destroyed (was Phase-2 behavior)
+    for (let i = 0; i < 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(mk(i));
+    assert.equal(ipc.clientCount(), 1);               // skip band — never destroyed (guarded mid-burst)
+    assert.ok(ipc.clientStats()[0].dropped > 0, "skip path must have engaged");   // positive proof (critic M-A)
     ch.sock.resume();                                 // drain
     await until(() => ch.frames.some((f) => f.type === "gap"));
     const gap = ch.frames.find((f) => f.type === "gap");
@@ -334,15 +345,16 @@ test("overflow(channel): SLOW-STEADY reader — gap arrives via flush-on-progres
     const mk = (i, size) => ({ envelope_id: `eS${i}`, seq: 200 + i, from: "did:wba:x", contact: "al",
       verified: true, key_changed: false, body: { type: "text", text: "y".repeat(size) } });
     ch.sock.pause();
-    for (let i = 0; i < 24; i++) await ipc.sink.deliver(mk(i, 16384));   // wedge past HWM → drops accumulate
-    assert.equal(ipc.clientCount(), 1);                                   // not destroyed (below 4× backstop)
+    for (let i = 0; i < 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(mk(i, 3000));   // in-band frames (critic H-A)
+    assert.equal(ipc.clientCount(), 1);                                   // never destroyed (guarded mid-burst)
+    assert.ok(ipc.clientStats()[0].dropped > 0, "skip path must have engaged");   // critic M-A
     // Slow-steady regime: partial reads free the queue gradually; the gap must arrive on the
     // next successful WRITE below the threshold — NOT only when the buffer fully empties.
     let gotGap = false;
     const tick = setInterval(() => { ch.sock.read(65536); }, 10);
     try {
       for (let i = 0; i < 200 && !gotGap; i++) {
-        await ipc.sink.deliver(mk(100 + i, 64));                          // small follow-ups
+        await ipc.sink.deliver(mk(1000 + i, 64));                         // small follow-ups (ids past the burst range)
         gotGap = ch.frames.some((f) => f.type === "gap");
         await new Promise((r) => setTimeout(r, 5));
       }
@@ -362,9 +374,10 @@ test("overflow(viewer): messages are dropped with a count, no gap frame, client 
     const v = await rawClient("viewer");
     v.sock.pause();
     const fat = (i) => ({ envelope_id: `eV${i}`, seq: i, from: "did:wba:x", verified: false,
-      body: { type: "text", text: "z".repeat(16384) } });
-    for (let i = 0; i < 24; i++) await ipc.sink.deliver(fat(i));
-    assert.equal(ipc.clientCount(), 1);               // stays connected
+      body: { type: "text", text: "z".repeat(3000) } });                   // in-band (critic H-A)
+    for (let i = 0; i < 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(fat(i));
+    assert.equal(ipc.clientCount(), 1);               // stays connected (guarded mid-burst)
+    assert.ok(ipc.clientStats()[0].dropped > 0, "skip path must have engaged");   // critic M-A
     v.sock.resume();
     await until(() => logs.some((l) => /dropped \d+ msgs to viewer/.test(l)));
     assert.equal(v.frames.some((f) => f.type === "gap"), false);   // gap is channel-only
@@ -392,7 +405,7 @@ test("overflow backstop: a socket wedged past 4×HWM is destroyed", async () => 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: FAIL — Phase-2 destroys at 1×HWM (first test's `clientCount()===1` assertion breaks).
+Expected: FAIL — Phase-2 destroys at 1×HWM, which fires on the FIRST over-HWM frame, so with in-band ~3KiB bodies the RED is deterministic (critic H-B: the determinism claims hold ONLY with in-band sizing; 16KiB bodies would overshoot the skip band and hit destroy in BOTH old and new code).
 
 - [ ] **Step 3: Implement.** In `createIpcServer`, replace the subscriber bookkeeping + `deliver`:
 
@@ -452,6 +465,11 @@ Expected: FAIL — Phase-2 destroys at 1×HWM (first test's `clientCount()===1` 
       },
 ```
 
+(d) Expose the skip-path state as a test seam (critic M-A — positive proof the skip engaged, so a future sizing drift fails LOUDLY instead of silently exercising destroy): in the server's returned object, next to `clientCount`, add:
+```js
+    clientStats: () => [...subscribers].map((s) => ({ role: s.role, dropped: s.dropped, lastSeq: s.lastSeq })),   // test seam
+```
+
 - [ ] **Step 4: Run to verify pass**
 
 Run: `node --test test/daemon-ipc.test.mjs`
@@ -491,11 +509,12 @@ test("connectDaemon: real gap round-trip — wedge beneath the client, progress,
     await ipc.sink.deliver(mk(0, 64));                       // one clean write → lastSeq ≥ 300
     await until(() => got.length === 1);
     handle._sock.pause();                                     // wedge beneath the client parser
-    for (let i = 1; i <= 24; i++) await ipc.sink.deliver(mk(i, 16384));   // skips accumulate
+    for (let i = 1; i <= 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(mk(i, 3000));   // in-band skips (critic H-A)
+    assert.equal(ipc.clientCount(), 1);                       // never destroyed during the wedge
     handle._sock.resume();                                    // progress
     await ipc.sink.deliver(mk(99, 64));                       // flush-on-progress emits the gap
     await until(() => gapAt !== null);
-    assert.ok(gapAt >= 300 && gapAt < 324, `after_seq=${gapAt} must be the last WRITTEN seq`);
+    assert.ok(gapAt >= 300 && gapAt < 901, `after_seq=${gapAt} must be the last WRITTEN seq`);
     handle.close();
   } finally { await ipc.close(); }
 });
@@ -759,6 +778,7 @@ No manual live smoke this phase: a gap is hard to stage by hand and the drain pa
 - **Replay fidelity:** three holes closed — the archive lacked `key_changed` (T1, found in planning); the BLOCKLIST is enforced only at receive so replay re-checks it (T6, critic H1); synthetic join notices are excluded from replay so a system notice can never re-enter as room chat (T2, critic H2). `contact` re-derived from current pins; the client pipeline re-gates everything. ✓
 - **Gap liveness (critic C1, empirically reproduced):** gap emission is flush-on-progress — pending drops flush on the next successful write below the threshold OR on drain, never drain-alone (which starves under slow-steady readers). Tested in BOTH regimes: pause-resume recovery AND the slow-steady partial-read loop. ✓
 - **Pure seams for the untestable:** cursor policy is a pure function (T3) because fault-injecting `receive()`'s archive writes would need network stubs; the wiring is 6 lines verified by review; the daemon's strict flag is tested via the injectable `receiveAllFn` (T4). Honest coverage boundary, stated. ✓
+- **Overflow-test sizing (critic H-A/H-B, v3):** a single frame must land writableLength inside the SKIP band (HWM, 4×HWM] — 16KiB bodies overshoot (2048, 8192] entirely and hit destroy (empirically: SAMPLES [0,0,16493] → destroyed at send #3). All overflow tests use ~3KiB bodies × up to 600 guarded sends to saturate any plausible SO_SNDBUF cross-platform, keep clientCount()===1 mid-burst guards, AND positively assert clientStats().dropped > 0 so the skip path is verified, never inferred. RED is deterministic pre-fix (Phase-2 destroys on the first over-HWM frame); GREEN is deterministic post-fix (in-band frames skip). ✓
 - **The connectDaemon gap test is a REAL round-trip** (critic M3): the handle exposes `_sock` as a documented test seam; the test wedges beneath the client parser, makes progress, and asserts `onGap` fires with the last-written seq. ✓
 - **Placeholder scan:** every step has complete code; names consistent (`replaySince`, `cursorAdvanceTarget`, `rowToMessage`, `makeReplayer` (`live`/`gap`/`seenSize`, opts incl. `isBlockedFn`), `receiveAllFn`, `onGap`, `_sock`, sub state `{lastSeq, dropped, flushPending}`). The v1 essay-comment test was replaced by the real round-trip. ✓
 - **Phase boundary:** reconnect/backoff, `since_seq` in hello (resume-on-reattach), bridge socket role, installers — all Phase 4. ✓
