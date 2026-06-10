@@ -19,7 +19,10 @@
 //   air-msg health
 
 import { fileURLToPath } from "node:url";
-import { realpathSync } from "node:fs";
+import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import { realpathSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import * as core from "./core.mjs";
 import { ensureIdentity } from "./identity.mjs";
 import { createNotifier } from "./notifier.mjs";
@@ -119,9 +122,10 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
   air-msg delete --message <id> --yes    Delete one message from your local diary
   air-msg delete --with <to> --yes       Delete a whole conversation from your local diary
   inbox/history also accept --include-spam to reveal hidden spam.
-  air-msg daemon status                  Show whether the receiver daemon is running
-  air-msg daemon start                   Start the receiver daemon (banner sink, lock-guarded)
+  air-msg daemon status                  Daemon + live socket state (clients, last seq, sinks)
+  air-msg daemon start [--detach]        Start the receiver daemon (foreground, or detached)
   air-msg daemon stop                    Stop the running daemon
+  air-msg daemon install | uninstall     Auto-start at login (macOS launchd / Linux systemd-user)
   air-msg health                         Relay + identity status
 
   <to> may be a DID, an AIR ID, or a saved contact alias.
@@ -133,16 +137,9 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
     AIRMSG_NOTIFY   node-notifier | osascript | bell | none   (auto if unset)
     AIRMSG_MUTE     comma-separated peers (alias/DID/AIR-id) to silence
 
-  auto-start on login (macOS launchd): save this to
-  ~/Library/LaunchAgents/org.air-msg.watch.plist then run: launchctl load <that path>
-    <?xml version="1.0"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0"><dict>
-      <key>Label</key><string>org.air-msg.watch</string>
-      <key>ProgramArguments</key><array>
-        <string>/usr/bin/env</string><string>air-msg</string><string>watch</string></array>
-      <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-    </dict></plist>
+  always-on (recommended): air-msg daemon install — one always-on pull; watch/channel/bridge
+  attach to it as clients (run \`air-msg watch\` in any terminal for a live feed).
+  (service-managed daemons relaunch on stop — use air-msg daemon uninstall to remove the auto-start)
 
   channel push (experimental — incoming mail into a live Claude Code session):
     1. add to your project .mcp.json (alongside the agent-bridge-mcp tools server, so the
@@ -611,6 +608,18 @@ async function main() {
       const { sub } = parseRoomArgs(rest); // reuse the sub-arg splitter
       switch (sub) {
         case "start": {
+          // rest = the RAW argv tail (["daemon","start","--detach"]) — verified in scope; don't
+          // refactor to the parseRoomArgs output (critic v1 ambiguity note).
+          if (rest.includes("--detach")) {
+            const { isDaemonRunning } = await import("./daemon.mjs");
+            const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "daemon", "start"], { detached: true, stdio: "ignore" });
+            child.unref();
+            const t0 = Date.now();
+            while (!isDaemonRunning() && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 100));
+            if (isDaemonRunning()) console.log(`${c.green("✓ daemon detached")} ${c.dim("pid " + (await import("./daemon.mjs")).readDaemonPid()?.pid)}`);
+            else { console.error("daemon did not come up within 3s — run `air-msg daemon start` in the foreground to see why"); process.exit(1); }
+            break;
+          }
           const { startDaemon } = await import("./daemon.mjs");
           await startDaemon();
           break;
@@ -648,9 +657,48 @@ async function main() {
           }
           break;
         }
+        case "install": {
+          const { servicePlan } = await import("./service.mjs");
+          const { isDaemonRunning } = await import("./daemon.mjs");
+          if (isDaemonRunning()) {
+            // A manually-started daemon holds the consumer lock; the service's daemon would
+            // exit(1) on acquireOrExit and launchd/systemd would relaunch-loop against it.
+            console.error("a daemon is already running — stop it first: air-msg daemon stop");
+            process.exit(1);
+          }
+          const plan = servicePlan({
+            platform: process.platform,
+            homedir: homedir(),
+            nodePath: process.execPath,
+            cliPath: fileURLToPath(import.meta.url),
+            home: process.env.AGENT_BRIDGE_HOME,
+          });
+          if (!plan) { console.error(`auto-start install is not supported on ${process.platform} (spec: POSIX-only in v1)`); process.exit(1); }
+          mkdirSync(dirname(plan.file), { recursive: true });
+          mkdirSync(dirname(plan.logPath), { recursive: true });   // launchd opens StandardOutPath pre-spawn and won't create parent dirs
+          writeFileSync(plan.file, plan.content, { mode: 0o644 });
+          const r = spawnSync(plan.loadCmd[0], plan.loadCmd.slice(1), { stdio: "inherit" });
+          if (r.status !== 0) { console.error(`${plan.loadCmd[0]} failed (exit ${r.status}) — unit written to ${plan.file}; load it manually or clean up with: air-msg daemon uninstall`); process.exit(1); }
+          console.log(`${c.green("✓ installed")} ${plan.kind} unit ${c.dim(plan.file)}`);
+          console.log(c.dim("the daemon now starts at login and stays alive; check: air-msg daemon status"));
+          break;
+        }
+        case "uninstall": {
+          const { servicePlan } = await import("./service.mjs");
+          const plan = servicePlan({
+            platform: process.platform, homedir: homedir(),
+            nodePath: process.execPath, cliPath: fileURLToPath(import.meta.url),
+            home: process.env.AGENT_BRIDGE_HOME,
+          });
+          if (!plan) { console.error(`nothing to uninstall on ${process.platform}`); process.exit(1); }
+          spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload
+          try { rmSync(plan.file, { force: true }); } catch { /* best effort */ }
+          console.log(`${c.green("✓ uninstalled")} ${c.dim(plan.file)}`);
+          break;
+        }
         default:
           console.error(`unknown daemon subcommand: ${sub || "(none)"}`);
-          console.log(`  daemon subcommands: start | stop | status`);
+          console.log(`  daemon subcommands: start | stop | status | install | uninstall`);
           process.exit(1);
       }
       break;
