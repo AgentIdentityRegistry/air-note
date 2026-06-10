@@ -31,7 +31,10 @@ const server = new Server(
 
 async function main() {
   await server.connect(new StdioServerTransport());
-  server.onclose = () => process.exit(0);   // host gone — a channel with no audience must not reconnect forever
+  // SDK 1.29.0: StdioServerTransport fires onclose only from a programmatic close(), never on
+  // stdin EOF — the host-death signal is stdin 'end' (probed). A channel with no audience must
+  // not reconnect forever.
+  process.stdin.once("end", () => process.exit(0));
   const identity = await ensureIdentity();
   const mute = parseMuteSet();
   const log = (s) => process.stderr.write(s + "\n");
