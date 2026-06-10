@@ -9,6 +9,7 @@ import { bridgeHome } from "./identity.mjs";
 import { channelGate, roomChannelGate } from "./channel.mjs";
 import { deriveRoom } from "./rooms.mjs";
 import { shortPeer } from "./peers.mjs";
+import { classifySendError } from "./core.mjs";
 
 export const socketPath = () => join(bridgeHome(), "daemon.sock");
 
@@ -16,6 +17,12 @@ export const socketPath = () => join(bridgeHome(), "daemon.sock");
 // so the ceiling must clear any plausible message; an over-ceiling line fails LOUDLY via
 // onError (a silent drop here would be invisible mail loss for a channel client).
 export const MAX_FRAME = 1 << 20;
+
+// send-err reasons ride the wire to GUIs and embed relay-controlled response text, which is
+// length-unbounded (a proxy's 502 HTML page, a chatty federated relay). Cap + de-control it at
+// the serialization boundary; rendering-side escaping stays the GUI's job.
+export const REASON_MAX_CHARS = 512;
+const clipReason = (s) => String(s).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").slice(0, REASON_MAX_CHARS);
 
 /** One JSON object per newline-terminated line. */
 export function encodeFrame(obj) {
@@ -104,6 +111,7 @@ export function createIpcServer({
   highWaterMark = 1 << 20,                    // 1 MiB queued per client, matches MAX_FRAME
   helloTimeoutMs = 5000,                      // pre-hello idlers are reaped (fd-pin guard)
   statusExtraFn = () => ({}),
+  sendFn = null,                              // injected by startDaemon (core.send); null → send unavailable
   log = (s) => process.stderr.write(s + "\n"),
 } = {}) {
   const subscribers = new Set();   // { socket, role, lastSeq, dropped, flushPending }
@@ -174,6 +182,39 @@ export function createIpcServer({
           clients: [...subscribers].filter((s) => s !== sub).map((s) => ({ role: s.role, lastSeq: s.lastSeq, dropped: s.dropped })),
           ...statusExtraFn(),
         }));
+      }
+      if (frame.type === "send") {
+        // Send-over-socket (AI-inbox design §3): the daemon is the only key-holder and the only
+        // archive writer, so surfaces send THROUGH it. Role-agnostic by design — roles are
+        // DELIVERY filters; the 0600 socket is the OS user boundary (any local process could
+        // already run `air-msg send`). No correlation id → no ack (we cannot address one).
+        if (frame.id === undefined) return;
+        if (!frame.to || frame.body === undefined || frame.body === null) {
+          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send requires to + body" }));
+          return;
+        }
+        if (!sendFn) {
+          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send unavailable (daemon started without a send function)" }));
+          return;
+        }
+        // Async on purpose: the ack arrives whenever core.send settles; the parser loop never
+        // blocks. Guard the write — the requester may have disconnected while the relay was slow.
+        // plaintext is optional wire-side and defaults false (CLI --plaintext parity; the desktop
+        // always sends encrypted — the field exists for tests and tooling).
+        sendFn({ to: frame.to, body: frame.body, plaintext: frame.plaintext === true })
+          .then((r) => {
+            // destroyed-guard is defensive — a write to a destroyed socket is benign on current Node (probed); the .catch below is the load-bearing guard.
+            if (socket.destroyed) return;
+            socket.write(encodeFrame({ type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }));
+          })
+          .catch((err) => {
+            if (socket.destroyed) return;
+            const verdict = classifySendError(err);
+            const reason = clipReason(verdict.reason);
+            log(`[daemon] send failed (${verdict.retryable ? "retryable" : "terminal"}): ${reason}`);
+            socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: verdict.retryable, reason }));
+          });
+        return;
       }
       // Duplicate hello and unknown frames from a subscribed client: ignored (forward compat).
     }, { onError: () => { socket.write(encodeFrame({ type: "error", reason: "bad frame" })); socket.destroy(); } });

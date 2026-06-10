@@ -205,9 +205,10 @@ export function cursorAdvanceTarget({ deliveredSeqs, failedSeqs, strict }) {
 export function classifySendError(err) {
   const reason = String(err?.message ?? err);
   if (typeof err?.status === "number") return { retryable: err.status >= 500, reason };
-  // Real undici fetch network failures ride the TypeError branch (their cause.code is often
-  // buried deeper than cause.code — probed). The code-list branch covers errors WRAPPED by other
-  // layers that surface a flat code; it is belt, not braces.
+  // Real undici fetch network failures ride the TypeError branch (their code is often buried
+  // DEEPER than cause.code, e.g. under cause.cause or an AggregateError — probed). The code-list
+  // branch covers errors WRAPPED by other layers that surface a flat code; it is belt, not braces.
+  // AbortError falls through to terminal by default — revisit if a fetch timeout is ever added.
   const networkish = err instanceof TypeError
     || ["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"].includes(err?.cause?.code ?? err?.code);
   return { retryable: !!networkish, reason };

@@ -768,3 +768,147 @@ test("queryDaemonStatus: timeout-raced handshake socket is closed, not leaked", 
   assert.equal(closed, true);        // late-arriving socket was closed
   assert.equal(wrote, false);        // status request was never written to a dead socket
 });
+
+test("send op: a post-hello subscriber sends; ack carries the correlation id and envelope_id", async () => {
+  chmodSync(dir, 0o700);
+  const calls = [];
+  const ipc = ipcFor({ sendFn: async (args) => { calls.push(args); return { envelope_id: "e-sent-1", encrypted: true }; } });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");                     // roles are delivery filters; send is role-agnostic
+    v.sock.write(encodeFrame({ type: "send", id: "corr-1", to: "did:wba:peer", body: { type: "text", text: "hi" } }));
+    await until(() => v.frames.some((f) => f.type === "send-ok"));
+    const ok = v.frames.find((f) => f.type === "send-ok");
+    assert.equal(ok.id, "corr-1");
+    assert.equal(ok.envelope_id, "e-sent-1");
+    assert.equal(ok.encrypted, true);
+    // plaintext is OPTIONAL on the wire and defaults false — absent on the frame, false at sendFn.
+    assert.deepEqual(calls, [{ to: "did:wba:peer", body: { type: "text", text: "hi" }, plaintext: false }]);
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op: plaintext:true on the frame is forwarded to sendFn (the CLI --plaintext parity field)", async () => {
+  chmodSync(dir, 0o700);
+  const calls = [];
+  const ipc = ipcFor({ sendFn: async (args) => { calls.push(args); return { envelope_id: "e-pt", encrypted: false }; } });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "pt-1", to: "did:wba:peer", body: { type: "text", text: "clear" }, plaintext: true }));
+    await until(() => v.frames.some((f) => f.type === "send-ok"));
+    assert.equal(v.frames.find((f) => f.type === "send-ok").encrypted, false);
+    assert.deepEqual(calls, [{ to: "did:wba:peer", body: { type: "text", text: "clear" }, plaintext: true }]);
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op: a send racing daemon shutdown neither crashes nor leaks an unhandled rejection", async () => {
+  chmodSync(dir, 0o700);
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const ipc = ipcFor({ sendFn: async () => { await gate; return { envelope_id: "late", encrypted: true }; } });
+  await ipc.listen();
+  const v = await rawClient("viewer");
+  v.sock.write(encodeFrame({ type: "send", id: "race-1", to: "x", body: { type: "text", text: "a" } }));
+  await new Promise((r) => setTimeout(r, 30));             // the send is now pending inside sendFn
+  await ipc.close();                                        // shutdown destroys all subscriber sockets
+  release();                                                // sendFn settles AFTER the socket died
+  await new Promise((r) => setTimeout(r, 50));              // an unhandled rejection would fail the test runner
+  assert.ok(true);                                          // surviving to here IS the assertion
+});
+
+test("send op: a REJECTING send racing daemon shutdown is caught, not an unhandled rejection", async () => {
+  chmodSync(dir, 0o700);
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const ipc = ipcFor({ sendFn: async () => { await gate; throw Object.assign(new Error("relay 503: late"), { status: 503 }); } });
+  await ipc.listen();
+  const v = await rawClient("viewer");
+  v.sock.write(encodeFrame({ type: "send", id: "race-2", to: "x", body: { type: "text", text: "a" } }));
+  await new Promise((r) => setTimeout(r, 30));             // the send is now pending inside sendFn
+  await ipc.close();                                        // shutdown destroys all subscriber sockets
+  release();                                                // sendFn REJECTS after the socket died
+  await new Promise((r) => setTimeout(r, 50));              // an unhandled rejection would fail the test runner
+  assert.ok(true);                                          // surviving to here IS the assertion
+});
+
+test("send op: failures ack as send-err with the classifier's retryable verdict", async () => {
+  chmodSync(dir, 0o700);
+  let fail = Object.assign(new Error("relay 503: down"), { status: 503 });
+  const ipc = ipcFor({ sendFn: async () => { throw fail; } });
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel");
+    ch.sock.write(encodeFrame({ type: "send", id: "c1", to: "x", body: { type: "text", text: "a" } }));
+    await until(() => ch.frames.some((f) => f.type === "send-err" && f.id === "c1"));
+    const e1 = ch.frames.find((f) => f.type === "send-err" && f.id === "c1");
+    assert.equal(e1.retryable, true);
+    assert.match(e1.reason, /relay 503/);
+    fail = new Error("recipient (DID, AIR ID, or contact alias) is required");
+    ch.sock.write(encodeFrame({ type: "send", id: "c2", to: "", body: { type: "text", text: "a" } }));
+    await until(() => ch.frames.some((f) => f.type === "send-err" && f.id === "c2"));
+    assert.equal(ch.frames.find((f) => f.type === "send-err" && f.id === "c2").retryable, false);
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op: malformed requests (missing id/to/body) ack terminal without calling sendFn; pre-hello send is refused", async () => {
+  chmodSync(dir, 0o700);
+  let called = 0;
+  const ipc = ipcFor({ sendFn: async () => { called += 1; return { envelope_id: "x", encrypted: true }; } });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "m1", body: { type: "text", text: "no-to" } }));
+    await until(() => v.frames.some((f) => f.type === "send-err" && f.id === "m1"));
+    assert.equal(v.frames.find((f) => f.id === "m1").retryable, false);
+    v.sock.write(encodeFrame({ type: "send", to: "x", body: { type: "text", text: "no-id" } }));
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(v.frames.some((f) => f.type === "send-err" && f.id === undefined), false);  // no-id → ignored (cannot correlate an ack)
+    assert.equal(called, 0);
+    v.sock.destroy();
+    // Pre-hello: the first frame must be hello — a send instead gets the standard error+destroy.
+    const raw = createConnection(socketPath());
+    const frames = [];
+    const feed = makeLineParser((f) => frames.push(f), { onError: () => {} });
+    raw.on("data", feed);
+    await new Promise((r) => raw.once("connect", r));
+    raw.write(encodeFrame({ type: "send", id: "ph", to: "x", body: { type: "text", text: "a" } }));
+    await until(() => frames.some((f) => f.type === "error"));
+    assert.equal(called, 0);
+    raw.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op: the wire reason is capped and control-char-stripped (relay-controlled text must not flood the socket)", async () => {
+  chmodSync(dir, 0o700);
+  const huge = "relay 502: " + "<html>x\x07\x00".repeat(4000);   // ~36k chars + control bytes
+  const ipc = ipcFor({ sendFn: async () => { throw Object.assign(new Error(huge), { status: 502 }); } });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "cap-1", to: "x", body: { type: "text", text: "a" } }));
+    await until(() => v.frames.some((f) => f.type === "send-err" && f.id === "cap-1"));
+    const e = v.frames.find((f) => f.id === "cap-1");
+    assert.equal(e.reason.length <= 512, true, `reason must be capped, got ${e.reason.length}`);
+    assert.equal(/[\x00-\x08\x0b-\x1f\x7f]/.test(e.reason), false, "control chars must be stripped");
+    assert.equal(e.retryable, true);                       // the verdict is untouched by clipping
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op: no sendFn wired → terminal send-err 'send unavailable'", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();                                      // ipcFor passes no sendFn
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "u1", to: "x", body: { type: "text", text: "a" } }));
+    await until(() => v.frames.some((f) => f.type === "send-err" && f.id === "u1"));
+    const e = v.frames.find((f) => f.id === "u1");
+    assert.equal(e.retryable, false);
+    assert.match(e.reason, /send unavailable/);
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});

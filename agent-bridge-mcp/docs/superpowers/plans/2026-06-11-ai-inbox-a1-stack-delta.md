@@ -246,6 +246,21 @@ test("send op: a send racing daemon shutdown neither crashes nor leaks an unhand
   assert.ok(true);                                          // surviving to here IS the assertion
 });
 
+test("send op: a REJECTING send racing daemon shutdown is caught, not an unhandled rejection", async () => {
+  chmodSync(dir, 0o700);
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const ipc = ipcFor({ sendFn: async () => { await gate; throw Object.assign(new Error("relay 503: late"), { status: 503 }); } });
+  await ipc.listen();
+  const v = await rawClient("viewer");
+  v.sock.write(encodeFrame({ type: "send", id: "race-2", to: "x", body: { type: "text", text: "a" } }));
+  await new Promise((r) => setTimeout(r, 30));             // the send is now pending inside sendFn
+  await ipc.close();                                        // shutdown destroys all subscriber sockets
+  release();                                                // sendFn REJECTS after the socket died
+  await new Promise((r) => setTimeout(r, 50));              // an unhandled rejection would fail the test runner
+  assert.ok(true);                                          // surviving to here IS the assertion
+});
+
 test("send op: failures ack as send-err with the classifier's retryable verdict", async () => {
   chmodSync(dir, 0o700);
   let fail = Object.assign(new Error("relay 503: down"), { status: 503 });
@@ -381,6 +396,7 @@ exists, move `classifySendError` into its own `src/send-verdict.mjs` and import 
         // always sends encrypted — the field exists for tests and tooling).
         sendFn({ to: frame.to, body: frame.body, plaintext: frame.plaintext === true })
           .then((r) => {
+            // destroyed-guard is defensive — a write to a destroyed socket is benign on current Node (probed); the .catch below is the load-bearing guard.
             if (socket.destroyed) return;
             socket.write(encodeFrame({ type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }));
           })
