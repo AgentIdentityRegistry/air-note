@@ -1,0 +1,25 @@
+name: messaging-tests
+# Runs the hermetic agent-bridge-mcp suite (278 tests; temp homes enforced by the bridgeHome
+# guard) on Linux. This is the standing empirical cross-check for the Phase-3 overflow-test
+# sizing under Linux unix-socket buffer defaults (SO_SNDBUF) — the tests positively assert the
+# skip path engaged (clientStats().dropped > 0), so a sizing drift fails loudly here.
+on:
+  push:
+    branches: [main]
+    paths: ["agent-bridge-mcp/**", ".github/workflows/messaging-tests.yml"]
+  pull_request:
+    paths: ["agent-bridge-mcp/**", ".github/workflows/messaging-tests.yml"]
+
+jobs:
+  node-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-bridge-mcp
+    steps:
+      - uses: actions/checkout@v5            # match the repo's pinned major (verify in step 1)
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"                 # quoted (repo convention — build.yml pins "20"); engines >=22; node --test test/ is broken on 25
+      - run: npm ci                          # or npm install if no lockfile (wire-fact (c))
+      - run: node --test
