@@ -1,6 +1,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -158,4 +159,35 @@ test("replaySince: received-only, spam-excluded, relay_seq ascending, strictly a
   assert.deepEqual(rows.map((r) => r.envelope_id), ["r2"]);   // >10, received, non-spam, has seq, not a join notice
   assert.deepEqual(replaySince(0).map((r) => r.envelope_id), ["r1", "r2"]);   // ascending
   assert.equal(replaySince(0, { limit: 1 }).length, 1);
+});
+
+test("openArchive: journal mode is WAL with a busy timeout (cross-process readers must not lock against the writer)", () => {
+  openArchive();                                            // first open sets the persistent property
+  const db = openArchive();
+  assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
+  // Key-agnostic read (critic H3): Node 22 (CI) and 25 (dev) may name the busy_timeout row's
+  // column differently; the VALUE is the contract.
+  assert.equal(Number(Object.values(db.prepare("PRAGMA busy_timeout").get())[0]), 5000);
+});
+
+test("openArchive: a pre-existing rollback-journal DB converts to WAL on open", () => {
+  // Simulate an archive created by an OLDER build: same schema, default journal mode.
+  const path = join(process.env.AGENT_BRIDGE_HOME, "archive.db");
+  mkdirSync(process.env.AGENT_BRIDGE_HOME, { recursive: true, mode: 0o700 });
+  const old = new DatabaseSync(path);
+  old.exec("CREATE TABLE IF NOT EXISTS marker (x INTEGER)");
+  assert.equal(old.prepare("PRAGMA journal_mode").get().journal_mode, "delete");
+  old.close();
+  const db = openArchive();                                 // our open must convert it
+  assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
+});
+
+test("openArchive: a second READ-ONLY connection reads while the writer holds rows (WAL property)", () => {
+  archiveMessage(rec({ envelope_id: "wal1" }));
+  const path = join(process.env.AGENT_BRIDGE_HOME, "archive.db");
+  const reader = new DatabaseSync(path, { readOnly: true });
+  try {
+    const n = reader.prepare("SELECT COUNT(*) AS n FROM messages").get().n;
+    assert.equal(n >= 1, true);                             // reader sees committed rows, no SQLITE_BUSY
+  } finally { reader.close(); }
 });

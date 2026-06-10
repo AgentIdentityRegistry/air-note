@@ -52,6 +52,14 @@ export function openArchive() {
   mkdirSync(bridgeHome(), { recursive: true, mode: 0o700 });
   const path = archivePath();
   const db = new DatabaseSync(path);
+  // WAL + busy timeout (AI-inbox design §5, second-opinion Critical): the desktop reads this DB
+  // read-only from another process while the daemon writes. Under the default rollback journal a
+  // writer's EXCLUSIVE lock and a reader's SHARED lock are mutually exclusive → SQLITE_BUSY
+  // exactly during gap-replay bursts. WAL allows one writer + many readers; it is a PERSISTENT
+  // file property the WRITER must set. journal_mode/busy_timeout are read-back pragmas — use
+  // .get(), not .run() (some builds error on run for row-returning pragmas).
+  db.prepare("PRAGMA journal_mode=WAL").get();
+  db.prepare("PRAGMA busy_timeout=5000").get();
   for (const stmt of SCHEMA) db.prepare(stmt).run();
   // Migration: add the moderation `spam` flag if an older DB predates it. Guarded by
   // PRAGMA so it runs at most once; ADD COLUMN ... NOT NULL DEFAULT 0 is legal in node:sqlite.
