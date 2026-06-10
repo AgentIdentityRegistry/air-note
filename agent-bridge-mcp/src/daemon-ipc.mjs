@@ -214,7 +214,7 @@ export function createIpcServer({
  *  handle; gated messages stream to onMessage(m). Rejects with {code:"DAEMON_DOWN"} when no
  *  daemon is reachable (callers use that to fall back to legacy standalone — spec §7).
  *  Reconnect/backoff is Phase 4; Phase 2 surfaces onClose and lets the caller decide. */
-export function connectDaemon({ role, onMessage, onClose = () => {}, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
+export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () => {}, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
   return new Promise((resolve, reject) => {
     const sock = createConnection(socketPath());
     const fail = (reason, cause) => {
@@ -232,13 +232,14 @@ export function connectDaemon({ role, onMessage, onClose = () => {}, handshakeMs
         if (frame.type === "hello-ok") {
           ready = true;
           log(`[client] attached to air-msgd pid=${frame.pid} as ${role}`);
-          resolve({ close: () => sock.destroy() });
+          resolve({ close: () => sock.destroy(), _sock: sock });   // _sock: test seam (gap round-trip), not public API
         } else {
           fail(`daemon refused: ${frame.reason ?? frame.type}`);
         }
         return;
       }
       if (frame.type === "message") onMessage(frame.message);
+      if (frame.type === "gap") onGap(frame.after_seq);
       // pong + unknown server frames: ignored.
     }, { onError: (e) => log(`[client] bad frame from daemon: ${e.message}`) });
     sock.on("data", feed);

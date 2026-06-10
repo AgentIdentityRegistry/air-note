@@ -408,3 +408,26 @@ test("overflow backstop: a socket wedged past 4×HWM is destroyed", async () => 
     await until(() => ipc.clientCount() === 0);       // backstop fired
   } finally { await ipc.close(); }
 });
+
+test("connectDaemon: real gap round-trip — wedge beneath the client, progress, onGap fires", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 2048 });
+  await ipc.listen();
+  try {
+    const got = []; let gapAt = null;
+    const handle = await connectDaemon({ role: "channel", onMessage: (m) => got.push(m.relay_seq),
+      onGap: (seq) => { gapAt = seq; }, log: () => {} });
+    const mk = (i, size) => ({ envelope_id: `eG${i}`, seq: 300 + i, from: "did:wba:x", contact: "al",
+      verified: true, key_changed: false, body: { type: "text", text: "g".repeat(size) } });
+    await ipc.sink.deliver(mk(0, 64));                       // one clean write → lastSeq ≥ 300
+    await until(() => got.length === 1);
+    handle._sock.pause();                                     // wedge beneath the client parser
+    for (let i = 1; i <= 600 && ipc.clientCount() === 1; i++) await ipc.sink.deliver(mk(i, 3000));   // in-band skips (critic H-A)
+    assert.equal(ipc.clientCount(), 1);                       // never destroyed during the wedge
+    handle._sock.resume();                                    // progress
+    await ipc.sink.deliver(mk(99, 64));                       // flush-on-progress emits the gap
+    await until(() => gapAt !== null);
+    assert.ok(gapAt >= 300 && gapAt < 901, `after_seq=${gapAt} must be the last WRITTEN seq`);
+    handle.close();
+  } finally { await ipc.close(); }
+});
