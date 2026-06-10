@@ -75,7 +75,6 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
   const identity = await ensureIdentity();
   if (!acquireOrExit("daemon")) return;            // another live consumer holds the cursor
   const startTime = new Date().toISOString();
-  writeDaemonPid({ pid: process.pid, startTime });
 
   const mute = parseMuteSet();
   const notifier = await createNotifier();         // click-to-open is a later-phase item (see bannerSink)
@@ -87,6 +86,7 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
     log,
   });
   await ipc.listen();                              // safe: we hold the consumer lock (single-daemon mutex)
+  writeDaemonPid({ pid: process.pid, startTime }); // written AFTER bind: a failed listen won't strand a PID file
   sinks = [bannerSink({ notifier, mute }), ipc.sink];
 
   const ac = new AbortController();

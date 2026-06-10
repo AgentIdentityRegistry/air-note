@@ -637,8 +637,13 @@ async function main() {
               console.log(`socket: ${socketPath()}`);
               console.log(`clients: ${live.clients.length} (${roles})  ·  last relay_seq: ${live.last_seq ?? "—"}`);
               console.log(`sinks: ${(live.sinks ?? []).join(", ") || "?"}`);
+              for (const cl of live.clients) {
+                if (cl.dropped > 0 || cl.lastSeq !== live.last_seq) {
+                  console.log(`  · ${cl.role}: lastSeq ${cl.lastSeq ?? "—"}${cl.dropped ? `, dropped ${cl.dropped}` : ""}`);
+                }
+              }
             } else {
-              console.log(c.yellow("socket: unreachable (PID alive but not answering — split-brain? check daemon logs)"));
+              console.log(c.yellow("socket: unreachable (split-brain or daemon starting/stopping — check daemon logs)"));
             }
           }
           break;

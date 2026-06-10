@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected. Task 5 amendment: watch viewer holds a ref'd keepAlive (unref'd backoff timer cannot pin the loop — probed exit-0 mid-outage); `log: () => {}` silences raw transport lines from the curated stdout feed; spawn harness waits exits via a consumed-event-safe `waitExit` helper; survival test added as C1 regression guard.
+**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected. Task 5 amendment: watch viewer holds a ref'd keepAlive (unref'd backoff timer cannot pin the loop — probed exit-0 mid-outage); `log: () => {}` silences raw transport lines from the curated stdout feed; spawn harness waits exits via a consumed-event-safe `waitExit` helper; survival test added as C1 regression guard. Task 7 amendment: queryDaemonStatus guards the timeout-vs-handshake race (same undead-socket class as 2a59f75) with a connectFn seam test; writeDaemonPid moved after listen (no stranded PID on failed bind; kills a benign split-brain warning window).
 
 **Goal:** Complete the daemon's roadmap-Phase-1 plumbing (spec §7 + §8): clients auto-reconnect with backoff and resume via `since_seq` in hello (closing the at-least-once "OR reconnect" trigger from §6); `air-msg watch` and `air-msg bridge` get their §7 decision-table rows; `air-msg daemon status` reports live socket state over IPC; `air-msg daemon install|uninstall` generates + loads launchd/systemd-user units; `daemon start --detach` backgrounds the process.
 
@@ -896,6 +896,24 @@ test("queryDaemonStatus: round-trips the status; null when no daemon", async () 
     assert.deepEqual(st.clients, []);                  // idle daemon: the probe itself is excluded
   } finally { await ipc.close(); }
 });
+
+test("queryDaemonStatus: timeout-raced handshake socket is closed, not leaked", async () => {
+  chmodSync(dir, 0o700);
+  let closed = false;
+  let wrote = false;
+  // Fake handle whose handshake resolves ~40ms after the 20ms outer timeout fires.
+  const fakeHandle = { close: () => { closed = true; }, _sock: { write: () => { wrote = true; } } };
+  let resolveConnect;
+  const connectFn = () => new Promise((res) => { resolveConnect = res; });
+  const resultPromise = queryDaemonStatus({ timeoutMs: 20, connectFn });
+  // Let the 20ms timeout fire first (result is null), THEN resolve the handshake.
+  await new Promise((r) => setTimeout(r, 40));
+  resolveConnect(fakeHandle);
+  const result = await resultPromise;
+  assert.equal(result, null);        // timed out
+  assert.equal(closed, true);        // late-arriving socket was closed
+  assert.equal(wrote, false);        // status request was never written to a dead socket
+});
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -923,23 +941,23 @@ Expected: FAIL — no `status` reply; `queryDaemonStatus` not exported.
         }));
       }
 ```
-(c) Append the client helper:
+(c) Append the client helper (`connectFn = connectDaemon` is the test seam for the timeout-race guard):
 ```js
 /** One-shot live status query for `air-msg daemon status` (spec §8): the CLI runs in a separate
  *  process, so connected-clients/last_seq state must cross the socket. Returns null if no daemon. */
-export async function queryDaemonStatus({ timeoutMs = 1500 } = {}) {
+export async function queryDaemonStatus({ timeoutMs = 1500, connectFn = connectDaemon } = {}) {
   return new Promise((resolve) => {
     let handle = null;
     let done = false;
     const finish = (v) => { if (!done) { done = true; handle?.close(); resolve(v); } };
     const timer = setTimeout(() => finish(null), timeoutMs);
-    connectDaemon({
+    connectFn({
       role: "viewer",
       onMessage: () => {},                             // live frames during the query: ignored
       onStatus: (st) => { clearTimeout(timer); finish(st); },
       handshakeMs: timeoutMs,
       log: () => {},
-    }).then((h) => { handle = h; h._sock.write(encodeFrame({ type: "status" })); })
+    }).then((h) => { if (done) { h.close(); return; } handle = h; h._sock.write(encodeFrame({ type: "status" })); })
       .catch(() => { clearTimeout(timer); finish(null); });
   });
 }
@@ -949,7 +967,7 @@ export async function queryDaemonStatus({ timeoutMs = 1500 } = {}) {
       if (frame.type === "status") onStatus(frame);
 ```
 
-In `src/daemon.mjs` (`startDaemon`), let the IPC server name the sinks — `sinks` is built after `ipc`, so bind late:
+In `src/daemon.mjs` (`startDaemon`), let the IPC server name the sinks — `sinks` is built after `ipc`, so bind late; `writeDaemonPid` moves AFTER `ipc.listen()` so a failed bind never strands a PID file (also kills a benign split-brain warning window):
 ```js
   let sinks = [];
   const ipc = createIpcServer({
@@ -959,9 +977,10 @@ In `src/daemon.mjs` (`startDaemon`), let the IPC server name the sinks — `sink
     log,
   });
   await ipc.listen();                              // safe: we hold the consumer lock (single-daemon mutex)
+  writeDaemonPid({ pid: process.pid, startTime }); // written AFTER bind: a failed listen won't strand a PID file
   sinks = [bannerSink({ notifier, mute }), ipc.sink];
 ```
-(replacing the current `const ipc = ...; await ipc.listen(); const sinks = ...` block, daemon.mjs:82-88).
+(replacing the current `writeDaemonPid(...); const ipc = ...; await ipc.listen(); const sinks = ...` block).
 
 In `src/cli.mjs` `case "status":` (cli.mjs:591-597), after the two existing `console.log` lines add:
 ```js
@@ -973,8 +992,13 @@ In `src/cli.mjs` `case "status":` (cli.mjs:591-597), after the two existing `con
               console.log(`socket: ${socketPath()}`);
               console.log(`clients: ${live.clients.length} (${roles})  ·  last relay_seq: ${live.last_seq ?? "—"}`);
               console.log(`sinks: ${(live.sinks ?? []).join(", ") || "?"}`);
+              for (const cl of live.clients) {
+                if (cl.dropped > 0 || cl.lastSeq !== live.last_seq) {
+                  console.log(`  · ${cl.role}: lastSeq ${cl.lastSeq ?? "—"}${cl.dropped ? `, dropped ${cl.dropped}` : ""}`);
+                }
+              }
             } else {
-              console.log(c.yellow("socket: unreachable (PID alive but not answering — split-brain? check daemon logs)"));
+              console.log(c.yellow("socket: unreachable (split-brain or daemon starting/stopping — check daemon logs)"));
             }
           }
 ```

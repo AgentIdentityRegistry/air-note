@@ -750,3 +750,21 @@ test("queryDaemonStatus: round-trips the status; null when no daemon", async () 
     assert.deepEqual(st.clients, []);                  // idle daemon: the probe itself is excluded
   } finally { await ipc.close(); }
 });
+
+test("queryDaemonStatus: timeout-raced handshake socket is closed, not leaked", async () => {
+  chmodSync(dir, 0o700);
+  let closed = false;
+  let wrote = false;
+  // Fake handle whose handshake resolves ~40ms after the 20ms outer timeout fires.
+  const fakeHandle = { close: () => { closed = true; }, _sock: { write: () => { wrote = true; } } };
+  let resolveConnect;
+  const connectFn = () => new Promise((res) => { resolveConnect = res; });
+  const resultPromise = queryDaemonStatus({ timeoutMs: 20, connectFn });
+  // Let the 20ms timeout fire first (result is null), THEN resolve the handshake.
+  await new Promise((r) => setTimeout(r, 40));
+  resolveConnect(fakeHandle);
+  const result = await resultPromise;
+  assert.equal(result, null);        // timed out
+  assert.equal(closed, true);        // late-arriving socket was closed
+  assert.equal(wrote, false);        // status request was never written to a dead socket
+});

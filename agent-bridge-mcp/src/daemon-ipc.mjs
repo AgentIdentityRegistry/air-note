@@ -194,6 +194,8 @@ export function createIpcServer({
       deliver: (m) => {
         // Stamp relay_seq at the boundary (Phase 2): onMessage objects carry `seq`.
         const wire = m && m.seq !== undefined && m.relay_seq === undefined ? { ...m, relay_seq: m.seq } : m;
+        // "Last seq FANNED OUT" (advances even if every subscriber skipped/destroyed) — the per-client
+        // lastSeq/dropped in the status reply are the per-write markers; both together make a wedged client diagnosable.
         if (wire && Number.isFinite(wire.relay_seq)) lastDeliveredSeq = wire.relay_seq;
         for (const sub of subscribers) {
           if (!admitForRole(sub.role, m, { mute })) continue;
@@ -271,7 +273,7 @@ export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () 
         if (frame.type === "hello-ok") {
           ready = true;
           log(`[client] attached to air-msgd pid=${frame.pid} as ${role}`);
-          resolve({ close: () => sock.destroy(), _sock: sock });   // _sock: test seam (gap round-trip), not public API
+          resolve({ close: () => sock.destroy(), _sock: sock });   // _sock: same-module use (queryDaemonStatus) + test seam (gap round-trip); not for external callers
         } else {
           fail(`daemon refused: ${frame.reason ?? frame.type}`);
         }
@@ -389,19 +391,19 @@ export async function probeDaemon({ timeoutMs = 1500 } = {}) {
 
 /** One-shot live status query for `air-msg daemon status` (spec §8): the CLI runs in a separate
  *  process, so connected-clients/last_seq state must cross the socket. Returns null if no daemon. */
-export async function queryDaemonStatus({ timeoutMs = 1500 } = {}) {
+export async function queryDaemonStatus({ timeoutMs = 1500, connectFn = connectDaemon } = {}) {
   return new Promise((resolve) => {
     let handle = null;
     let done = false;
     const finish = (v) => { if (!done) { done = true; handle?.close(); resolve(v); } };
     const timer = setTimeout(() => finish(null), timeoutMs);
-    connectDaemon({
+    connectFn({
       role: "viewer",
       onMessage: () => {},                             // live frames during the query: ignored
       onStatus: (st) => { clearTimeout(timer); finish(st); },
       handshakeMs: timeoutMs,
       log: () => {},
-    }).then((h) => { handle = h; h._sock.write(encodeFrame({ type: "status" })); })
+    }).then((h) => { if (done) { h.close(); return; } handle = h; h._sock.write(encodeFrame({ type: "status" })); })
       .catch(() => { clearTimeout(timer); finish(null); });
   });
 }
