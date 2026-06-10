@@ -1250,7 +1250,6 @@ Expected: new cases FAIL (subcommands unknown).
           });
           if (!plan) { console.error(`nothing to uninstall on ${process.platform}`); process.exit(1); }
           spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload (attempt even if file is missing — may still be loaded)
-          const { existsSync } = await import("node:fs");
           if (!existsSync(plan.file)) {
             console.log(`nothing installed at ${c.dim(plan.file)}`);
             break;

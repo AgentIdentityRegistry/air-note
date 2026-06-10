@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
-import { realpathSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { realpathSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import * as core from "./core.mjs";
 import { ensureIdentity } from "./identity.mjs";
 import { createNotifier } from "./notifier.mjs";
@@ -706,7 +706,6 @@ async function main() {
           });
           if (!plan) { console.error(`nothing to uninstall on ${process.platform}`); process.exit(1); }
           spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload (attempt even if file is missing — may still be loaded)
-          const { existsSync } = await import("node:fs");
           if (!existsSync(plan.file)) {
             console.log(`nothing installed at ${c.dim(plan.file)}`);
             break;
