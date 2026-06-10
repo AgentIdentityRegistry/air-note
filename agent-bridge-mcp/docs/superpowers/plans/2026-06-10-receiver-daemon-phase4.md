@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint.
+**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests.
 
 **Goal:** Complete the daemon's roadmap-Phase-1 plumbing (spec §7 + §8): clients auto-reconnect with backoff and resume via `since_seq` in hello (closing the at-least-once "OR reconnect" trigger from §6); `air-msg watch` and `air-msg bridge` get their §7 decision-table rows; `air-msg daemon status` reports live socket state over IPC; `air-msg daemon install|uninstall` generates + loads launchd/systemd-user units; `daemon start --detach` backgrounds the process.
 
@@ -270,6 +270,74 @@ test("connectDaemonPersistent: close() stops the reconnect loop for good", async
     assert.equal(b.clientCount(), 0);
   } finally { await b.close(); }
 });
+
+// Lifecycle regression tests (v3 fix): deterministic via the connectFn seam — no real sockets.
+
+test("connectDaemonPersistent: close() during an in-flight reconnect closes the late-arriving socket (no undead connection)", async () => {
+  // Seam-based: no real sockets, no timing races beyond the intentional ~20ms gate window.
+  // call 1: succeeds immediately, captures onClose so we can trigger a reconnect.
+  // call 2: blocks until we release the gate, simulating a long handshake.
+  let capturedOnClose = null;
+  let lateCloseCalled = false;
+  let callCount = 0;
+  let releaseGate;
+  const gate = new Promise((r) => { releaseGate = r; });
+
+  const fakeConnect = ({ onClose }) => {
+    callCount += 1;
+    if (callCount === 1) {
+      capturedOnClose = onClose;
+      return Promise.resolve({ close: () => {}, _sock: null });
+    }
+    // call 2: block until gate released, then return a handle whose close() we track
+    return gate.then(() => ({ close: () => { lateCloseCalled = true; }, _sock: null }));
+  };
+
+  let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {}, onAttach: () => { attaches += 1; },
+    connectFn: fakeConnect, initialBackoffMs: 5, log: () => {},
+  });
+  // Trigger reconnect loop (loop is now sleeping 5ms then will await the gated fakeConnect call 2)
+  capturedOnClose();
+  await new Promise((r) => setTimeout(r, 20));  // loop is now awaiting the gated connectFn
+  handle.close();                               // close() races the in-flight handshake
+  releaseGate();                                // release: connectFn call 2 resolves late
+  await new Promise((r) => setTimeout(r, 10)); // give the resolution microtask time to run
+  assert.equal(lateCloseCalled, true,  "late-arriving socket must be closed immediately");
+  assert.equal(attaches, 1,            "onAttach must fire exactly once (first attach only)");
+});
+
+test("connectDaemonPersistent: a throwing onAttach on reattach is logged, not retried as a failed connect", async () => {
+  // Seam-based: connectFn always succeeds; onAttach throws on its 2nd invocation.
+  // The bug: without the fix, the throw is caught by the bare catch, increments backoff,
+  // and the loop retries — calling connectFn a 3rd+ time while the 2nd connection is live.
+  let capturedOnClose = null;
+  let callCount = 0;
+  const logs = [];
+
+  const fakeConnect = ({ onClose }) => {
+    callCount += 1;
+    if (callCount === 1) capturedOnClose = onClose;
+    return Promise.resolve({ close: () => {}, _sock: null });
+  };
+
+  let attachCount = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {},
+    onAttach: () => {
+      attachCount += 1;
+      if (attachCount === 2) throw new Error("boom from onAttach");
+    },
+    connectFn: fakeConnect, initialBackoffMs: 5, backoffCapMs: 10,
+    log: (s) => logs.push(s),
+  });
+  capturedOnClose();                            // trigger the reconnect loop
+  await new Promise((r) => setTimeout(r, 40)); // several would-be 5ms retry cycles
+  handle.close();
+  assert.equal(callCount, 2, "connectFn must be called exactly twice — no pile-up of retries");
+  assert.ok(logs.some((l) => /onAttach callback threw/.test(l)), "throw must be logged, not swallowed");
+});
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -292,7 +360,10 @@ Expected: FAIL — `connectDaemonPersistent` not exported.
  *
  *  The returned promise settles like connectDaemon: rejects DAEMON_DOWN if the FIRST attempt
  *  finds no daemon (callers use that to fall back to legacy standalone, spec §7); after the
- *  first successful attach it never gives up until close(). */
+ *  first successful attach it never gives up until close().
+ *
+ *  Callbacks (onAttach, onDetach, onMessage, onGap) are invoked from socket event handlers and
+ *  the reconnect loop; they are guarded against throws, but SHOULD not throw. */
 export function connectDaemonPersistent({
   role, onMessage, onGap = () => {}, onAttach = () => {}, onDetach = () => {},
   cursorFn = () => null,
@@ -318,28 +389,35 @@ export function connectDaemonPersistent({
     let backoff = initialBackoffMs;
     while (!stopped) {
       // Sleep BEFORE the first retry on purpose: onClose means the daemon is gone RIGHT NOW —
-      // an immediate attempt would just burn an ECONNREFUSED.
-      await new Promise((r) => setTimeout(r, backoff));
+      // an immediate attempt would just burn an ECONNREFUSED. unref: a closed handle must not
+      // pin the event loop for a pending backoff tick.
+      await new Promise((r) => { const t = setTimeout(r, backoff); t.unref?.(); });
       if (stopped) return;
+      const sinceSeq = maxSeen ?? baseline ?? undefined;
+      let next;
       try {
-        const sinceSeq = maxSeen ?? baseline ?? undefined;
-        current = await connectFn({
+        next = await connectFn({
           role, sinceSeq, onMessage: seen, onGap,
-          onClose: () => { if (!stopped) { onDetach(); void reconnectLoop(); } },
+          onClose: () => { if (!stopped) { try { onDetach(); } catch (e) { log(`[client] onDetach callback threw: ${e?.message ?? e}`); } void reconnectLoop(); } },
           log,
         });
-        onAttach();
-        log(`[client] reattached to air-msgd as ${role}${Number.isFinite(sinceSeq) ? ` (resume since_seq=${sinceSeq})` : ""}`);
-        return;
       } catch {
         backoff = Math.min(backoff * 2, backoffCapMs);  // daemon still down — keep trying
+        continue;
       }
+      if (stopped) { next.close(); return; }  // close() raced the in-flight handshake — kill the undead socket
+      current = next;
+      // User callbacks OUTSIDE the try: a throwing onAttach must not masquerade as a failed
+      // connect (it would silently pile up duplicate live connections). Loud log, no retry.
+      try { onAttach(); } catch (e) { log(`[client] onAttach callback threw: ${e?.message ?? e}`); }
+      log(`[client] reattached to air-msgd as ${role}${Number.isFinite(sinceSeq) ? ` (resume since_seq=${sinceSeq})` : ""}`);
+      return;
     }
   };
 
   return connectFn({
     role, onMessage: seen, onGap,
-    onClose: () => { if (!stopped) { onDetach(); void reconnectLoop(); } },
+    onClose: () => { if (!stopped) { try { onDetach(); } catch (e) { log(`[client] onDetach callback threw: ${e?.message ?? e}`); } void reconnectLoop(); } },
     log,
   }).then((first) => {
     current = first;

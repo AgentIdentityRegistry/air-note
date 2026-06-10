@@ -592,3 +592,69 @@ test("connectDaemonPersistent: close() stops the reconnect loop for good", async
     assert.equal(b.clientCount(), 0);
   } finally { await b.close(); }
 });
+
+test("connectDaemonPersistent: close() during an in-flight reconnect closes the late-arriving socket (no undead connection)", async () => {
+  // Seam-based: no real sockets, no timing races beyond the intentional ~20ms gate window.
+  // call 1: succeeds immediately, captures onClose so we can trigger a reconnect.
+  // call 2: blocks until we release the gate, simulating a long handshake.
+  let capturedOnClose = null;
+  let lateCloseCalled = false;
+  let callCount = 0;
+  let releaseGate;
+  const gate = new Promise((r) => { releaseGate = r; });
+
+  const fakeConnect = ({ onClose }) => {
+    callCount += 1;
+    if (callCount === 1) {
+      capturedOnClose = onClose;
+      return Promise.resolve({ close: () => {}, _sock: null });
+    }
+    // call 2: block until gate released, then return a handle whose close() we track
+    return gate.then(() => ({ close: () => { lateCloseCalled = true; }, _sock: null }));
+  };
+
+  let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {}, onAttach: () => { attaches += 1; },
+    connectFn: fakeConnect, initialBackoffMs: 5, log: () => {},
+  });
+  // Trigger reconnect loop (loop is now sleeping 5ms then will await the gated fakeConnect call 2)
+  capturedOnClose();
+  await new Promise((r) => setTimeout(r, 20));  // loop is now awaiting the gated connectFn
+  handle.close();                               // close() races the in-flight handshake
+  releaseGate();                                // release: connectFn call 2 resolves late
+  await new Promise((r) => setTimeout(r, 10)); // give the resolution microtask time to run
+  assert.equal(lateCloseCalled, true,  "late-arriving socket must be closed immediately");
+  assert.equal(attaches, 1,            "onAttach must fire exactly once (first attach only)");
+});
+
+test("connectDaemonPersistent: a throwing onAttach on reattach is logged, not retried as a failed connect", async () => {
+  // Seam-based: connectFn always succeeds; onAttach throws on its 2nd invocation.
+  // The bug: without the fix, the throw is caught by the bare catch, increments backoff,
+  // and the loop retries — calling connectFn a 3rd+ time while the 2nd connection is live.
+  let capturedOnClose = null;
+  let callCount = 0;
+  const logs = [];
+
+  const fakeConnect = ({ onClose }) => {
+    callCount += 1;
+    if (callCount === 1) capturedOnClose = onClose;
+    return Promise.resolve({ close: () => {}, _sock: null });
+  };
+
+  let attachCount = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {},
+    onAttach: () => {
+      attachCount += 1;
+      if (attachCount === 2) throw new Error("boom from onAttach");
+    },
+    connectFn: fakeConnect, initialBackoffMs: 5, backoffCapMs: 10,
+    log: (s) => logs.push(s),
+  });
+  capturedOnClose();                            // trigger the reconnect loop
+  await new Promise((r) => setTimeout(r, 40)); // several would-be 5ms retry cycles
+  handle.close();
+  assert.equal(callCount, 2, "connectFn must be called exactly twice — no pile-up of retries");
+  assert.ok(logs.some((l) => /onAttach callback threw/.test(l)), "throw must be logged, not swallowed");
+});

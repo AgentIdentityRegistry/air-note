@@ -275,7 +275,10 @@ export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () 
  *
  *  The returned promise settles like connectDaemon: rejects DAEMON_DOWN if the FIRST attempt
  *  finds no daemon (callers use that to fall back to legacy standalone, spec §7); after the
- *  first successful attach it never gives up until close(). */
+ *  first successful attach it never gives up until close().
+ *
+ *  Callbacks (onAttach, onDetach, onMessage, onGap) are invoked from socket event handlers and
+ *  the reconnect loop; they are guarded against throws, but SHOULD not throw. */
 export function connectDaemonPersistent({
   role, onMessage, onGap = () => {}, onAttach = () => {}, onDetach = () => {},
   cursorFn = () => null,
@@ -301,28 +304,35 @@ export function connectDaemonPersistent({
     let backoff = initialBackoffMs;
     while (!stopped) {
       // Sleep BEFORE the first retry on purpose: onClose means the daemon is gone RIGHT NOW —
-      // an immediate attempt would just burn an ECONNREFUSED.
-      await new Promise((r) => setTimeout(r, backoff));
+      // an immediate attempt would just burn an ECONNREFUSED. unref: a closed handle must not
+      // pin the event loop for a pending backoff tick.
+      await new Promise((r) => { const t = setTimeout(r, backoff); t.unref?.(); });
       if (stopped) return;
+      const sinceSeq = maxSeen ?? baseline ?? undefined;
+      let next;
       try {
-        const sinceSeq = maxSeen ?? baseline ?? undefined;
-        current = await connectFn({
+        next = await connectFn({
           role, sinceSeq, onMessage: seen, onGap,
-          onClose: () => { if (!stopped) { onDetach(); void reconnectLoop(); } },
+          onClose: () => { if (!stopped) { try { onDetach(); } catch (e) { log(`[client] onDetach callback threw: ${e?.message ?? e}`); } void reconnectLoop(); } },
           log,
         });
-        onAttach();
-        log(`[client] reattached to air-msgd as ${role}${Number.isFinite(sinceSeq) ? ` (resume since_seq=${sinceSeq})` : ""}`);
-        return;
       } catch {
         backoff = Math.min(backoff * 2, backoffCapMs);  // daemon still down — keep trying
+        continue;
       }
+      if (stopped) { next.close(); return; }  // close() raced the in-flight handshake — kill the undead socket
+      current = next;
+      // User callbacks OUTSIDE the try: a throwing onAttach must not masquerade as a failed
+      // connect (it would silently pile up duplicate live connections). Loud log, no retry.
+      try { onAttach(); } catch (e) { log(`[client] onAttach callback threw: ${e?.message ?? e}`); }
+      log(`[client] reattached to air-msgd as ${role}${Number.isFinite(sinceSeq) ? ` (resume since_seq=${sinceSeq})` : ""}`);
+      return;
     }
   };
 
   return connectFn({
     role, onMessage: seen, onGap,
-    onClose: () => { if (!stopped) { onDetach(); void reconnectLoop(); } },
+    onClose: () => { if (!stopped) { try { onDetach(); } catch (e) { log(`[client] onDetach callback threw: ${e?.message ?? e}`); } void reconnectLoop(); } },
     log,
   }).then((first) => {
     current = first;
