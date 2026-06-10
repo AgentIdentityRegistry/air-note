@@ -511,6 +511,8 @@ export async function receive({ since, limit } = {}) {
       const joinNotice = roomJoinNotice({ op: body, selfDid: identity.did, roomName: getRoom(body.room_id)?.name });
       const joinedState = joinNotice ? deriveRoom(body.room_id) : null;
       const nowMember = !!joinedState && joinedState.members.some((mm) => mm.did === identity.did);
+      // NOTE: replaySince() (archive.mjs) excludes these synthetic ids via NOT LIKE '%:joined' —
+      // keep this suffix in sync with that query or replayed join notices re-enter as room chat.
       const joinId = `${body.room_id}:joined`;
       if (joinNotice && nowMember && !isArchived(joinId, "received")) {
         const joinedRoom = getRoom(body.room_id);

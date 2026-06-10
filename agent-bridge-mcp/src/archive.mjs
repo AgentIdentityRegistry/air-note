@@ -196,5 +196,21 @@ export function closeArchive() {
   if (_db) { _db.close(); _db = null; }
 }
 
+/** Replay source for at-least-once channel delivery (spec §6): received, non-spam rows with a
+ *  relay_seq STRICTLY AFTER since_seq, oldest-first. Synthetic room-join notices
+ *  (envelope_id "<room_id>:joined") are EXCLUDED: live surfaces them once as a system inbox
+ *  notice and never as channel chat — replaying them would route a system notice into the
+ *  room-chat push path (critic H2). The caller re-applies the channel gate — rows carry
+ *  verified + key_changed so the replay can withhold what live withheld. */
+export function replaySince(since_seq, { limit = 500 } = {}) {
+  const db = openArchive();
+  return db.prepare(
+    `SELECT * FROM messages
+      WHERE direction = 'received' AND spam = 0 AND relay_seq IS NOT NULL AND relay_seq > ?
+        AND envelope_id NOT LIKE '%:joined'
+      ORDER BY relay_seq ASC LIMIT ?`
+  ).all(Number(since_seq) || 0, limit).map(parseRow);
+}
+
 /** Placeholder for the future cloud-backup layer (#14 stage 2; see design §6). Deferred. */
 export async function backupArchive(/* adapter */) { /* intentionally a no-op seam */ }
