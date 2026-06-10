@@ -1057,7 +1057,7 @@ test("systemdUnit: quoted ExecStart, Restart=always, default.target", () => {
   assert.match(unit, /Restart=always/);
   assert.match(unit, /Environment="AGENT_BRIDGE_HOME=/);
   assert.match(unit, /WantedBy=default\.target/);
-  assert.doesNotMatch(systemdUnit({ ...ARGS, home: undefined }), /Environment=AGENT_BRIDGE_HOME/);
+  assert.doesNotMatch(systemdUnit({ ...ARGS, home: undefined }), /AGENT_BRIDGE_HOME/);
 });
 
 test("servicePlan: darwin → launchd plist under LaunchAgents; linux → systemd-user unit; else null", () => {
