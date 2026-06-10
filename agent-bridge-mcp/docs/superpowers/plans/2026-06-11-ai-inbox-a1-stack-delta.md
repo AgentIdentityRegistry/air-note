@@ -163,9 +163,10 @@ with:
 export function classifySendError(err) {
   const reason = String(err?.message ?? err);
   if (typeof err?.status === "number") return { retryable: err.status >= 500, reason };
-  // Real undici fetch network failures ride the TypeError branch (their cause.code is often
-  // buried deeper than cause.code — probed). The code-list branch covers errors WRAPPED by other
-  // layers that surface a flat code; it is belt, not braces.
+  // Real undici fetch network failures ride the TypeError branch (their code is often buried
+  // DEEPER than cause.code, e.g. under cause.cause or an AggregateError — probed). The code-list
+  // branch covers errors WRAPPED by other layers that surface a flat code; it is belt, not braces.
+  // AbortError falls through to terminal by default — revisit if a fetch timeout is ever added.
   const networkish = err instanceof TypeError
     || ["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"].includes(err?.cause?.code ?? err?.code);
   return { retryable: !!networkish, reason };
@@ -293,6 +294,23 @@ test("send op: malformed requests (missing id/to/body) ack terminal without call
   } finally { await ipc.close(); }
 });
 
+test("send op: the wire reason is capped and control-char-stripped (relay-controlled text must not flood the socket)", async () => {
+  chmodSync(dir, 0o700);
+  const huge = "relay 502: " + "<html>x\x07\x00".repeat(4000);   // ~36k chars + control bytes
+  const ipc = ipcFor({ sendFn: async () => { throw Object.assign(new Error(huge), { status: 502 }); } });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "cap-1", to: "x", body: { type: "text", text: "a" } }));
+    await until(() => v.frames.some((f) => f.type === "send-err" && f.id === "cap-1"));
+    const e = v.frames.find((f) => f.id === "cap-1");
+    assert.equal(e.reason.length <= 512, true, `reason must be capped, got ${e.reason.length}`);
+    assert.equal(/[\x00-\x08\x0b-\x1f\x7f]/.test(e.reason), false, "control chars must be stripped");
+    assert.equal(e.retryable, true);                       // the verdict is untouched by clipping
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
 test("send op: no sendFn wired → terminal send-err 'send unavailable'", async () => {
   chmodSync(dir, 0o700);
   const ipc = ipcFor();                                      // ipcFor passes no sendFn
@@ -323,6 +341,14 @@ assertion via the existing handshake guard — its load-bearing assert is `calle
 (a) Import the classifier (top of file, with the other local imports):
 ```js
 import { classifySendError } from "./core.mjs";
+```
+And near MAX_FRAME, add the reason cap (Task 2 review, Important):
+```js
+// send-err reasons ride the wire to GUIs and embed relay-controlled response text, which is
+// length-unbounded (a proxy's 502 HTML page, a chatty federated relay). Cap + de-control it at
+// the serialization boundary; rendering-side escaping stays the GUI's job.
+export const REASON_MAX_CHARS = 512;
+const clipReason = (s) => String(s).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").slice(0, REASON_MAX_CHARS);
 ```
 **Circular-import check (do this BEFORE wiring):** `core.mjs` must not import from
 `daemon-ipc.mjs` (verify with `grep -n "daemon-ipc" src/core.mjs` — expected: no hits). If a cycle
@@ -361,8 +387,9 @@ exists, move `classifySendError` into its own `src/send-verdict.mjs` and import 
           .catch((err) => {
             if (socket.destroyed) return;
             const verdict = classifySendError(err);
-            log(`[daemon] send failed (${verdict.retryable ? "retryable" : "terminal"}): ${verdict.reason}`);
-            socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: verdict.retryable, reason: verdict.reason }));
+            const reason = clipReason(verdict.reason);
+            log(`[daemon] send failed (${verdict.retryable ? "retryable" : "terminal"}): ${reason}`);
+            socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: verdict.retryable, reason }));
           });
         return;
       }
@@ -548,7 +575,9 @@ role-agnostic); each frame type with a field table and direction, mirroring
 control summary (per-subscriber skip above HWM, gap-on-progress for channel, 4×HWM destroy
 backstop; reconnect with since_seq is the recovery); the send op contract incl. the optional
 `plaintext` boolean (default false; CLI `--plaintext` parity), the retryable/terminal taxonomy,
-the no-id-no-ack rule, and an explicit statement that the ack is INTENTIONALLY MINIMAL
+the no-id-no-ack rule, the `reason` cap (≤512 chars, control characters stripped at the daemon —
+relay-controlled text is length-unbounded; rendering-side escaping stays the GUI's job), and an
+explicit statement that the ack is INTENTIONALLY MINIMAL
 (`id, envelope_id, encrypted` — no thread_id/relay_seq; the archive is the source of truth for
 sent-row detail); a "Message fields" note that `contact`/`key_changed`/`thread_id`/`body` are
 OPTIONAL — omitted when falsy/unset (parsers must not require them); a "Versioning" section
