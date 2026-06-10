@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected.
+**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected. Task 5 amendment: watch viewer holds a ref'd keepAlive (unref'd backoff timer cannot pin the loop — probed exit-0 mid-outage); `log: () => {}` silences raw transport lines from the curated stdout feed; spawn harness waits exits via a consumed-event-safe `waitExit` helper; survival test added as C1 regression guard.
 
 **Goal:** Complete the daemon's roadmap-Phase-1 plumbing (spec §7 + §8): clients auto-reconnect with backoff and resume via `since_seq` in hello (closing the at-least-once "OR reconnect" trigger from §6); `air-msg watch` and `air-msg bridge` get their §7 decision-table rows; `air-msg daemon status` reports live socket state over IPC; `air-msg daemon install|uninstall` generates + loads launchd/systemd-user units; `daemon start --detach` backgrounds the process.
 
@@ -612,9 +612,14 @@ export function cleanStaleSocket() {
           onMessage: printFeedLine,
           onAttach: () => console.log(`${c.green("● watching")} ${c.dim("(attached to air-msgd — daemon owns the pull; Ctrl-C detaches only this feed)")}`),
           onDetach: () => console.log(c.dim("  …daemon connection lost — reconnecting")),
+          log: () => {},   // M1: suppress raw [client] transport lines from the curated stdout feed
         });
+        // C1: connectDaemonPersistent holds only an unref'd backoff timer during outages — it
+        // cannot pin the event loop. Signal listeners do not pin it either. This ref'd interval
+        // keeps the process alive across daemon restarts until the user explicitly Ctrl-Cs.
+        const keepAlive = setInterval(() => {}, 60_000);
         await new Promise((resolve) => {
-          const stop = () => { console.log(c.dim("\n…detaching from daemon")); handle.close(); resolve(); };
+          const stop = () => { console.log(c.dim("\n…detaching from daemon")); clearInterval(keepAlive); handle.close(); resolve(); };
           process.once("SIGINT", stop);
           process.once("SIGTERM", stop);
         });
@@ -633,6 +638,8 @@ Finally add `connectDaemonPersistent, cleanStaleSocket` to cli.mjs's existing `.
 // are invisible to core unit tests). Each spawn gets a temp home with a PRE-SEEDED identity —
 // VERIFY FIRST that ensureIdentity() is network-silent when identity.json exists; if it is not,
 // delete this file and extend the unit coverage instead, saying so in the commit message.
+// VERIFIED (empirically): ensureIdentity()/loadIdentity() re-derive the keypair from seed_hex —
+// no network call when identity.json exists.
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
@@ -648,10 +655,10 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "air-msg-table-"));
   chmodSync(dir, 0o700);
   process.env.AGENT_BRIDGE_HOME = dir;
-  // REAL identity.json shape (identity.mjs:133). seed_hex is the LOAD-BEARING field: loadIdentity()
-  // re-derives the keypair via generateIdentity(stored.seed_hex), and without it a fresh unrelated
-  // key is silently generated instead of failing loudly (critic v1 H2). ensureIdentity() makes no
-  // network call on this path (verified: identity.mjs:60-67). Public-key fields are re-derived
+  // REAL identity.json shape (fields from registerNewIdentity/loadIdentity in identity.mjs).
+  // seed_hex is the LOAD-BEARING field: loadIdentity() re-derives the keypair via
+  // generateIdentity(stored.seed_hex), and without it a fresh unrelated key is silently
+  // generated instead of failing loudly (critic v1 H2). Public-key fields are re-derived
   // from seed_hex on load, so placeholders are fine; the relay/air URLs are never contacted by
   // the code paths these tests exercise (.invalid guards against that ever changing silently).
   writeFileSync(join(dir, "identity.json"), JSON.stringify({
@@ -678,6 +685,13 @@ const runCli = (args, { env = {} } = {}) => {
   child.stderr.on("data", (d) => { out.stderr += d; });
   return { child, out };
 };
+
+/** I1: a consumed 'exit' event never re-fires; waitExit is safe whether the child already
+ *  exited (exitCode/signalCode set) or is still running (registers the once listener). */
+const waitExit = (ch) => (ch.exitCode !== null || ch.signalCode !== null)
+  ? Promise.resolve(ch.exitCode)
+  : new Promise((r) => ch.once("exit", r));
+
 const until = async (cond, ms = 5000) => {
   const t0 = Date.now();
   while (!cond()) {
@@ -697,8 +711,34 @@ test("§7 watch row: socket live → CLI attaches as viewer and renders daemon-d
     await until(() => out.stdout.includes("table-row-1"));
   } finally {
     child.kill("SIGINT");
-    await new Promise((r) => child.once("exit", r));
+    await waitExit(child);
     await ipc.close();
+  }
+});
+
+test("§7 watch row: viewer survives a daemon restart and re-renders mail", async () => {
+  // C1 regression guard: without the ref'd keepAlive the process exits ~500ms after onDetach
+  // (the unref'd backoff timer cannot pin the event loop). This test fails if keepAlive is removed.
+  const ipc = createIpcServer({ daemonInfo: { pid: 4242, start_time: "t", did: "did:wba:me" }, log: () => {} });
+  await ipc.listen();
+  const { child, out } = runCli(["watch"]);
+  try {
+    await until(() => out.stdout.includes("attached to air-msgd"));
+    await until(() => ipc.clientCount() === 1);
+    await ipc.close();
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(child.exitCode, null, "watch viewer must stay alive during daemon outage (C1: ref'd keepAlive required)");
+    const ipc2 = createIpcServer({ daemonInfo: { pid: 4243, start_time: "t2", did: "did:wba:me" }, log: () => {} });
+    await ipc2.listen();
+    try {
+      await until(() => out.stdout.indexOf("attached to air-msgd", out.stdout.indexOf("attached to air-msgd") + 1) !== -1, 8000);
+      await until(() => ipc2.clientCount() === 1, 8000);
+      await ipc2.sink.deliver({ envelope_id: "w2", seq: 4, from: "did:wba:x", verified: true, encrypted: false, body: { type: "text", text: "post-restart-mail" } });
+      await until(() => out.stdout.includes("post-restart-mail"), 5000);
+    } finally { await ipc2.close(); }
+  } finally {
+    child.kill("SIGINT");
+    await waitExit(child);
   }
 });
 
@@ -709,10 +749,19 @@ test("§7 bridge row: socket live → bridge refuses with a pointer at the daemo
   writeFileSync(join(dir, "bridge.json"), JSON.stringify({ telegram: { bot_token: "x", chat_id: 1 } }), { mode: 0o600 });
   const { child, out } = runCli(["bridge"]);
   try {
-    const code = await new Promise((r) => child.once("exit", r));
+    // Give the CLI 3 s to exit on its own (Task 6 wires the refusal; until then it hangs on
+    // acquireOrExit). Task 6's RED: probeDaemon not yet wired → child won't self-exit.
+    const code = await Promise.race([
+      waitExit(child),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("bridge did not exit within 3 s — probeDaemon not yet wired (Task 6 RED)")), 3000)),
+    ]);
     assert.equal(code, 1);
     assert.match(out.stderr, /daemon owns the message pull/);
-  } finally { await ipc.close(); }
+  } finally {
+    child.kill("SIGKILL");
+    await waitExit(child);
+    await ipc.close();
+  }
 });
 ```
 **Wire-fact verification inside this step:** before trusting the seeded `identity.json`/`bridge.json` shapes, read `src/identity.mjs` (`ensureIdentity`, the on-disk identity shape) and `src/bridge-config.mjs` or wherever `loadBridgeConfig` lives (cli.mjs:313) and adjust the fixtures to the REAL shapes. If `ensureIdentity()` cannot run network-silent from a seeded file, delete this spawn file, fall back to unit coverage (`probeDaemon` in Task 6 + `cleanStaleSocket` here), and say so in the commit message.

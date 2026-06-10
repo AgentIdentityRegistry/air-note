@@ -85,7 +85,7 @@ export function prepareSocketPath() {
  *  consumer lock (the lock proves no live daemon owns the path), remove any leftover socket so
  *  later probes fail fast with ENOENT instead of ECONNREFUSED. Never call without the lock. */
 export function cleanStaleSocket() {
-  try { rmSync(socketPath(), { force: true }); } catch { /* best effort */ }
+  prepareSocketPath();   // byte-identical rm — single-source the idiom; distinct doc contracts kept
 }
 
 /** The daemon's socket server. Returned `sink` plugs into fanOut ({name, deliver}).

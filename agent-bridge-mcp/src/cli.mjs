@@ -290,9 +290,14 @@ async function main() {
           onMessage: printFeedLine,
           onAttach: () => console.log(`${c.green("● watching")} ${c.dim("(attached to air-msgd — daemon owns the pull; Ctrl-C detaches only this feed)")}`),
           onDetach: () => console.log(c.dim("  …daemon connection lost — reconnecting")),
+          log: () => {},   // M1: suppress raw [client] transport lines from the curated stdout feed
         });
+        // C1: connectDaemonPersistent holds only an unref'd backoff timer during outages — it
+        // cannot pin the event loop. Signal listeners do not pin it either. This ref'd interval
+        // keeps the process alive across daemon restarts until the user explicitly Ctrl-Cs.
+        const keepAlive = setInterval(() => {}, 60_000);
         await new Promise((resolve) => {
-          const stop = () => { console.log(c.dim("\n…detaching from daemon")); handle.close(); resolve(); };
+          const stop = () => { console.log(c.dim("\n…detaching from daemon")); clearInterval(keepAlive); handle.close(); resolve(); };
           process.once("SIGINT", stop);
           process.once("SIGTERM", stop);
         });
