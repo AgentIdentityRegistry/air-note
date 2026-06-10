@@ -1,0 +1,108 @@
+name: systemd-smoke
+# Manual-dispatch REAL-LINUX smoke for the systemd-user installer path (spec §8/§9: the
+# generators are content-tested only — this run is the stated "manual smoke on a real box",
+# made repeatable). It exercises the two installer landmines on a real systemd:
+#   1. ExecStart + Environment= quoting — AGENT_BRIDGE_HOME deliberately contains a SPACE;
+#      an unquoted assignment would silently truncate the path and the socket assertion fails.
+#   2. Restart=always — the daemon is killed and must come back with a new MainPID.
+# The seeded identity is network-silent (seed_hex on disk; .invalid relay/air URLs) — the
+# daemon's relay loop just backs off forever, which is the designed degraded mode.
+on:
+  workflow_dispatch:
+
+jobs:
+  systemd-user-install:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent-bridge-mcp
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - run: npm ci
+
+      - name: Start a user systemd session for the runner
+        run: |
+          sudo loginctl enable-linger "$(whoami)"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+
+      - name: Wait for the user manager to answer
+        run: |
+          for i in $(seq 1 30); do
+            systemctl --user list-units >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "user systemd never came up" >&2; exit 1
+
+      - name: Seed a network-silent identity in a home WITH A SPACE
+        run: |
+          AIR_HOME="$RUNNER_TEMP/air home"
+          mkdir -p -m 700 "$AIR_HOME"
+          cat > "$AIR_HOME/identity.json" <<'JSON'
+          {
+            "version": 1,
+            "name": "systemd-smoke",
+            "air_id": "AIR-TEST-TEST-TEST",
+            "did": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST",
+            "seed_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+            "public_key_base64url": "",
+            "public_key_multibase": "",
+            "relay_url": "https://relay.invalid",
+            "air_url": "https://air.invalid",
+            "agent_secret": "smoke"
+          }
+          JSON
+          chmod 600 "$AIR_HOME/identity.json"
+          echo "AIR_HOME=$AIR_HOME" >> "$GITHUB_ENV"
+
+      - name: daemon install (writes unit + systemctl --user enable --now)
+        run: AGENT_BRIDGE_HOME="$AIR_HOME" node src/cli.mjs daemon install
+
+      - name: Assert unit active
+        run: |
+          for i in $(seq 1 15); do
+            state="$(systemctl --user is-active air-msg-daemon.service || true)"
+            [ "$state" = "active" ] && exit 0
+            sleep 1
+          done
+          echo "unit never became active (last: $state)" >&2
+          journalctl --user -u air-msg-daemon.service --no-pager | tail -30 >&2
+          exit 1
+
+      - name: Assert the daemon bound its socket INSIDE the spaced home (quoting proof)
+        run: |
+          out="$(AGENT_BRIDGE_HOME="$AIR_HOME" node src/cli.mjs daemon status)"
+          echo "$out"
+          echo "$out" | grep -q "daemon: running" || { echo "status not running" >&2; exit 1; }
+          echo "$out" | grep -qF "air home/daemon.sock" || { echo "socket NOT in the spaced home — Environment= quoting broke" >&2; exit 1; }
+
+      - name: Restart=always — kill the daemon, expect a new MainPID
+        run: |
+          old="$(systemctl --user show -p MainPID --value air-msg-daemon.service)"
+          [ "$old" != "0" ] || { echo "no MainPID" >&2; exit 1; }
+          kill "$old"
+          for i in $(seq 1 15); do
+            sleep 1
+            new="$(systemctl --user show -p MainPID --value air-msg-daemon.service)"
+            if [ "$new" != "0" ] && [ "$new" != "$old" ]; then
+              echo "relaunched: $old -> $new"; exit 0
+            fi
+          done
+          echo "daemon was not relaunched (old=$old new=$new)" >&2
+          journalctl --user -u air-msg-daemon.service --no-pager | tail -30 >&2
+          exit 1
+
+      - name: Journal evidence
+        if: always()
+        run: journalctl --user -u air-msg-daemon.service --no-pager | tail -25 || true
+
+      - name: daemon uninstall (disable --now + unit removed)
+        run: |
+          AGENT_BRIDGE_HOME="$AIR_HOME" node src/cli.mjs daemon uninstall
+          state="$(systemctl --user is-active air-msg-daemon.service || true)"
+          [ "$state" != "active" ] || { echo "unit still active after uninstall" >&2; exit 1; }
+          [ ! -f "$HOME/.config/systemd/user/air-msg-daemon.service" ] || { echo "unit file still present" >&2; exit 1; }
+          echo "uninstalled cleanly (state: $state)"
