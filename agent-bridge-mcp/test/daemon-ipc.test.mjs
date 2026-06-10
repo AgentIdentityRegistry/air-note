@@ -658,3 +658,43 @@ test("connectDaemonPersistent: a throwing onAttach on reattach is logged, not re
   assert.equal(callCount, 2, "connectFn must be called exactly twice — no pile-up of retries");
   assert.ok(logs.some((l) => /onAttach callback threw/.test(l)), "throw must be logged, not swallowed");
 });
+
+test("backstop recovery: a channel client destroyed at 4×HWM reconnects and resumes via since_seq gap (no final-gap-hint needed)", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 512 });
+  await ipc.listen();
+  try {
+    const got = []; const gaps = []; let attaches = 0;
+    const handle = await connectDaemonPersistent({
+      role: "channel",
+      onMessage: (m) => got.push(m.relay_seq),
+      onGap: (s) => gaps.push(s),
+      onAttach: () => { attaches += 1; },
+      initialBackoffMs: 10, backoffCapMs: 50,
+      log: () => {},
+    });
+    try {
+      await ipc.sink.deliver({ envelope_id: "b1", seq: 5, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "ok" } });
+      await until(() => got.length === 1);
+      handle._sock().pause();                          // wedge beneath the client parser
+      const huge = (i) => ({ envelope_id: `bH${i}`, seq: 10 + i, from: "did:wba:x", contact: "al",
+        verified: true, key_changed: false, body: { type: "text", text: "w".repeat(262144) } });
+      await ipc.sink.deliver(huge(0));                 // lands in the queue (>4×512 once written)
+      await ipc.sink.deliver(huge(1));                 // next deliver sees it wedged → destroy
+      await until(() => ipc.clientCount() === 0);      // backstop fired (Phase 3 semantics)
+      // A paused socket defers ALL stream events — including 'close' from the server-side
+      // destroy (Node readable semantics). Resume models the wedged consumer RECOVERING; in
+      // production the same wedge is a blocked event loop, which defers the close identically
+      // and unblocks the same way. No client-side liveness machinery is warranted for a local
+      // Unix socket (no half-open failure mode) — rejected as over-engineering.
+      handle._sock().resume();
+      await until(() => attaches === 2, 5000);         // wrapper reconnected
+      await until(() => gaps.length >= 1, 5000);       // resume gap arrived
+      // The drain after resume may parse the wedged-but-buffered huge frame (seq 10) before the
+      // close fires — or the server-side destroy may have truncated it mid-line. Both anchors
+      // are safe under at-least-once: replay is strictly-greater + envelope_id-deduped.
+      assert.ok([5, 10].includes(gaps[0]), `gap anchored at last fully-seen seq, got ${gaps[0]}`);
+      assert.equal(ipc.clientCount(), 1);              // healthy again
+    } finally { handle.close(); }
+  } finally { await ipc.close(); }
+});

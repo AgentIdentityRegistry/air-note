@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test.
+**Status:** v2 — v1 review returned **APPROVE-WITH-FIXES** (all wire-fact citations verified by the reviewer; the persistent wrapper's restart-resume and close-stops-loop scenarios were reproduced verbatim against the real server and passed; server-destroy was probed to fire client-side `close`, which Task 4 depends on). v2 applies every finding: **H1** systemd quoting marked as a manual-verify boundary + de-tautologized test comment; **H2** real identity fixture (`seed_hex` is the load-bearing field); **M1** baseline snapshot moved BEFORE the first connect (the reviewer probed a real loss window: a frame unparsed in the client buffer while the cursor advances past it); **M3** status reply excludes the requesting subscriber; **M5** quoted `node-version`; plus a backoff-escalation test, the watch-insertion disambiguation, rationale comments (sleep-before-retry, silent deliberate close, room notices in the viewer feed), log path beside the resolved home, and the half-install recovery hint. v3 — Task 2's post-landing quality review demonstrated two lifecycle defects in this plan's own Step-3 code (close-during-in-flight undead socket; throwing onAttach masquerading as a failed connect); code and plan amended together, with deterministic seam-based regression tests. Task 3's composition review added two fixes: a stdin-'end' orphan guard in channel-server (SDK onclose never fires on host death — probed), and gap-replay pagination in makeReplayer (page past the 500-row limit; short page terminates) with a deterministic pageSize=2 test. Task 4 amendment: the backstop-recovery test resumes the paused socket after destroy (paused sockets defer 'close'); liveness pings rejected.
 
 **Goal:** Complete the daemon's roadmap-Phase-1 plumbing (spec §7 + §8): clients auto-reconnect with backoff and resume via `since_seq` in hello (closing the at-least-once "OR reconnect" trigger from §6); `air-msg watch` and `air-msg bridge` get their §7 decision-table rows; `air-msg daemon status` reports live socket state over IPC; `air-msg daemon install|uninstall` generates + loads launchd/systemd-user units; `daemon start --detach` backgrounds the process.
 
@@ -524,9 +524,18 @@ test("backstop recovery: a channel client destroyed at 4×HWM reconnects and res
       await ipc.sink.deliver(huge(0));                 // lands in the queue (>4×512 once written)
       await ipc.sink.deliver(huge(1));                 // next deliver sees it wedged → destroy
       await until(() => ipc.clientCount() === 0);      // backstop fired (Phase 3 semantics)
+      // A paused socket defers ALL stream events — including 'close' from the server-side
+      // destroy (Node readable semantics). Resume models the wedged consumer RECOVERING; in
+      // production the same wedge is a blocked event loop, which defers the close identically
+      // and unblocks the same way. No client-side liveness machinery is warranted for a local
+      // Unix socket (no half-open failure mode) — rejected as over-engineering.
+      handle._sock().resume();
       await until(() => attaches === 2, 5000);         // wrapper reconnected
       await until(() => gaps.length >= 1, 5000);       // resume gap arrived
-      assert.equal(gaps[0], 5);                        // exactly the last seq the client SAW
+      // The drain after resume may parse the wedged-but-buffered huge frame (seq 10) before the
+      // close fires — or the server-side destroy may have truncated it mid-line. Both anchors
+      // are safe under at-least-once: replay is strictly-greater + envelope_id-deduped.
+      assert.ok([5, 10].includes(gaps[0]), `gap anchored at last fully-seen seq, got ${gaps[0]}`);
       assert.equal(ipc.clientCount(), 1);              // healthy again
     } finally { handle.close(); }
   } finally { await ipc.close(); }
@@ -536,7 +545,7 @@ test("backstop recovery: a channel client destroyed at 4×HWM reconnects and res
 - [ ] **Step 2: Run to verify pass**
 
 Run: `node --test test/daemon-ipc.test.mjs`
-Expected: PASS with code from Tasks 1–2 only. If it FAILS, that is a real Phase-4 integration bug — fix forward in `connectDaemonPersistent` (most likely suspect: the destroyed socket's `close` event racing the pause; the wrapper must reconnect off `onClose` regardless of who destroyed the socket).
+Expected: PASS with code from Tasks 1–2 only. If it FAILS, that is a real Phase-4 integration bug — fix forward in `connectDaemonPersistent` (the pause-wedge defers ALL client stream events including 'close' — the test must resume() after the destroy to model a recovering consumer; client-side liveness pings were prototyped and REJECTED: a blocked production event loop defers close identically and defeats timers too, and local Unix sockets have no half-open failure mode).
 
 - [ ] **Step 3: Commit**
 
