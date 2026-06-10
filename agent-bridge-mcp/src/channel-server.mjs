@@ -14,6 +14,7 @@ import { watch } from "./watch.mjs";
 import { makeChannelPush } from "./channel.mjs";
 import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 import { parseMuteSet } from "./peers.mjs";
+import { connectDaemon } from "./daemon-ipc.mjs";
 
 const server = new Server(
   { name: "air-msg-channel", version: CORE_VERSION },
@@ -29,22 +30,46 @@ const server = new Server(
 async function main() {
   await server.connect(new StdioServerTransport());
   const identity = await ensureIdentity();
-  if (!acquireOrExit("channel-server")) return;
-  // mute feeds the push gate (channelGate inside makeChannelPush). watch() builds its
-  // own mute from AIRMSG_MUTE for the (here no-op) notifier path, so we construct ours here.
   const mute = parseMuteSet();
+  const log = (s) => process.stderr.write(s + "\n");
+  // makeChannelPush keeps its own gate — harmless double-gating: the DAEMON's copy is the
+  // security boundary (other clients can't skip it); this one is local defense-in-depth.
+  const push = makeChannelPush(server, { mute, me: { airId: identity.air_id, did: identity.did } });
+
+  // Daemon-first (spec §7): attach as a gated channel client — NO consumer lock held.
+  try {
+    await connectDaemon({
+      role: "channel",
+      onMessage: push,
+      onClose: () => {
+        // Deliberate Phase-2 stopgap: clean exit on daemon restart/stop. Mail push pauses
+        // until this server is relaunched; Phase 4 replaces this with reconnect/backoff.
+        log("air-msg-channel: daemon connection closed — exiting cleanly (Phase 4 adds reconnect)");
+        process.exit(0);
+      },
+      log,
+    });
+    log(`air-msg-channel v${CORE_VERSION} attached to air-msgd for ${identity.did} (gate enforced by daemon)`);
+    process.once("SIGINT", () => process.exit(0));   // no lock held on this path — plain clean exit
+    process.once("SIGTERM", () => process.exit(0));
+    await new Promise(() => {});                     // stay alive until a signal or daemon close
+  } catch (e) {
+    if (e.code !== "DAEMON_DOWN") throw e;
+    log("air-msg-channel: no daemon — running standalone (legacy)");
+  }
+
+  // Legacy standalone fallback: unchanged Phase-1 behavior, takes the single consumer lock.
+  if (!acquireOrExit("channel-server")) return;
   const ac = new AbortController();
   process.once("SIGINT", () => { ac.abort(); releaseConsumerLock(); });
   process.once("SIGTERM", () => { ac.abort(); releaseConsumerLock(); });
-
   process.stderr.write(`air-msg-channel v${CORE_VERSION} watching ${identity.did} (push gate: verified+pinned)\n`);
-
   await watch({
     signal: ac.signal,
     identity,
-    notifier: { notify: async () => {} },          // no OS banner — the channel IS the delivery
-    openResolver: () => null,                        // unused on the channel path
-    onMessage: makeChannelPush(server, { mute, me: { airId: identity.air_id, did: identity.did } }),
+    notifier: { notify: async () => {} },
+    openResolver: () => null,
+    onMessage: push,
   }).catch((e) => { if (e?.name !== "AbortError") throw e; });   // clean signal shutdown
   releaseConsumerLock();
 }

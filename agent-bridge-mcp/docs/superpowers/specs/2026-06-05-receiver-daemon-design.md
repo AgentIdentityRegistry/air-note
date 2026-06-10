@@ -175,8 +175,16 @@ all clients, who reconnect and (for `channel`) receive a `gap` + replay.
 
 ## 11. Open questions
 
-- Does the relay's `/pull` SSE `since` guarantee no gap if two consumers briefly overlap during a
-  daemon↔legacy handoff, or does the relay dedup by cursor? (Affects the §7 transition window;
-  not verifiable from this repo.)
+- ~~Does the relay's `/pull` SSE `since` guarantee no gap if two consumers briefly overlap during a
+  daemon↔legacy handoff, or does the relay dedup by cursor?~~
+  **RESOLVED 2026-06-10:** `/pull` (poll AND SSE) filters `acked_at IS NULL` and is cursor-driven
+  (`since=N`) — see `~/air-site/relay/src/index.js` L193–237. Daemon and legacy share one
+  `AGENT_BRIDGE_HOME` → one cursor + the archive's `(envelope_id, direction)` PK dedup, so a brief
+  handoff overlap is at-least-once, never lossy.
 - Should `bridge` be *only* a daemon sink in v1 (simpler), or retain a standalone mode? (Current
   spec keeps standalone as the no-daemon fallback.)
+- Phase 2 note: the wire protocol stamps `relay_seq` from the pushed object's `seq` at the socket
+  boundary (`core.receive()`'s onMessage objects carry `seq`; `relay_seq` exists only on archive
+  rows) — Phase 3's gap/replay keys on `message.relay_seq` with no frame change.
+- Open (Phase 4): does the MCP host auto-relaunch a channel server that exits 0 when the daemon
+  goes away? Phase 2 ships clean-exit-on-disconnect as a stopgap; reconnect/backoff supersedes it.
