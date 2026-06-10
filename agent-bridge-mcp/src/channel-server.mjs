@@ -31,6 +31,7 @@ const server = new Server(
 
 async function main() {
   await server.connect(new StdioServerTransport());
+  server.onclose = () => process.exit(0);   // host gone — a channel with no audience must not reconnect forever
   const identity = await ensureIdentity();
   const mute = parseMuteSet();
   const log = (s) => process.stderr.write(s + "\n");
@@ -49,12 +50,12 @@ async function main() {
       // archiveExists()-gated so a status probe never materializes a fresh DB (daemon.mjs precedent).
       cursorFn: () => (archiveExists() ? getCursor() : null),
       onDetach: () => log("air-msg-channel: daemon connection lost — reconnecting with backoff"),
-      onAttach: () => log("air-msg-channel: attached to air-msgd (gate enforced by daemon)"),
+      onAttach: () => log(`air-msg-channel v${CORE_VERSION} attached to air-msgd for ${identity.did} (gate enforced by daemon)`),
       log,
     });
     process.once("SIGINT", () => process.exit(0));   // no lock held on this path — plain clean exit
     process.once("SIGTERM", () => process.exit(0));
-    await new Promise(() => {});                     // stay alive until a signal or daemon close
+    await new Promise(() => {});                     // stay alive until a signal or transport close
   } catch (e) {
     if (e.code !== "DAEMON_DOWN") throw e;
     log("air-msg-channel: no daemon — running standalone (legacy)");

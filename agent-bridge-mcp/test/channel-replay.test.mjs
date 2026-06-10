@@ -89,3 +89,26 @@ test("makeReplayer: bounded memory — the seen-set keeps only the most recent m
   for (let i = 0; i < 10; i++) replayer.live({ envelope_id: `e${i}`, seq: i });
   assert.equal(replayer.seenSize(), 3);
 });
+
+test("makeReplayer: gap() paginates past the pageSize limit — all rows pushed, stub called 3 times", async () => {
+  // Strict stub: when limit is missing it defaults to slicing 2, emulating a bounded real query.
+  // This makes the current (non-paginating) code deterministically RED: it calls the stub once
+  // with no limit arg, gets only 2 rows, and pushes only 2 — not all 5.
+  const all = [1, 2, 3, 4, 5].map((i) => row({ envelope_id: `ep${i}`, relay_seq: i }));
+  const calls = [];
+  const stub = (s, { limit } = {}) => {
+    calls.push(limit);
+    return all.filter((r) => r.relay_seq > s).slice(0, limit ?? 2);
+  };
+  const pushed = [];
+  const replayer = makeReplayer({
+    push: (m) => pushed.push(m.relay_seq),
+    replaySinceFn: stub,
+    contactLookup: () => undefined,
+    isBlockedFn: () => false,
+    pageSize: 2,
+  });
+  await replayer.gap(0);
+  assert.deepEqual(pushed, [1, 2, 3, 4, 5]);   // all 5 rows pushed in order
+  assert.equal(calls.length, 3);                // pages: [1,2], [3,4], [5] (short → stop)
+});
