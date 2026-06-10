@@ -74,10 +74,18 @@ jobs:
 
       - name: Assert the daemon bound its socket INSIDE the spaced home (quoting proof)
         run: |
-          out="$(AGENT_BRIDGE_HOME="$AIR_HOME" node src/cli.mjs daemon status)"
+          # is-active is instant for Type=simple (process spawned = active), but the daemon
+          # writes its PID file only AFTER binding the socket (deliberate: no stranded PID on a
+          # failed listen) — so "daemon: running" needs a few hundred ms of patience.
+          for i in $(seq 1 15); do
+            out="$(AGENT_BRIDGE_HOME="$AIR_HOME" node src/cli.mjs daemon status)"
+            echo "$out" | grep -q "daemon: running" && break
+            sleep 1
+          done
           echo "$out"
-          echo "$out" | grep -q "daemon: running" || { echo "status not running" >&2; exit 1; }
+          echo "$out" | grep -q "daemon: running" || { echo "status never reached running" >&2; exit 1; }
           echo "$out" | grep -qF "air home/daemon.sock" || { echo "socket NOT in the spaced home — Environment= quoting broke" >&2; exit 1; }
+          [ -S "$AIR_HOME/daemon.sock" ] || { echo "no socket file on disk in the spaced home" >&2; exit 1; }
 
       - name: Restart=always — kill the daemon, expect a new MainPID
         run: |
