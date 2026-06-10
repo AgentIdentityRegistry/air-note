@@ -121,6 +121,22 @@ silent-failure factory. So delivery guarantees differ by role:
 Fan-out is non-blocking per client: a slow channel client triggers gap+replay, it never stalls
 the daemon's `receive()` loop.
 
+- **Phase 3 (2026-06-10) implements this** with refinements: replay fidelity requires the
+  archive to record `key_changed` (added, default 0); the replay adapter re-derives `contact`
+  from CURRENT pins and re-checks the BLOCKLIST (live enforces it only at receive — replay must
+  too); synthetic room-join notices are excluded from replay (live never pushes them as chat).
+  Overflow is skip+count for all roles; a `channel` subscriber's pending gap is emitted on
+  **flush-on-progress** (the next successful write below the threshold OR drain — never drain
+  alone, which starves under slow-steady readers), with a 4×HWM destroy backstop for wedged
+  sockets. The concrete numbers supersede the illustrative 256 KiB above: skip above 1 MiB
+  (`highWaterMark`, also set as the subscriber sockets' stream HWM so `drain` arms at the same
+  threshold), destroy at 4×. The replay query is a dedicated `replaySince()` (not
+  `history({since_seq})`). Strict cursor mode lives behind `receive({strict})`, used only by
+  the daemon — it trades liveness for completeness: a persistently failing archive (e.g. disk
+  full) halts cursor advance and re-delivers the current page each wake (banner re-rings) until
+  writes succeed; degraded-but-safe and self-correcting. The "OR reconnect" gap trigger above
+  is Phase 4 (resume-on-reattach via since_seq in hello).
+
 ## 7. Daemon ↔ legacy resolution (no split-brain)
 
 The lock makes "just become a client" impossible without an explicit, ordered decision. Every
