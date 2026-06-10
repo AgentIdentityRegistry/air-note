@@ -83,8 +83,10 @@ Expected: FAIL — journal_mode is `delete` (or another non-wal mode), busy_time
   // exactly during gap-replay bursts. WAL allows one writer + many readers; it is a PERSISTENT
   // file property the WRITER must set. journal_mode/busy_timeout are read-back pragmas — use
   // .get(), not .run() (some builds error on run for row-returning pragmas).
-  db.prepare("PRAGMA journal_mode=WAL").get();
+  // busy_timeout FIRST: the WAL conversion itself can contend with a concurrent writer and must
+  // inherit the retry window.
   db.prepare("PRAGMA busy_timeout=5000").get();
+  db.prepare("PRAGMA journal_mode=WAL").get();
 ```
 
 - [ ] **Step 4: Run to verify pass**
