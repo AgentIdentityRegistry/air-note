@@ -255,7 +255,7 @@ test("ipc server: a silent connection that never says hello is reaped", async ()
   } finally { await ipc.close(); }
 });
 
-import { connectDaemon, connectDaemonPersistent } from "../src/daemon-ipc.mjs";
+import { connectDaemon, connectDaemonPersistent, probeDaemon } from "../src/daemon-ipc.mjs";
 
 test("connectDaemon: handshakes, then delivers admitted messages to onMessage", async () => {
   chmodSync(dir, 0o700);
@@ -705,4 +705,15 @@ test("cleanStaleSocket: removes a stale socket file; never throws when absent", 
   cleanStaleSocket();
   assert.equal(existsSync(socketPath()), false);
   cleanStaleSocket();                                  // absent → still fine
+});
+
+test("probeDaemon: true against a live daemon socket, false when nothing listens", async () => {
+  chmodSync(dir, 0o700);
+  assert.equal(await probeDaemon({ timeoutMs: 300 }), false);   // nothing there
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    assert.equal(await probeDaemon(), true);
+    await until(() => ipc.clientCount() === 0);                 // probe detached cleanly
+  } finally { await ipc.close(); }
 });

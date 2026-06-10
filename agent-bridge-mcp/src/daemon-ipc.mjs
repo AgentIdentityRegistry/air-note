@@ -356,3 +356,16 @@ export function connectDaemonPersistent({
     };
   });
 }
+
+/** One-shot liveness probe (§7 decision table): is a daemon answering the socket RIGHT NOW?
+ *  Attaches as a throwaway viewer and detaches immediately — the socket answering hello is the
+ *  truth the table keys on (a PID file can outlive a crashed daemon; ECONNREFUSED cannot lie). */
+export async function probeDaemon({ timeoutMs = 1500 } = {}) {
+  try {
+    const h = await connectDaemon({ role: "viewer", onMessage: () => {}, handshakeMs: timeoutMs, log: () => {} });
+    h.close();
+    return true;
+  } catch {
+    return false;
+  }
+}

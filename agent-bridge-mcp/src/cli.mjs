@@ -31,7 +31,7 @@ import { createTelegramAdapter, captureFirstChat } from "./adapters/telegram.mjs
 import { makeBridgeOutbound, makeReplyHandler, makeConfirmStore } from "./bridge.mjs";
 import { getUpdateOffset, setUpdateOffset, pruneRoutes } from "./bridge-routes.mjs";
 import { createInterface } from "node:readline/promises";
-import { connectDaemonPersistent, cleanStaleSocket } from "./daemon-ipc.mjs";
+import { connectDaemonPersistent, cleanStaleSocket, probeDaemon } from "./daemon-ipc.mjs";
 
 const tty = process.stdout.isTTY;
 const c = {
@@ -340,7 +340,17 @@ async function main() {
         console.error("Bridge not configured. Run: air-msg bridge setup");
         process.exit(1);
       }
+      // §7 bridge row: the daemon owns the pull; a standalone bridge beside it would fight for
+      // the consumer lock and lose with a generic message — refuse with the real reason instead.
+      // (In-daemon Telegram is the "bridge to doorbell-grade" roadmap item, not Phase 4.)
+      if (await probeDaemon()) {
+        console.error("bridge: the daemon owns the message pull on this identity.");
+        console.error("Stop it first (air-msg daemon stop) to run the standalone bridge,");
+        console.error("or keep the daemon — in-daemon Telegram is on the roadmap.");
+        process.exit(1);
+      }
       if (!acquireOrExit("bridge")) break;
+      cleanStaleSocket();                              // §7 row 2: lock acquired proves socket is stale
       try {
         const identity = await ensureIdentity();
         const bodyMode = process.env.AIRMSG_BRIDGE_BODY === "meta" ? "meta" : "full";

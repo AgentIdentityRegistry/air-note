@@ -14,7 +14,7 @@ import { watch } from "./watch.mjs";
 import { makeChannelPush } from "./channel.mjs";
 import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 import { parseMuteSet } from "./peers.mjs";
-import { connectDaemonPersistent } from "./daemon-ipc.mjs";
+import { connectDaemonPersistent, cleanStaleSocket } from "./daemon-ipc.mjs";
 import { getCursor, archiveExists } from "./archive.mjs";
 import { makeReplayer } from "./channel-replay.mjs";
 
@@ -66,6 +66,7 @@ async function main() {
 
   // Legacy standalone fallback: unchanged Phase-1 behavior, takes the single consumer lock.
   if (!acquireOrExit("channel-server")) return;
+  cleanStaleSocket();                              // §7 row 2: lock acquired proves socket is stale
   const ac = new AbortController();
   process.once("SIGINT", () => { ac.abort(); releaseConsumerLock(); });
   process.once("SIGTERM", () => { ac.abort(); releaseConsumerLock(); });
