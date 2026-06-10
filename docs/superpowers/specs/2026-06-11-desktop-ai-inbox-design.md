@@ -67,7 +67,9 @@ interaction — a slow relay POST delays both, accepted). **Fail-fast is a delib
 no outbox; a send during a relay blip surfaces as an error row, not a silent queue. A persistent
 outbox is a named v1.5 follow-up. Send is accepted from any POST-hello subscriber regardless of
 role: roles are DELIVERY filters (confidentiality), not request authority — the 0600 socket is
-the OS user boundary, and any process that can connect could already run `air-msg send`.
+the OS user boundary, and any process that can connect could already run `air-msg send`. The
+frame also carries an optional `plaintext` boolean (default false; CLI `--plaintext` parity,
+needed for hermetic tests) — the desktop always sends encrypted.
 
 ## 4. Identity adoption (Phase A) — the collision is the primary case
 
