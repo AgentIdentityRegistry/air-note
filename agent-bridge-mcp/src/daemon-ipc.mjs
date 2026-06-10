@@ -85,10 +85,12 @@ export function prepareSocketPath() {
  *  Each subscriber declared a role at hello; deliver() applies admitForRole per subscriber
  *  BEFORE writing — the daemon enforces, the client never chooses (spec §5).
  *
- *  Flow control (Phase-2 FLOOR, not the Phase-3 §6 semantics): a subscriber whose unflushed
- *  node-side queue (`socket.writableLength`) exceeds `highWaterMark` is DROPPED with a log —
- *  an always-on daemon must never let one wedged local client balloon its memory. Phase 3
- *  replaces drop-the-client with per-role buffers + gap/replay for `channel`. */
+ *  Flow control (spec §6): a subscriber whose unflushed node-side queue (`socket.writableLength`)
+ *  exceeds `highWaterMark` has writes SKIPPED with a per-subscriber count; on progress (drain or
+ *  a successful write back below the threshold) `channel` gets ONE gap frame (its cue to replay
+ *  from the archive) while viewer/bridge just log the drop count (best-effort roles). A queue
+ *  past 4×highWaterMark means truly wedged — that client is destroyed (the absolute backstop:
+ *  an always-on daemon must never let one wedged local client balloon its memory). */
 export function createIpcServer({
   mute = new Set(),
   daemonInfo = {},
@@ -96,9 +98,14 @@ export function createIpcServer({
   helloTimeoutMs = 5000,                      // pre-hello idlers are reaped (fd-pin guard)
   log = (s) => process.stderr.write(s + "\n"),
 } = {}) {
-  const subscribers = new Set();   // { socket, role }
+  const subscribers = new Set();   // { socket, role, lastSeq, dropped, flushPending }
 
-  const server = createServer((socket) => {
+  // Socket-stream HWM = policy HWM: 'drain' only fires after a write() returned FALSE, and
+  // write() only returns false once writableLength crosses the STREAM's writableHighWaterMark
+  // (default 16 KiB) — but the skip band stops writing at the POLICY threshold first. Unless
+  // the two thresholds coincide, the crossing write never returns false, drain is never armed,
+  // and a fully-drained client would wait forever for its gap frame.
+  const server = createServer({ highWaterMark }, (socket) => {
     let sub = null;
     const reaper = setTimeout(() => { if (!sub) socket.destroy(); }, helloTimeoutMs);
     const feed = makeLineParser((frame) => {
@@ -109,10 +116,28 @@ export function createIpcServer({
           return;
         }
         clearTimeout(reaper);
-        sub = { socket, role: frame.role };
+        sub = { socket, role: frame.role, lastSeq: null, dropped: 0 };
         subscribers.add(sub);
         socket.write(encodeFrame({ type: "hello-ok", ...daemonInfo }));
         log(`[daemon] client attached: role=${frame.role} (${subscribers.size} connected)`);
+        // C1 (critic, empirically reproduced): 'drain' fires only after a write() returned
+        // false AND the buffer empties to ZERO — a slow-but-steady reader can keep the queue
+        // non-empty forever while our skip-pattern suppresses write(), starving the gap.
+        // Therefore: flush pending drops on ANY progress (drain OR a successful write below
+        // the threshold), never on drain alone.
+        const flushPending = () => {
+          if (!sub || sub.dropped === 0) return;
+          if (sub.socket.writableLength > highWaterMark) return;   // still congested — wait for progress
+          if (sub.role === "channel") {
+            socket.write(encodeFrame({ type: "gap", after_seq: sub.lastSeq ?? 0 }));
+            log(`[daemon] gap → channel client (skipped ${sub.dropped}, after_seq=${sub.lastSeq ?? 0})`);
+          } else {
+            log(`[daemon] dropped ${sub.dropped} msgs to ${sub.role} client (slow consumer)`);
+          }
+          sub.dropped = 0;
+        };
+        sub.flushPending = flushPending;
+        socket.on("drain", flushPending);
         return;
       }
       if (frame.type === "ping") socket.write(encodeFrame({ type: "pong" }));
@@ -133,22 +158,35 @@ export function createIpcServer({
     sink: {
       name: "socket",
       deliver: (m) => {
-        // Stamp relay_seq at the boundary: onMessage objects carry `seq` (core.mjs:467/:537);
-        // `relay_seq` otherwise exists only on the archive row. Phase 3 keys gap/replay on this.
+        // Stamp relay_seq at the boundary (Phase 2): onMessage objects carry `seq`.
         const wire = m && m.seq !== undefined && m.relay_seq === undefined ? { ...m, relay_seq: m.seq } : m;
         for (const sub of subscribers) {
           if (!admitForRole(sub.role, m, { mute })) continue;
-          if (sub.socket.writableLength > highWaterMark) {
-            log(`[daemon] dropping slow ${sub.role} client (writableLength=${sub.socket.writableLength})`);
-            sub.socket.destroy();               // 'close' handler deregisters it
+          const queued = sub.socket.writableLength;
+          if (queued > highWaterMark * 4) {
+            // Truly wedged: protect the daemon (absolute backstop; spec §6 floor).
+            log(`[daemon] destroying wedged ${sub.role} client (writableLength=${queued})`);
+            sub.socket.destroy();
             continue;
           }
-          // Best-effort write; real dead-socket reclamation is the close/error handler above.
+          if (queued > highWaterMark) {
+            // Soft overflow: skip this write. channel recovers via gap+replay on progress;
+            // viewer/bridge are best-effort (drop + count) per spec §6.
+            sub.dropped += 1;
+            continue;
+          }
           sub.socket.write(encodeFrame({ type: "message", message: wire }));
+          if (wire && wire.relay_seq !== undefined) sub.lastSeq = wire.relay_seq;
+          // INVARIANT (critic M1): every channel-admissible message carries seq (receive()
+          // always sets it), so lastSeq is never null once a real write happened — a gap's
+          // after_seq=0 full-window replay can only occur before ANY successful write (bounded
+          // by replaySince's limit).
+          sub.flushPending?.();   // C1: emit any pending gap now that we made progress
         }
       },
     },
     clientCount: () => subscribers.size,
+    clientStats: () => [...subscribers].map((s) => ({ role: s.role, dropped: s.dropped, lastSeq: s.lastSeq })),   // test seam
     listen: async () => {
       assertSafeHome();
       prepareSocketPath();                  // caller (startDaemon) holds the consumer lock
