@@ -81,6 +81,13 @@ export function prepareSocketPath() {
   try { rmSync(socketPath(), { force: true }); } catch { /* best effort */ }
 }
 
+/** §7 stale-socket hygiene for LEGACY entrypoints: after a standalone consumer ACQUIRED the
+ *  consumer lock (the lock proves no live daemon owns the path), remove any leftover socket so
+ *  later probes fail fast with ENOENT instead of ECONNREFUSED. Never call without the lock. */
+export function cleanStaleSocket() {
+  try { rmSync(socketPath(), { force: true }); } catch { /* best effort */ }
+}
+
 /** The daemon's socket server. Returned `sink` plugs into fanOut ({name, deliver}).
  *  Each subscriber declared a role at hello; deliver() applies admitForRole per subscriber
  *  BEFORE writing — the daemon enforces, the client never chooses (spec §5).
@@ -278,7 +285,11 @@ export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () 
  *  first successful attach it never gives up until close().
  *
  *  Callbacks (onAttach, onDetach, onMessage, onGap) are invoked from socket event handlers and
- *  the reconnect loop; they are guarded against throws, but SHOULD not throw. */
+ *  the reconnect loop; they are guarded against throws on the reconnect path (the first-attach
+ *  onAttach in the .then() is unguarded — callers SHOULD NOT throw from onAttach). During a
+ *  backoff window the wrapper holds only an unref'd timer, so a process whose ONLY live handle
+ *  is this client may exit mid-outage — callers must hold another handle (stdio transport,
+ *  stdin, a server) to outlive outages. */
 export function connectDaemonPersistent({
   role, onMessage, onGap = () => {}, onAttach = () => {}, onDetach = () => {},
   cursorFn = () => null,

@@ -114,7 +114,7 @@ test("admitForRole(channel): room messages route through the ROOM gate (member a
 });
 
 import { chmodSync, mkdirSync, statSync, writeFileSync, existsSync } from "node:fs";
-import { assertSafeHome, prepareSocketPath, socketPath } from "../src/daemon-ipc.mjs";
+import { assertSafeHome, prepareSocketPath, socketPath, cleanStaleSocket } from "../src/daemon-ipc.mjs";
 
 test("assertSafeHome: 0700 home passes; group- or other-writable home refuses", () => {
   const home = join(dir, "h1"); mkdirSync(home, { mode: 0o700 });
@@ -697,4 +697,12 @@ test("backstop recovery: a channel client destroyed at 4×HWM reconnects and res
       assert.equal(ipc.clientCount(), 1);              // healthy again
     } finally { handle.close(); }
   } finally { await ipc.close(); }
+});
+
+test("cleanStaleSocket: removes a stale socket file; never throws when absent", () => {
+  chmodSync(dir, 0o700);
+  writeFileSync(socketPath(), "");                     // stale leftover from a crashed daemon
+  cleanStaleSocket();
+  assert.equal(existsSync(socketPath()), false);
+  cleanStaleSocket();                                  // absent → still fine
 });

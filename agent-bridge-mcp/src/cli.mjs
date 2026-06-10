@@ -31,6 +31,7 @@ import { createTelegramAdapter, captureFirstChat } from "./adapters/telegram.mjs
 import { makeBridgeOutbound, makeReplyHandler, makeConfirmStore } from "./bridge.mjs";
 import { getUpdateOffset, setUpdateOffset, pruneRoutes } from "./bridge-routes.mjs";
 import { createInterface } from "node:readline/promises";
+import { connectDaemonPersistent, cleanStaleSocket } from "./daemon-ipc.mjs";
 
 const tty = process.stdout.isTTY;
 const c = {
@@ -274,7 +275,33 @@ async function main() {
     }
     case "watch": {
       const identity = await ensureIdentity();
+      const printFeedLine = (m) => {
+        const who = m.contact ? m.contact : m.from;
+        const enc = m.encrypted ? "🔒" : "✉️ ";
+        const vrf = m.verified ? c.green("✓") : c.red("✗");
+        console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
+        console.log(`    ${bodyText(m.body)}`);
+      };
+      // §7 row 1: socket live → attach as viewer (no lock, no second banner — the daemon's
+      // bannerSink already rings; this terminal is a passive feed).
+      try {
+        const handle = await connectDaemonPersistent({
+          role: "viewer",
+          onMessage: printFeedLine,
+          onAttach: () => console.log(`${c.green("● watching")} ${c.dim("(attached to air-msgd — daemon owns the pull; Ctrl-C detaches only this feed)")}`),
+          onDetach: () => console.log(c.dim("  …daemon connection lost — reconnecting")),
+        });
+        await new Promise((resolve) => {
+          const stop = () => { console.log(c.dim("\n…detaching from daemon")); handle.close(); resolve(); };
+          process.once("SIGINT", stop);
+          process.once("SIGTERM", stop);
+        });
+        break;
+      } catch (e) {
+        if (e.code !== "DAEMON_DOWN") throw e;         // §7 rows 2-3: no daemon → legacy standalone below
+      }
       if (!acquireOrExit("watch")) break;
+      cleanStaleSocket();                              // §7 row 2: lock acquired proves socket is stale
       try {
         const openMode = process.env.AIRMSG_OPEN || "terminal-history";
         const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
@@ -293,14 +320,7 @@ async function main() {
 
         await watch({
           signal: ac.signal, identity, notifier, openResolver,
-          onMessage: (m) => {
-            const who = m.contact ? m.contact : m.from;
-            const enc = m.encrypted ? "🔒" : "✉️ ";
-            const vrf = m.verified ? c.green("✓") : c.red("✗");
-            const txt = bodyText(m.body);
-            console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
-            console.log(`    ${txt}`);
-          },
+          onMessage: printFeedLine,
         }).catch((e) => { if (e?.name !== "AbortError") throw e; });
       } finally {
         releaseConsumerLock();
