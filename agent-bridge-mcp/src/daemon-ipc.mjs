@@ -116,7 +116,11 @@ export function createIpcServer({
           return;
         }
         clearTimeout(reaper);
-        sub = { socket, role: frame.role, lastSeq: Number.isFinite(frame.since_seq) ? frame.since_seq : null, dropped: 0 };
+        // Hoist ONE constant so seed-and-gap share a value AND the seed is channel-only:
+        // a viewer's reported lastSeq must never reflect a seq that was never delivered to it
+        // (since_seq is ignored for best-effort roles; the constant guards both the seed and the gap).
+        const resumeSeq = frame.role === "channel" && Number.isFinite(frame.since_seq) ? frame.since_seq : null;
+        sub = { socket, role: frame.role, lastSeq: resumeSeq, dropped: 0 };
         subscribers.add(sub);
         socket.write(encodeFrame({ type: "hello-ok", ...daemonInfo }));
         log(`[daemon] client attached: role=${frame.role} (${subscribers.size} connected)`);
@@ -142,9 +146,9 @@ export function createIpcServer({
         // left off gets an immediate gap; its Phase-3 replayer fills the hole from the archive.
         // The daemon stays stateless about client history — the client's archive is the source.
         // Viewer/bridge are best-effort roles: since_seq is ignored for them.
-        if (sub.role === "channel" && Number.isFinite(frame.since_seq)) {
-          socket.write(encodeFrame({ type: "gap", after_seq: frame.since_seq }));
-          log(`[daemon] resume: gap → channel client (after_seq=${frame.since_seq})`);
+        if (resumeSeq !== null) {
+          socket.write(encodeFrame({ type: "gap", after_seq: resumeSeq }));
+          log(`[daemon] resume: gap → channel client (after_seq=${resumeSeq})`);
         }
         return;
       }
@@ -221,7 +225,9 @@ export function createIpcServer({
 /** Connect to the local daemon socket as `role`. Resolves AFTER hello-ok with a {close()}
  *  handle; gated messages stream to onMessage(m). Rejects with {code:"DAEMON_DOWN"} when no
  *  daemon is reachable (callers use that to fall back to legacy standalone — spec §7).
- *  Reconnect/backoff is Phase 4; Phase 2 surfaces onClose and lets the caller decide. */
+ *  `sinceSeq`: pass the max-seen relay_seq; the daemon answers a channel hello bearing it with
+ *  an immediate gap into `onGap` so the Phase-3 replayer can fill the outage window.
+ *  For persistent reconnect with backoff, use `connectDaemonPersistent` instead. */
 export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () => {}, sinceSeq, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
   return new Promise((resolve, reject) => {
     const sock = createConnection(socketPath());
@@ -254,5 +260,78 @@ export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () 
     }, { onError: (e) => log(`[client] bad frame from daemon: ${e.message}`) });
     sock.on("data", feed);
     sock.on("close", () => { if (ready) onClose(); });
+  });
+}
+
+/** Persistent daemon client (spec §7 reconnect contract): wraps connectDaemon with auto-reconnect
+ *  + exponential backoff (reset on a successful attach), and resume-on-reattach for `channel`.
+ *
+ *  Resume bookkeeping: tracks the max relay_seq seen on message frames; every REconnect sends
+ *  since_seq = maxSeen ?? baseline, where baseline = cursorFn() snapshotted at the FIRST attach.
+ *  The baseline closes the outage-window hole: a client that saw no frames before the daemon
+ *  bounced would otherwise reattach live-from-attach and silently miss mail the restarted daemon
+ *  pulled in between. cursorFn is injected (archive stays out of this transport module); the
+ *  FIRST attach deliberately sends NO since_seq — a fresh session is live-from-attach (spec §4).
+ *
+ *  The returned promise settles like connectDaemon: rejects DAEMON_DOWN if the FIRST attempt
+ *  finds no daemon (callers use that to fall back to legacy standalone, spec §7); after the
+ *  first successful attach it never gives up until close(). */
+export function connectDaemonPersistent({
+  role, onMessage, onGap = () => {}, onAttach = () => {}, onDetach = () => {},
+  cursorFn = () => null,
+  initialBackoffMs = 500, backoffCapMs = 5000,
+  connectFn = connectDaemon,                            // test seam
+  log = (s) => process.stderr.write(s + "\n"),
+}) {
+  let stopped = false;
+  let current = null;
+  let maxSeen = null;
+  // Baseline BEFORE the first connect (critic v1 M1, probed): a frame can sit unparsed in this
+  // client's socket buffer while the daemon advances the cursor past it — a post-attach snapshot
+  // can then skip that seq on resume (replaySince is strictly-greater-than). An early, over-broad
+  // baseline only costs a few envelope_id-deduped replays; a late one loses mail.
+  let baseline = null;
+  try { baseline = cursorFn(); } catch { baseline = null; }
+  const seen = (m) => {
+    if (m && Number.isFinite(m.relay_seq) && (maxSeen === null || m.relay_seq > maxSeen)) maxSeen = m.relay_seq;
+    onMessage(m);
+  };
+
+  const reconnectLoop = async () => {
+    let backoff = initialBackoffMs;
+    while (!stopped) {
+      // Sleep BEFORE the first retry on purpose: onClose means the daemon is gone RIGHT NOW —
+      // an immediate attempt would just burn an ECONNREFUSED.
+      await new Promise((r) => setTimeout(r, backoff));
+      if (stopped) return;
+      try {
+        const sinceSeq = maxSeen ?? baseline ?? undefined;
+        current = await connectFn({
+          role, sinceSeq, onMessage: seen, onGap,
+          onClose: () => { if (!stopped) { onDetach(); void reconnectLoop(); } },
+          log,
+        });
+        onAttach();
+        log(`[client] reattached to air-msgd as ${role}${Number.isFinite(sinceSeq) ? ` (resume since_seq=${sinceSeq})` : ""}`);
+        return;
+      } catch {
+        backoff = Math.min(backoff * 2, backoffCapMs);  // daemon still down — keep trying
+      }
+    }
+  };
+
+  return connectFn({
+    role, onMessage: seen, onGap,
+    onClose: () => { if (!stopped) { onDetach(); void reconnectLoop(); } },
+    log,
+  }).then((first) => {
+    current = first;
+    onAttach();
+    return {
+      // A deliberate close() is SILENT (no onDetach): `stopped` flips first, so the socket's
+      // close event takes the if(!stopped) branch. Don't "fix" this into a spurious detach log.
+      close: () => { stopped = true; current?.close(); },
+      _sock: () => current?._sock,                      // test seam (backstop-recovery round-trip)
+    };
   });
 }

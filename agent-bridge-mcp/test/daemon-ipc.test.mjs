@@ -255,7 +255,7 @@ test("ipc server: a silent connection that never says hello is reaped", async ()
   } finally { await ipc.close(); }
 });
 
-import { connectDaemon } from "../src/daemon-ipc.mjs";
+import { connectDaemon, connectDaemonPersistent } from "../src/daemon-ipc.mjs";
 
 test("connectDaemon: handshakes, then delivers admitted messages to onMessage", async () => {
   chmodSync(dir, 0o700);
@@ -461,7 +461,7 @@ test("hello with since_seq: viewer gets NO gap (best-effort role); channel witho
   } finally { await ipc.close(); }
 });
 
-test("hello with since_seq seeds lastSeq: an overflow gap before any write resumes from since_seq, not 0", async () => {
+test("hello with since_seq seeds lastSeq so a later gap is anchored at since_seq, not 0", async () => {
   chmodSync(dir, 0o700);
   const ipc = ipcFor();
   await ipc.listen();
@@ -484,4 +484,111 @@ test("connectDaemon: sinceSeq option puts since_seq on the wire and the gap roun
     assert.equal(gapAt, 7);
     h.close();
   } finally { await ipc.close(); }
+});
+
+test("connectDaemonPersistent: first attempt with no daemon rejects DAEMON_DOWN (caller falls back standalone)", async () => {
+  chmodSync(dir, 0o700);
+  await assert.rejects(
+    () => connectDaemonPersistent({ role: "viewer", onMessage: () => {}, log: () => {} }),
+    (e) => e.code === "DAEMON_DOWN",
+  );
+});
+
+test("connectDaemonPersistent: survives a daemon restart and resumes with since_seq = max seen relay_seq", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  const got = []; const gaps = []; let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "channel",
+    onMessage: (m) => got.push(m.relay_seq),
+    onGap: (s) => gaps.push(s),
+    onAttach: () => { attaches += 1; },
+    initialBackoffMs: 10, backoffCapMs: 50,
+    log: () => {},
+  });
+  try {
+    await a.sink.deliver({ envelope_id: "p1", seq: 7, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "hi" } });
+    await until(() => got.length === 1);
+    await a.close();                                   // daemon "restart": all clients dropped
+    const b = ipcFor();
+    await b.listen();                                  // same dir → same socket path
+    try {
+      await until(() => attaches === 2, 5000);         // wrapper reconnected by itself
+      await until(() => gaps.length === 1, 5000);      // resume: hello carried since_seq=7 → gap(7)
+      assert.equal(gaps[0], 7);
+      await b.sink.deliver({ envelope_id: "p2", seq: 8, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "again" } });
+      await until(() => got.length === 2);
+      assert.deepEqual(got, [7, 8]);                   // live flow resumed on the new daemon
+    } finally { handle.close(); await b.close(); }
+  } catch (e) { handle.close(); await a.close().catch(() => {}); throw e; }
+});
+
+test("connectDaemonPersistent: reconnect with NOTHING seen falls back to the cursorFn baseline (outage-window mail is not lost)", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  const gaps = []; let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "channel",
+    onMessage: () => {},
+    onGap: (s) => gaps.push(s),
+    onAttach: () => { attaches += 1; },
+    cursorFn: () => 42,                                // archive cursor snapshot at first attach
+    initialBackoffMs: 10, backoffCapMs: 50,
+    log: () => {},
+  });
+  try {
+    assert.equal(gaps.length, 0);                      // FIRST attach is live-from-attach: no since_seq, no gap
+    await a.close();
+    const b = ipcFor();
+    await b.listen();
+    try {
+      await until(() => attaches === 2, 5000);
+      await until(() => gaps.length === 1, 5000);
+      assert.equal(gaps[0], 42);                       // saw no frames → resumed from the baseline
+    } finally { handle.close(); await b.close(); }
+  } catch (e) { handle.close(); await a.close().catch(() => {}); throw e; }
+});
+
+test("connectDaemonPersistent: survives MULTIPLE backoff cycles while the daemon stays down, then reattaches", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {}, onAttach: () => { attaches += 1; },
+    initialBackoffMs: 10, backoffCapMs: 20,
+    log: () => {},
+  });
+  try {
+    await a.close();
+    await new Promise((r) => setTimeout(r, 120));      // several failed retry cycles at the 20ms cap
+    const b = ipcFor();
+    await b.listen();
+    try {
+      await until(() => attaches === 2, 5000);         // the loop survived repeated failures + the cap
+      assert.equal(b.clientCount(), 1);
+    } finally { handle.close(); await b.close(); }
+  } catch (e) { handle.close(); throw e; }
+});
+
+test("connectDaemonPersistent: close() stops the reconnect loop for good", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {}, onAttach: () => { attaches += 1; },
+    initialBackoffMs: 10, log: () => {},
+  });
+  handle.close();
+  await a.close();
+  const b = ipcFor();
+  await b.listen();
+  try {
+    await new Promise((r) => setTimeout(r, 150));      // > several backoff periods
+    assert.equal(attaches, 1);                         // never re-attached after close()
+    assert.equal(b.clientCount(), 0);
+  } finally { await b.close(); }
 });
