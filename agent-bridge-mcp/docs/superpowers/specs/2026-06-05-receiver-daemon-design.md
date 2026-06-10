@@ -187,6 +187,11 @@ launchd/systemd provide no user PATH), `start --detach`, and the defined `status
 PID-file block plus a live-over-IPC block (`{type:"status"}` frame → socket path, clients with
 roles, last delivered relay_seq, enabled sinks). A PID-alive-but-socket-unreachable daemon is
 reported as possible split-brain rather than guessed at.
+Both installer smokes are DONE (2026-06-11): macOS `daemon install` live on the real machine
+(encrypted relay round-trip + KeepAlive relaunch proven), and the systemd path on real ubuntu via
+the repeatable `.github/workflows/systemd-smoke.yml` (manual dispatch; spaced-home quoting,
+Restart=always, clean uninstall). The systemd generator stays content-tested in unit tests; the
+workflow is the runtime gate — re-run it after generator changes.
 
 ## 9. Testing
 

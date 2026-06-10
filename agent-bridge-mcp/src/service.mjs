@@ -42,10 +42,10 @@ export function launchdPlist({ nodePath, cliPath, home, logPath }) {
 
 /** Linux systemd-user unit: same contract as the LaunchAgent.
  *  QUOTING BOUNDARY (critic v1 H1): systemd does its own word-splitting — double quotes group
- *  tokens per systemd.service(5) — but this generator is content-tested only; no systemd exists
- *  in the dev environment, so the actual enable/--now load is a REQUIRED manual smoke on a real
- *  Linux box before the systemd path is trusted. Additional pathological-input caveats behind
- *  that same manual-smoke boundary: `%` is a systemd specifier prefix in unit values (a literal
+ *  tokens per systemd.service(5) — but this generator is content-tested only. The enable/--now
+ *  load is covered by the repeatable `systemd-smoke` workflow (real ubuntu systemd; spaced-home
+ *  Environment= quoting + Restart=always + uninstall — first green 2026-06-11). Re-run it after
+ *  any change to this generator. Pathological-input caveats remain OUTSIDE that smoke's coverage: `%` is a systemd specifier prefix in unit values (a literal
  *  % needs %% doubling); a literal `"` or `\` inside quoted ExecStart tokens would also break
  *  C-style quoting — not fixed here, noted as a known boundary. */
 export function systemdUnit({ nodePath, cliPath, home }) {
