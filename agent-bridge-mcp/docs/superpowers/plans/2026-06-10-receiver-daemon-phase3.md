@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** v1 — pending independent critic review before execution.
+**Status:** v2 — reworked 2026-06-10 after independent critic review (verdict REWORK: C1 gap starvation under slow-steady readers — empirically reproduced; H1 blocklist bypass on replay; H2 join-notice replayed as room chat; M1–M3, L1–L2). All findings addressed below; gap emission is now flush-on-progress, replay is blocklist-aware and excludes synthetic join notices, and the connectDaemon gap round-trip test is real.
 
 **Goal:** Give the `channel` role at-least-once delivery (spec §6): a slow/stuck channel subscriber gets a `{type:"gap"}` marker instead of silent loss and replays the hole from the local archive; the daemon's pull makes the archive write a precondition for advancing the cursor so the archive is a complete replay source; `viewer` overflow becomes drop-messages-with-a-count instead of drop-the-client.
 
@@ -103,9 +103,10 @@ test("replaySince: received-only, spam-excluded, relay_seq ascending, strictly a
   archiveMessage(rec({ envelope_id: "r3", direction: "received", relay_seq: 12 }));
   archiveMessage(rec({ envelope_id: "s1", direction: "sent", relay_seq: 13 }));      // not replayed
   archiveMessage(rec({ envelope_id: "r4", direction: "received" }));                  // no relay_seq → not replayed
+  archiveMessage(rec({ envelope_id: "room9:joined", direction: "received", relay_seq: 14, room_id: "room9" })); // synthetic join notice → never replayed (H2)
   markSpam("r3");
   const rows = replaySince(10);
-  assert.deepEqual(rows.map((r) => r.envelope_id), ["r2"]);   // >10, received, non-spam, has seq
+  assert.deepEqual(rows.map((r) => r.envelope_id), ["r2"]);   // >10, received, non-spam, has seq, not a join notice
   assert.deepEqual(replaySince(0).map((r) => r.envelope_id), ["r1", "r2"]);   // ascending
   assert.equal(replaySince(0, { limit: 1 }).length, 1);
 });
@@ -120,13 +121,17 @@ Expected: FAIL — `replaySince` not exported.
 
 ```js
 /** Replay source for at-least-once channel delivery (spec §6): received, non-spam rows with a
- *  relay_seq STRICTLY AFTER since_seq, oldest-first. The caller re-applies the channel gate —
- *  rows carry verified + key_changed so the replay can withhold what live withheld. */
+ *  relay_seq STRICTLY AFTER since_seq, oldest-first. Synthetic room-join notices
+ *  (envelope_id "<room_id>:joined") are EXCLUDED: live surfaces them once as a system inbox
+ *  notice and never as channel chat — replaying them would route a system notice into the
+ *  room-chat push path (critic H2). The caller re-applies the channel gate — rows carry
+ *  verified + key_changed so the replay can withhold what live withheld. */
 export function replaySince(since_seq, { limit = 500 } = {}) {
   const db = openArchive();
   return db.prepare(
     `SELECT * FROM messages
       WHERE direction = 'received' AND spam = 0 AND relay_seq IS NOT NULL AND relay_seq > ?
+        AND envelope_id NOT LIKE '%:joined'
       ORDER BY relay_seq ASC LIMIT ?`
   ).all(Number(since_seq) || 0, limit).map(parseRow);
 }
@@ -320,6 +325,34 @@ test("overflow(channel): writes are skipped over the HWM, then ONE gap frame arr
   } finally { await ipc.close(); }
 });
 
+test("overflow(channel): SLOW-STEADY reader — gap arrives via flush-on-progress (no reliance on 'drain')", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 2048 });
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel");
+    const mk = (i, size) => ({ envelope_id: `eS${i}`, seq: 200 + i, from: "did:wba:x", contact: "al",
+      verified: true, key_changed: false, body: { type: "text", text: "y".repeat(size) } });
+    ch.sock.pause();
+    for (let i = 0; i < 24; i++) await ipc.sink.deliver(mk(i, 16384));   // wedge past HWM → drops accumulate
+    assert.equal(ipc.clientCount(), 1);                                   // not destroyed (below 4× backstop)
+    // Slow-steady regime: partial reads free the queue gradually; the gap must arrive on the
+    // next successful WRITE below the threshold — NOT only when the buffer fully empties.
+    let gotGap = false;
+    const tick = setInterval(() => { ch.sock.read(65536); }, 10);
+    try {
+      for (let i = 0; i < 200 && !gotGap; i++) {
+        await ipc.sink.deliver(mk(100 + i, 64));                          // small follow-ups
+        gotGap = ch.frames.some((f) => f.type === "gap");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    } finally { clearInterval(tick); }
+    assert.equal(gotGap, true);                                           // C1: no silent starvation
+    assert.equal(ipc.clientCount(), 1);                                   // and never destroyed
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
 test("overflow(viewer): messages are dropped with a count, no gap frame, client stays", async () => {
   chmodSync(dir, 0o700);
   const logs = [];
@@ -369,8 +402,14 @@ Expected: FAIL — Phase-2 destroys at 1×HWM (first test's `clientCount()===1` 
 ```
 (b) After registration, give the socket a drain handler that converts accumulated drops into a single gap (channel) or a log line (viewer/bridge):
 ```js
-        socket.on("drain", () => {
+        // C1 (critic, empirically reproduced): 'drain' fires only after a write() returned
+        // false AND the buffer empties to ZERO — a slow-but-steady reader can keep the queue
+        // non-empty forever while our skip-pattern suppresses write(), starving the gap.
+        // Therefore: flush pending drops on ANY progress (drain OR a successful write below
+        // the threshold), never on drain alone.
+        const flushPending = () => {
           if (!sub || sub.dropped === 0) return;
+          if (sub.socket.writableLength > highWaterMark) return;   // still congested — wait for progress
           if (sub.role === "channel") {
             socket.write(encodeFrame({ type: "gap", after_seq: sub.lastSeq ?? 0 }));
             log(`[daemon] gap → channel client (skipped ${sub.dropped}, after_seq=${sub.lastSeq ?? 0})`);
@@ -378,7 +417,9 @@ Expected: FAIL — Phase-2 destroys at 1×HWM (first test's `clientCount()===1` 
             log(`[daemon] dropped ${sub.dropped} msgs to ${sub.role} client (slow consumer)`);
           }
           sub.dropped = 0;
-        });
+        };
+        sub.flushPending = flushPending;
+        socket.on("drain", flushPending);
 ```
 (c) Replace `deliver` with skip-over-HWM + backstop:
 ```js
@@ -402,6 +443,11 @@ Expected: FAIL — Phase-2 destroys at 1×HWM (first test's `clientCount()===1` 
           }
           sub.socket.write(encodeFrame({ type: "message", message: wire }));
           if (wire && wire.relay_seq !== undefined) sub.lastSeq = wire.relay_seq;
+          // INVARIANT (critic M1): every channel-admissible message carries seq (receive()
+          // always sets it), so lastSeq is never null once a real write happened — a gap's
+          // after_seq=0 full-window replay can only occur before ANY successful write (bounded
+          // by replaySince's limit).
+          sub.flushPending?.();   // C1: emit any pending gap now that we made progress
         }
       },
 ```
@@ -430,33 +476,32 @@ git commit -m "feat(daemon): per-role overflow — skip+count, gap-on-drain for 
 
 - [ ] **Step 1: Write the failing tests.**
 
-Append to `test/daemon-ipc.test.mjs`:
+Append to `test/daemon-ipc.test.mjs` — a REAL gap round-trip (critic M3: required, not optional; the handle exposes its socket as a test seam):
 ```js
-test("connectDaemon: gap frames invoke onGap with after_seq", async () => {
+test("connectDaemon: real gap round-trip — wedge beneath the client, progress, onGap fires", async () => {
   chmodSync(dir, 0o700);
   const ipc = ipcFor({ highWaterMark: 2048 });
   await ipc.listen();
   try {
-    let gapAt = null;
-    const handle = await connectDaemon({ role: "channel", onMessage: () => {}, onGap: (s) => { gapAt = s; }, log: () => {} });
-    // Reach into the server side via a second wedged path is overkill here: emit a gap directly
-    // by wedging THIS client (pause is not reachable through connectDaemon), so instead assert
-    // the frame routing contract with a crafted server: use a raw socket server is heavier than
-    // needed — the deliver/drain path is already covered in Task 5. Here we only need routing:
-    // simulate by sending a gap frame through the real server's subscriber.
-    // Easiest faithful route: wedge via many large UNADMITTED-for-others messages is moot —
-    // so use the documented test seam: ipc.sink.deliver large admitted frames after pausing
-    // the underlying socket is not exposed; therefore this test asserts onGap via a direct
-    // server write: grab the only subscriber through clientCount-side-effects is not exposed
-    // either. KEEP THIS SIMPLE: the routing is one line in connectDaemon — assert it with a
-    // unit-level fake instead (below in channel-replay tests via makeReplayer), and here just
-    // assert that an unknown→gap frame does not crash an attached client and onGap is optional.
+    const got = []; let gapAt = null;
+    const handle = await connectDaemon({ role: "channel", onMessage: (m) => got.push(m.relay_seq),
+      onGap: (seq) => { gapAt = seq; }, log: () => {} });
+    const mk = (i, size) => ({ envelope_id: `eG${i}`, seq: 300 + i, from: "did:wba:x", contact: "al",
+      verified: true, key_changed: false, body: { type: "text", text: "g".repeat(size) } });
+    await ipc.sink.deliver(mk(0, 64));                       // one clean write → lastSeq ≥ 300
+    await until(() => got.length === 1);
+    handle._sock.pause();                                     // wedge beneath the client parser
+    for (let i = 1; i <= 24; i++) await ipc.sink.deliver(mk(i, 16384));   // skips accumulate
+    handle._sock.resume();                                    // progress
+    await ipc.sink.deliver(mk(99, 64));                       // flush-on-progress emits the gap
+    await until(() => gapAt !== null);
+    assert.ok(gapAt >= 300 && gapAt < 324, `after_seq=${gapAt} must be the last WRITTEN seq`);
     handle.close();
-    assert.equal(gapAt, null);
   } finally { await ipc.close(); }
 });
 ```
-**NOTE TO IMPLEMENTER:** the comment block above is deliberate plan-level honesty — the gap ROUTING in `connectDaemon` is one line; its end-to-end proof rides Task 5's drain test plus this Task's replayer tests. If you find a clean way to pause the client socket beneath `connectDaemon` (e.g., returning the socket on the handle), prefer that and assert a real gap round-trip; otherwise keep this placeholder-free smoke (attach + close + onGap unfired) and rely on the unit seam below.
+
+
 
 Create `test/channel-replay.test.mjs`:
 ```js
@@ -526,6 +571,19 @@ test("makeReplayer: live() pushes and records; replay never double-pushes what l
   assert.deepEqual(pushed, ["eDup"]);                // exactly once
 });
 
+test("makeReplayer: a sender blocked AFTER archival is not replayed (live drops blocked at receive)", async () => {
+  const pushed = [];
+  const replayer = makeReplayer({
+    push: (m) => pushed.push(m.envelope_id),
+    replaySinceFn: () => [row({ envelope_id: "eBlocked", relay_seq: 60, from: "did:wba:evil" }),
+                          row({ envelope_id: "eFine", relay_seq: 61 })],
+    contactLookup: () => ({ alias: "pat" }),
+    isBlockedFn: (did) => did === "did:wba:evil",
+  });
+  await replayer.gap(59);
+  assert.deepEqual(pushed, ["eFine"]);     // critic H1: the blocklist holds on replay too
+});
+
 test("makeReplayer: bounded memory — the seen-set keeps only the most recent maxSeen ids", async () => {
   const replayer = makeReplayer({ push: () => {}, replaySinceFn: () => [], contactLookup: () => undefined, maxSeen: 3 });
   for (let i = 0; i < 10; i++) replayer.live({ envelope_id: `e${i}`, seq: i });
@@ -549,6 +607,7 @@ Create `src/channel-replay.mjs`:
 // and `contact` is re-derived from CURRENT pin state, so replay can never push more than live.
 import { replaySince } from "./archive.mjs";
 import { getContactByDid } from "./contacts.mjs";
+import { isBlocked } from "./moderation.mjs";
 
 /** Map an archive row (parseRow shape) to the live/wire message shape makeChannelPush expects. */
 export function rowToMessage(row, { contactLookup = getContactByDid } = {}) {
@@ -570,8 +629,12 @@ export function rowToMessage(row, { contactLookup = getContactByDid } = {}) {
 }
 
 /** Deduped replay coordinator. live(m) for every streamed frame; gap(after_seq) replays the
- *  hole. A bounded seen-set (envelope_id) prevents double-push where replay and live overlap. */
-export function makeReplayer({ push, replaySinceFn = replaySince, contactLookup = getContactByDid, maxSeen = 1000, log = (s) => process.stderr.write(s + "\n") }) {
+ *  hole. A bounded seen-set (envelope_id) prevents double-push where replay and live overlap —
+ *  best-effort dedup (critic L2): eviction under sustained back-to-back gaps can in principle
+ *  allow a rare double-push, which is harmless under at-least-once semantics. Do not "fix" the
+ *  bound into an unbounded set. Blocked senders are skipped (critic H1): live enforces the
+ *  blocklist at receive (core.mjs:397) and NO downstream gate rechecks it, so replay must. */
+export function makeReplayer({ push, replaySinceFn = replaySince, contactLookup = getContactByDid, isBlockedFn = isBlocked, maxSeen = 1000, log = (s) => process.stderr.write(s + "\n") }) {
   const seen = new Set();
   const remember = (id) => {
     seen.add(id);
@@ -589,6 +652,7 @@ export function makeReplayer({ push, replaySinceFn = replaySince, contactLookup 
       const rows = replaySinceFn(after_seq);
       log(`[channel] gap after_seq=${after_seq} — replaying ${rows.length} from archive`);
       for (const row of rows) {
+        if (isBlockedFn(row.from)) continue;   // critic H1: blocked-after-archive must not replay
         if (seen.has(row.envelope_id)) continue;
         remember(row.envelope_id);
         push(rowToMessage(row, { contactLookup }));
@@ -599,9 +663,12 @@ export function makeReplayer({ push, replaySinceFn = replaySince, contactLookup 
 }
 ```
 
-In `src/daemon-ipc.mjs`, extend `connectDaemon({ role, onMessage, onClose, onGap = () => {}, ... })` and route the frame (one line in the parser, next to the `message` route):
+In `src/daemon-ipc.mjs`, extend `connectDaemon({ role, onMessage, onClose, onGap = () => {}, ... })`, route the frame (one line in the parser, next to the `message` route), and expose the socket on the resolved handle as a test seam (critic M3 — the real round-trip test above depends on it):
 ```js
       if (frame.type === "gap") onGap(frame.after_seq);
+```
+```js
+          resolve({ close: () => sock.destroy(), _sock: sock });   // _sock: test seam (gap round-trip), not public API
 ```
 
 In `src/channel-server.mjs`, wire the replayer on the daemon-attached path:
@@ -646,12 +713,19 @@ git commit -m "feat(channel): gap-triggered archive replay — deduped, gate-ref
 - [ ] **Step 1: Spec note.** In §6, append one bullet at the end of the section:
 
 ```markdown
-- **Phase 3 (2026-06-10) implements this** with one refinement: replay fidelity requires the
-  archive to record `key_changed` (added, default 0) and the replay adapter re-derives `contact`
-  from CURRENT pins — so a replayed row passes the exact same gate state live would apply today.
-  Overflow is skip+count for all roles with a single `gap` emitted on drain (channel only) and a
-  4×HWM destroy backstop for wedged sockets. Strict cursor mode lives behind
-  `receive({strict})`, used only by the daemon.
+- **Phase 3 (2026-06-10) implements this** with refinements: replay fidelity requires the
+  archive to record `key_changed` (added, default 0); the replay adapter re-derives `contact`
+  from CURRENT pins and re-checks the BLOCKLIST (live enforces it only at receive — replay must
+  too); synthetic room-join notices are excluded from replay (live never pushes them as chat).
+  Overflow is skip+count for all roles; a `channel` subscriber's pending gap is emitted on
+  **flush-on-progress** (the next successful write below the threshold OR drain — never drain
+  alone, which starves under slow-steady readers), with a 4×HWM destroy backstop for wedged
+  sockets. The concrete numbers supersede this section's illustrative 256 KiB: skip above
+  1 MiB (`highWaterMark`), destroy at 4×. Strict cursor mode lives behind `receive({strict})`,
+  used only by the daemon — it trades liveness for completeness: a persistently failing archive
+  (e.g. disk full) halts cursor advance and re-delivers the current page each wake (banner
+  re-rings) until writes succeed; degraded-but-safe and self-correcting. The "OR reconnect" gap
+  trigger in this section is Phase 4 (resume-on-reattach via since_seq in hello).
 ```
 
 - [ ] **Step 2: Full suite + hermeticity**
@@ -682,8 +756,9 @@ No manual live smoke this phase: a gap is hard to stage by hand and the drain pa
 
 - **§6 channel at-least-once:** gap on drain (T5) + archive replay deduped by envelope_id (T6) + strict cursor so the archive is complete (T3, T4). ✓
 - **§6 viewer/bridge best-effort:** skip+count+log, client stays; 4×HWM backstop replaces Phase 2's 1×HWM destroy (T5) — Phase 2's floor remains as the backstop, not deleted. ✓
-- **Replay fidelity (new risk found in planning):** the archive lacked `key_changed`; replay would have pushed what live withheld. Fixed at the source (T1) + `contact` re-derived from current pins in the adapter (T6) + the client pipeline re-gates everything (double-gate now load-bearing for replay). ✓
+- **Replay fidelity:** three holes closed — the archive lacked `key_changed` (T1, found in planning); the BLOCKLIST is enforced only at receive so replay re-checks it (T6, critic H1); synthetic join notices are excluded from replay so a system notice can never re-enter as room chat (T2, critic H2). `contact` re-derived from current pins; the client pipeline re-gates everything. ✓
+- **Gap liveness (critic C1, empirically reproduced):** gap emission is flush-on-progress — pending drops flush on the next successful write below the threshold OR on drain, never drain-alone (which starves under slow-steady readers). Tested in BOTH regimes: pause-resume recovery AND the slow-steady partial-read loop. ✓
 - **Pure seams for the untestable:** cursor policy is a pure function (T3) because fault-injecting `receive()`'s archive writes would need network stubs; the wiring is 6 lines verified by review; the daemon's strict flag is tested via the injectable `receiveAllFn` (T4). Honest coverage boundary, stated. ✓
-- **Known weak test:** Task 6's `connectDaemon onGap` socket-level test is a smoke (routing is 1 line; the full path is covered by T5's drain test + T6's replayer units). Flagged in-plan for the implementer to upgrade if the handle can expose pause cleanly. ✓
-- **Placeholder scan:** every step has complete code; names consistent (`replaySince`, `cursorAdvanceTarget`, `rowToMessage`, `makeReplayer` (`live`/`gap`/`seenSize`), `receiveAllFn`, `onGap`, sub state `{lastSeq, dropped}`). One deliberate honesty-comment block in T6 Step 1 explains a test-design constraint — it is instruction, not a TODO. ✓
+- **The connectDaemon gap test is a REAL round-trip** (critic M3): the handle exposes `_sock` as a documented test seam; the test wedges beneath the client parser, makes progress, and asserts `onGap` fires with the last-written seq. ✓
+- **Placeholder scan:** every step has complete code; names consistent (`replaySince`, `cursorAdvanceTarget`, `rowToMessage`, `makeReplayer` (`live`/`gap`/`seenSize`, opts incl. `isBlockedFn`), `receiveAllFn`, `onGap`, `_sock`, sub state `{lastSeq, dropped, flushPending}`). The v1 essay-comment test was replaced by the real round-trip. ✓
 - **Phase boundary:** reconnect/backoff, `since_seq` in hello (resume-on-reattach), bridge socket role, installers — all Phase 4. ✓
