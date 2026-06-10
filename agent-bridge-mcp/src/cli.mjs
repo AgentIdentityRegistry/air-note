@@ -19,7 +19,10 @@
 //   air-msg health
 
 import { fileURLToPath } from "node:url";
-import { realpathSync } from "node:fs";
+import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { spawn, spawnSync } from "node:child_process";
+import { realpathSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import * as core from "./core.mjs";
 import { ensureIdentity } from "./identity.mjs";
 import { createNotifier } from "./notifier.mjs";
@@ -31,6 +34,7 @@ import { createTelegramAdapter, captureFirstChat } from "./adapters/telegram.mjs
 import { makeBridgeOutbound, makeReplyHandler, makeConfirmStore } from "./bridge.mjs";
 import { getUpdateOffset, setUpdateOffset, pruneRoutes } from "./bridge-routes.mjs";
 import { createInterface } from "node:readline/promises";
+import { connectDaemonPersistent, cleanStaleSocket, probeDaemon } from "./daemon-ipc.mjs";
 
 const tty = process.stdout.isTTY;
 const c = {
@@ -118,9 +122,10 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
   air-msg delete --message <id> --yes    Delete one message from your local diary
   air-msg delete --with <to> --yes       Delete a whole conversation from your local diary
   inbox/history also accept --include-spam to reveal hidden spam.
-  air-msg daemon status                  Show whether the receiver daemon is running
-  air-msg daemon start                   Start the receiver daemon (banner sink, lock-guarded)
+  air-msg daemon status                  Daemon + live socket state (clients, last seq, sinks)
+  air-msg daemon start [--detach]        Start the receiver daemon (foreground, or detached)
   air-msg daemon stop                    Stop the running daemon
+  air-msg daemon install | uninstall     Auto-start at login (macOS launchd / Linux systemd-user)
   air-msg health                         Relay + identity status
 
   <to> may be a DID, an AIR ID, or a saved contact alias.
@@ -132,16 +137,10 @@ const HELP = `air-msg — cryptographically-signed agent messaging from your ter
     AIRMSG_NOTIFY   node-notifier | osascript | bell | none   (auto if unset)
     AIRMSG_MUTE     comma-separated peers (alias/DID/AIR-id) to silence
 
-  auto-start on login (macOS launchd): save this to
-  ~/Library/LaunchAgents/org.air-msg.watch.plist then run: launchctl load <that path>
-    <?xml version="1.0"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0"><dict>
-      <key>Label</key><string>org.air-msg.watch</string>
-      <key>ProgramArguments</key><array>
-        <string>/usr/bin/env</string><string>air-msg</string><string>watch</string></array>
-      <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-    </dict></plist>
+  always-on (recommended): air-msg daemon install — one always-on pull; watch/channel attach to it
+  as clients (run \`air-msg watch\` in any terminal for a live feed); the standalone bridge needs the
+  daemon stopped — in-daemon Telegram is on the roadmap.
+  (service-managed daemons relaunch on stop — use air-msg daemon uninstall to remove the auto-start)
 
   channel push (experimental — incoming mail into a live Claude Code session):
     1. add to your project .mcp.json (alongside the agent-bridge-mcp tools server, so the
@@ -274,7 +273,38 @@ async function main() {
     }
     case "watch": {
       const identity = await ensureIdentity();
+      const printFeedLine = (m) => {
+        const who = m.contact ? m.contact : m.from;
+        const enc = m.encrypted ? "🔒" : "✉️ ";
+        const vrf = m.verified ? c.green("✓") : c.red("✗");
+        console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
+        console.log(`    ${bodyText(m.body)}`);
+      };
+      // §7 row 1: socket live → attach as viewer (no lock, no second banner — the daemon's
+      // bannerSink already rings; this terminal is a passive feed).
+      try {
+        const handle = await connectDaemonPersistent({
+          role: "viewer",
+          onMessage: printFeedLine,
+          onAttach: () => console.log(`${c.green("● watching")} ${c.dim("(attached to air-msgd — daemon owns the pull; Ctrl-C detaches only this feed)")}`),
+          onDetach: () => console.log(c.dim("  …daemon connection lost — reconnecting")),
+          log: () => {},   // M1: suppress raw [client] transport lines from the curated stdout feed
+        });
+        // C1: connectDaemonPersistent holds only an unref'd backoff timer during outages — it
+        // cannot pin the event loop. Signal listeners do not pin it either. This ref'd interval
+        // keeps the process alive across daemon restarts until the user explicitly Ctrl-Cs.
+        const keepAlive = setInterval(() => {}, 60_000);
+        await new Promise((resolve) => {
+          const stop = () => { console.log(c.dim("\n…detaching from daemon")); clearInterval(keepAlive); handle.close(); resolve(); };
+          process.once("SIGINT", stop);
+          process.once("SIGTERM", stop);
+        });
+        break;
+      } catch (e) {
+        if (e.code !== "DAEMON_DOWN") throw e;         // §7 rows 2-3: no daemon → legacy standalone below
+      }
       if (!acquireOrExit("watch")) break;
+      cleanStaleSocket();                              // §7 row 2: lock acquired proves socket is stale
       try {
         const openMode = process.env.AIRMSG_OPEN || "terminal-history";
         const aiCmd = process.env.AIRMSG_AI_CMD || (openMode === "ai" ? detectAiCmd() : undefined);
@@ -293,14 +323,7 @@ async function main() {
 
         await watch({
           signal: ac.signal, identity, notifier, openResolver,
-          onMessage: (m) => {
-            const who = m.contact ? m.contact : m.from;
-            const enc = m.encrypted ? "🔒" : "✉️ ";
-            const vrf = m.verified ? c.green("✓") : c.red("✗");
-            const txt = bodyText(m.body);
-            console.log(`  ↓ ${enc} ${vrf} ${who}  ${c.dim(new Date().toISOString())}`);
-            console.log(`    ${txt}`);
-          },
+          onMessage: printFeedLine,
         }).catch((e) => { if (e?.name !== "AbortError") throw e; });
       } finally {
         releaseConsumerLock();
@@ -315,7 +338,17 @@ async function main() {
         console.error("Bridge not configured. Run: air-msg bridge setup");
         process.exit(1);
       }
+      // §7 bridge row: the daemon owns the pull; a standalone bridge beside it would fight for
+      // the consumer lock and lose with a generic message — refuse with the real reason instead.
+      // (In-daemon Telegram is the "bridge to doorbell-grade" roadmap item, not Phase 4.)
+      if (await probeDaemon()) {
+        console.error("bridge: the daemon owns the message pull on this identity.");
+        console.error("Stop it first (air-msg daemon stop) to run the standalone bridge,");
+        console.error("or keep the daemon — in-daemon Telegram is on the roadmap.");
+        process.exit(1);
+      }
       if (!acquireOrExit("bridge")) break;
+      cleanStaleSocket();                              // §7 row 2: lock acquired proves socket is stale
       try {
         const identity = await ensureIdentity();
         const bodyMode = process.env.AIRMSG_BRIDGE_BODY === "meta" ? "meta" : "full";
@@ -576,6 +609,31 @@ async function main() {
       const { sub } = parseRoomArgs(rest); // reuse the sub-arg splitter
       switch (sub) {
         case "start": {
+          // rest = the argv tail after the top-level command (["start","--detach"]) — verified in
+          // scope; don't refactor to the parseRoomArgs output (critic v1 ambiguity note).
+          if (rest.includes("--detach")) {
+            const { isDaemonRunning, readDaemonPid } = await import("./daemon.mjs");
+            if (isDaemonRunning()) {
+              console.log(`daemon already running ${c.dim("pid " + readDaemonPid()?.pid)}`);
+              break;
+            }
+            // First-run registration is network-bound; do it in the parent so the child's call
+            // returns from disk and the 3s poll covers only bind+PID-write — also keeps
+            // registration output visible (the child's stdio is discarded).
+            await ensureIdentity();
+            const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "daemon", "start"], { detached: true, stdio: "ignore" });
+            child.unref();
+            const t0 = Date.now();
+            while (!isDaemonRunning() && Date.now() - t0 < 3000) await new Promise((r) => setTimeout(r, 100));
+            if (isDaemonRunning()) {
+              console.log(`${c.green("✓ daemon detached")} ${c.dim("pid " + readDaemonPid()?.pid)}`);
+              console.log(c.dim("note: detached logs are discarded — air-msg daemon install gives you a log file"));
+            } else {
+              console.error("daemon did not come up within 3s — it may still be starting (check: air-msg daemon status) or run `air-msg daemon start` in the foreground to see why");
+              process.exit(1);
+            }
+            break;
+          }
           const { startDaemon } = await import("./daemon.mjs");
           await startDaemon();
           break;
@@ -594,11 +652,71 @@ async function main() {
           console.log(`daemon: ${s.running ? c.green("running") : c.dim("stopped")}` +
             (s.pid ? `  ${c.dim("pid " + s.pid + (s.start_time ? " since " + s.start_time : ""))}` : ""));
           console.log(`cursor: ${s.cursor ?? "?"}`);
+          if (s.running) {
+            const { queryDaemonStatus, socketPath } = await import("./daemon-ipc.mjs");
+            const live = await queryDaemonStatus();
+            if (live) {
+              const roles = live.clients.map((cl) => cl.role).join(", ") || "none";
+              console.log(`socket: ${socketPath()}`);
+              console.log(`clients: ${live.clients.length} (${roles})  ·  last relay_seq: ${live.last_seq ?? "—"}`);
+              console.log(`sinks: ${(live.sinks ?? []).join(", ") || "?"}`);
+              for (const cl of live.clients) {
+                if (cl.dropped > 0 || cl.lastSeq !== live.last_seq) {
+                  console.log(`  · ${cl.role}: lastSeq ${cl.lastSeq ?? "—"}${cl.dropped ? `, dropped ${cl.dropped}` : ""}`);
+                }
+              }
+            } else {
+              console.log(c.yellow("socket: unreachable (split-brain or daemon starting/stopping — check daemon logs)"));
+            }
+          }
+          break;
+        }
+        case "install": {
+          const { servicePlan } = await import("./service.mjs");
+          const { isDaemonRunning } = await import("./daemon.mjs");
+          if (isDaemonRunning()) {
+            // A manually-started daemon holds the consumer lock; the service's daemon would
+            // exit(1) on acquireOrExit and launchd/systemd would relaunch-loop against it.
+            console.error("a daemon is already running — stop it first: air-msg daemon stop (if it was installed as a service, use: air-msg daemon uninstall)");
+            process.exit(1);
+          }
+          const plan = servicePlan({
+            platform: process.platform,
+            homedir: homedir(),
+            nodePath: process.execPath,
+            cliPath: fileURLToPath(import.meta.url),
+            home: process.env.AGENT_BRIDGE_HOME,
+          });
+          if (!plan) { console.error(`auto-start install is not supported on ${process.platform} (spec: POSIX-only in v1)`); process.exit(1); }
+          mkdirSync(dirname(plan.file), { recursive: true });
+          mkdirSync(dirname(plan.logPath), { recursive: true });   // launchd opens StandardOutPath pre-spawn and won't create parent dirs
+          writeFileSync(plan.file, plan.content, { mode: 0o644 });
+          const r = spawnSync(plan.loadCmd[0], plan.loadCmd.slice(1), { stdio: "inherit" });
+          if (r.status !== 0) { console.error(`${plan.loadCmd[0]} failed (exit ${r.status}${r.error ? `, ${r.error.message}` : ""}) — unit written to ${plan.file}; load it manually or clean up with: air-msg daemon uninstall`); process.exit(1); }
+          console.log(`${c.green("✓ installed")} ${plan.kind} unit ${c.dim(plan.file)}`);
+          console.log(c.dim("the daemon now starts at login and stays alive; check: air-msg daemon status"));
+          break;
+        }
+        case "uninstall": {
+          const { servicePlan } = await import("./service.mjs");
+          const plan = servicePlan({
+            platform: process.platform, homedir: homedir(),
+            nodePath: process.execPath, cliPath: fileURLToPath(import.meta.url),
+            home: process.env.AGENT_BRIDGE_HOME,
+          });
+          if (!plan) { console.error(`nothing to uninstall on ${process.platform}`); process.exit(1); }
+          spawnSync(plan.unloadCmd[0], plan.unloadCmd.slice(1), { stdio: "ignore" });   // best-effort unload (attempt even if file is missing — may still be loaded)
+          if (!existsSync(plan.file)) {
+            console.log(`nothing installed at ${c.dim(plan.file)}`);
+            break;
+          }
+          try { rmSync(plan.file, { force: true }); } catch { /* best effort */ }
+          console.log(`${c.green("✓ uninstalled")} ${c.dim(plan.file)}`);
           break;
         }
         default:
           console.error(`unknown daemon subcommand: ${sub || "(none)"}`);
-          console.log(`  daemon subcommands: start | stop | status`);
+          console.log(`  daemon subcommands: start | stop | status | install | uninstall`);
           process.exit(1);
       }
       break;

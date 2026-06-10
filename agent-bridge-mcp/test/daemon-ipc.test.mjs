@@ -114,7 +114,7 @@ test("admitForRole(channel): room messages route through the ROOM gate (member a
 });
 
 import { chmodSync, mkdirSync, statSync, writeFileSync, existsSync } from "node:fs";
-import { assertSafeHome, prepareSocketPath, socketPath } from "../src/daemon-ipc.mjs";
+import { assertSafeHome, prepareSocketPath, socketPath, cleanStaleSocket } from "../src/daemon-ipc.mjs";
 
 test("assertSafeHome: 0700 home passes; group- or other-writable home refuses", () => {
   const home = join(dir, "h1"); mkdirSync(home, { mode: 0o700 });
@@ -137,7 +137,7 @@ import { createConnection } from "node:net";
 import { createIpcServer } from "../src/daemon-ipc.mjs";
 
 /** Minimal raw test client: connect, send hello, collect frames. */
-function rawClient(role) {
+function rawClient(role, helloExtra = {}) {
   return new Promise((resolve, reject) => {
     const frames = [];
     const sock = createConnection(socketPath());
@@ -147,7 +147,7 @@ function rawClient(role) {
     });
     sock.on("data", feed);
     sock.once("error", reject);
-    sock.once("connect", () => sock.write(encodeFrame({ type: "hello", role })));
+    sock.once("connect", () => sock.write(encodeFrame({ type: "hello", role, ...helloExtra })));
   });
 }
 
@@ -255,7 +255,7 @@ test("ipc server: a silent connection that never says hello is reaped", async ()
   } finally { await ipc.close(); }
 });
 
-import { connectDaemon } from "../src/daemon-ipc.mjs";
+import { connectDaemon, connectDaemonPersistent, probeDaemon, queryDaemonStatus } from "../src/daemon-ipc.mjs";
 
 test("connectDaemon: handshakes, then delivers admitted messages to onMessage", async () => {
   chmodSync(dir, 0o700);
@@ -430,4 +430,341 @@ test("connectDaemon: real gap round-trip — wedge beneath the client, progress,
     assert.ok(gapAt >= 300 && gapAt < 901, `after_seq=${gapAt} must be the last WRITTEN seq`);
     handle.close();
   } finally { await ipc.close(); }
+});
+
+test("hello with since_seq (channel): hello-ok is followed by an immediate gap at exactly since_seq", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel", { since_seq: 41 });
+    await until(() => ch.frames.some((f) => f.type === "gap"));
+    const gap = ch.frames.find((f) => f.type === "gap");
+    assert.equal(gap.after_seq, 41);
+    // hello-ok must arrive BEFORE the gap (client resolves its handle first)
+    assert.ok(ch.frames.findIndex((f) => f.type === "hello-ok") < ch.frames.indexOf(gap));
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("hello with since_seq: viewer gets NO gap (best-effort role); channel without since_seq gets NO gap (live-from-attach)", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer", { since_seq: 41 });
+    const ch = await rawClient("channel");
+    await new Promise((r) => setTimeout(r, 50));   // give a wrong gap time to arrive
+    assert.equal(v.frames.some((f) => f.type === "gap"), false);
+    assert.equal(ch.frames.some((f) => f.type === "gap"), false);
+    v.sock.destroy(); ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("hello with since_seq seeds lastSeq so a later gap is anchored at since_seq, not 0", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel", { since_seq: 41 });
+    await until(() => ch.frames.some((f) => f.type === "gap"));
+    assert.equal(ipc.clientStats()[0].lastSeq, 41);   // not null — flushPending's after_seq is anchored
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("connectDaemon: sinceSeq option puts since_seq on the wire and the gap round-trips to onGap", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    let gapAt = null;
+    const h = await connectDaemon({ role: "channel", sinceSeq: 7, onMessage: () => {}, onGap: (s) => { gapAt = s; }, log: () => {} });
+    await until(() => gapAt !== null);
+    assert.equal(gapAt, 7);
+    h.close();
+  } finally { await ipc.close(); }
+});
+
+test("connectDaemonPersistent: first attempt with no daemon rejects DAEMON_DOWN (caller falls back standalone)", async () => {
+  chmodSync(dir, 0o700);
+  await assert.rejects(
+    () => connectDaemonPersistent({ role: "viewer", onMessage: () => {}, log: () => {} }),
+    (e) => e.code === "DAEMON_DOWN",
+  );
+});
+
+test("connectDaemonPersistent: survives a daemon restart and resumes with since_seq = max seen relay_seq", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  const got = []; const gaps = []; let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "channel",
+    onMessage: (m) => got.push(m.relay_seq),
+    onGap: (s) => gaps.push(s),
+    onAttach: () => { attaches += 1; },
+    initialBackoffMs: 10, backoffCapMs: 50,
+    log: () => {},
+  });
+  try {
+    await a.sink.deliver({ envelope_id: "p1", seq: 7, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "hi" } });
+    await until(() => got.length === 1);
+    await a.close();                                   // daemon "restart": all clients dropped
+    const b = ipcFor();
+    await b.listen();                                  // same dir → same socket path
+    try {
+      await until(() => attaches === 2, 5000);         // wrapper reconnected by itself
+      await until(() => gaps.length === 1, 5000);      // resume: hello carried since_seq=7 → gap(7)
+      assert.equal(gaps[0], 7);
+      await b.sink.deliver({ envelope_id: "p2", seq: 8, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "again" } });
+      await until(() => got.length === 2);
+      assert.deepEqual(got, [7, 8]);                   // live flow resumed on the new daemon
+    } finally { handle.close(); await b.close(); }
+  } catch (e) { handle.close(); await a.close().catch(() => {}); throw e; }
+});
+
+test("connectDaemonPersistent: reconnect with NOTHING seen falls back to the cursorFn baseline (outage-window mail is not lost)", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  const gaps = []; let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "channel",
+    onMessage: () => {},
+    onGap: (s) => gaps.push(s),
+    onAttach: () => { attaches += 1; },
+    cursorFn: () => 42,                                // archive cursor snapshot at first attach
+    initialBackoffMs: 10, backoffCapMs: 50,
+    log: () => {},
+  });
+  try {
+    assert.equal(gaps.length, 0);                      // FIRST attach is live-from-attach: no since_seq, no gap
+    await a.close();
+    const b = ipcFor();
+    await b.listen();
+    try {
+      await until(() => attaches === 2, 5000);
+      await until(() => gaps.length === 1, 5000);
+      assert.equal(gaps[0], 42);                       // saw no frames → resumed from the baseline
+    } finally { handle.close(); await b.close(); }
+  } catch (e) { handle.close(); await a.close().catch(() => {}); throw e; }
+});
+
+test("connectDaemonPersistent: survives MULTIPLE backoff cycles while the daemon stays down, then reattaches", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {}, onAttach: () => { attaches += 1; },
+    initialBackoffMs: 10, backoffCapMs: 20,
+    log: () => {},
+  });
+  try {
+    await a.close();
+    await new Promise((r) => setTimeout(r, 120));      // several failed retry cycles at the 20ms cap
+    const b = ipcFor();
+    await b.listen();
+    try {
+      await until(() => attaches === 2, 5000);         // the loop survived repeated failures + the cap
+      assert.equal(b.clientCount(), 1);
+    } finally { handle.close(); await b.close(); }
+  } catch (e) { handle.close(); throw e; }
+});
+
+test("connectDaemonPersistent: close() stops the reconnect loop for good", async () => {
+  chmodSync(dir, 0o700);
+  const a = ipcFor();
+  await a.listen();
+  let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {}, onAttach: () => { attaches += 1; },
+    initialBackoffMs: 10, log: () => {},
+  });
+  handle.close();
+  await a.close();
+  const b = ipcFor();
+  await b.listen();
+  try {
+    await new Promise((r) => setTimeout(r, 150));      // > several backoff periods
+    assert.equal(attaches, 1);                         // never re-attached after close()
+    assert.equal(b.clientCount(), 0);
+  } finally { await b.close(); }
+});
+
+test("connectDaemonPersistent: close() during an in-flight reconnect closes the late-arriving socket (no undead connection)", async () => {
+  // Seam-based: no real sockets, no timing races beyond the intentional ~20ms gate window.
+  // call 1: succeeds immediately, captures onClose so we can trigger a reconnect.
+  // call 2: blocks until we release the gate, simulating a long handshake.
+  let capturedOnClose = null;
+  let lateCloseCalled = false;
+  let callCount = 0;
+  let releaseGate;
+  const gate = new Promise((r) => { releaseGate = r; });
+
+  const fakeConnect = ({ onClose }) => {
+    callCount += 1;
+    if (callCount === 1) {
+      capturedOnClose = onClose;
+      return Promise.resolve({ close: () => {}, _sock: null });
+    }
+    // call 2: block until gate released, then return a handle whose close() we track
+    return gate.then(() => ({ close: () => { lateCloseCalled = true; }, _sock: null }));
+  };
+
+  let attaches = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {}, onAttach: () => { attaches += 1; },
+    connectFn: fakeConnect, initialBackoffMs: 5, log: () => {},
+  });
+  // Trigger reconnect loop (loop is now sleeping 5ms then will await the gated fakeConnect call 2)
+  capturedOnClose();
+  await new Promise((r) => setTimeout(r, 20));  // loop is now awaiting the gated connectFn
+  handle.close();                               // close() races the in-flight handshake
+  releaseGate();                                // release: connectFn call 2 resolves late
+  await new Promise((r) => setTimeout(r, 10)); // give the resolution microtask time to run
+  assert.equal(lateCloseCalled, true,  "late-arriving socket must be closed immediately");
+  assert.equal(attaches, 1,            "onAttach must fire exactly once (first attach only)");
+});
+
+test("connectDaemonPersistent: a throwing onAttach on reattach is logged, not retried as a failed connect", async () => {
+  // Seam-based: connectFn always succeeds; onAttach throws on its 2nd invocation.
+  // The bug: without the fix, the throw is caught by the bare catch, increments backoff,
+  // and the loop retries — calling connectFn a 3rd+ time while the 2nd connection is live.
+  let capturedOnClose = null;
+  let callCount = 0;
+  const logs = [];
+
+  const fakeConnect = ({ onClose }) => {
+    callCount += 1;
+    if (callCount === 1) capturedOnClose = onClose;
+    return Promise.resolve({ close: () => {}, _sock: null });
+  };
+
+  let attachCount = 0;
+  const handle = await connectDaemonPersistent({
+    role: "viewer", onMessage: () => {},
+    onAttach: () => {
+      attachCount += 1;
+      if (attachCount === 2) throw new Error("boom from onAttach");
+    },
+    connectFn: fakeConnect, initialBackoffMs: 5, backoffCapMs: 10,
+    log: (s) => logs.push(s),
+  });
+  capturedOnClose();                            // trigger the reconnect loop
+  await new Promise((r) => setTimeout(r, 40)); // several would-be 5ms retry cycles
+  handle.close();
+  assert.equal(callCount, 2, "connectFn must be called exactly twice — no pile-up of retries");
+  assert.ok(logs.some((l) => /onAttach callback threw/.test(l)), "throw must be logged, not swallowed");
+});
+
+test("backstop recovery: a channel client destroyed at 4×HWM reconnects and resumes via since_seq gap (no final-gap-hint needed)", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ highWaterMark: 512 });
+  await ipc.listen();
+  try {
+    const got = []; const gaps = []; let attaches = 0;
+    const handle = await connectDaemonPersistent({
+      role: "channel",
+      onMessage: (m) => got.push(m.relay_seq),
+      onGap: (s) => gaps.push(s),
+      onAttach: () => { attaches += 1; },
+      initialBackoffMs: 10, backoffCapMs: 50,
+      log: () => {},
+    });
+    try {
+      await ipc.sink.deliver({ envelope_id: "b1", seq: 5, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "ok" } });
+      await until(() => got.length === 1);
+      handle._sock().pause();                          // wedge beneath the client parser
+      const huge = (i) => ({ envelope_id: `bH${i}`, seq: 10 + i, from: "did:wba:x", contact: "al",
+        verified: true, key_changed: false, body: { type: "text", text: "w".repeat(262144) } });
+      await ipc.sink.deliver(huge(0));                 // lands in the queue (>4×512 once written)
+      await ipc.sink.deliver(huge(1));                 // next deliver sees it wedged → destroy
+      await until(() => ipc.clientCount() === 0);      // backstop fired (Phase 3 semantics)
+      // A paused socket defers ALL stream events — including 'close' from the server-side
+      // destroy (Node readable semantics). Resume models the wedged consumer RECOVERING; in
+      // production the same wedge is a blocked event loop, which defers the close identically
+      // and unblocks the same way. No client-side liveness machinery is warranted for a local
+      // Unix socket (no half-open failure mode) — rejected as over-engineering.
+      handle._sock().resume();
+      await until(() => attaches === 2, 5000);         // wrapper reconnected
+      await until(() => gaps.length >= 1, 5000);       // resume gap arrived
+      // The drain after resume may parse the wedged-but-buffered huge frame (seq 10) before the
+      // close fires — or the server-side destroy may have truncated it mid-line. Both anchors
+      // are safe under at-least-once: replay is strictly-greater + envelope_id-deduped.
+      assert.ok([5, 10].includes(gaps[0]), `gap anchored at last fully-seen seq, got ${gaps[0]}`);
+      assert.equal(ipc.clientCount(), 1);              // healthy again
+    } finally { handle.close(); }
+  } finally { await ipc.close(); }
+});
+
+test("cleanStaleSocket: removes a stale socket file; never throws when absent", () => {
+  chmodSync(dir, 0o700);
+  writeFileSync(socketPath(), "");                     // stale leftover from a crashed daemon
+  cleanStaleSocket();
+  assert.equal(existsSync(socketPath()), false);
+  cleanStaleSocket();                                  // absent → still fine
+});
+
+test("probeDaemon: true against a live daemon socket, false when nothing listens", async () => {
+  chmodSync(dir, 0o700);
+  assert.equal(await probeDaemon({ timeoutMs: 300 }), false);   // nothing there
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    assert.equal(await probeDaemon(), true);
+    await until(() => ipc.clientCount() === 0);                 // probe detached cleanly
+  } finally { await ipc.close(); }
+});
+
+test("status frame: reply carries the OTHER clients (requester excluded), last_seq, and statusExtraFn fields", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({ statusExtraFn: () => ({ sinks: ["banner", "socket"] }) });
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel");
+    const v = await rawClient("viewer");
+    await ipc.sink.deliver({ envelope_id: "st1", seq: 9, from: "did:wba:x", contact: "al", verified: true, key_changed: false, body: { type: "text", text: "s" } });
+    await until(() => ch.frames.some((f) => f.type === "message"));
+    ch.sock.write(encodeFrame({ type: "status" }));
+    await until(() => ch.frames.some((f) => f.type === "status"));
+    const st = ch.frames.find((f) => f.type === "status");
+    assert.equal(st.last_seq, 9);
+    // The requesting channel client is EXCLUDED (critic v1 M3); the viewer saw the delivery too.
+    assert.deepEqual(st.clients, [{ role: "viewer", dropped: 0, lastSeq: 9 }]);
+    assert.deepEqual(st.sinks, ["banner", "socket"]);
+    assert.equal(st.socket, socketPath());
+    ch.sock.destroy(); v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("queryDaemonStatus: round-trips the status; null when no daemon", async () => {
+  chmodSync(dir, 0o700);
+  assert.equal(await queryDaemonStatus({ timeoutMs: 300 }), null);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const st = await queryDaemonStatus();
+    assert.equal(st.last_seq, null);                   // nothing delivered yet
+    assert.deepEqual(st.clients, []);                  // idle daemon: the probe itself is excluded
+  } finally { await ipc.close(); }
+});
+
+test("queryDaemonStatus: timeout-raced handshake socket is closed, not leaked", async () => {
+  chmodSync(dir, 0o700);
+  let closed = false;
+  let wrote = false;
+  // Fake handle whose handshake resolves ~40ms after the 20ms outer timeout fires.
+  const fakeHandle = { close: () => { closed = true; }, _sock: { write: () => { wrote = true; } } };
+  let resolveConnect;
+  const connectFn = () => new Promise((res) => { resolveConnect = res; });
+  const resultPromise = queryDaemonStatus({ timeoutMs: 20, connectFn });
+  // Let the 20ms timeout fire first (result is null), THEN resolve the handshake.
+  await new Promise((r) => setTimeout(r, 40));
+  resolveConnect(fakeHandle);
+  const result = await resultPromise;
+  assert.equal(result, null);        // timed out
+  assert.equal(closed, true);        // late-arriving socket was closed
+  assert.equal(wrote, false);        // status request was never written to a dead socket
 });

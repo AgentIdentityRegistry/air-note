@@ -136,6 +136,14 @@ the daemon's `receive()` loop.
   full) halts cursor advance and re-delivers the current page each wake (banner re-rings) until
   writes succeed; degraded-but-safe and self-correcting. The "OR reconnect" gap trigger above
   is Phase 4 (resume-on-reattach via since_seq in hello).
+- **Phase 4 (2026-06-10) closes the loop:** the "OR reconnect" trigger is live — hello carries an
+  optional `since_seq`; the daemon answers a channel hello bearing one with an immediate
+  `{type:"gap", after_seq: since_seq}` (and seeds that subscriber's `lastSeq` so a pre-write
+  overflow gap is anchored, not 0). Clients reconnect via `connectDaemonPersistent` (backoff
+  500ms→×2→5s cap, reset on attach), resuming from max-seen relay_seq, or — when the outage hit
+  before any frame arrived — from an archive-cursor baseline snapshotted at first attach. The
+  4×HWM backstop-destroy needs NO final gap hint: a wedged socket cannot usefully receive one,
+  and the destroyed client's reconnect+since_seq path IS the recovery (integration-proven).
 
 ## 7. Daemon ↔ legacy resolution (no split-brain)
 
@@ -154,6 +162,12 @@ Ordering at bind: connect-probe → on ECONNREFUSED, acquire lock → `unlink` s
 Reconnect contract: clients auto-reconnect with backoff; a daemon restart (e.g. upgrade) drops
 all clients, who reconnect and (for `channel`) receive a `gap` + replay.
 
+Phase 4 implements the table's `watch` and `bridge` rows: `air-msg watch` attaches as a `viewer`
+(feed-only — the daemon's banner sink rings, the terminal never double-rings) with persistent
+reconnect; `air-msg bridge` beside a live daemon refuses with a pointer (in-daemon Telegram is a
+follow-up); all three legacy entrypoints unlink a stale socket immediately after winning the
+consumer lock (`cleanStaleSocket` — the lock proves nothing live owns the path).
+
 ## 8. Lifecycle / install (POSIX)
 
 - `air-msg daemon start` — foreground or `--detach`; writes a PID file `{home}/daemon.pid` with
@@ -167,6 +181,12 @@ all clients, who reconnect and (for `channel`) receive a `gap` + replay.
   systemd-user service (Linux) that runs `air-msg daemon start --detach` at login + keeps it
   alive. `uninstall` removes it. Opt-out = never install (or `uninstall`); the manual snippet in
   `air-msg help` remains for users who want to hand-roll it.
+
+Phase 4 ships `install`/`uninstall` (pure generators in `service.mjs`; absolute node+cli paths —
+launchd/systemd provide no user PATH), `start --detach`, and the defined `status` output: the
+PID-file block plus a live-over-IPC block (`{type:"status"}` frame → socket path, clients with
+roles, last delivered relay_seq, enabled sinks). A PID-alive-but-socket-unreachable daemon is
+reported as possible split-brain rather than guessed at.
 
 ## 9. Testing
 
@@ -202,5 +222,7 @@ all clients, who reconnect and (for `channel`) receive a `gap` + replay.
 - Phase 2 note: the wire protocol stamps `relay_seq` from the pushed object's `seq` at the socket
   boundary (`core.receive()`'s onMessage objects carry `seq`; `relay_seq` exists only on archive
   rows) — Phase 3's gap/replay keys on `message.relay_seq` with no frame change.
-- Open (Phase 4): does the MCP host auto-relaunch a channel server that exits 0 when the daemon
-  goes away? Phase 2 ships clean-exit-on-disconnect as a stopgap; reconnect/backoff supersedes it.
+- ~~Open (Phase 4): does the MCP host auto-relaunch a channel server that exits 0 when the daemon
+  goes away? Phase 2 ships clean-exit-on-disconnect as a stopgap; reconnect/backoff supersedes it.~~
+  **RESOLVED 2026-06-10 (Phase 4):** moot — the channel server no longer exits on daemon close;
+  `connectDaemonPersistent` reconnects with backoff and resumes via `since_seq`.

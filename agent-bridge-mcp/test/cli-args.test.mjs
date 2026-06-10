@@ -65,3 +65,27 @@ test("bodyText still renders plain text + falls back to JSON for unknown types",
   assert.equal(bodyText({ type: "weird", x: 1 }), JSON.stringify({ type: "weird", x: 1 }));
   assert.equal(bodyText(null), "");
 });
+
+// daemon subcommand routing — tested at the parseRoomArgs boundary (the daemon case calls
+// `parseRoomArgs(rest)` to extract `sub`; these tests prove install/uninstall/start are routed,
+// not "unknown daemon subcommand"). Side-effect-free: no spawning, no I/O.
+test("daemon install: parseRoomArgs routes to sub='install'", () => {
+  const { sub } = parseRoomArgs(["install"]);
+  assert.equal(sub, "install");
+});
+
+test("daemon uninstall: parseRoomArgs routes to sub='uninstall'", () => {
+  const { sub } = parseRoomArgs(["uninstall"]);
+  assert.equal(sub, "uninstall");
+});
+
+test("daemon start --detach: parseRoomArgs sub='start'; --detach survives in raw rest", () => {
+  const { sub } = parseRoomArgs(["start", "--detach"]);
+  assert.equal(sub, "start");
+  // The daemon case checks rest.includes("--detach") on the RAW argv tail (verified wire-fact).
+  // Confirm parseArgs also sees it as a flag so the full argv round-trips cleanly.
+  const { positionals, flags } = parseArgs(["daemon", "start", "--detach"]);
+  assert.equal(positionals[0], "daemon");
+  assert.equal(positionals[1], "start");
+  assert.equal(flags.detach, true);
+});

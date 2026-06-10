@@ -14,7 +14,8 @@ import { watch } from "./watch.mjs";
 import { makeChannelPush } from "./channel.mjs";
 import { acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 import { parseMuteSet } from "./peers.mjs";
-import { connectDaemon } from "./daemon-ipc.mjs";
+import { connectDaemonPersistent, cleanStaleSocket } from "./daemon-ipc.mjs";
+import { getCursor, archiveExists } from "./archive.mjs";
 import { makeReplayer } from "./channel-replay.mjs";
 
 const server = new Server(
@@ -30,6 +31,10 @@ const server = new Server(
 
 async function main() {
   await server.connect(new StdioServerTransport());
+  // SDK 1.29.0: StdioServerTransport fires onclose only from a programmatic close(), never on
+  // stdin EOF — the host-death signal is stdin 'end' (probed). A channel with no audience must
+  // not reconnect forever.
+  process.stdin.once("end", () => process.exit(0));
   const identity = await ensureIdentity();
   const mute = parseMuteSet();
   const log = (s) => process.stderr.write(s + "\n");
@@ -40,22 +45,20 @@ async function main() {
   // Daemon-first (spec §7): attach as a gated channel client — NO consumer lock held.
   try {
     const replayer = makeReplayer({ push, log });
-    await connectDaemon({
+    await connectDaemonPersistent({
       role: "channel",
       onMessage: (m) => replayer.live(m),
       onGap: (after_seq) => { replayer.gap(after_seq).catch((e) => log(`[channel] replay failed: ${e.message ?? e}`)); },
-      onClose: () => {
-        // Deliberate Phase-2 stopgap: clean exit on daemon restart/stop. Mail push pauses
-        // until this server is relaunched; Phase 4 replaces this with reconnect/backoff.
-        log("air-msg-channel: daemon connection closed — exiting cleanly (Phase 4 adds reconnect)");
-        process.exit(0);
-      },
+      // Resume baseline: the archive cursor at first attach. Same home as the daemon, read-only,
+      // archiveExists()-gated so a status probe never materializes a fresh DB (daemon.mjs precedent).
+      cursorFn: () => (archiveExists() ? getCursor() : null),
+      onDetach: () => log("air-msg-channel: daemon connection lost — reconnecting with backoff"),
+      onAttach: () => log(`air-msg-channel v${CORE_VERSION} attached to air-msgd for ${identity.did} (gate enforced by daemon)`),
       log,
     });
-    log(`air-msg-channel v${CORE_VERSION} attached to air-msgd for ${identity.did} (gate enforced by daemon)`);
     process.once("SIGINT", () => process.exit(0));   // no lock held on this path — plain clean exit
     process.once("SIGTERM", () => process.exit(0));
-    await new Promise(() => {});                     // stay alive until a signal or daemon close
+    await new Promise(() => {});                     // stay alive until a signal or transport close
   } catch (e) {
     if (e.code !== "DAEMON_DOWN") throw e;
     log("air-msg-channel: no daemon — running standalone (legacy)");
@@ -63,6 +66,7 @@ async function main() {
 
   // Legacy standalone fallback: unchanged Phase-1 behavior, takes the single consumer lock.
   if (!acquireOrExit("channel-server")) return;
+  cleanStaleSocket();                              // §7 row 2: lock acquired proves socket is stale
   const ac = new AbortController();
   process.once("SIGINT", () => { ac.abort(); releaseConsumerLock(); });
   process.once("SIGTERM", () => { ac.abort(); releaseConsumerLock(); });
