@@ -183,6 +183,20 @@ export function roomJoinNotice({ op, selfDid, roomName }) {
   return { type: "room/joined", room_id: op.room_id, room_name: roomName ?? op.room_id };
 }
 
+/** Pure cursor policy (spec §6). Default: the diary is best-effort — advance past the whole
+ *  delivered batch even if some archive writes failed (live delivery already happened).
+ *  Strict (daemon mode): the archive is the channel's replay source, so never advance past
+ *  the first failed write — those messages will be re-pulled and re-archived next wake.
+ *  Returns the seq to advance to, or null to leave the cursor untouched. */
+export function cursorAdvanceTarget({ deliveredSeqs, failedSeqs, strict }) {
+  if (!deliveredSeqs.length) return null;
+  const max = Math.max(...deliveredSeqs);
+  if (!strict || !failedSeqs.length) return max;
+  const firstFail = Math.min(...failedSeqs);
+  const safe = deliveredSeqs.filter((s) => s < firstFail);
+  return safe.length ? Math.max(...safe) : null;
+}
+
 /**
  * Ingest one received control op (spec §9, §6.4). The envelope signature is already
  * verified by the caller; here we verify the op's OWN `op_sig` against the authoritative
@@ -379,7 +393,7 @@ export async function send({ to, body, thread_id, in_reply_to, plaintext = false
   };
 }
 
-export async function receive({ since, limit } = {}) {
+export async function receive({ since, limit, strict = false } = {}) {
   const identity = await ensureIdentity();
   let from = since;
   if (from == null) {
@@ -393,6 +407,7 @@ export async function receive({ since, limit } = {}) {
 
   const messages = [];
   const drops = new Map(); // batched block drop-tally (one write after the loop)
+  const archiveFailedSeqs = [];
   for (const m of batch.messages) {
     if (isBlocked(m.sender_did)) {        // hard drop BEFORE decode/verify/archive (D2/D12)
       drops.set(m.sender_did, (drops.get(m.sender_did) ?? 0) + 1);
@@ -490,6 +505,7 @@ export async function receive({ since, limit } = {}) {
             body, encrypted: decoded.encrypted, verified, relay_seq: m.seq, room_id: roomId,
           });
         } catch (err) {
+          archiveFailedSeqs.push(m.seq);
           console.error(`[archive] failed to persist room message ${m.envelope_id}: ${err.message ?? err}`);
         }
         continue;
@@ -530,6 +546,7 @@ export async function receive({ since, limit } = {}) {
             body: joinNotice, encrypted: false, verified, relay_seq: m.seq, room_id: body.room_id,
           });
         } catch (err) {
+          archiveFailedSeqs.push(m.seq);
           console.error(`[rooms] failed to persist room-join notice for ${body.room_id}: ${err.message ?? err}`);
         }
       }
@@ -564,6 +581,7 @@ export async function receive({ since, limit } = {}) {
         key_changed: !!key_changed,
       });
     } catch (err) {
+      archiveFailedSeqs.push(m.seq);
       // A local archive write must never drop a live-delivered message.
       console.error(`[archive] failed to persist received message ${m.envelope_id}: ${err.message ?? err}`);
     }
@@ -573,8 +591,13 @@ export async function receive({ since, limit } = {}) {
   // the live batch was already returned to the caller; the diary is best-effort (see Task 2).
   // NOTE: receive() fetches ONE relay page per call + reports `has_more`; receiveAll() loops
   // this to completion so a backlog larger than one page is fully drained per wake.
-  if (batch.messages.length) {
-    try { setCursor(Math.max(...batch.messages.map((m) => m.seq))); }
+  const cursorTarget = cursorAdvanceTarget({
+    deliveredSeqs: batch.messages.map((m) => m.seq),
+    failedSeqs: archiveFailedSeqs,
+    strict,
+  });
+  if (cursorTarget != null) {
+    try { setCursor(cursorTarget); }
     catch (err) { console.error(`[archive] failed to advance cursor: ${err.message ?? err}`); }
   }
   return {
@@ -597,13 +620,13 @@ export async function receive({ since, limit } = {}) {
  * already happened inside receive(), so even a partial drain persists what it pulled.
  * `receiveFn` is injectable for tests.
  */
-export async function receiveAll({ since, limit, maxPages = 100 } = {}, receiveFn = receive) {
+export async function receiveAll({ since, limit, maxPages = 100, strict = false } = {}, receiveFn = receive) {
   const all = [];
   let last = { messages: [], has_more: false, cursor: undefined, my_did: undefined };
   let cursorArg = since;   // first pull may use an explicit `since`; later pulls follow the cursor
   let pages = 0;
   do {
-    last = await receiveFn({ since: cursorArg, limit });
+    last = await receiveFn({ since: cursorArg, limit, strict });
     all.push(...(last.messages ?? []));
     cursorArg = undefined;  // subsequent pulls read the now-advanced persisted cursor
     pages += 1;
