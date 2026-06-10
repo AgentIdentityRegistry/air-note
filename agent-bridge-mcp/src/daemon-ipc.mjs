@@ -116,7 +116,7 @@ export function createIpcServer({
           return;
         }
         clearTimeout(reaper);
-        sub = { socket, role: frame.role, lastSeq: null, dropped: 0 };
+        sub = { socket, role: frame.role, lastSeq: Number.isFinite(frame.since_seq) ? frame.since_seq : null, dropped: 0 };
         subscribers.add(sub);
         socket.write(encodeFrame({ type: "hello-ok", ...daemonInfo }));
         log(`[daemon] client attached: role=${frame.role} (${subscribers.size} connected)`);
@@ -138,6 +138,14 @@ export function createIpcServer({
         };
         sub.flushPending = flushPending;
         socket.on("drain", flushPending);
+        // Resume-on-reattach (spec §6 "OR reconnect"): a channel client that declares where it
+        // left off gets an immediate gap; its Phase-3 replayer fills the hole from the archive.
+        // The daemon stays stateless about client history — the client's archive is the source.
+        // Viewer/bridge are best-effort roles: since_seq is ignored for them.
+        if (sub.role === "channel" && Number.isFinite(frame.since_seq)) {
+          socket.write(encodeFrame({ type: "gap", after_seq: frame.since_seq }));
+          log(`[daemon] resume: gap → channel client (after_seq=${frame.since_seq})`);
+        }
         return;
       }
       if (frame.type === "ping") socket.write(encodeFrame({ type: "pong" }));
@@ -214,7 +222,7 @@ export function createIpcServer({
  *  handle; gated messages stream to onMessage(m). Rejects with {code:"DAEMON_DOWN"} when no
  *  daemon is reachable (callers use that to fall back to legacy standalone — spec §7).
  *  Reconnect/backoff is Phase 4; Phase 2 surfaces onClose and lets the caller decide. */
-export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () => {}, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
+export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () => {}, sinceSeq, handshakeMs = 3000, log = (s) => process.stderr.write(s + "\n") }) {
   return new Promise((resolve, reject) => {
     const sock = createConnection(socketPath());
     const fail = (reason, cause) => {
@@ -225,7 +233,9 @@ export function connectDaemon({ role, onMessage, onGap = () => {}, onClose = () 
     let ready = false;
 
     sock.once("error", (e) => { if (!ready) { clearTimeout(timer); fail(`no daemon: ${e.code}`, e); } });
-    sock.once("connect", () => sock.write(encodeFrame({ type: "hello", role })));
+    sock.once("connect", () => sock.write(encodeFrame({
+      type: "hello", role, ...(Number.isFinite(sinceSeq) ? { since_seq: sinceSeq } : {}),
+    })));
     const feed = makeLineParser((frame) => {
       if (!ready) {
         clearTimeout(timer);

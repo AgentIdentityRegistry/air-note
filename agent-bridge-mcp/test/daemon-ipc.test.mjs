@@ -137,7 +137,7 @@ import { createConnection } from "node:net";
 import { createIpcServer } from "../src/daemon-ipc.mjs";
 
 /** Minimal raw test client: connect, send hello, collect frames. */
-function rawClient(role) {
+function rawClient(role, helloExtra = {}) {
   return new Promise((resolve, reject) => {
     const frames = [];
     const sock = createConnection(socketPath());
@@ -147,7 +147,7 @@ function rawClient(role) {
     });
     sock.on("data", feed);
     sock.once("error", reject);
-    sock.once("connect", () => sock.write(encodeFrame({ type: "hello", role })));
+    sock.once("connect", () => sock.write(encodeFrame({ type: "hello", role, ...helloExtra })));
   });
 }
 
@@ -429,5 +429,59 @@ test("connectDaemon: real gap round-trip — wedge beneath the client, progress,
     await until(() => gapAt !== null);
     assert.ok(gapAt >= 300 && gapAt < 901, `after_seq=${gapAt} must be the last WRITTEN seq`);
     handle.close();
+  } finally { await ipc.close(); }
+});
+
+test("hello with since_seq (channel): hello-ok is followed by an immediate gap at exactly since_seq", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel", { since_seq: 41 });
+    await until(() => ch.frames.some((f) => f.type === "gap"));
+    const gap = ch.frames.find((f) => f.type === "gap");
+    assert.equal(gap.after_seq, 41);
+    // hello-ok must arrive BEFORE the gap (client resolves its handle first)
+    assert.ok(ch.frames.findIndex((f) => f.type === "hello-ok") < ch.frames.indexOf(gap));
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("hello with since_seq: viewer gets NO gap (best-effort role); channel without since_seq gets NO gap (live-from-attach)", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer", { since_seq: 41 });
+    const ch = await rawClient("channel");
+    await new Promise((r) => setTimeout(r, 50));   // give a wrong gap time to arrive
+    assert.equal(v.frames.some((f) => f.type === "gap"), false);
+    assert.equal(ch.frames.some((f) => f.type === "gap"), false);
+    v.sock.destroy(); ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("hello with since_seq seeds lastSeq: an overflow gap before any write resumes from since_seq, not 0", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    const ch = await rawClient("channel", { since_seq: 41 });
+    await until(() => ch.frames.some((f) => f.type === "gap"));
+    assert.equal(ipc.clientStats()[0].lastSeq, 41);   // not null — flushPending's after_seq is anchored
+    ch.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("connectDaemon: sinceSeq option puts since_seq on the wire and the gap round-trips to onGap", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor();
+  await ipc.listen();
+  try {
+    let gapAt = null;
+    const h = await connectDaemon({ role: "channel", sinceSeq: 7, onMessage: () => {}, onGap: (s) => { gapAt = s; }, log: () => {} });
+    await until(() => gapAt !== null);
+    assert.equal(gapAt, 7);
+    h.close();
   } finally { await ipc.close(); }
 });
