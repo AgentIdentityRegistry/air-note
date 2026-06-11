@@ -262,13 +262,10 @@ async fn connect_once(
                 }
             }
             out = rx_out.recv() => {
-                match out {
-                    Some(frame) => {
-                        if write_frame(&mut wr, &frame).await.is_err() {
-                            return ConnOutcome::Attached;
-                        }
+                if let Some(frame) = out {
+                    if write_frame(&mut wr, &frame).await.is_err() {
+                        return ConnOutcome::Attached;
                     }
-                    None => {}
                 }
             }
             read = reader.read_until(b'\n', &mut buf) => {
@@ -303,7 +300,7 @@ fn dispatch(
     };
     match frame {
         ServerFrame::Message { message } => {
-            if max_seen.map_or(true, |m| message.relay_seq > m) {
+            if max_seen.is_none_or(|m| message.relay_seq > m) {
                 *max_seen = Some(message.relay_seq);
             }
             let _ = events.send(InboxEvent::Message(message));

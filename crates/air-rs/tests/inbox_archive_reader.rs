@@ -20,7 +20,7 @@ fn seed_archive() -> TempDir {
             PRIMARY KEY (envelope_id, direction));
          CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     ).unwrap();
-    let mut ins = |env: &str, dir: &str, from: &str, relay_seq: Option<i64>, verified: i64, key_changed: i64, spam: i64, ts: &str| {
+    let ins = |env: &str, dir: &str, from: &str, relay_seq: Option<i64>, verified: i64, key_changed: i64, spam: i64, ts: &str| {
         conn.execute(
             "INSERT INTO messages (envelope_id,direction,thread_id,peer_did,from_did,to_did,timestamp,body_json,encrypted,verified,key_changed,relay_seq,spam,room_id,archived_at) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?10,?11,?12,NULL,?7)",
