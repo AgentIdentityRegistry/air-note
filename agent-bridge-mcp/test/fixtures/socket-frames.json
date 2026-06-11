@@ -16,7 +16,7 @@
     "comment_message_optional_fields": "message.message: contact / key_changed / thread_id / body presence is CONDITIONAL — the daemon OMITS falsy/unset fields (a real key_changed:false frame carries NO key_changed key; an unpinned sender carries NO contact). The fixture shows a pinned, verified, key-unchanged sender. Parsers MUST treat these as optional.",
     "gap": { "type": "gap", "after_seq": 41 },
     "pong": { "type": "pong" },
-    "status": { "type": "status", "socket": "/home/user/.air-msg/daemon.sock", "last_seq": 7, "clients": [{ "role": "viewer", "lastSeq": 7, "dropped": 0 }] },
+    "status": { "type": "status", "socket": "/home/user/.air-msg/daemon.sock", "last_seq": 7, "clients": [{ "role": "viewer", "lastSeq": 7, "dropped": 0 }], "sinks": ["banner", "socket"] },
     "send_ok": { "type": "send-ok", "id": "11111111-2222-4333-8444-555555555555", "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "encrypted": true },
     "send_err": { "type": "send-err", "id": "11111111-2222-4333-8444-555555555555", "retryable": true, "reason": "relay 503: down" },
     "error": { "type": "error", "reason": "first frame must be hello with role channel|viewer" }

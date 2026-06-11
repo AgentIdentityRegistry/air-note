@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** v2 + Task 4 amendment: the status fixture photographs the PRODUCTION daemon (sinks present via statusExtraFn); the plan's test block had omitted the wiring — root cause of a wrong-side fixture fix.
+
 **Status:** v2 — v1 review returned **REWORK** with empirically proven findings, all applied: **C1** the E2E stub relay now echoes `envelope_id: envelope.id` in its receipt (`core.send` returns `receipt.envelope_id` — the relay's word, not the local uuid; the v1 stub returned neither, a guaranteed-red E2E that also contradicted the normative fixture); **H1** `plaintext` is DESIGNED INTO the send op (frame field, forwarding, fixture, PROTOCOL.md, unit test) instead of a mid-E2E pivot that reopened three committed tasks; **H2** the `message` fixture now matches a REAL `deliver()` emission (conditional fields like `key_changed` are OMITTED when falsy — pinned by a live deliver-vs-fixture deepEqual test) and PROTOCOL.md documents optional-when-falsy fields; **H3** the busy_timeout assertion reads the row's value key-agnostically (Node 22 CI vs 25 dev); plus M1 (classifier branch comment), M2 (import folded), M3 (executor return-placement self-check), a send-racing-shutdown test, `encrypted:false` asserted on the plaintext ack, an E2E stderr drain, and a Task 6 production-relay receipt verification.
 
 **Goal:** The two messaging-stack changes the desktop AI-inbox design (spec `docs/superpowers/specs/2026-06-11-desktop-ai-inbox-design.md`, repo root) requires: a `{type:"send"}` request op on the daemon socket (with a retryable/terminal error taxonomy) and `archive.db` in WAL mode (cross-process readers must not lock against the daemon writer), plus the protocol contract artifacts (`PROTOCOL.md` + cross-language frame fixtures) that Phase A2's Rust client will be built against.
@@ -554,6 +556,7 @@ test("request fixtures elicit the catalogued response SHAPES from a live server"
   const ipc = createIpcServer({
     daemonInfo: { pid: 4242, start_time: "2026-06-11T00:00:00.000Z", did: FIXTURES.daemon_to_client.hello_ok.did },
     sendFn: async () => ({ envelope_id: FIXTURES.daemon_to_client.send_ok.envelope_id, encrypted: true }),
+    statusExtraFn: () => ({ sinks: ["banner", "socket"] }),   // mirrors daemon.mjs:85 — photographs the production shape
     log: () => {},
   });
   await ipc.listen();

@@ -5,7 +5,7 @@
 > When prose and fixture disagree, the fixture wins.
 >
 > **Related specs:** daemon design §5/§6 (`docs/superpowers/specs/2026-06-05-receiver-daemon-design.md`);
-> AI-inbox design §3/§5 (`docs/superpowers/specs/2026-06-11-desktop-ai-inbox-design.md`).
+> AI-inbox design §3/§5 (`../../docs/superpowers/specs/2026-06-11-desktop-ai-inbox-design.md`).
 
 ---
 
@@ -162,6 +162,7 @@ from the archive starting after `after_seq`.
 | `socket` | string | required | Absolute path to the socket file |
 | `last_seq` | integer \| null | required | Last `relay_seq` fanned out across all subscribers; `null` if no messages have been delivered since the daemon started |
 | `clients` | array | required | Per-subscriber snapshot, one entry per connected client **excluding the requester**. Each entry: `{role, lastSeq, dropped}`. |
+| `sinks` | array of strings | optional-but-expected | Names of the daemon's active fan-out sinks (e.g. `["banner", "socket"]`). Supplied via `startDaemon`'s `statusExtraFn` extension seam; always present from a production daemon. MAY be absent from minimal or test servers that omit `statusExtraFn` — parsers treat it as optional. |
 
 ### `send-ok`
 

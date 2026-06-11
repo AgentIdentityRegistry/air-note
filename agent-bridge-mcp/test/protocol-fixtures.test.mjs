@@ -41,6 +41,7 @@ test("request fixtures elicit the catalogued response SHAPES from a live server"
   const ipc = createIpcServer({
     daemonInfo: { pid: 4242, start_time: "2026-06-11T00:00:00.000Z", did: FIXTURES.daemon_to_client.hello_ok.did },
     sendFn: async () => ({ envelope_id: FIXTURES.daemon_to_client.send_ok.envelope_id, encrypted: true }),
+    statusExtraFn: () => ({ sinks: ["banner", "socket"] }),
     log: () => {},
   });
   await ipc.listen();
