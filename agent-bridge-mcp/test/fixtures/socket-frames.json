@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "comment": "Canonical socket frames. JS asserts the daemon emits/accepts these; Rust (Phase A2) asserts its client builds/parses these. One JSON object per line on the wire, newline-terminated, 1 MiB line ceiling.",
+  "client_to_daemon": {
+    "hello": { "type": "hello", "role": "viewer" },
+    "hello_channel_resume": { "type": "hello", "role": "channel", "since_seq": 41 },
+    "ping": { "type": "ping" },
+    "status_request": { "type": "status" },
+    "send": { "type": "send", "id": "11111111-2222-4333-8444-555555555555", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "hello from a GUI" } },
+    "send_plaintext": { "type": "send", "id": "22222222-3333-4444-8555-666666666666", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "deliberately clear" }, "plaintext": true },
+    "send_reply": { "type": "send", "id": "33333333-4444-4555-8666-777777777777", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "threaded reply" }, "thread_id": "tttttttt-uuuu-4vvv-8www-xxxxxxxxxxxx", "in_reply_to": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }
+  },
+  "daemon_to_client": {
+    "hello_ok": { "type": "hello-ok", "pid": 4242, "start_time": "2026-06-11T00:00:00.000Z", "did": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST" },
+    "message": { "type": "message", "message": { "seq": 7, "relay_seq": 7, "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "from": "did:wba:agentidentityregistry.org:agents:AIR-PEER-PEER-PEER", "contact": "pat", "verified": true, "encrypted": true, "received_at": "2026-06-11T00:00:01.000Z", "thread_id": "tttttttt-uuuu-4vvv-8www-xxxxxxxxxxxx", "body": { "type": "text", "text": "hi" } } },
+    "comment_message_optional_fields": "message.message: contact / key_changed / thread_id / body presence is CONDITIONAL — the daemon OMITS falsy/unset fields (a real key_changed:false frame carries NO key_changed key; an unpinned sender carries NO contact). The fixture shows a pinned, verified, key-unchanged sender. Parsers MUST treat these as optional.",
+    "gap": { "type": "gap", "after_seq": 41 },
+    "pong": { "type": "pong" },
+    "status": { "type": "status", "socket": "/home/user/.air-msg/daemon.sock", "last_seq": 7, "clients": [{ "role": "viewer", "lastSeq": 7, "dropped": 0 }] },
+    "send_ok": { "type": "send-ok", "id": "11111111-2222-4333-8444-555555555555", "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "encrypted": true },
+    "send_err": { "type": "send-err", "id": "11111111-2222-4333-8444-555555555555", "retryable": true, "reason": "relay 503: down" },
+    "error": { "type": "error", "reason": "first frame must be hello with role channel|viewer" }
+  }
+}
