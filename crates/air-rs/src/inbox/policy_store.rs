@@ -65,6 +65,9 @@ pub fn autonomy_for(home: &Path, did: &str) -> Autonomy {
 /// Set a contact's dial and persist 0600. Returns the written Policy.
 pub fn set_autonomy(home: &Path, did: &str, value: Autonomy) -> std::io::Result<Policy> {
     let mut p = load(home);
+    // Phase B (design §7 key-rotation mandate): when the channel/AI loop is wired, a RE-PIN of a
+    // contact must reset that contact's dial to Draft here (auto requires a deliberate human re-arm
+    // against the new key). A2 only round-trips the dial; this breadcrumb marks the call site (review M2).
     p.contacts.entry(did.to_string()).or_default().ai_autonomy = value;
     write_atomic(home, &p)?;
     Ok(p)

@@ -253,7 +253,11 @@ async fn connect_once(
     let mut buf = Vec::new();
 
     loop {
-        buf.clear();
+        // Cancellation safety (review I1): do NOT clear `buf` at the top of the loop. `read_until`
+        // is a `select!` arm — if `wake`/`rx_out` wins while it has partially read a multi-segment
+        // frame, those bytes are already appended to `buf` and the next iteration's `read_until`
+        // MUST resume from them. Clearing here would discard a half-read frame (silent corruption).
+        // We clear ONLY after a complete, newline-terminated read has been consumed (below).
         tokio::select! {
             biased;
             _ = wake.notified() => {
@@ -263,6 +267,10 @@ async fn connect_once(
             }
             out = rx_out.recv() => {
                 if let Some(frame) = out {
+                    // A write failure after a successful attach ends the session like an EOF; the
+                    // reconnect loop treats `Attached` as "a real session ended" and the backoff
+                    // reset is intentional (we DID attach). A still-down daemon then escalates via
+                    // FailedToConnect on the next attempt (review I2).
                     if write_frame(&mut wr, &frame).await.is_err() {
                         return ConnOutcome::Attached;
                     }
@@ -281,6 +289,7 @@ async fn connect_once(
                         dispatch(v, events, max_seen);
                     }
                 }
+                buf.clear(); // safe: read_until returned at a newline, so `buf` held one full line
                 if stop.load(Ordering::SeqCst) {
                     return ConnOutcome::Stopped;
                 }

@@ -170,3 +170,59 @@ async fn signals_offline_when_no_daemon_is_listening() {
     );
     handle.stop();
 }
+
+#[tokio::test]
+async fn a_send_concurrent_with_a_split_inbound_frame_does_not_corrupt_it() {
+    // Regression for review I1: the post-handshake select! loop must NOT clear `buf` at the top of
+    // each iteration. A multi-segment inbound frame interrupted by a concurrent `send` would lose
+    // its first segment (the cancelled read_until's partial bytes), corrupting/dropping the message.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("daemon.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = stream.into_split();
+        let mut reader = BufReader::new(rd);
+        read_line(&mut reader).await; // hello
+        wr.write_all(b"{\"type\":\"hello-ok\",\"pid\":1,\"start_time\":\"t\",\"did\":\"did:me\"}\n").await.unwrap();
+        // First HALF of a message frame (no newline), flushed — the client reads it into `buf` and
+        // a concurrent send will interrupt the in-flight read_until.
+        wr.write_all(b"{\"type\":\"message\",\"message\":{\"seq\":9,\"relay_seq\":9,\"envelope_id\":\"split-9\",\"from\":\"did:peer\",").await.unwrap();
+        wr.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await; // window for the send to interleave
+        let send = read_line(&mut reader).await; // the client's queued send
+        assert_eq!(send["type"], "send");
+        // Second half + newline — completes the frame the client must reassemble.
+        wr.write_all(b"\"verified\":true,\"encrypted\":true,\"received_at\":\"t\"}}\n").await.unwrap();
+        wr.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<InboxEvent>();
+    let handle = connect_persistent(
+        ClientConfig { socket_path: sock, role: Role::Viewer, baseline: None },
+        tx,
+    );
+    assert!(matches!(rx.recv().await.unwrap(), InboxEvent::Attached { .. }));
+    // Let the client read the partial first half into `buf`, THEN send — interrupting read_until.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.send_frame(ClientFrame::Send {
+        id: "s1".into(), to: "did:peer".into(), body: json!({"type":"text","text":"hi"}),
+        plaintext: None, thread_id: None, in_reply_to: None,
+    });
+    // The split frame must arrive INTACT (reassembled across the interruption). Without the fix the
+    // first half is dropped, the frame is unparseable, and no Message event ever arrives → timeout.
+    let got = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let InboxEvent::Message(m) = rx.recv().await.unwrap() {
+                return m;
+            }
+        }
+    })
+    .await
+    .expect("split message must arrive intact within 3s");
+    assert_eq!(got.envelope_id, "split-9");
+    handle.stop();
+    let _ = server.await;
+}

@@ -66,7 +66,10 @@ impl ArchiveReader {
     /// the bounded retry budget.
     pub fn open(home: &Path) -> Result<Self, rusqlite::Error> {
         let path = archive_path(home);
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        // Default (serialized) threading — NOT NO_MUTEX (review M3): a fresh reader is opened per
+        // spawn_blocking call so it never crosses threads today, but dropping NO_MUTEX removes the
+        // UB footgun if a future caller ever shares one. Negligible cost at this read volume.
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY;
         let mut last: Option<rusqlite::Error> = None;
         for _ in 0..OPEN_RETRIES {
             match Connection::open_with_flags(&path, flags) {

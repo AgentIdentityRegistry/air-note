@@ -88,7 +88,12 @@ impl Replayer {
                 }
             }
             if n < PAGE_SIZE { break; }                               // short page = end of hole
-            since = rows.last().and_then(|r| r.relay_seq).unwrap_or(since);
+            // A continuing (full) page always has a non-null relay_seq in its last row (replay_since
+            // filters `relay_seq IS NOT NULL`). Break rather than spin if that ever changes (review M1).
+            match rows.last().and_then(|r| r.relay_seq) {
+                Some(s) => since = s,
+                None => break,
+            }
         }
         Ok(out)
     }
