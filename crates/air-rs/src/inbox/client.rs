@@ -1,14 +1,24 @@
 //! Reconnecting daemon-socket client (ports daemon-ipc.mjs connectDaemon[Persistent]).
-use crate::inbox::frames::{ClientFrame, Message, ServerFrame};
-use crate::inbox::line_parser::{FrameEvent, LineParser};
+use crate::inbox::frames::{ClientFrame, Message};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Notify};
+
+// The live socket client is Unix-only (the daemon is a POSIX Unix-domain-socket service). On
+// Windows the inbox still COMPILES — the rusqlite reader, frames, stores, gate, replay, policy, and
+// identity modules are all portable — but `connect_persistent` is a build-stub: Windows is a build
+// target, not a run target, in v1 (design §11).
+#[cfg(unix)]
+use crate::inbox::frames::ServerFrame;
+#[cfg(unix)]
+use crate::inbox::line_parser::{FrameEvent, LineParser};
+#[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 /// Initial reconnect backoff.
 pub const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
@@ -26,6 +36,7 @@ pub enum Role {
     Channel,
 }
 
+#[cfg(unix)]
 impl Role {
     fn wire(self) -> &'static str {
         match self {
@@ -121,10 +132,23 @@ pub fn connect_persistent(
         wake: wake.clone(),
         tx_out,
     };
+    #[cfg(unix)]
     tokio::spawn(reconnect_loop(cfg, events, stop, wake, rx_out));
+    #[cfg(not(unix))]
+    {
+        // Windows build-stub (design §11): no Unix-domain sockets here. Signal Offline once and
+        // park on `wake` until `stop()` notifies it, so callers get a well-behaved (never-attaching)
+        // handle instead of a compile error.
+        let _ = (cfg, rx_out, stop);
+        tokio::spawn(async move {
+            let _ = events.send(InboxEvent::Offline);
+            wake.notified().await;
+        });
+    }
     handle
 }
 
+#[cfg(unix)]
 async fn reconnect_loop(
     cfg: ClientConfig,
     events: mpsc::UnboundedSender<InboxEvent>,
@@ -178,12 +202,14 @@ async fn reconnect_loop(
     }
 }
 
+#[cfg(unix)]
 enum ConnOutcome {
     Stopped,
     Attached,
     FailedToConnect,
 }
 
+#[cfg(unix)]
 async fn connect_once(
     cfg: &ClientConfig,
     since: Option<i64>,
@@ -298,6 +324,7 @@ async fn connect_once(
     }
 }
 
+#[cfg(unix)]
 fn dispatch(
     v: Value,
     events: &mpsc::UnboundedSender<InboxEvent>,
@@ -347,6 +374,7 @@ fn dispatch(
     }
 }
 
+#[cfg(unix)]
 async fn write_frame<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     f: &ClientFrame,
