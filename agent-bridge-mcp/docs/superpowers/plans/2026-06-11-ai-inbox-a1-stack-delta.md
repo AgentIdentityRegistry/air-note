@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** v2 + Task 4 amendment: the status fixture photographs the PRODUCTION daemon (sinks present via statusExtraFn); the plan's test block had omitted the wiring — root cause of a wrong-side fixture fix.
+
 **Status:** v2 — v1 review returned **REWORK** with empirically proven findings, all applied: **C1** the E2E stub relay now echoes `envelope_id: envelope.id` in its receipt (`core.send` returns `receipt.envelope_id` — the relay's word, not the local uuid; the v1 stub returned neither, a guaranteed-red E2E that also contradicted the normative fixture); **H1** `plaintext` is DESIGNED INTO the send op (frame field, forwarding, fixture, PROTOCOL.md, unit test) instead of a mid-E2E pivot that reopened three committed tasks; **H2** the `message` fixture now matches a REAL `deliver()` emission (conditional fields like `key_changed` are OMITTED when falsy — pinned by a live deliver-vs-fixture deepEqual test) and PROTOCOL.md documents optional-when-falsy fields; **H3** the busy_timeout assertion reads the row's value key-agnostically (Node 22 CI vs 25 dev); plus M1 (classifier branch comment), M2 (import folded), M3 (executor return-placement self-check), a send-racing-shutdown test, `encrypted:false` asserted on the plaintext ack, an E2E stderr drain, and a Task 6 production-relay receipt verification.
 
 **Goal:** The two messaging-stack changes the desktop AI-inbox design (spec `docs/superpowers/specs/2026-06-11-desktop-ai-inbox-design.md`, repo root) requires: a `{type:"send"}` request op on the daemon socket (with a retryable/terminal error taxonomy) and `archive.db` in WAL mode (cross-process readers must not lock against the daemon writer), plus the protocol contract artifacts (`PROTOCOL.md` + cross-language frame fixtures) that Phase A2's Rust client will be built against.
@@ -83,8 +85,10 @@ Expected: FAIL — journal_mode is `delete` (or another non-wal mode), busy_time
   // exactly during gap-replay bursts. WAL allows one writer + many readers; it is a PERSISTENT
   // file property the WRITER must set. journal_mode/busy_timeout are read-back pragmas — use
   // .get(), not .run() (some builds error on run for row-returning pragmas).
-  db.prepare("PRAGMA journal_mode=WAL").get();
+  // busy_timeout FIRST: the WAL conversion itself can contend with a concurrent writer and must
+  // inherit the retry window.
   db.prepare("PRAGMA busy_timeout=5000").get();
+  db.prepare("PRAGMA journal_mode=WAL").get();
 ```
 
 - [ ] **Step 4: Run to verify pass**
@@ -161,9 +165,10 @@ with:
 export function classifySendError(err) {
   const reason = String(err?.message ?? err);
   if (typeof err?.status === "number") return { retryable: err.status >= 500, reason };
-  // Real undici fetch network failures ride the TypeError branch (their cause.code is often
-  // buried deeper than cause.code — probed). The code-list branch covers errors WRAPPED by other
-  // layers that surface a flat code; it is belt, not braces.
+  // Real undici fetch network failures ride the TypeError branch (their code is often buried
+  // DEEPER than cause.code, e.g. under cause.cause or an AggregateError — probed). The code-list
+  // branch covers errors WRAPPED by other layers that surface a flat code; it is belt, not braces.
+  // AbortError falls through to terminal by default — revisit if a fetch timeout is ever added.
   const networkish = err instanceof TypeError
     || ["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"].includes(err?.cause?.code ?? err?.code);
   return { retryable: !!networkish, reason };
@@ -243,6 +248,21 @@ test("send op: a send racing daemon shutdown neither crashes nor leaks an unhand
   assert.ok(true);                                          // surviving to here IS the assertion
 });
 
+test("send op: a REJECTING send racing daemon shutdown is caught, not an unhandled rejection", async () => {
+  chmodSync(dir, 0o700);
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const ipc = ipcFor({ sendFn: async () => { await gate; throw Object.assign(new Error("relay 503: late"), { status: 503 }); } });
+  await ipc.listen();
+  const v = await rawClient("viewer");
+  v.sock.write(encodeFrame({ type: "send", id: "race-2", to: "x", body: { type: "text", text: "a" } }));
+  await new Promise((r) => setTimeout(r, 30));             // the send is now pending inside sendFn
+  await ipc.close();                                        // shutdown destroys all subscriber sockets
+  release();                                                // sendFn REJECTS after the socket died
+  await new Promise((r) => setTimeout(r, 50));              // an unhandled rejection would fail the test runner
+  assert.ok(true);                                          // surviving to here IS the assertion
+});
+
 test("send op: failures ack as send-err with the classifier's retryable verdict", async () => {
   chmodSync(dir, 0o700);
   let fail = Object.assign(new Error("relay 503: down"), { status: 503 });
@@ -291,6 +311,23 @@ test("send op: malformed requests (missing id/to/body) ack terminal without call
   } finally { await ipc.close(); }
 });
 
+test("send op: the wire reason is capped and control-char-stripped (relay-controlled text must not flood the socket)", async () => {
+  chmodSync(dir, 0o700);
+  const huge = "relay 502: " + "<html>x\x07\x00".repeat(4000);   // ~36k chars + control bytes
+  const ipc = ipcFor({ sendFn: async () => { throw Object.assign(new Error(huge), { status: 502 }); } });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "cap-1", to: "x", body: { type: "text", text: "a" } }));
+    await until(() => v.frames.some((f) => f.type === "send-err" && f.id === "cap-1"));
+    const e = v.frames.find((f) => f.id === "cap-1");
+    assert.equal(e.reason.length <= 512, true, `reason must be capped, got ${e.reason.length}`);
+    assert.equal(/[\x00-\x08\x0b-\x1f\x7f]/.test(e.reason), false, "control chars must be stripped");
+    assert.equal(e.retryable, true);                       // the verdict is untouched by clipping
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
 test("send op: no sendFn wired → terminal send-err 'send unavailable'", async () => {
   chmodSync(dir, 0o700);
   const ipc = ipcFor();                                      // ipcFor passes no sendFn
@@ -322,16 +359,44 @@ assertion via the existing handshake guard — its load-bearing assert is `calle
 ```js
 import { classifySendError } from "./core.mjs";
 ```
+And near MAX_FRAME, add the reason cap (Task 2 review, Important):
+```js
+// send-err reasons ride the wire to GUIs and embed relay-controlled response text, which is
+// length-unbounded (a proxy's 502 HTML page, a chatty federated relay). Cap + de-control it at
+// the serialization boundary; rendering-side escaping stays the GUI's job.
+export const REASON_MAX_CHARS = 512;
+// Full C0 + DEL strip (not just the sub-range): log lines interpolate the raw clipped string, and
+// JSON-encode-only discipline does not cover daemon log output.
+const clipReason = (s) => String(s).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, REASON_MAX_CHARS);
+```
 **Circular-import check (do this BEFORE wiring):** `core.mjs` must not import from
 `daemon-ipc.mjs` (verify with `grep -n "daemon-ipc" src/core.mjs` — expected: no hits). If a cycle
 exists, move `classifySendError` into its own `src/send-verdict.mjs` and import from both sides.
 
-(b) `createIpcServer` options gain (after `statusExtraFn`):
+(b) Near `clipReason`, add the ack-write helper (I1: ack path inherits the 4×HWM backstop):
+```js
+/** Ack/control writes (send-ok/err, pong, status) bypass deliver()'s skip-band — they are tiny
+ *  and must not be silently dropped. But the ABSOLUTE backstop still applies: a wedged client
+ *  flooding requests while never reading must be destroyed, not buffered without bound. */
+const ackWrite = (socket, frame, hwm, log) => {
+  if (socket.destroyed) return;
+  if (socket.writableLength > hwm * 4) {
+    log(`[daemon] destroying wedged client (ack backlog ${socket.writableLength})`);
+    socket.destroy();
+    return;
+  }
+  socket.write(encodeFrame(frame));
+};
+```
+Use `ackWrite(socket, {...}, highWaterMark, log)` at ALL ack sites (hello-ok, pong, status,
+send-ok, send-err ×3) instead of bare `socket.write(encodeFrame(...))`.
+
+(c) `createIpcServer` options gain (after `statusExtraFn`):
 ```js
   sendFn = null,                              // injected by startDaemon (core.send); null → send unavailable
 ```
 
-(c) In the post-hello frame handler, after the `status` branch, add:
+(d) In the post-hello frame handler, after the `status` branch, add:
 ```js
       if (frame.type === "send") {
         // Send-over-socket (AI-inbox design §3): the daemon is the only key-holder and the only
@@ -340,27 +405,34 @@ exists, move `classifySendError` into its own `src/send-verdict.mjs` and import 
         // already run `air-msg send`). No correlation id → no ack (we cannot address one).
         if (frame.id === undefined) return;
         if (!frame.to || frame.body === undefined || frame.body === null) {
-          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send requires to + body" }));
+          ackWrite(socket, { type: "send-err", id: frame.id, retryable: false, reason: "send requires to + body" }, highWaterMark, log);
           return;
         }
         if (!sendFn) {
-          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send unavailable (daemon started without a send function)" }));
+          ackWrite(socket, { type: "send-err", id: frame.id, retryable: false, reason: "send unavailable (daemon started without a send function)" }, highWaterMark, log);
           return;
         }
         // Async on purpose: the ack arrives whenever core.send settles; the parser loop never
         // blocks. Guard the write — the requester may have disconnected while the relay was slow.
         // plaintext is optional wire-side and defaults false (CLI --plaintext parity; the desktop
         // always sends encrypted — the field exists for tests and tooling).
-        sendFn({ to: frame.to, body: frame.body, plaintext: frame.plaintext === true })
+        // thread_id/in_reply_to are optional wire-side (§6 composer threading — undefined-safe).
+        // Promise.resolve().then() isolates a synchronously-throwing sendFn from the parser loop:
+        // a sync throw would otherwise propagate into makeLineParser's onError and destroy the
+        // innocent client as "bad frame". Wrapping guarantees all failures land in .catch.
+        Promise.resolve().then(() => sendFn({
+          to: frame.to, body: frame.body, plaintext: frame.plaintext === true,
+          thread_id: frame.thread_id, in_reply_to: frame.in_reply_to,
+        }))
           .then((r) => {
-            if (socket.destroyed) return;
-            socket.write(encodeFrame({ type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }));
+            // destroyed-guard is defensive — a write to a destroyed socket is benign on current Node (probed); the .catch below is the load-bearing guard.
+            ackWrite(socket, { type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }, highWaterMark, log);
           })
           .catch((err) => {
-            if (socket.destroyed) return;
             const verdict = classifySendError(err);
-            log(`[daemon] send failed (${verdict.retryable ? "retryable" : "terminal"}): ${verdict.reason}`);
-            socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: verdict.retryable, reason: verdict.reason }));
+            const reason = clipReason(verdict.reason);
+            log(`[daemon] send failed (${verdict.retryable ? "retryable" : "terminal"}): ${reason}`);
+            ackWrite(socket, { type: "send-err", id: frame.id, retryable: verdict.retryable, reason }, highWaterMark, log);
           });
         return;
       }
@@ -371,7 +443,7 @@ In `src/daemon.mjs`:
   current import line first — it may already import more; extend, never duplicate).
 - In `startDaemon`'s `createIpcServer({...})` call, add after `statusExtraFn`:
 ```js
-    sendFn: ({ to, body, plaintext }) => coreSend({ to, body, plaintext }),
+    sendFn: ({ to, body, plaintext, thread_id, in_reply_to }) => coreSend({ to, body, plaintext, thread_id, in_reply_to }),
 ```
 **Executor self-check (critic M3):** the existing `ping`/`status` branches fall through without
 `return`; your `send` branch early-returns. Confirm after editing that the trailing
@@ -421,15 +493,15 @@ interop-vector precedent applied to the socket layer.
     "ping": { "type": "ping" },
     "status_request": { "type": "status" },
     "send": { "type": "send", "id": "11111111-2222-4333-8444-555555555555", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "hello from a GUI" } },
-    "send_plaintext": { "type": "send", "id": "22222222-3333-4444-8555-666666666666", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "deliberately clear" }, "plaintext": true }
+    "send_plaintext": { "type": "send", "id": "22222222-3333-4444-8555-666666666666", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "deliberately clear" }, "plaintext": true },
+    "send_reply": { "type": "send", "id": "33333333-4444-4555-8666-777777777777", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "threaded reply" }, "thread_id": "tttttttt-uuuu-4vvv-8www-xxxxxxxxxxxx", "in_reply_to": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }
   },
   "daemon_to_client": {
     "hello_ok": { "type": "hello-ok", "pid": 4242, "start_time": "2026-06-11T00:00:00.000Z", "did": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST" },
     "message": { "type": "message", "message": { "seq": 7, "relay_seq": 7, "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "from": "did:wba:agentidentityregistry.org:agents:AIR-PEER-PEER-PEER", "contact": "pat", "verified": true, "encrypted": true, "received_at": "2026-06-11T00:00:01.000Z", "thread_id": "tttttttt-uuuu-4vvv-8www-xxxxxxxxxxxx", "body": { "type": "text", "text": "hi" } } },
-    "comment_message_optional_fields": "message.message: contact / key_changed / thread_id / body presence is CONDITIONAL — the daemon OMITS falsy/unset fields (a real key_changed:false frame carries NO key_changed key; an unpinned sender carries NO contact). The fixture shows a pinned, verified, key-unchanged sender. Parsers MUST treat these as optional.",
     "gap": { "type": "gap", "after_seq": 41 },
     "pong": { "type": "pong" },
-    "status": { "type": "status", "socket": "/home/user/.air-msg/daemon.sock", "last_seq": 7, "clients": [{ "role": "viewer", "lastSeq": 7, "dropped": 0 }], "sinks": ["banner", "socket"] },
+    "status": { "type": "status", "socket": "/home/user/.air-msg/daemon.sock", "last_seq": 7, "clients": [{ "role": "viewer", "lastSeq": 7, "dropped": 0 }, { "role": "channel", "lastSeq": null, "dropped": 0 }], "sinks": ["banner", "socket"] },
     "send_ok": { "type": "send-ok", "id": "11111111-2222-4333-8444-555555555555", "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "encrypted": true },
     "send_err": { "type": "send-err", "id": "11111111-2222-4333-8444-555555555555", "retryable": true, "reason": "relay 503: down" },
     "error": { "type": "error", "reason": "first frame must be hello with role channel|viewer" }
@@ -483,6 +555,7 @@ test("request fixtures elicit the catalogued response SHAPES from a live server"
   const ipc = createIpcServer({
     daemonInfo: { pid: 4242, start_time: "2026-06-11T00:00:00.000Z", did: FIXTURES.daemon_to_client.hello_ok.did },
     sendFn: async () => ({ envelope_id: FIXTURES.daemon_to_client.send_ok.envelope_id, encrypted: true }),
+    statusExtraFn: () => ({ sinks: ["banner", "socket"] }),   // mirrors daemon.mjs:85 — photographs the production shape
     log: () => {},
   });
   await ipc.listen();
@@ -544,14 +617,28 @@ channel = verified+pinned+key-unchanged / room-gated; roles are DELIVERY filters
 role-agnostic); each frame type with a field table and direction, mirroring
 `test/fixtures/socket-frames.json` (state that the fixtures file is normative for shapes); flow
 control summary (per-subscriber skip above HWM, gap-on-progress for channel, 4×HWM destroy
-backstop; reconnect with since_seq is the recovery); the send op contract incl. the optional
-`plaintext` boolean (default false; CLI `--plaintext` parity), the retryable/terminal taxonomy,
-the no-id-no-ack rule, and an explicit statement that the ack is INTENTIONALLY MINIMAL
+backstop; pre-hello reaper — client that sends no hello within 5 s is destroyed silently; client
+SHOULD enforce a hello-ok timeout (reference: 3 s); `{type:"error"}` scope covers BOTH pre-hello
+violations AND post-hello malformed/oversized lines; `since_seq` bookkeeping — first attach sends
+NO since_seq (live-from-attach), on reconnect since_seq = max-seen relay_seq falling back to the
+archive cursor snapshotted at first attach; reconnect with since_seq is the recovery);
+**gap replay invariants INLINE — five filters** (replay never delivers more than live did: received-only; spam excluded unconditionally; synthetic room-join notices excluded by `envelope_id` ending in `:joined` — ID suffix is the canonical filter, NOT body type `%:joined` (wrong); blocklist re-checked at replay; channel admission gate re-applied per §3 (verified + currently-pinned + key-unchanged + mute) — the archive stores viewer-visible rows channel-withheld — full rationale AI-inbox design §5);
+the send op contract incl. the optional
+`plaintext` boolean (default false; CLI `--plaintext` parity), optional `thread_id`/`in_reply_to`
+for composer threading (§6 — the reply composer reuses the incoming thread_id and sets in_reply_to
+to the envelope being replied to; both are forwarded unchanged to core.send; see `send_reply`
+fixture), the retryable/terminal taxonomy,
+the no-id-no-ack rule, the `reason` cap (≤512 chars, full C0+DEL range stripped at the daemon —
+relay-controlled text is length-unbounded; rendering-side escaping stays the GUI's job), and an
+explicit statement that the ack is INTENTIONALLY MINIMAL
 (`id, envelope_id, encrypted` — no thread_id/relay_seq; the archive is the source of truth for
 sent-row detail); a "Message fields" note that `contact`/`key_changed`/`thread_id`/`body` are
-OPTIONAL — omitted when falsy/unset (parsers must not require them); a "Versioning" section
-(unknown frame types are ignored by both sides — additive evolution; the fixtures file carries
-`version`). Cross-link the daemon design spec §5/§6 and the AI-inbox design §3/§5.
+OPTIONAL — omitted when falsy/unset (parsers must not require them); `clients[]` sub-table with
+`lastSeq: integer|null` (null for viewers and channel clients without since_seq) and `dropped:
+integer`, with a note that field names are camelCase on the wire; a "Versioning" section
+(unknown frame types are ignored by both sides — additive evolution; unknown fields within known
+frame types MUST likewise be ignored — strict parsers with deny_unknown_fields are non-conformant;
+the fixtures file carries `version`). Cross-link the daemon design spec §5/§6 and the AI-inbox design §3/§5.
 
 - [ ] **Step 5: Commit**
 

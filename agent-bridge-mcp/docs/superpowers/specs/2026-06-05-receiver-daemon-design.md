@@ -144,6 +144,9 @@ the daemon's `receive()` loop.
   before any frame arrived — from an archive-cursor baseline snapshotted at first attach. The
   4×HWM backstop-destroy needs NO final gap hint: a wedged socket cannot usefully receive one,
   and the destroyed client's reconnect+since_seq path IS the recovery (integration-proven).
+- **Phase A1 (2026-06-11, AI-inbox):** the archive runs in WAL mode with a 5 s busy timeout —
+  cross-process READ-ONLY consumers (the desktop's archive reader, gap replay) proceed
+  concurrently with the daemon writer; WAL is set by the writer in `openArchive()`.
 
 ## 7. Daemon ↔ legacy resolution (no split-brain)
 
@@ -192,6 +195,12 @@ Both installer smokes are DONE (2026-06-11): macOS `daemon install` live on the 
 the repeatable `.github/workflows/systemd-smoke.yml` (manual dispatch; spaced-home quoting,
 Restart=always, clean uninstall). The systemd generator stays content-tested in unit tests; the
 workflow is the runtime gate — re-run it after generator changes.
+
+Phase A1 adds the socket's first REQUEST op: `{type:"send", id, to, body}` → `core.send` →
+`{type:"send-ok"|"send-err"}` with a retryable/terminal taxonomy (`classifySendError`). Roles
+remain delivery filters; send is role-agnostic (the 0600 socket is the OS user boundary). The
+wire contract lives in `docs/PROTOCOL.md` + `test/fixtures/socket-frames.json` (normative,
+cross-language).
 
 ## 9. Testing
 

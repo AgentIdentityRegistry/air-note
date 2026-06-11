@@ -197,6 +197,23 @@ export function cursorAdvanceTarget({ deliveredSeqs, failedSeqs, strict }) {
   return safe.length ? Math.max(...safe) : null;
 }
 
+/** Classify a send() failure for the socket ack (AI-inbox design §3): retryable means "trying
+ *  again later can plausibly succeed" — relay 5xx or a network-level fetch failure. Everything
+ *  else (relay 4xx, validation, unresolvable recipient, refuse-unencrypted) is terminal: a blind
+ *  retry would loop forever. Unknown errors default to TERMINAL — the retry affordance must never
+ *  attach to an error we cannot reason about. */
+export function classifySendError(err) {
+  const reason = String(err?.message ?? err);
+  if (typeof err?.status === "number") return { retryable: err.status >= 500, reason };
+  // Real undici fetch network failures ride the TypeError branch (their code is often buried
+  // DEEPER than cause.code, e.g. under cause.cause or an AggregateError — probed). The code-list
+  // branch covers errors WRAPPED by other layers that surface a flat code; it is belt, not braces.
+  // AbortError falls through to terminal by default — revisit if a fetch timeout is ever added.
+  const networkish = err instanceof TypeError
+    || ["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "EAI_AGAIN"].includes(err?.cause?.code ?? err?.code);
+  return { retryable: !!networkish, reason };
+}
+
 /**
  * Ingest one received control op (spec §9, §6.4). The envelope signature is already
  * verified by the caller; here we verify the op's OWN `op_sig` against the authoritative
@@ -348,7 +365,11 @@ async function postEnvelope(identity, recipient, envelope) {
   const resp = await fetch(`${identity.relay_url}/inbox/${encodeURIComponent(recipient)}`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(envelope),
   });
-  if (!resp.ok) throw new Error(`relay ${resp.status}: ${await resp.text()}`);
+  if (!resp.ok) {
+    // Structured status (AI-inbox design §3): the send-over-socket ack must tell a GUI whether
+    // retrying can help; a classifier should never regex-parse error prose for the code.
+    throw Object.assign(new Error(`relay ${resp.status}: ${await resp.text()}`), { status: resp.status });
+  }
   return resp.json();
 }
 

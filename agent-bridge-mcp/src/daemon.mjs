@@ -5,7 +5,7 @@ import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { watch } from "./watch.mjs";
 import { fanOut } from "./fanout.mjs";
-import { receiveAll } from "./core.mjs";
+import { receiveAll, send as coreSend } from "./core.mjs";
 import { bridgeHome, ensureIdentity } from "./identity.mjs";
 import { isPidAlive, acquireOrExit, releaseConsumerLock } from "./consumer-lock.mjs";
 import { getCursor, archiveExists } from "./archive.mjs";
@@ -83,6 +83,7 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
     mute,
     daemonInfo: { pid: process.pid, start_time: startTime, did: identity.did },
     statusExtraFn: () => ({ sinks: sinks.map((s) => s.name) }),
+    sendFn: ({ to, body, plaintext, thread_id, in_reply_to }) => coreSend({ to, body, plaintext, thread_id, in_reply_to }),
     log,
   });
   await ipc.listen();                              // safe: we hold the consumer lock (single-daemon mutex)

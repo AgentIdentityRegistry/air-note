@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveRecipient, didFromAirId, cursorAdvanceTarget } from "../src/core.mjs";
+import { resolveRecipient, didFromAirId, cursorAdvanceTarget, classifySendError } from "../src/core.mjs";
 
 // resolveRecipient's alias branch reads the contacts store; point it at an empty temp
 // home so an unknown alias has no matching contact and falls through unchanged.
@@ -46,4 +46,20 @@ test("cursorAdvanceTarget: strict mode never advances past the first archive fai
 
 test("cursorAdvanceTarget: empty batch → null (no cursor touch)", () => {
   assert.equal(cursorAdvanceTarget({ deliveredSeqs: [], failedSeqs: [], strict: true }), null);
+});
+
+test("classifySendError: relay 5xx and network failures are retryable", () => {
+  assert.deepEqual(classifySendError(Object.assign(new Error("relay 503: nope"), { status: 503 })),
+    { retryable: true, reason: "relay 503: nope" });
+  const netErr = new TypeError("fetch failed");
+  netErr.cause = Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+  assert.equal(classifySendError(netErr).retryable, true);
+  assert.equal(classifySendError(Object.assign(new TypeError("fetch failed"), {})).retryable, true);
+});
+
+test("classifySendError: relay 4xx, validation, and refuse-unencrypted are terminal", () => {
+  assert.equal(classifySendError(Object.assign(new Error("relay 404: unknown inbox"), { status: 404 })).retryable, false);
+  assert.equal(classifySendError(new Error("recipient (DID, AIR ID, or contact alias) is required")).retryable, false);
+  assert.equal(classifySendError(new Error("cannot resolve recipient's key from AIR — refusing to send unencrypted. Pass plaintext:true to send in the clear on purpose.")).retryable, false);
+  assert.equal(classifySendError(new Error("anything unknown")).retryable, false);   // default terminal
 });

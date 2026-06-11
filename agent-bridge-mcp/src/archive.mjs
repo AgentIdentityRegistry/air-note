@@ -52,6 +52,19 @@ export function openArchive() {
   mkdirSync(bridgeHome(), { recursive: true, mode: 0o700 });
   const path = archivePath();
   const db = new DatabaseSync(path);
+  try { chmodSync(path, 0o600); } catch { /* best effort on non-POSIX */ }
+  // WAL + busy timeout (AI-inbox design §5, second-opinion Critical): the desktop reads this DB
+  // read-only from another process while the daemon writes. Under the default rollback journal a
+  // writer's EXCLUSIVE lock and a reader's SHARED lock are mutually exclusive → SQLITE_BUSY
+  // exactly during gap-replay bursts. WAL allows one writer + many readers; it is a PERSISTENT
+  // file property the WRITER must set. journal_mode/busy_timeout are read-back pragmas — use
+  // .get(), not .run() (some builds error on run for row-returning pragmas).
+  // busy_timeout FIRST: the WAL conversion itself can contend with a concurrent writer and must
+  // inherit the retry window. Auto-checkpoint (default 1000 pages ≈ 4 MB) bounds WAL size for
+  // the always-on daemon; long-lived READ transactions are the only unbounding hazard — the A2
+  // reader must use short-lived statements (its spec carries that rule).
+  db.prepare("PRAGMA busy_timeout=5000").get();
+  db.prepare("PRAGMA journal_mode=WAL").get();
   for (const stmt of SCHEMA) db.prepare(stmt).run();
   // Migration: add the moderation `spam` flag if an older DB predates it. Guarded by
   // PRAGMA so it runs at most once; ADD COLUMN ... NOT NULL DEFAULT 0 is legal in node:sqlite.
@@ -68,7 +81,6 @@ export function openArchive() {
     // archive must record that bit or a replay would push what live deliberately withheld.
     db.prepare(`ALTER TABLE messages ADD COLUMN key_changed INTEGER NOT NULL DEFAULT 0`).run();
   }
-  try { chmodSync(path, 0o600); } catch { /* best effort on non-POSIX */ }
   _db = db;
   return db;
 }
@@ -212,5 +224,7 @@ export function replaySince(since_seq, { limit = 500 } = {}) {
   ).all(Number(since_seq) || 0, limit).map(parseRow);
 }
 
-/** Placeholder for the future cloud-backup layer (#14 stage 2; see design §6). Deferred. */
+/** Placeholder for the future cloud-backup layer (#14 stage 2; see design §6). Deferred.
+ *  WAL note: a bare file copy of a live WAL database misses un-checkpointed frames and can tear —
+ *  use VACUUM INTO or the backup API when this seam becomes real. */
 export async function backupArchive(/* adapter */) { /* intentionally a no-op seam */ }
