@@ -622,8 +622,7 @@ SHOULD enforce a hello-ok timeout (reference: 3 s); `{type:"error"}` scope cover
 violations AND post-hello malformed/oversized lines; `since_seq` bookkeeping — first attach sends
 NO since_seq (live-from-attach), on reconnect since_seq = max-seen relay_seq falling back to the
 archive cursor snapshotted at first attach; reconnect with since_seq is the recovery);
-**gap replay invariants INLINE** (replay never delivers more than live did: received-only,
-spam excluded, synthetic `%:joined` excluded, blocklist re-checked at replay — full rationale AI-inbox design §5);
+**gap replay invariants INLINE — five filters** (replay never delivers more than live did: received-only; spam excluded unconditionally; synthetic room-join notices excluded by `envelope_id` ending in `:joined` — ID suffix is the canonical filter, NOT body type `%:joined` (wrong); blocklist re-checked at replay; channel admission gate re-applied per §3 (verified + currently-pinned + key-unchanged + mute) — the archive stores viewer-visible rows channel-withheld — full rationale AI-inbox design §5);
 the send op contract incl. the optional
 `plaintext` boolean (default false; CLI `--plaintext` parity), optional `thread_id`/`in_reply_to`
 for composer threading (§6 — the reply composer reuses the incoming thread_id and sets in_reply_to

@@ -146,16 +146,17 @@ from the archive starting after `after_seq`.
 | Field | Type | Required | Semantics |
 |---|---|---|---|
 | `type` | `"gap"` | required | Frame discriminator |
-| `after_seq` | integer | required | The last cleanly-delivered `relay_seq`. The client replays archive messages with `relay_seq > after_seq`, subject to the four invariants below. |
+| `after_seq` | integer | required | The last cleanly-delivered `relay_seq`. The client replays archive messages with `relay_seq > after_seq`, subject to the five invariants below. |
 
 **Replay invariants — replay never delivers more than live did.** A conforming client MUST apply
-all four filters identically to the live-delivery path (full rationale: AI-inbox design §5,
+all five filters identically to the live-delivery path (full rationale: AI-inbox design §5,
 `../../docs/superpowers/specs/2026-06-11-desktop-ai-inbox-design.md`):
 
 1. **Received-only** — replay rows with `direction = 'received'` only; sent rows are not messages to surface.
-2. **Spam excluded** — rows flagged as spam are hidden by default (mirrors the live path's spam gate).
-3. **Synthetic `%:joined` excluded** — room-join notice rows (body type `%:joined`) are internal bookkeeping; exclude them from replay just as live delivery does.
+2. **Spam excluded** — rows flagged as spam are excluded unconditionally.
+3. **Synthetic room-join notices excluded** — identified by `envelope_id` ending in `:joined` (synthetic id `"<room_id>:joined"`; their body type is `room/joined`, but the ID suffix is the canonical filter, matching the reference `replaySince()` query). Exclude them from replay just as live delivery does.
 4. **Blocklist re-checked at replay time** — a sender may have been blocked after the original live delivery; the block takes effect retroactively on replay. Skipping this check is a filter bypass.
+5. **Channel admission gate re-applied** — the §3 channel gate (verified + currently-pinned + key-unchanged, mute re-checked) is applied to every replayed row. The archive deliberately stores rows that live delivery withheld from `channel` subscribers (viewer-visible mail); rows carry `verified` and `key_changed` precisely so replay can withhold what live withheld.
 
 ### `pong`
 
@@ -179,8 +180,8 @@ oddity inherited from the in-process subscriber record; Rust parsers must use `#
 | Field | Type | Semantics |
 |---|---|---|
 | `role` | `"viewer"` \| `"channel"` | The subscriber's declared role |
-| `lastSeq` | integer \| **null** | Last `relay_seq` successfully written to this subscriber. `null` for every `viewer` (best-effort role; seq not tracked) and for any `channel` client whose `since_seq` was not supplied at hello — production seeds `null` at sub creation in `daemon-ipc.mjs`. |
-| `dropped` | integer | Count of delivery writes skipped due to back-pressure since attach or last gap emission |
+| `lastSeq` | integer \| **null** | Last `relay_seq` successfully written to this subscriber. Starts `null` (a channel client supplying `since_seq` is seeded with it); thereafter tracks the last `relay_seq` successfully written to this subscriber, any role — the adjacent fixture shows a viewer at 7. |
+| `dropped` | integer | Count of delivery writes skipped due to back-pressure since attach or last flush-on-progress |
 
 ### `send-ok`
 
