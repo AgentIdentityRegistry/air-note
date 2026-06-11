@@ -28,6 +28,7 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "1.0"
 urlencoding = "2.1"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "2.3", features = ["linux-secret-service", "linux-keyutils"] }

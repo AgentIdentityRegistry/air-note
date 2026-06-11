@@ -494,6 +494,7 @@ dependencies = [
  "tokio",
  "unsigned-varint",
  "urlencoding",
+ "uuid",
 ]
 
 [[package]]
