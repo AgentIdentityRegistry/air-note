@@ -22,7 +22,22 @@ export const MAX_FRAME = 1 << 20;
 // length-unbounded (a proxy's 502 HTML page, a chatty federated relay). Cap + de-control it at
 // the serialization boundary; rendering-side escaping stays the GUI's job.
 export const REASON_MAX_CHARS = 512;
-const clipReason = (s) => String(s).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").slice(0, REASON_MAX_CHARS);
+// Full C0 + DEL strip (not just the sub-range): log lines interpolate the raw clipped string, and
+// JSON-encode-only discipline does not cover daemon log output.
+const clipReason = (s) => String(s).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, REASON_MAX_CHARS);
+
+/** Ack/control writes (send-ok/err, pong, status) bypass deliver()'s skip-band — they are tiny
+ *  and must not be silently dropped. But the ABSOLUTE backstop still applies: a wedged client
+ *  flooding requests while never reading must be destroyed, not buffered without bound. */
+const ackWrite = (socket, frame, hwm, log) => {
+  if (socket.destroyed) return;
+  if (socket.writableLength > hwm * 4) {
+    log(`[daemon] destroying wedged client (ack backlog ${socket.writableLength})`);
+    socket.destroy();
+    return;
+  }
+  socket.write(encodeFrame(frame));
+};
 
 /** One JSON object per newline-terminated line. */
 export function encodeFrame(obj) {
@@ -139,7 +154,7 @@ export function createIpcServer({
         const resumeSeq = frame.role === "channel" && Number.isFinite(frame.since_seq) ? frame.since_seq : null;
         sub = { socket, role: frame.role, lastSeq: resumeSeq, dropped: 0 };
         subscribers.add(sub);
-        socket.write(encodeFrame({ type: "hello-ok", ...daemonInfo }));
+        ackWrite(socket, { type: "hello-ok", ...daemonInfo }, highWaterMark, log);
         log(`[daemon] client attached: role=${frame.role} (${subscribers.size} connected)`);
         // C1 (critic, empirically reproduced): 'drain' fires only after a write() returned
         // false AND the buffer empties to ZERO — a slow-but-steady reader can keep the queue
@@ -169,11 +184,11 @@ export function createIpcServer({
         }
         return;
       }
-      if (frame.type === "ping") socket.write(encodeFrame({ type: "pong" }));
+      if (frame.type === "ping") ackWrite(socket, { type: "pong" }, highWaterMark, log);
       // Status probes appear in the attach/detach log lines — accepted noise for interactive use;
       // revisit (e.g. a probe:true hello hint) only if status polling becomes a pattern.
       if (frame.type === "status") {
-        socket.write(encodeFrame({
+        ackWrite(socket, {
           type: "status",
           socket: socketPath(),
           last_seq: lastDeliveredSeq,
@@ -181,7 +196,7 @@ export function createIpcServer({
           // counting it would make an idle daemon always report one client (critic v1 M3).
           clients: [...subscribers].filter((s) => s !== sub).map((s) => ({ role: s.role, lastSeq: s.lastSeq, dropped: s.dropped })),
           ...statusExtraFn(),
-        }));
+        }, highWaterMark, log);
       }
       if (frame.type === "send") {
         // Send-over-socket (AI-inbox design §3): the daemon is the only key-holder and the only
@@ -190,29 +205,34 @@ export function createIpcServer({
         // already run `air-msg send`). No correlation id → no ack (we cannot address one).
         if (frame.id === undefined) return;
         if (!frame.to || frame.body === undefined || frame.body === null) {
-          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send requires to + body" }));
+          ackWrite(socket, { type: "send-err", id: frame.id, retryable: false, reason: "send requires to + body" }, highWaterMark, log);
           return;
         }
         if (!sendFn) {
-          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send unavailable (daemon started without a send function)" }));
+          ackWrite(socket, { type: "send-err", id: frame.id, retryable: false, reason: "send unavailable (daemon started without a send function)" }, highWaterMark, log);
           return;
         }
         // Async on purpose: the ack arrives whenever core.send settles; the parser loop never
         // blocks. Guard the write — the requester may have disconnected while the relay was slow.
         // plaintext is optional wire-side and defaults false (CLI --plaintext parity; the desktop
         // always sends encrypted — the field exists for tests and tooling).
-        sendFn({ to: frame.to, body: frame.body, plaintext: frame.plaintext === true })
+        // thread_id/in_reply_to are optional wire-side (§6 composer threading — undefined-safe).
+        // Promise.resolve().then() isolates a synchronously-throwing sendFn from the parser loop:
+        // a sync throw would otherwise propagate into makeLineParser's onError and destroy the
+        // innocent client as "bad frame". Wrapping guarantees all failures land in .catch.
+        Promise.resolve().then(() => sendFn({
+          to: frame.to, body: frame.body, plaintext: frame.plaintext === true,
+          thread_id: frame.thread_id, in_reply_to: frame.in_reply_to,
+        }))
           .then((r) => {
             // destroyed-guard is defensive — a write to a destroyed socket is benign on current Node (probed); the .catch below is the load-bearing guard.
-            if (socket.destroyed) return;
-            socket.write(encodeFrame({ type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }));
+            ackWrite(socket, { type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }, highWaterMark, log);
           })
           .catch((err) => {
-            if (socket.destroyed) return;
             const verdict = classifySendError(err);
             const reason = clipReason(verdict.reason);
             log(`[daemon] send failed (${verdict.retryable ? "retryable" : "terminal"}): ${reason}`);
-            socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: verdict.retryable, reason }));
+            ackWrite(socket, { type: "send-err", id: frame.id, retryable: verdict.retryable, reason }, highWaterMark, log);
           });
         return;
       }

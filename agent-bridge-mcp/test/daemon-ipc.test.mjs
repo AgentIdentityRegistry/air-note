@@ -782,8 +782,8 @@ test("send op: a post-hello subscriber sends; ack carries the correlation id and
     assert.equal(ok.id, "corr-1");
     assert.equal(ok.envelope_id, "e-sent-1");
     assert.equal(ok.encrypted, true);
-    // plaintext is OPTIONAL on the wire and defaults false — absent on the frame, false at sendFn.
-    assert.deepEqual(calls, [{ to: "did:wba:peer", body: { type: "text", text: "hi" }, plaintext: false }]);
+    // plaintext defaults false; thread_id/in_reply_to are forwarded as undefined when absent.
+    assert.deepEqual(calls, [{ to: "did:wba:peer", body: { type: "text", text: "hi" }, plaintext: false, thread_id: undefined, in_reply_to: undefined }]);
     v.sock.destroy();
   } finally { await ipc.close(); }
 });
@@ -798,7 +798,7 @@ test("send op: plaintext:true on the frame is forwarded to sendFn (the CLI --pla
     v.sock.write(encodeFrame({ type: "send", id: "pt-1", to: "did:wba:peer", body: { type: "text", text: "clear" }, plaintext: true }));
     await until(() => v.frames.some((f) => f.type === "send-ok"));
     assert.equal(v.frames.find((f) => f.type === "send-ok").encrypted, false);
-    assert.deepEqual(calls, [{ to: "did:wba:peer", body: { type: "text", text: "clear" }, plaintext: true }]);
+    assert.deepEqual(calls, [{ to: "did:wba:peer", body: { type: "text", text: "clear" }, plaintext: true, thread_id: undefined, in_reply_to: undefined }]);
     v.sock.destroy();
   } finally { await ipc.close(); }
 });
@@ -892,7 +892,7 @@ test("send op: the wire reason is capped and control-char-stripped (relay-contro
     await until(() => v.frames.some((f) => f.type === "send-err" && f.id === "cap-1"));
     const e = v.frames.find((f) => f.id === "cap-1");
     assert.equal(e.reason.length <= 512, true, `reason must be capped, got ${e.reason.length}`);
-    assert.equal(/[\x00-\x08\x0b-\x1f\x7f]/.test(e.reason), false, "control chars must be stripped");
+    assert.equal(/[\x00-\x1f\x7f]/.test(e.reason), false, "control chars must be stripped");
     assert.equal(e.retryable, true);                       // the verdict is untouched by clipping
     v.sock.destroy();
   } finally { await ipc.close(); }
@@ -909,6 +909,69 @@ test("send op: no sendFn wired → terminal send-err 'send unavailable'", async 
     const e = v.frames.find((f) => f.id === "u1");
     assert.equal(e.retryable, false);
     assert.match(e.reason, /send unavailable/);
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op: thread_id and in_reply_to on the frame are forwarded to sendFn (§6 composer threading)", async () => {
+  chmodSync(dir, 0o700);
+  const calls = [];
+  const ipc = ipcFor({ sendFn: async (args) => { calls.push(args); return { envelope_id: "e-thread-1", encrypted: true }; } });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "th-1", to: "did:wba:peer", body: { type: "text", text: "reply" },
+      thread_id: "tid-abc", in_reply_to: "env-xyz" }));
+    await until(() => v.frames.some((f) => f.type === "send-ok" && f.id === "th-1"));
+    assert.equal(calls[0].thread_id, "tid-abc");
+    assert.equal(calls[0].in_reply_to, "env-xyz");
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op (M6a): two concurrent in-flight sends from one client; acks correlate by id regardless of settlement order", async () => {
+  chmodSync(dir, 0o700);
+  let releaseA, releaseB;
+  const gateA = new Promise((r) => { releaseA = r; });
+  const gateB = new Promise((r) => { releaseB = r; });
+  const ipc = ipcFor({
+    sendFn: async ({ to }) => {
+      if (to === "did:wba:a") { await gateA; return { envelope_id: "env-a", encrypted: true }; }
+      await gateB; return { envelope_id: "env-b", encrypted: false };
+    },
+  });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "s-a", to: "did:wba:a", body: { type: "text", text: "a" } }));
+    v.sock.write(encodeFrame({ type: "send", id: "s-b", to: "did:wba:b", body: { type: "text", text: "b" } }));
+    await new Promise((r) => setTimeout(r, 20));             // both sends are now gated in-flight
+    releaseB();                                               // B settles first (out of order)
+    await until(() => v.frames.some((f) => f.type === "send-ok" && f.id === "s-b"));
+    releaseA();
+    await until(() => v.frames.some((f) => f.type === "send-ok" && f.id === "s-a"));
+    assert.equal(v.frames.find((f) => f.id === "s-a").envelope_id, "env-a");
+    assert.equal(v.frames.find((f) => f.id === "s-b").envelope_id, "env-b");
+    v.sock.destroy();
+  } finally { await ipc.close(); }
+});
+
+test("send op (M6b): a synchronously-throwing sendFn yields a terminal send-err and the client STAYS connected", async () => {
+  chmodSync(dir, 0o700);
+  const ipc = ipcFor({
+    sendFn: () => { throw Object.assign(new Error("relay 404: not found"), { status: 404 }); },
+  });
+  await ipc.listen();
+  try {
+    const v = await rawClient("viewer");
+    v.sock.write(encodeFrame({ type: "send", id: "sync-1", to: "x", body: { type: "text", text: "a" } }));
+    await until(() => v.frames.some((f) => f.type === "send-err" && f.id === "sync-1"));
+    const e = v.frames.find((f) => f.id === "sync-1");
+    assert.equal(e.retryable, false);                        // 404 is terminal
+    assert.match(e.reason, /relay 404/);
+    assert.equal(ipc.clientCount(), 1);                      // client was NOT destroyed as "bad frame"
+    v.sock.write(encodeFrame({ type: "ping" }));             // proves the parser loop is still alive
+    await until(() => v.frames.some((f) => f.type === "pong"));
     v.sock.destroy();
   } finally { await ipc.close(); }
 });

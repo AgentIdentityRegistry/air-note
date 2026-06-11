@@ -83,7 +83,7 @@ export async function startDaemon({ log = (s) => process.stderr.write(s + "\n") 
     mute,
     daemonInfo: { pid: process.pid, start_time: startTime, did: identity.did },
     statusExtraFn: () => ({ sinks: sinks.map((s) => s.name) }),
-    sendFn: ({ to, body, plaintext }) => coreSend({ to, body, plaintext }),
+    sendFn: ({ to, body, plaintext, thread_id, in_reply_to }) => coreSend({ to, body, plaintext, thread_id, in_reply_to }),
     log,
   });
   await ipc.listen();                              // safe: we hold the consumer lock (single-daemon mutex)

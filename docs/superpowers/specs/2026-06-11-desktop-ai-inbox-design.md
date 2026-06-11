@@ -69,7 +69,10 @@ outbox is a named v1.5 follow-up. Send is accepted from any POST-hello subscribe
 role: roles are DELIVERY filters (confidentiality), not request authority — the 0600 socket is
 the OS user boundary, and any process that can connect could already run `air-msg send`. The
 frame also carries an optional `plaintext` boolean (default false; CLI `--plaintext` parity,
-needed for hermetic tests) — the desktop always sends encrypted.
+needed for hermetic tests) — the desktop always sends encrypted. The frame additionally accepts
+optional `thread_id` and `in_reply_to` fields for composer threading (§6): the reply composer
+reuses the incoming `thread_id` and sets `in_reply_to` to the envelope being replied to; both
+are forwarded unchanged to `core.send`.
 
 ## 4. Identity adoption (Phase A) — the collision is the primary case
 

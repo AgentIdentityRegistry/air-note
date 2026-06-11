@@ -363,18 +363,38 @@ And near MAX_FRAME, add the reason cap (Task 2 review, Important):
 // length-unbounded (a proxy's 502 HTML page, a chatty federated relay). Cap + de-control it at
 // the serialization boundary; rendering-side escaping stays the GUI's job.
 export const REASON_MAX_CHARS = 512;
-const clipReason = (s) => String(s).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ").slice(0, REASON_MAX_CHARS);
+// Full C0 + DEL strip (not just the sub-range): log lines interpolate the raw clipped string, and
+// JSON-encode-only discipline does not cover daemon log output.
+const clipReason = (s) => String(s).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, REASON_MAX_CHARS);
 ```
 **Circular-import check (do this BEFORE wiring):** `core.mjs` must not import from
 `daemon-ipc.mjs` (verify with `grep -n "daemon-ipc" src/core.mjs` — expected: no hits). If a cycle
 exists, move `classifySendError` into its own `src/send-verdict.mjs` and import from both sides.
 
-(b) `createIpcServer` options gain (after `statusExtraFn`):
+(b) Near `clipReason`, add the ack-write helper (I1: ack path inherits the 4×HWM backstop):
+```js
+/** Ack/control writes (send-ok/err, pong, status) bypass deliver()'s skip-band — they are tiny
+ *  and must not be silently dropped. But the ABSOLUTE backstop still applies: a wedged client
+ *  flooding requests while never reading must be destroyed, not buffered without bound. */
+const ackWrite = (socket, frame, hwm, log) => {
+  if (socket.destroyed) return;
+  if (socket.writableLength > hwm * 4) {
+    log(`[daemon] destroying wedged client (ack backlog ${socket.writableLength})`);
+    socket.destroy();
+    return;
+  }
+  socket.write(encodeFrame(frame));
+};
+```
+Use `ackWrite(socket, {...}, highWaterMark, log)` at ALL ack sites (hello-ok, pong, status,
+send-ok, send-err ×3) instead of bare `socket.write(encodeFrame(...))`.
+
+(c) `createIpcServer` options gain (after `statusExtraFn`):
 ```js
   sendFn = null,                              // injected by startDaemon (core.send); null → send unavailable
 ```
 
-(c) In the post-hello frame handler, after the `status` branch, add:
+(d) In the post-hello frame handler, after the `status` branch, add:
 ```js
       if (frame.type === "send") {
         // Send-over-socket (AI-inbox design §3): the daemon is the only key-holder and the only
@@ -383,29 +403,34 @@ exists, move `classifySendError` into its own `src/send-verdict.mjs` and import 
         // already run `air-msg send`). No correlation id → no ack (we cannot address one).
         if (frame.id === undefined) return;
         if (!frame.to || frame.body === undefined || frame.body === null) {
-          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send requires to + body" }));
+          ackWrite(socket, { type: "send-err", id: frame.id, retryable: false, reason: "send requires to + body" }, highWaterMark, log);
           return;
         }
         if (!sendFn) {
-          socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: false, reason: "send unavailable (daemon started without a send function)" }));
+          ackWrite(socket, { type: "send-err", id: frame.id, retryable: false, reason: "send unavailable (daemon started without a send function)" }, highWaterMark, log);
           return;
         }
         // Async on purpose: the ack arrives whenever core.send settles; the parser loop never
         // blocks. Guard the write — the requester may have disconnected while the relay was slow.
         // plaintext is optional wire-side and defaults false (CLI --plaintext parity; the desktop
         // always sends encrypted — the field exists for tests and tooling).
-        sendFn({ to: frame.to, body: frame.body, plaintext: frame.plaintext === true })
+        // thread_id/in_reply_to are optional wire-side (§6 composer threading — undefined-safe).
+        // Promise.resolve().then() isolates a synchronously-throwing sendFn from the parser loop:
+        // a sync throw would otherwise propagate into makeLineParser's onError and destroy the
+        // innocent client as "bad frame". Wrapping guarantees all failures land in .catch.
+        Promise.resolve().then(() => sendFn({
+          to: frame.to, body: frame.body, plaintext: frame.plaintext === true,
+          thread_id: frame.thread_id, in_reply_to: frame.in_reply_to,
+        }))
           .then((r) => {
             // destroyed-guard is defensive — a write to a destroyed socket is benign on current Node (probed); the .catch below is the load-bearing guard.
-            if (socket.destroyed) return;
-            socket.write(encodeFrame({ type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }));
+            ackWrite(socket, { type: "send-ok", id: frame.id, envelope_id: r.envelope_id, encrypted: r.encrypted ?? true }, highWaterMark, log);
           })
           .catch((err) => {
-            if (socket.destroyed) return;
             const verdict = classifySendError(err);
             const reason = clipReason(verdict.reason);
             log(`[daemon] send failed (${verdict.retryable ? "retryable" : "terminal"}): ${reason}`);
-            socket.write(encodeFrame({ type: "send-err", id: frame.id, retryable: verdict.retryable, reason }));
+            ackWrite(socket, { type: "send-err", id: frame.id, retryable: verdict.retryable, reason }, highWaterMark, log);
           });
         return;
       }
@@ -416,7 +441,7 @@ In `src/daemon.mjs`:
   current import line first — it may already import more; extend, never duplicate).
 - In `startDaemon`'s `createIpcServer({...})` call, add after `statusExtraFn`:
 ```js
-    sendFn: ({ to, body, plaintext }) => coreSend({ to, body, plaintext }),
+    sendFn: ({ to, body, plaintext, thread_id, in_reply_to }) => coreSend({ to, body, plaintext, thread_id, in_reply_to }),
 ```
 **Executor self-check (critic M3):** the existing `ping`/`status` branches fall through without
 `return`; your `send` branch early-returns. Confirm after editing that the trailing
@@ -466,7 +491,8 @@ interop-vector precedent applied to the socket layer.
     "ping": { "type": "ping" },
     "status_request": { "type": "status" },
     "send": { "type": "send", "id": "11111111-2222-4333-8444-555555555555", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "hello from a GUI" } },
-    "send_plaintext": { "type": "send", "id": "22222222-3333-4444-8555-666666666666", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "deliberately clear" }, "plaintext": true }
+    "send_plaintext": { "type": "send", "id": "22222222-3333-4444-8555-666666666666", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "deliberately clear" }, "plaintext": true },
+    "send_reply": { "type": "send", "id": "33333333-4444-4555-8666-777777777777", "to": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST", "body": { "type": "text", "text": "threaded reply" }, "thread_id": "tttttttt-uuuu-4vvv-8www-xxxxxxxxxxxx", "in_reply_to": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }
   },
   "daemon_to_client": {
     "hello_ok": { "type": "hello-ok", "pid": 4242, "start_time": "2026-06-11T00:00:00.000Z", "did": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST" },
@@ -590,8 +616,11 @@ role-agnostic); each frame type with a field table and direction, mirroring
 `test/fixtures/socket-frames.json` (state that the fixtures file is normative for shapes); flow
 control summary (per-subscriber skip above HWM, gap-on-progress for channel, 4×HWM destroy
 backstop; reconnect with since_seq is the recovery); the send op contract incl. the optional
-`plaintext` boolean (default false; CLI `--plaintext` parity), the retryable/terminal taxonomy,
-the no-id-no-ack rule, the `reason` cap (≤512 chars, control characters stripped at the daemon —
+`plaintext` boolean (default false; CLI `--plaintext` parity), optional `thread_id`/`in_reply_to`
+for composer threading (§6 — the reply composer reuses the incoming thread_id and sets in_reply_to
+to the envelope being replied to; both are forwarded unchanged to core.send; see `send_reply`
+fixture), the retryable/terminal taxonomy,
+the no-id-no-ack rule, the `reason` cap (≤512 chars, full C0+DEL range stripped at the daemon —
 relay-controlled text is length-unbounded; rendering-side escaping stays the GUI's job), and an
 explicit statement that the ack is INTENTIONALLY MINIMAL
 (`id, envelope_id, encrypted` — no thread_id/relay_seq; the archive is the source of truth for
