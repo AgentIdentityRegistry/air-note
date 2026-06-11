@@ -278,9 +278,10 @@ The daemon maintains a per-subscriber **policy high-water mark** (default 1 MiB)
   saw no frames before the daemon bounced would otherwise miss mail pulled in during the outage).
   The **first** attach deliberately sends **no** `since_seq` — a fresh session is live-from-attach.
   The daemon is stateless about client history; the client's archive copy is the source of truth.
-  When a `gap` is received, apply the four replay invariants from §5 (`received-only`, spam
-  excluded, `%:joined` excluded, blocklist re-checked) — replay must never deliver more than live
-  did.
+  When a `gap` is received, apply **all five replay invariants from §5** (received-only; spam
+  excluded; synthetic join notices excluded by the `envelope_id` `:joined` suffix; blocklist
+  re-checked; the channel admission gate re-applied) — §5's list is the single normative source;
+  the governing rule is that replay must never deliver more than live did.
 
 ---
 
