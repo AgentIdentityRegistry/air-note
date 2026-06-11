@@ -3,6 +3,7 @@
 mod air;
 mod commands;
 mod file_access;
+mod inbox;
 mod llm_stream;
 mod markitdown;
 mod secrets;
@@ -38,6 +39,7 @@ fn main() {
             app.manage(AppState {
                 air_client,
                 identity_store,
+                inbox: std::sync::Arc::new(crate::inbox::manager::InboxManager::new()),
             });
             Ok(())
         })
