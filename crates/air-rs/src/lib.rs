@@ -34,6 +34,9 @@ pub mod signing;
 #[cfg(feature = "transport")]
 pub mod transport;
 
+#[cfg(feature = "inbox")]
+pub mod inbox;
+
 pub use envelope::{
     Accept, Counter, Decline, Envelope, MessageBody, Offer, Value, Withdraw,
 };
