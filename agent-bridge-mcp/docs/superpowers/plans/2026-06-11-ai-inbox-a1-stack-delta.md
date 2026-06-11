@@ -499,10 +499,9 @@ interop-vector precedent applied to the socket layer.
   "daemon_to_client": {
     "hello_ok": { "type": "hello-ok", "pid": 4242, "start_time": "2026-06-11T00:00:00.000Z", "did": "did:wba:agentidentityregistry.org:agents:AIR-TEST-TEST-TEST" },
     "message": { "type": "message", "message": { "seq": 7, "relay_seq": 7, "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "from": "did:wba:agentidentityregistry.org:agents:AIR-PEER-PEER-PEER", "contact": "pat", "verified": true, "encrypted": true, "received_at": "2026-06-11T00:00:01.000Z", "thread_id": "tttttttt-uuuu-4vvv-8www-xxxxxxxxxxxx", "body": { "type": "text", "text": "hi" } } },
-    "comment_message_optional_fields": "message.message: contact / key_changed / thread_id / body presence is CONDITIONAL — the daemon OMITS falsy/unset fields (a real key_changed:false frame carries NO key_changed key; an unpinned sender carries NO contact). The fixture shows a pinned, verified, key-unchanged sender. Parsers MUST treat these as optional.",
     "gap": { "type": "gap", "after_seq": 41 },
     "pong": { "type": "pong" },
-    "status": { "type": "status", "socket": "/home/user/.air-msg/daemon.sock", "last_seq": 7, "clients": [{ "role": "viewer", "lastSeq": 7, "dropped": 0 }], "sinks": ["banner", "socket"] },
+    "status": { "type": "status", "socket": "/home/user/.air-msg/daemon.sock", "last_seq": 7, "clients": [{ "role": "viewer", "lastSeq": 7, "dropped": 0 }, { "role": "channel", "lastSeq": null, "dropped": 0 }], "sinks": ["banner", "socket"] },
     "send_ok": { "type": "send-ok", "id": "11111111-2222-4333-8444-555555555555", "envelope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "encrypted": true },
     "send_err": { "type": "send-err", "id": "11111111-2222-4333-8444-555555555555", "retryable": true, "reason": "relay 503: down" },
     "error": { "type": "error", "reason": "first frame must be hello with role channel|viewer" }
@@ -618,7 +617,14 @@ channel = verified+pinned+key-unchanged / room-gated; roles are DELIVERY filters
 role-agnostic); each frame type with a field table and direction, mirroring
 `test/fixtures/socket-frames.json` (state that the fixtures file is normative for shapes); flow
 control summary (per-subscriber skip above HWM, gap-on-progress for channel, 4×HWM destroy
-backstop; reconnect with since_seq is the recovery); the send op contract incl. the optional
+backstop; pre-hello reaper — client that sends no hello within 5 s is destroyed silently; client
+SHOULD enforce a hello-ok timeout (reference: 3 s); `{type:"error"}` scope covers BOTH pre-hello
+violations AND post-hello malformed/oversized lines; `since_seq` bookkeeping — first attach sends
+NO since_seq (live-from-attach), on reconnect since_seq = max-seen relay_seq falling back to the
+archive cursor snapshotted at first attach; reconnect with since_seq is the recovery);
+**gap replay invariants INLINE** (replay never delivers more than live did: received-only,
+spam excluded, synthetic `%:joined` excluded, blocklist re-checked at replay — full rationale AI-inbox design §5);
+the send op contract incl. the optional
 `plaintext` boolean (default false; CLI `--plaintext` parity), optional `thread_id`/`in_reply_to`
 for composer threading (§6 — the reply composer reuses the incoming thread_id and sets in_reply_to
 to the envelope being replied to; both are forwarded unchanged to core.send; see `send_reply`
@@ -628,9 +634,12 @@ relay-controlled text is length-unbounded; rendering-side escaping stays the GUI
 explicit statement that the ack is INTENTIONALLY MINIMAL
 (`id, envelope_id, encrypted` — no thread_id/relay_seq; the archive is the source of truth for
 sent-row detail); a "Message fields" note that `contact`/`key_changed`/`thread_id`/`body` are
-OPTIONAL — omitted when falsy/unset (parsers must not require them); a "Versioning" section
-(unknown frame types are ignored by both sides — additive evolution; the fixtures file carries
-`version`). Cross-link the daemon design spec §5/§6 and the AI-inbox design §3/§5.
+OPTIONAL — omitted when falsy/unset (parsers must not require them); `clients[]` sub-table with
+`lastSeq: integer|null` (null for viewers and channel clients without since_seq) and `dropped:
+integer`, with a note that field names are camelCase on the wire; a "Versioning" section
+(unknown frame types are ignored by both sides — additive evolution; unknown fields within known
+frame types MUST likewise be ignored — strict parsers with deny_unknown_fields are non-conformant;
+the fixtures file carries `version`). Cross-link the daemon design spec §5/§6 and the AI-inbox design §3/§5.
 
 - [ ] **Step 5: Commit**
 

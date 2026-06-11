@@ -146,7 +146,16 @@ from the archive starting after `after_seq`.
 | Field | Type | Required | Semantics |
 |---|---|---|---|
 | `type` | `"gap"` | required | Frame discriminator |
-| `after_seq` | integer | required | The last cleanly-delivered `relay_seq`. The client should replay all archive messages with `relay_seq > after_seq`. |
+| `after_seq` | integer | required | The last cleanly-delivered `relay_seq`. The client replays archive messages with `relay_seq > after_seq`, subject to the four invariants below. |
+
+**Replay invariants — replay never delivers more than live did.** A conforming client MUST apply
+all four filters identically to the live-delivery path (full rationale: AI-inbox design §5,
+`../../docs/superpowers/specs/2026-06-11-desktop-ai-inbox-design.md`):
+
+1. **Received-only** — replay rows with `direction = 'received'` only; sent rows are not messages to surface.
+2. **Spam excluded** — rows flagged as spam are hidden by default (mirrors the live path's spam gate).
+3. **Synthetic `%:joined` excluded** — room-join notice rows (body type `%:joined`) are internal bookkeeping; exclude them from replay just as live delivery does.
+4. **Blocklist re-checked at replay time** — a sender may have been blocked after the original live delivery; the block takes effect retroactively on replay. Skipping this check is a filter bypass.
 
 ### `pong`
 
@@ -161,8 +170,17 @@ from the archive starting after `after_seq`.
 | `type` | `"status"` | required | Frame discriminator |
 | `socket` | string | required | Absolute path to the socket file |
 | `last_seq` | integer \| null | required | Last `relay_seq` fanned out across all subscribers; `null` if no messages have been delivered since the daemon started |
-| `clients` | array | required | Per-subscriber snapshot, one entry per connected client **excluding the requester**. Each entry: `{role, lastSeq, dropped}`. |
+| `clients` | array | required | Per-subscriber snapshot, one entry per connected client **excluding the requester**. Fields per entry — see sub-table below. |
 | `sinks` | array of strings | optional-but-expected | Names of the daemon's active fan-out sinks (e.g. `["banner", "socket"]`). Supplied via `startDaemon`'s `statusExtraFn` extension seam; always present from a production daemon. MAY be absent from minimal or test servers that omit `statusExtraFn` — parsers treat it as optional. |
+
+**`clients[]` entry sub-fields** (note: field names are **camelCase on the wire** — an intentional
+oddity inherited from the in-process subscriber record; Rust parsers must use `#[serde(rename)]`):
+
+| Field | Type | Semantics |
+|---|---|---|
+| `role` | `"viewer"` \| `"channel"` | The subscriber's declared role |
+| `lastSeq` | integer \| **null** | Last `relay_seq` successfully written to this subscriber. `null` for every `viewer` (best-effort role; seq not tracked) and for any `channel` client whose `since_seq` was not supplied at hello — production seeds `null` at sub creation in `daemon-ipc.mjs`. |
+| `dropped` | integer | Count of delivery writes skipped due to back-pressure since attach or last gap emission |
 
 ### `send-ok`
 
@@ -244,10 +262,24 @@ The daemon maintains a per-subscriber **policy high-water mark** (default 1 MiB)
   subscribers receive a log entry only — drops are best-effort for that role.
 - At **4× HWM**, the subscriber is **destroyed** unconditionally (the absolute backstop: a single
   wedged local client must never balloon the daemon's memory).
-- **Reconnect + `since_seq`** is the recovery path: a `channel` client that reconnects with
-  `since_seq` equal to its last-seen `relay_seq` gets an immediate `gap` and replays the window
-  from the archive. The daemon is stateless about client history — the client's archive copy is
-  the source of truth.
+- **Pre-hello reaper:** a connected client that sends no `hello` within 5 seconds is destroyed
+  silently (no `error` frame is sent — the connection simply closes). Clients SHOULD complete the
+  handshake well within this window.
+- **Hello timeout (client side):** clients SHOULD enforce their own timeout on the `hello-ok`
+  response (reference implementation: 3 s via `handshakeMs`). An unanswered hello indicates the
+  daemon is overloaded or the socket is stale.
+- **`error` frame scope:** the `{type:"error"}` frame is sent for both pre-hello violations (wrong
+  first frame) and post-hello framing failures (malformed or oversized line per §1). Both cases
+  have the same fatal semantics: the socket is closed immediately after.
+- **Reconnect + `since_seq`** is the recovery path: a `channel` client that reconnects sends
+  `since_seq` = max relay_seq seen, falling back to a baseline snapshotted from the archive cursor
+  at the time of the **first** attach (the baseline closes the outage-window hole — a client that
+  saw no frames before the daemon bounced would otherwise miss mail pulled in during the outage).
+  The **first** attach deliberately sends **no** `since_seq` — a fresh session is live-from-attach.
+  The daemon is stateless about client history; the client's archive copy is the source of truth.
+  When a `gap` is received, apply the four replay invariants from §5 (`received-only`, spam
+  excluded, `%:joined` excluded, blocklist re-checked) — replay must never deliver more than live
+  did.
 
 ---
 
@@ -256,6 +288,9 @@ The daemon maintains a per-subscriber **policy high-water mark** (default 1 MiB)
 - **Unknown frame types are silently ignored by both sides.** The daemon ignores unrecognised
   client frames (after the hello check); clients ignore unrecognised daemon frames. This permits
   additive evolution without version negotiation.
+- **Unknown fields within known frame types MUST likewise be ignored.** Strict parsers that reject
+  unknown fields (e.g. serde `deny_unknown_fields`) are non-conformant — additive field evolution
+  does not bump the version number.
 - The `test/fixtures/socket-frames.json` file carries a top-level `version` integer. A breaking
   change to the wire format increments this version; additive changes do not.
 - The current version is **1**.
