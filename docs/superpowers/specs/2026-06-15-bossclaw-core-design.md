@@ -1,12 +1,13 @@
 # bossclaw-core — Design Spec
 
-**Status:** Draft for review · 2026-06-15
+**Status:** Reviewed (3 independent reviewers, all SHIP) · 2026-06-15
 **Author:** Peter + Claude (brainstorm session, superpowers:brainstorming)
 **Repo:** `~/air-note` (canonical) · new crate `crates/bossclaw-core`
 **Supersedes for the memory layer:** the "Phase B — Brain" guesswork in [[air/forever-companion-architecture]] (all-MiniLM + sqlite-vec, 2026-05). This spec is the researched, decided version.
 
 ## 0. Revision log
-- **Rev 2 (2026-06-15):** folded three independent adversarial reviews (architecture / security / critic, all **SHIP-WITH-FIXES**, all codebase-verified). Material changes: two-tier rebuild invariant (model output is committed as signed events, not recomputed); fully-specified event canonicalization + single serialized writer; honest reuse relabeling (the hash chain + at-rest encryption are NET-NEW, not reuse); v1 index default flipped to pure-Rust `hnsw_rs`; hardened file-access security (provenance, canonicalize-then-contain, content-aware never-touch, anti-fatigue confirm, taint-by-origin); key-custody named + truncation/rollback defense; new sections for versioning, backup/export, observability, first-run, supply-chain.
+- **Rev 3 (2026-06-15):** re-verification by the same three reviewers — **all SHIP**, no blockers. Folded the convergent residual (signed high-water-mark write-ordering + debounce) and the two IMPORTANT security code-gates (fail-closed lineage-walked taint; ingest `O_NOFOLLOW`/fd-passing), plus minor clarifications (advisory diff-guard, page-supersede projection, active-model as a control surface, export-format gate, DID-pin resolution path).
+- **Rev 2 (2026-06-15):** folded three independent adversarial reviews (architecture / security / critic, all SHIP-WITH-FIXES, codebase-verified). Two-tier rebuild invariant; fully-specified canonicalization + single serialized writer; honest reuse relabeling (hash chain + at-rest encryption are NET-NEW); index default flipped to pure-Rust `hnsw_rs`; hardened file-access security; key-custody named + truncation/rollback defense; new sections for versioning, backup/export, observability, first-run, supply-chain.
 - **Rev 1 (2026-06-15):** initial design from the brainstorm + deep-research pass.
 
 ---
@@ -109,11 +110,11 @@ The §11 "rebuild" test asserts byte-identity for Tier A and replay-fidelity for
   1. `canon = serde_jcs(event_without { hash, signature })` (JCS, matching the house standard).
   2. `hash = SHA256( prev_hash_bytes ‖ canon )`, where `prev_hash_bytes` = the 32 raw bytes of the previous event's hash; **genesis `prev_hash_bytes` = 32 zero bytes.**
   3. `signature = Ed25519_sign(signing_key, hash)` — signing the hash binds content + chain position.
-  4. `verify` = recompute `hash` from `canon` + `prev_hash`, assert equal; verify `signature` over `hash` against the pubkey resolved from `signed_by_did` (pinned).
+  4. `verify` = recompute `hash` from `canon` + `prev_hash`, assert equal; verify `signature` over `hash` against the pubkey resolved from `signed_by_did` (**pinned via the air-rs DID-resolution path / a local trust store**).
   - A **frozen test vector** (one known event → known hash → known signature) lands in §11, the same way air-rs pins cross-language vectors.
 - **Event types:** `memory`, `file_ingested`, `page` (Tier-B summary), `link` / `invalidate` (Tier-B graph ops), `supersede`, `config` (active model, schema version), `grant` / `revoke`, `file_written`.
 - **Interface:** `append(event) -> EventId` (serialized, §4); `stream(since)`; `verify_chain()`; `head_checkpoint()`.
-- **Truncation/rollback defense (review fix C3-sec):** maintain a **signed high-water-mark** `{ tip_id, count, tip_hash }` persisted to the keychain (and updated per append). On open, if the live tip is behind the stored high-water → **truncation/rollback detected** → open read-only + alert (§10). A plain chain detects edits but *not* deletion-of-the-tail; the high-water closes that.
+- **Truncation/rollback defense (review fix C3-sec; all 3 re-reviewers converged here):** maintain a **signed high-water-mark** `{ tip_id, count, tip_hash }`, **written append-first then watermark-second, and debounced** (every K events / on idle / on clean shutdown — *not* per-append: keychain writes are slow and may prompt). On open: live tip **ahead** of the watermark by a small N with valid chain links = benign crash catch-up (normal); only live tip **behind** the watermark (or a broken link) = **truncation/rollback** → open read-only + alert (§10). A signed export/restore (§15) re-seats the watermark. A plain chain detects edits but *not* tail-deletion; the watermark closes that.
 - **Depends on:** `store`, `ed25519-dalek`, `serde_jcs`, `sha2`, `zeroize`.
 
 ### 5.3 Embedder (`embed`)
@@ -155,7 +156,7 @@ The §11 "rebuild" test asserts byte-identity for Tier A and replay-fidelity for
 
 ### 5.10 File reader / ingest (`connector::reader`) — app layer
 - **Does:** walks a *granted* folder, converts files to text (external parser, §8.6), emits **signed `file_ingested` events**. Read-only.
-- **Safety (review fix C2-sec):** `WalkDir::follow_links(false)`; **canonicalize each path and assert it stays inside the grant root** (reject symlinked components that escape); apply the **content-aware never-touch filter during the walk** (skip + log `.env`, `*.pem`, `*.key`, `id_*`, `*.p12`, `.aws/`, `.npmrc`, `.git/`, `credentials`, `*.kdbx`, plus a high-entropy-line heuristic).
+- **Safety (review fix C2-sec):** `WalkDir::follow_links(false)`; **canonicalize each path and assert it stays inside the grant root** (reject symlinked components that escape); apply the **content-aware never-touch filter during the walk** (skip + log `.env`, `*.pem`, `*.key`, `id_*`, `*.p12`, `.aws/`, `.npmrc`, `.git/`, `credentials`, `*.kdbx`, plus a high-entropy-line heuristic). **Open the file with `O_NOFOLLOW` on the final component (ideally `openat` from a verified dir fd) and hand the *fd / already-read bytes* to the sandboxed parser — never re-resolve the path string in the child** (closes the read-side TOCTOU symlink-swap, the same class as the write-side execute-time re-check).
 - **Dedup/supersede (review gap):** incremental re-scan by mtime/hash; a re-ingested edited file appends a `supersede` event so recall surfaces only the latest (no stale duplicates).
 - **Signs the canonical post-conversion text** (conversion is lossy-by-design; documented).
 - **Depends on:** grant manager, the sandboxed parser (§8.6), `events`.
@@ -165,8 +166,8 @@ The §11 "rebuild" test asserts byte-identity for Tier A and replay-fidelity for
 - **Hardening (review fix C1-sec):**
   - **Provenance on every proposal:** show which source event(s) induced it ("this edit was suggested by content from `~/repo/x/README.md`, ingested 2026-06-14").
   - **Write-target ⊆ explicitly write-granted paths**, enforced in the actuator, **canonicalized and re-checked at *execute* time inside the rename critical section** (closes TOCTOU), never widened by model output.
-  - **Secret/value-shaped diff guard:** louder confirm for diffs touching money amounts, URLs, keys, `curl|sh`, crontab, shell rc / `.command` / `.sh`.
-  - **Taint-by-origin:** any proposal whose causal chain touches ingested (non-user-authored) content → "untrusted-origin" → loud modal.
+  - **Secret/value-shaped diff guard (advisory, not a boundary):** louder confirm for diffs touching money amounts, URLs, keys, `curl|sh`, crontab, shell rc / `.command` / `.sh`. A denylist misses obfuscated/homoglyph payloads — the load-bearing controls are target-restriction + taint + human confirm; this only escalates the prompt.
+  - **Taint-by-origin (fail-closed):** the actuator computes taint by **walking the signed event lineage itself** (never trusting an event's self-reported provenance); every Tier-B event carries a **mandatory non-empty `source_event_ids`** (rejected at append otherwise); any proposal whose lineage touches ingested (non-user-authored) content — **or whose provenance is unknown/unresolvable** — is "untrusted-origin" → loud modal.
   - **Anti-fatigue:** no "approve all"; proposals touching different files can't be bundled; deletes always get the loud modal.
 
 ### 5.12 Grant manager (`connector::grants`) — app layer
@@ -180,8 +181,8 @@ The §11 "rebuild" test asserts byte-identity for Tier A and replay-fidelity for
 - **Remember:** caller → **serialized** `events.append` (sign + chain) → store → enqueue Tier-A derive (embed/FTS/graph-fold).
 - **Recall:** query → `recall` (embed → hybrid → optional rerank → graph/recency boost) → top-N with provenance.
 - **Evolve:** background tick → local reasoner over recent events → **append signed Tier-B events** (pages/links/invalidations) via the serialized writer.
-- **Ingest:** walk grant (no symlink follow, contain, never-touch filter) → sandboxed convert → `supersede`-aware → append signed `file_ingested`.
-- **Act:** `propose_write` (provenance + taint + diff guard) → user confirms → **re-canonicalize + re-check target ⊆ grant at execute** → temp+rename → signed `file_written` → undo.
+- **Ingest:** walk grant (no symlink follow, contain, never-touch filter) → `O_NOFOLLOW` open → sandboxed convert → `supersede`-aware → append signed `file_ingested`.
+- **Act:** `propose_write` (provenance + lineage-walked taint + diff guard) → user confirms → **re-canonicalize + re-check target ⊆ grant at execute** → temp+rename → signed `file_written` → undo.
 
 ---
 
@@ -190,7 +191,7 @@ The §11 "rebuild" test asserts byte-identity for Tier A and replay-fidelity for
 - `vectors` — `(event_id, embedding, model_id, dim)`; Tier-A derived; queries filter to the active model.
 - `fts` — FTS5; Tier-A derived.
 - `nodes` / `edges` — bi-temporal graph; **projection (fold) of `link`/`invalidate` events**; Tier-A.
-- `pages` — **projection of `page` events** (the events are authoritative; the table is a convenience view).
+- `pages` — **projection of `page` events** (the events are authoritative; the table is a convenience view, **resolved to the latest summary per topic via `supersede` / `model_meta.source_event_ids`** so stale summaries never surface).
 - `grants` — projection of `grant`/`revoke` events.
 - `config` — active embedding model + `schema_version` (projection of `config` events).
 Resist widening `events`; derive richer structures.
@@ -215,13 +216,13 @@ Resist widening `events`; derive richer structures.
 Canonicalize-then-contain (propose **and** execute); read/write separated; content-aware never-touch during the walk; no symlink follow; honest "we see the whole granted subtree" statement.
 
 ### 8.4 Injection defense — honest scope (review fix C1-sec)
-Ingested content + retrieved memories are **data, never instructions**, fenced into the reasoner (the `channel.mjs` fence pattern). **But that fence is not, by itself, sufficient here:** in `channel.mjs` the fenced path is summary-only with a human-gated send; in bossclaw the same bytes feed a reasoner that can *propose disk writes*. So a booby-trapped file can't *command* the model but **can socially-engineer a benign-looking write proposal** (confused deputy). Defense-in-depth, all required: **fence + write-target restriction + execute-time re-check + provenance display + taint-by-origin + secret-shaped-diff guard + anti-fatigue confirm**. §8.4 prose says "raises the bar against direct injection; does **not** by itself stop confused-deputy proposals" — never "cannot."
+Ingested content + retrieved memories are **data, never instructions**, fenced into the reasoner (the `channel.mjs` fence pattern). **But that fence is not, by itself, sufficient here:** in `channel.mjs` the fenced path is summary-only with a human-gated send; in bossclaw the same bytes feed a reasoner that can *propose disk writes*. So a booby-trapped file can't *command* the model but **can socially-engineer a benign-looking write proposal** (confused deputy). Defense-in-depth, all required: **fence + write-target restriction + execute-time re-check + provenance display + fail-closed taint-by-origin + secret-shaped-diff guard + anti-fatigue confirm**. §8.4 prose says "raises the bar against direct injection; does **not** by itself stop confused-deputy proposals" — never "cannot."
 
 ### 8.5 Write safety
 Confirm-each with the §5.11 hardening; no autonomous writes in v1.
 
 ### 8.6 Supply chain & the ingest parser (review fix I1/M3)
-- **Ingest shells out to an external document parser** (`markitdown`, a Python stack) on **attacker-controlled files** — a real parser/zip-bomb/XXE surface **outside** the Rust sandbox. Run it in a restricted child: **timeout, memory cap, output-size cap, no network**, reject/expand archives under a depth+size budget.
+- **Ingest shells out to an external document parser** (`markitdown`, a Python stack) on **attacker-controlled files** — a real parser/zip-bomb/XXE surface **outside** the Rust sandbox. Run it in a restricted child: **timeout, memory cap, output-size cap, no network**, reject/expand archives under a depth+size budget. *(Combined with §5.10's `O_NOFOLLOW`/fd-passing so the child never re-resolves a path.)*
 - **Audit all trust roots in CI:** `cargo-deny`/`cargo audit` (Rust), `pip-audit` (the parser venv), the `ort`/ONNX native blob, and **digest-pinned** model weights.
 
 ---
@@ -258,18 +259,18 @@ Deep-research basis: 109-agent adversarially-verified pass (23/25 claims). Full 
 ## 11. Testing strategy
 - **Two-tier rebuild (review fix C1):** Tier A → rebuild from log is **byte-identical**; Tier B → replay reproduces recorded events (never "re-run the LLM and match bytes").
 - **Canonicalization:** the frozen event test vector (§5.2).
-- **Security:** injection confused-deputy (a malicious file must not yield an *unconfirmed* write, and its proposal must show untrusted provenance); never-touch + symlink/`..` traversal enforcement; **truncation/rollback detection**; **no-plaintext-index-on-disk** (the §8.1 spike, as a test).
+- **Security:** injection confused-deputy (a malicious file must not yield an *unconfirmed* write, and its proposal must show untrusted provenance); never-touch + symlink/`..` traversal enforcement (read **and** write side); **truncation/rollback detection**; **no-plaintext-index-on-disk** (the §8.1 spike, as a test).
 - **Recall quality:** a labelled fixture corpus; `recall@k` tracked across model/ranker changes — **this is the empirical embedder-default gate**.
 - **Hermeticity:** temp homes only; never touch the real store (the messaging suite's `bridgeHome` guard discipline).
 - **Supply chain:** `cargo-deny` + `pip-audit` in CI.
 
 ## 12. Build sequence (milestones; each demoable)
-1. **Bedrock:** crate + encrypted store + signed log. **DoD includes the C1/C3 decisions** — the event schema carries Tier-B event types and the serialized-writer append path + the frozen canonicalization vector. (These are the most expensive things to change later.)
-2. **Recall:** embedder (bge-small) + `hnsw_rs` + FTS5 + hybrid. *(A tiny throwaway ingest exists here to feed the recall fixture.)* **Go/no-go gate:** the §8.1 encryption spike + the ort-bundling spike resolve here; if either fails, fall back to the pure-Rust path (`model2vec`).
+1. **Bedrock:** crate + encrypted store + signed log. **DoD includes the C1/C3 decisions** — the event schema carries Tier-B event types and the serialized-writer append path + the frozen canonicalization vector + the **high-water-mark write-ordering/debounce rule** (§5.2). (These are the most expensive things to change later.)
+2. **Recall:** embedder (bge-small) + `hnsw_rs` + FTS5 + hybrid. *(A tiny throwaway ingest exists here to feed the recall fixture.)* **Go/no-go gate:** the §8.1 encryption spike + the ort-bundling spike resolve here; if either fails, fall back to the pure-Rust path (`model2vec`). *Also produce the re-embed-migration time budget here.*
 3. **Graph:** bi-temporal fold over link/invalidate events + backlinks.
-4. **Reasoner + evolve (minimal):** local reasoner + extract/link/summarize emitting signed Tier-B events; resource policy + off switch + observability.
-5. **Ingest:** read-only folder ingest via grants (contain + never-touch + dedup) + sandboxed parser.
-6. **Actuator (v1 CUT-LINE):** confirm-each writes + provenance + taint + execute-time containment + undo. *A slip here never blocks shipping the engine (1–5).*
+4. **Reasoner + evolve (minimal):** local reasoner + extract/link/summarize emitting signed Tier-B events; resource policy + off switch + observability; **page-supersede in the projection** (§7).
+5. **Ingest:** read-only folder ingest via grants (contain + never-touch + `O_NOFOLLOW` + dedup) + sandboxed parser. **Code DoD: fail-closed lineage-walked taint + read-side `O_NOFOLLOW`/fd-passing must land here.**
+6. **Actuator (v1 CUT-LINE):** confirm-each writes + provenance + taint + execute-time containment + undo. *A slip here never blocks shipping the engine (1–5). Export format decided before this milestone.*
 7. **Desktop surface:** Tauri commands/events; a plain-words Memory panel ("Journal", "Notes", "What does it know?").
 
 ## 13. Deferred
@@ -281,13 +282,14 @@ Universal hub · tool-orchestration · sign/pay Mandate · **silent autonomous w
 3. **Local reasoner backend:** require/detect Ollama vs bundle llama.cpp.
 4. **Evolve scheduling policy** specifics (cadence, thermal/battery thresholds).
 5. **Tier-B determinism (optional):** could a pinned greedy local model make some Tier-B output reproducible enough to keep a weak golden test? Spike before finalizing §11 wording.
+6. **Signed-export format** (§15): raw re-verifiable chain, encrypted at rest — decided before milestone 6.
 
 ## 15. New cross-cutting concerns (added in review)
-- **Versioning & migration:** one active embedding model per store (config event); a model change triggers a **re-embed migration** (replay → re-embed → atomic active-model switch → GC stale vectors) — the one *expensive* Tier-A rebuild; budget it. A `schema_version` gates store format.
-- **Backup / recovery / export:** a **signed, portable export** of the event log (makes §8.2 "portable" real); documented restore + corruption-recovery (rebuild Tier-A from the log). For a never-forget product this is first-tier, not optional.
-- **Observability:** evolve `last_tick` / queue depth / error counts; recall latency; index lag vs log tip — surfaced to the desktop so Peter (dogfooding) can see it's alive, stalled, or thrashing.
+- **Versioning & migration:** one active embedding model per store (config event); a model change triggers a **re-embed migration** (replay → re-embed → atomic active-model switch → GC stale vectors) — the one *expensive* Tier-A rebuild; budget it (**produce an actual time bound at milestone 2**). A `schema_version` gates store format.
+- **Backup / recovery / export:** a **signed, portable export** of the event log (makes §8.2 "portable" real); documented restore + corruption-recovery (rebuild Tier-A from the log); **the export format (raw re-verifiable chain, encrypted at rest) is decided before milestone 6 (§14).** For a never-forget product this is first-tier, not optional.
+- **Observability:** evolve `last_tick` / queue depth / error counts; recall latency; index lag vs log tip; **active embedding-model changes** (a forged/replayed `config` model-switch is a recall-integrity attack — surface it) — surfaced to the desktop so Peter (dogfooding) can see it's alive, stalled, or thrashing.
 - **First-run:** defined behavior before any local model is installed (§10).
 
 ## 16. Research & review basis
 - Deep-research (2026-06-15): 5 angles → 27 sources → 25 verified (23 confirmed). GBrain `air/bossclaw-core-stack-research-2026-06-15`.
-- Independent review (2026-06-15): three adversarial reviewers (architecture / security / critic), all **SHIP-WITH-FIXES**, codebase-verified. Their CRITICAL/IMPORTANT findings are folded into Rev 2 above.
+- Independent review (2026-06-15): three adversarial reviewers (architecture / security / critic). Rev 1 → all **SHIP-WITH-FIXES** (folded into Rev 2). Rev 2 re-verification → **all three SHIP**, every Critical/Important closed (security risk MEDIUM → LOW; critic confirmed no over-claims were traded in); residuals folded into Rev 3 (spec) + carried as milestone-5/6 code-DoD acceptance criteria.
