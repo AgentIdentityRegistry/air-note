@@ -14,6 +14,12 @@ const PAGE_SIZE: i64 = 500;
 
 /// Map an archive row to the wire `Message` shape, deriving `contact` from CURRENT pin state
 /// (invariant #5's "currently-pinned"). Ports `rowToMessage`.
+///
+/// `received_at` is sourced from `row.archived_at` — the daemon-set ingest time (`NOT NULL` for
+/// every row) — NOT `row.timestamp`, which is the SENDER-chosen `envelope.timestamp` and is
+/// future-datable by a verified sender (CF3). This aligns the replay clock with the LIVE path, which
+/// already delivers `received_at` from the relay queue time, not the sender. The recency guard (D11)
+/// therefore can't be tricked into treating a stale, forward-dated replayed message as "recent".
 pub fn row_to_message(row: &ArchiveRow, home: &Path) -> Message {
     let contact = get_contact_by_did(home, &row.from).and_then(|c| c.alias);
     Message {
@@ -22,7 +28,7 @@ pub fn row_to_message(row: &ArchiveRow, home: &Path) -> Message {
         from: row.from.clone(),
         contact: contact.filter(|a| !a.is_empty()),
         envelope_id: row.envelope_id.clone(),
-        received_at: row.timestamp.clone(),
+        received_at: row.archived_at.clone(),
         verified: row.verified,
         encrypted: row.encrypted,
         key_changed: if row.key_changed { Some(true) } else { None },

@@ -148,6 +148,68 @@ async fn resumes_with_since_seq_after_a_reconnect() {
 }
 
 #[tokio::test]
+async fn terminates_when_event_receiver_is_dropped_without_stop() {
+    // D1: a caller that drops the event receiver without calling `stop()` must NOT leave the
+    // reconnect loop spinning forever. After the receiver is gone, the next Message emit fails and
+    // the loop terminates — so when the (still-open) first session ends, there is NO reconnect.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("daemon.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (s1, _) = listener.accept().await.unwrap();
+        let (rd, mut wr) = s1.into_split();
+        let mut reader = BufReader::new(rd);
+        read_line(&mut reader).await; // hello
+        wr.write_all(b"{\"type\":\"hello-ok\",\"pid\":1,\"start_time\":\"t\",\"did\":\"did:me\"}\n")
+            .await
+            .unwrap();
+        wr.write_all(b"{\"type\":\"message\",\"message\":{\"seq\":7,\"relay_seq\":7,\"envelope_id\":\"e7\",\"from\":\"did:peer\",\"verified\":true,\"encrypted\":true,\"received_at\":\"t\"}}\n")
+            .await
+            .unwrap();
+        // Give the client time to deliver e7 (which the test consumes, then drops rx). A second
+        // message then hits a dropped receiver → the loop should terminate (D1).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        wr.write_all(b"{\"type\":\"message\",\"message\":{\"seq\":8,\"relay_seq\":8,\"envelope_id\":\"e8\",\"from\":\"did:peer\",\"verified\":true,\"encrypted\":true,\"received_at\":\"t\"}}\n")
+            .await
+            .unwrap();
+        // End session 1. A still-spinning loop (the bug) would reconnect here; the fixed loop won't.
+        drop(wr);
+        drop(reader);
+        // If a reconnect happens, this accept resolves and we signal it. With the fix it never does.
+        if listener.accept().await.is_ok() {
+            let _ = accepted_tx.send(());
+        }
+    });
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<InboxEvent>();
+    let _handle = connect_persistent(
+        ClientConfig {
+            socket_path: sock,
+            role: Role::Channel,
+            baseline: None,
+        },
+        tx,
+    );
+    assert!(matches!(rx.recv().await.unwrap(), InboxEvent::Attached { .. }));
+    match rx.recv().await.unwrap() {
+        InboxEvent::Message(m) => assert_eq!(m.envelope_id, "e7"),
+        e => panic!("{e:?}"),
+    }
+    // Drop the receiver WITHOUT stopping the handle — the loop must self-terminate (D1).
+    drop(rx);
+
+    // No reconnection must occur within a generous window (the loop is gone, not respawning).
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(
+        accepted_rx.try_recv().is_err(),
+        "loop must NOT reconnect after the event receiver was dropped"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn signals_offline_when_no_daemon_is_listening() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("daemon.sock");
