@@ -25,6 +25,10 @@ fn main() {
     // each run a channel + AI loop and both reserve the same budget slot (cross-process race →
     // budget bypass). Register this FIRST (Tauri 2 requirement) so a second launch hands off to the
     // running process and exits; the callback focuses the existing main window.
+    //
+    // M-3: `#[cfg(desktop)]` here = Tauri's `not(any(android, ios))`, which matches the dependency's
+    // `cfg(any(target_os = "macos", "windows", "linux"))` predicate in Cargo.toml — both resolve to
+    // "desktop only" for every supported target, so the crate is always available where this compiles.
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -82,7 +86,6 @@ fn main() {
             llm_stream::claude_generate,
             llm_stream::llm_stream_start,
             llm_stream::llm_stream_cancel,
-            llm_stream::inbox_default_agent,
             is_onboarded,
             get_identity,
             get_trust_score,
@@ -101,6 +104,7 @@ fn main() {
             commands::inbox::inbox_ai_reserve,
             commands::inbox::inbox_ai_confirm,
             commands::inbox::inbox_ai_cancel,
+            commands::inbox::inbox_default_agent,
             inbox::channel::inbox_channel_start,
             inbox::channel::inbox_channel_stop,
         ])

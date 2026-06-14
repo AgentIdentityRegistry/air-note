@@ -24,8 +24,11 @@ use tokio::sync::mpsc;
 /// for the lifetime of this connection and held in the spawned task's `Replayer`.
 #[tauri::command]
 pub async fn inbox_channel_start(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // M-1: assumes single-threaded front-end invocation (one webview, no concurrent double-start).
+    // The lock is released between this idempotency check and the store below; that check-then-store
+    // window is acceptable under that assumption and is not guarded against a concurrent racer.
     {
-        let guard = state.inbox.channel.lock().map_err(|_| "inbox lock".to_string())?;
+        let guard = state.inbox.channel.lock().map_err(|_| "channel lock poisoned".to_string())?;
         if guard.is_some() {
             return Ok(());
         }
@@ -34,18 +37,19 @@ pub async fn inbox_channel_start(app: AppHandle, state: State<'_, AppState>) -> 
 
     // Baseline cursor is blocking file/DB I/O — read it off the Tokio workers (read discipline).
     // A missing/unreadable archive yields `None` (full first-attach resume), never a hard error.
-    let baseline: Option<i64> = if home.join("archive.db").exists() {
-        let home_for_cursor = home.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            ArchiveReader::open(&home_for_cursor)
-                .and_then(|r| r.get_cursor())
-                .ok()
-        })
-        .await
-        .map_err(|e| e.to_string())?
-    } else {
-        None
-    };
+    // M-2: the existence probe lives INSIDE the closure too — both to keep all I/O off the async
+    // thread and to short-circuit BEFORE `ArchiveReader::open`'s retry loop (12×50ms) on a missing DB.
+    let home_for_cursor = home.clone();
+    let baseline: Option<i64> = tauri::async_runtime::spawn_blocking(move || {
+        if !home_for_cursor.join("archive.db").exists() {
+            return None;
+        }
+        ArchiveReader::open(&home_for_cursor)
+            .and_then(|r| r.get_cursor())
+            .ok()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<InboxEvent>();
     let handle: ClientHandle = connect_persistent(
@@ -53,7 +57,7 @@ pub async fn inbox_channel_start(app: AppHandle, state: State<'_, AppState>) -> 
         tx,
     );
     {
-        let mut guard = state.inbox.channel.lock().map_err(|_| "inbox lock".to_string())?;
+        let mut guard = state.inbox.channel.lock().map_err(|_| "channel lock poisoned".to_string())?;
         *guard = Some(handle);
     }
 
@@ -128,7 +132,7 @@ pub async fn inbox_channel_start(app: AppHandle, state: State<'_, AppState>) -> 
 /// Stop the live channel connection.
 #[tauri::command]
 pub async fn inbox_channel_stop(state: State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.inbox.channel.lock().map_err(|_| "inbox lock".to_string())?;
+    let mut guard = state.inbox.channel.lock().map_err(|_| "channel lock poisoned".to_string())?;
     if let Some(h) = guard.take() {
         h.stop();
     }

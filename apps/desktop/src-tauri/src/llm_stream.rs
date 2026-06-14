@@ -254,8 +254,8 @@ fn read_agent(app: &AppHandle, agent_id: &str) -> Option<AgentRecord> {
 /// The id of an `agents.json` entry, handling BOTH the wrapped (`{id, version, data}`) and flat
 /// (`AgentRecord`) shapes `read_agent` accepts. For the wrapped shape the object-level `id` wins,
 /// falling back to `data.id`; for the flat shape it's the record's `id`. None if neither yields a
-/// non-empty id.
-fn agent_entry_id(entry: &Value) -> Option<String> {
+/// non-empty id. `pub(crate)` so the inbox command surface can reuse this `agents.json` shape logic.
+pub(crate) fn agent_entry_id(entry: &Value) -> Option<String> {
     let object_id = entry
         .get("id")
         .and_then(Value::as_str)
@@ -275,8 +275,8 @@ fn agent_entry_id(entry: &Value) -> Option<String> {
 
 /// Is an `agents.json` entry archived? Reads `data.archived` for the wrapped shape, else the entry's
 /// own `archived`. Absent/malformed → treated as NOT archived (so a typo'd record stays selectable
-/// rather than silently dropping the user's only agent).
-fn agent_entry_archived(entry: &Value) -> bool {
+/// rather than silently dropping the user's only agent). `pub(crate)` alongside the other shape helpers.
+pub(crate) fn agent_entry_archived(entry: &Value) -> bool {
     let source = entry.get("data").unwrap_or(entry);
     source
         .get("archived")
@@ -287,7 +287,8 @@ fn agent_entry_archived(entry: &Value) -> bool {
 /// D4: the first NON-archived agent id from a raw `agents.json` string, in array order
 /// (deterministic). None when the file is malformed, empty, or every agent is archived — the UI then
 /// shows "configure a reply model" rather than crashing. Pure + unit-testable (no AppHandle).
-fn first_active_agent_id(raw: &str) -> Option<String> {
+/// `pub(crate)` so the `inbox_default_agent` command (in `commands/inbox.rs`) can reuse it.
+pub(crate) fn first_active_agent_id(raw: &str) -> Option<String> {
     let entries = serde_json::from_str::<Vec<Value>>(raw).ok()?;
     entries
         .iter()
@@ -771,10 +772,9 @@ async fn stream_chat_completion(
         let api_key = provider_api_key()?;
         // I1: an explicit `system_override` (e.g. the fully-fenced AI-reply prompt from task 4) wins
         // as the system-role content; otherwise fall back to the agent's derived system prompt. The
-        // user `prompt` is unchanged either way.
-        let system_prompt = system_override
-            .clone()
-            .unwrap_or_else(|| system_prompt_for_agent(&app, &agent_id));
+        // user `prompt` is unchanged either way. `system_override` is owned and used once — consume it.
+        let system_prompt =
+            system_override.unwrap_or_else(|| system_prompt_for_agent(&app, &agent_id));
 
         let client = Client::builder()
             .build()
@@ -1241,21 +1241,6 @@ pub async fn llm_openai_compat_list_models(app: AppHandle) -> Result<Vec<String>
     list_models_for_provider("openai_compat", &base_url).await
 }
 
-/// D4: the default reply agent for the AI loop — the first non-archived agent id from `agents.json`,
-/// deterministic in array order. Returns `None` (not an error) when there's no usable agent, so the
-/// UI can prompt "configure a reply model" without the command failing. File read/parse errors also
-/// collapse to `None` for the same reason.
-#[tauri::command]
-pub fn inbox_default_agent(app: AppHandle) -> Result<Option<String>, String> {
-    let Ok(dir) = app_data_dir(&app) else {
-        return Ok(None);
-    };
-    let Ok(raw) = fs::read_to_string(dir.join("agents.json")) else {
-        return Ok(None);
-    };
-    Ok(first_active_agent_id(&raw))
-}
-
 #[tauri::command]
 pub fn llm_stream_cancel(run_id: String) -> Result<(), String> {
     let streams = ACTIVE_STREAMS
@@ -1326,5 +1311,14 @@ mod tests {
         assert_eq!(first_active_agent_id("[]"), None);
         // A non-archived entry with no usable id anywhere is skipped → None.
         assert_eq!(first_active_agent_id(r#"[{"version":1,"data":{"purpose":"x"}}]"#), None);
+    }
+
+    #[test]
+    fn non_bool_archived_is_treated_as_live() {
+        // M-4: `archived` as a non-bool (e.g. the string "true") is NOT a real bool, so
+        // `as_bool().unwrap_or(false)` reads it as NOT archived — the entry stays selectable rather
+        // than being silently dropped on a malformed flag.
+        let raw = r#"[{"id":"a","version":1,"data":{"archived":"true","purpose":"x"}}]"#;
+        assert_eq!(first_active_agent_id(raw).as_deref(), Some("a"));
     }
 }
