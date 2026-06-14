@@ -1,0 +1,25 @@
+[package]
+name = "bossclaw-core"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Local-first, signed, encrypted memory engine for BossClaw."
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+
+[dependencies]
+ed25519-dalek = "2.1"
+serde_jcs = "0.1.0"
+sha2 = "0.10"
+multibase = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+ulid = "1"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "1"
+hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+
+[dev-dependencies]
+tempfile = "3"

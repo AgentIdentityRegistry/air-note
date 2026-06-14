@@ -471,6 +471,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bossclaw-core"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "multibase",
+ "rusqlite",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "ulid",
+ "unicode-normalization",
+ "zeroize",
+]
+
+[[package]]
 name = "bossclaw_desktop"
 version = "0.0.1"
 dependencies = [
@@ -5422,6 +5442,16 @@ dependencies = [
  "memoffset 0.9.1",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.4",
+ "web-time",
 ]
 
 [[package]]
