@@ -20,8 +20,9 @@ const FENCE_END = "⟦untrusted message end⟧";
 const MAX_LINE = 2000;
 const MAX_TOTAL = 12000; // D13
 
-/** Removes fence chars (so attacker text can't forge a marker) AND clamps each piece to MAX_LINE. */
-const strip = (s: string): string => s.replace(/[⟦⟧]/g, "").slice(0, MAX_LINE);
+/** Coerces to string (parity with channel.mjs `String(s ?? "")` — never throws on null/undefined/
+ *  non-string), removes fence chars (so attacker text can't forge a marker), AND clamps to MAX_LINE. */
+const strip = (s: unknown): string => String(s ?? "").replace(/[⟦⟧]/g, "").slice(0, MAX_LINE);
 
 export type ReplyContext = {
   senderAlias: string | null;

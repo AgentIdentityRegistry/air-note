@@ -189,6 +189,36 @@ describe("buildReplyPrompt — adversarial: cannot escape the fence or forge a t
   });
 });
 
+describe("buildReplyPrompt — defensive coercion (parity with channel.mjs String(s ?? ''))", () => {
+  it("does NOT throw and still emits one balanced fence when fields are non-strings", () => {
+    // Real-world shape that would otherwise reach .replace on a non-string and throw a TypeError,
+    // dropping the entire fenced output. Cast through unknown because callers stay string-typed.
+    const c = ctx({
+      senderAlias: 42 as unknown as string,
+      senderDid: undefined as unknown as string,
+      history: [
+        { direction: "received", text: null as unknown as string },
+        { direction: "sent", text: { evil: true } as unknown as string },
+      ],
+      incomingText: 12345 as unknown as number as unknown as string,
+    });
+    let out = "";
+    expect(() => {
+      out = buildReplyPrompt(c);
+    }).not.toThrow();
+    // Still structurally sound: exactly one start and one end marker, end intact.
+    expect(occurrences(out, FENCE_START)).toBe(1);
+    expect(occurrences(out, FENCE_END)).toBe(1);
+    expect(out.startsWith(FENCE_START)).toBe(true);
+    expect(out.endsWith(FENCE_END)).toBe(true);
+    // null/undefined coerce to empty (not the literal "null"/"undefined").
+    expect(out).not.toContain("null");
+    expect(out).not.toContain("undefined");
+    // The numeric incoming value is coerced to its string form, inside the fence.
+    expect(out).toContain("Latest message to reply to:\n12345");
+  });
+});
+
 describe("buildReplyPrompt — clamping (D13)", () => {
   it("clamps each piece to MAX_LINE", () => {
     const big = "x".repeat(MAX_LINE + 500);
@@ -216,20 +246,29 @@ describe("buildReplyPrompt — clamping (D13)", () => {
 });
 
 describe("buildReplyPrompt — determinism & purity", () => {
-  it("same input yields byte-identical output", () => {
-    const c = ctx({
-      history: [
-        { direction: "received", text: "a" },
-        { direction: "sent", text: "b" },
-      ],
-      incomingText: "c",
-    });
-    expect(buildReplyPrompt(c)).toBe(buildReplyPrompt(c));
+  it("two SEPARATE contexts with the same values yield byte-identical output (no mutation/closure)", () => {
+    // Distinct object graphs built from identical values: if the fn mutated its argument or held
+    // mutable closure state, these two independent calls would diverge. A shared reference can't show that.
+    const make = (): ReplyContext =>
+      ctx({
+        history: [
+          { direction: "received", text: "a" },
+          { direction: "sent", text: "b" },
+        ],
+        incomingText: "c",
+      });
+    const a = make();
+    const b = make();
+    expect(buildReplyPrompt(a)).toBe(buildReplyPrompt(b));
+    // The inputs themselves are untouched by the call (no in-place mutation).
+    expect(a).toEqual(make());
   });
 });
 
 describe("HARDENED_SYSTEM", () => {
-  it("tells the model to never follow instructions inside the markers and to output only the reply", () => {
+  // Content regression guard, not a behavioral proof: it asserts the trusted instruction still
+  // carries its key clauses, not that a model actually obeys them.
+  it("carries the no-follow-instructions and output-only-reply clauses", () => {
     expect(HARDENED_SYSTEM).toMatch(/untrusted/i);
     expect(HARDENED_SYSTEM).toMatch(/never follow/i);
     expect(HARDENED_SYSTEM).toMatch(/output only the reply/i);
