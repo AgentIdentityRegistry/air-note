@@ -137,3 +137,18 @@ fn store_is_encrypted_on_disk_and_keyed() {
     let got: String = store.query_one("SELECT x FROM t LIMIT 1").unwrap();
     assert_eq!(got, "secret-marker");
 }
+
+#[test]
+fn stream_returns_events_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let log = EventLog::open(&dir.path().join("m.db"), &[42u8; 32], key).unwrap();
+    for t in ["a", "b", "c"] { log.append(mk_event(t)).unwrap(); }
+
+    let all = log.stream_all().unwrap();
+    assert_eq!(all.len(), 3);
+    let texts: Vec<String> = all.iter()
+        .map(|e| e.content["text"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(texts, vec!["a", "b", "c"]);
+}

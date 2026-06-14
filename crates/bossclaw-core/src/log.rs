@@ -154,6 +154,19 @@ impl EventLog {
         Ok(log)
     }
 
+    /// Return every event in chain order (M1: full scan; M2 adds `since`).
+    pub fn stream_all(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect("event log mutex poisoned");
+        let conn = store.conn();
+        let mut stmt = conn.prepare("SELECT payload FROM events ORDER BY seq ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
     /// Persist the current tip as the signed high-water mark (debounced by the
     /// caller — every K events / on idle / on clean shutdown, NOT per append).
     pub fn checkpoint_highwater(&self) -> Result<(), BossclawError> {
