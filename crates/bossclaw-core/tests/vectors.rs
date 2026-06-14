@@ -1,4 +1,6 @@
 use bossclaw_core::event::{canonical_bytes, compute_hash, Event};
+use bossclaw_core::sign::{sign_hash, verify_hash};
+use ed25519_dalek::SigningKey;
 
 fn fixture_event() -> Event {
     Event {
@@ -47,4 +49,27 @@ fn second_event_links_to_first() {
     let h2 = compute_hash(&second).unwrap();
 
     assert_ne!(h1, h2, "different events hash differently");
+}
+
+fn fixture_key() -> SigningKey {
+    SigningKey::from_bytes(&[7u8; 32]) // deterministic test key
+}
+
+#[test]
+fn sign_then_verify_roundtrips() {
+    let key = fixture_key();
+    let hash = compute_hash(&fixture_event()).unwrap();
+    let sig = sign_hash(&hash, &key);
+    assert!(sig.starts_with('z'), "multibase base58btc 'z' prefix");
+    verify_hash(&hash, &sig, &key.verifying_key()).expect("valid signature verifies");
+}
+
+#[test]
+fn tampered_hash_fails_verification() {
+    let key = fixture_key();
+    let hash = compute_hash(&fixture_event()).unwrap();
+    let sig = sign_hash(&hash, &key);
+    let mut bad = hash;
+    bad[0] ^= 0xFF;
+    assert!(verify_hash(&bad, &sig, &key.verifying_key()).is_err());
 }
