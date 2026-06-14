@@ -16,7 +16,7 @@ export function rowToMessage(row, { contactLookup = getContactByDid } = {}) {
     from: row.from,
     ...(contact?.alias ? { contact: contact.alias } : {}),
     envelope_id: row.envelope_id,
-    received_at: row.timestamp,
+    received_at: row.archived_at,   // daemon ingest time, NOT the sender-chosen `timestamp` (future-datable) — recency-guard safety; matches the Rust replayer (replay.rs row_to_message)
     verified: row.verified,
     encrypted: row.encrypted,
     ...(row.key_changed ? { key_changed: true } : {}),
