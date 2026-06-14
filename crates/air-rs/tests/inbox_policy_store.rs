@@ -534,6 +534,186 @@ fn old_policy_without_auto_sends_deserializes() {
     assert!(c.auto_sends.is_empty()); // serde default
 }
 
+// ── FIX 1: the stale-pending wedge self-heals (prune-before-decide) ───────────────────────────────
+
+#[test]
+fn reserve_self_heals_from_stale_pending_wedge() {
+    // Regression: 3 stale pending reservations (~20m old, controller died before their acks) had
+    // wedged the contact at Draft — they inflated decide()'s hourly count, forcing Draft, so the
+    // old Auto-only prune never ran. With prune-before-decide, reserve sees honest (zero) counts and
+    // returns Auto, and the 3 stale pendings are gone afterward (only the new one remains).
+    let h = TempDir::new().unwrap();
+    let mut p = policy_with(Autonomy::Auto);
+    let sends = &mut p.contacts.get_mut(DID).unwrap().auto_sends;
+    for i in 0..PER_CONTACT_HOURLY {
+        sends.push(AutoSend {
+            token: format!("wedge{i}"),
+            envelope_id: String::new(),
+            thread_id: format!("wedge-thread-{i}"),
+            at: secs_ago(1200), // ~20 min → pending & > 15m stale
+            pending: true,
+        });
+    }
+    write_policy(h.path(), &p);
+
+    let res = reserve(h.path(), DID, Some("fresh-thread"), NOW, NOW).unwrap();
+    assert_eq!(
+        res.decision,
+        Autonomy::Auto,
+        "wedge must self-heal; reason: {}",
+        res.reason
+    );
+
+    let after = load(h.path());
+    let sends = &after.contacts.get(DID).unwrap().auto_sends;
+    assert_eq!(sends.len(), 1, "only the new reservation should remain");
+    assert!(
+        !sends[0].token.starts_with("wedge"),
+        "stale pendings must be gone"
+    );
+    assert!(sends[0].pending);
+}
+
+#[test]
+fn reserve_draft_path_flushes_prune_to_disk() {
+    // Even when the decision is Draft (dial off), a prune that removed stale debris must be
+    // persisted — otherwise the file never self-heals on non-Auto reserves.
+    let h = TempDir::new().unwrap();
+    let mut p = policy_with(Autonomy::Off); // dial off → decide returns Draft, never Auto
+    p.contacts.get_mut(DID).unwrap().auto_sends.push(AutoSend {
+        token: "debris".into(),
+        envelope_id: String::new(),
+        thread_id: "t".into(),
+        at: secs_ago(1200), // stale pending
+        pending: true,
+    });
+    write_policy(h.path(), &p);
+
+    let res = reserve(h.path(), DID, Some("t"), NOW, NOW).unwrap();
+    assert_eq!(res.decision, Autonomy::Off);
+    assert!(res.token.is_none());
+
+    // The stale debris was flushed away despite the non-Auto path.
+    let after = load(h.path());
+    assert!(after.contacts.get(DID).unwrap().auto_sends.is_empty());
+}
+
+// ── FIX 2: within() fails closed on future timestamps ─────────────────────────────────────────────
+
+#[test]
+fn decide_future_received_at_is_too_old_not_auto() {
+    // A future-dated message must NOT bypass the recency cutoff. 5 min in the FUTURE → out-of-window
+    // → "too old" → Draft (fail-closed).
+    let p = policy_with(Autonomy::Auto);
+    let future = secs_ago(-300); // 5 min ahead of NOW
+    let (d, r) = decide(&p, DID, Some("t1"), &future, NOW);
+    assert_eq!(d, Autonomy::Draft);
+    assert_eq!(r, "auto skipped: message too old (replay)");
+}
+
+#[test]
+fn decide_future_auto_send_does_not_count_toward_caps() {
+    // A future-stamped auto_send record (clock skew / tampering) is out-of-window for every cap, so
+    // it can't be used to either inflate OR (here) be ignored maliciously — it simply doesn't count.
+    // With 2 real recent + 1 future record, the hourly count is 2 (not 3) → still Auto.
+    let mut p = policy_with(Autonomy::Auto);
+    let sends = &mut p.contacts.get_mut(DID).unwrap().auto_sends;
+    sends.push(confirmed_at("a", &secs_ago(60), "a"));
+    sends.push(confirmed_at("b", &secs_ago(120), "b"));
+    sends.push(confirmed_at("c", &secs_ago(-600), "c")); // future → not counted
+    assert_eq!(
+        decide(&p, DID, Some("new"), NOW, NOW),
+        (Autonomy::Auto, "auto")
+    );
+}
+
+// ── FIX 3: confirm is idempotent for the ledger (at-least-once delivery) ───────────────────────────
+
+#[test]
+fn confirm_is_idempotent_on_duplicate_ack() {
+    // A duplicate inbox_send_ok (delivery is at-least-once) must not double-write the ledger.
+    let h = TempDir::new().unwrap();
+    set_autonomy(h.path(), DID, Autonomy::Auto).unwrap();
+    let token = reserve(h.path(), DID, Some("t1"), NOW, NOW)
+        .unwrap()
+        .token
+        .unwrap();
+
+    confirm(h.path(), DID, &token, "env-dup", "t1", NOW).unwrap();
+    confirm(h.path(), DID, &token, "env-dup", "t1", NOW).unwrap(); // duplicate ack
+
+    let p = load(h.path());
+    let c = p.contacts.get(DID).unwrap();
+    // Ledger has the envelope_id exactly once…
+    assert_eq!(c.auto_ledger, vec!["env-dup".to_string()]);
+    // …and there's still exactly one auto_send record (the confirmed one).
+    assert_eq!(c.auto_sends.len(), 1);
+    assert!(!c.auto_sends[0].pending);
+}
+
+// ── FIX 6: overlapping writers don't corrupt the file (unique tmp) ────────────────────────────────
+
+#[test]
+fn concurrent_confirms_do_not_corrupt_the_file() {
+    // Unique tmp names mean overlapping write_atomic calls can't collide on a shared tmp (which
+    // previously caused torn files / ENOENT renames). After a burst of concurrent confirms the file
+    // must still parse as valid JSON and every confirmed envelope must be in the ledger exactly once.
+    use std::sync::Arc;
+    use std::thread;
+
+    let h = TempDir::new().unwrap();
+    set_autonomy(h.path(), DID, Autonomy::Auto).unwrap();
+    let home: Arc<std::path::PathBuf> = Arc::new(h.path().to_path_buf());
+
+    let n = 12;
+    let handles: Vec<_> = (0..n)
+        .map(|i| {
+            let home = Arc::clone(&home);
+            thread::spawn(move || {
+                // Each confirm uses a distinct token+envelope; the not-found arm re-inserts a
+                // confirmed record (I-A), so all N should land without any corruption.
+                confirm(
+                    &home,
+                    DID,
+                    &format!("tok-{i}"),
+                    &format!("env-{i}"),
+                    "t",
+                    NOW,
+                )
+                .unwrap();
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // The file is still valid and complete.
+    let p = load(home.as_path());
+    let c = p.contacts.get(DID).unwrap();
+    assert_eq!(
+        c.auto_ledger.len(),
+        n,
+        "every confirm should be recorded exactly once"
+    );
+    for i in 0..n {
+        assert!(
+            c.auto_ledger.contains(&format!("env-{i}")),
+            "env-{i} missing from ledger"
+        );
+    }
+    // No leftover tmp files in the home dir.
+    let leftover_tmp: Vec<_> = fs::read_dir(home.as_path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(
+        leftover_tmp.is_empty(),
+        "no .tmp files should remain: {leftover_tmp:?}"
+    );
+}
+
 /// Write a `Policy` straight to `home` for seeding tests (mirrors the crate's atomic write but is
 /// test-local so we don't expose the private `write_atomic`).
 fn write_policy(home: &std::path::Path, p: &Policy) {

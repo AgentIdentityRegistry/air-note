@@ -133,6 +133,8 @@ pub const PER_CONTACT_HOURLY: usize = 3;
 pub const PER_CONTACT_DAILY: usize = 10;
 /// Max auto-sends across ALL contacts per rolling 24h (D1).
 pub const GLOBAL_DAILY: usize = 30;
+/// Rolling per-contact hourly budget window (D1).
+const HOURLY_WINDOW_SECS: i64 = 3600;
 /// D2: after auto-replying in a thread, pause auto for 30 min in that thread.
 const STRUCTURAL_WINDOW_SECS: i64 = 1800;
 /// D11: never auto-reply to a message older than 10 min (replay defense).
@@ -144,8 +146,13 @@ const RETENTION_SECS: i64 = 86400;
 /// Cap on the confirmed-envelope audit ledger per contact.
 const LEDGER_CAP: usize = 500;
 
-/// `(now - at) <= secs`, INCLUSIVE. Both args are RFC-3339 timestamps; an unparseable `at` (debris)
-/// is treated as out-of-window (`false`) so it never counts toward a cap or a guard.
+/// `0 <= (now - at) <= secs`, INCLUSIVE. Both args are RFC-3339 timestamps; an unparseable `at`
+/// (debris) is treated as out-of-window (`false`) so it never counts toward a cap or a guard.
+///
+/// Fail-closed on the future: a negative delta (`at` is AFTER `now`) returns `false`. Otherwise a
+/// future-dated `received_at` would satisfy every window — including the recency cutoff — letting an
+/// attacker bypass the "too old" guard by stamping a message in the future. Future ⇒ out-of-window
+/// ⇒ treated as too old ⇒ Draft (the safe direction).
 fn within(at: &str, now: &str, secs: i64) -> bool {
     let (at, now) = match (
         chrono::DateTime::parse_from_rfc3339(at),
@@ -155,7 +162,7 @@ fn within(at: &str, now: &str, secs: i64) -> bool {
         _ => return false,
     };
     let delta = now.signed_duration_since(at).num_seconds();
-    delta <= secs
+    (0..=secs).contains(&delta)
 }
 
 /// A fresh reservation token.
@@ -186,7 +193,9 @@ pub fn decide(
             if !within(received_at, now, AUTO_RECENCY_SECS) {
                 return (Autonomy::Draft, "auto skipped: message too old (replay)");
             }
-            // D2: one auto-reply per thread per structural window.
+            // D2: one auto-reply per thread per structural window. Best-effort for HONEST threaded
+            // conversations only — a peer that rotates or omits `thread_id` slips past this; the
+            // per-contact budget cap below is the adversarial backstop (plan I4).
             if let (Some(tid), Some(c)) = (thread_id, p.contacts.get(did)) {
                 if c.auto_sends
                     .iter()
@@ -204,7 +213,10 @@ pub fn decide(
                 .get(did)
                 .map(|c| c.auto_sends.iter().collect())
                 .unwrap_or_default();
-            let hourly = per.iter().filter(|a| within(&a.at, now, 3600)).count();
+            let hourly = per
+                .iter()
+                .filter(|a| within(&a.at, now, HOURLY_WINDOW_SECS))
+                .count();
             let daily = per
                 .iter()
                 .filter(|a| within(&a.at, now, RETENTION_SECS))
@@ -249,7 +261,14 @@ pub struct Reservation {
 
 /// Atomically decide against the CURRENT on-disk state (pending reservations included) and, if the
 /// answer is `Auto`, persist a pending reservation before returning. The lock spans the entire
-/// load→decide→write, so two concurrent callers can't both slip past a cap (C2).
+/// load→prune→decide→write, so two concurrent callers can't both slip past a cap (C2).
+///
+/// Prune runs BEFORE `decide` so the counts are honest: a stale pending (the controller died before
+/// its ack) is dropped here rather than inflating the count forever. Without prune-first, that
+/// inflation would force Draft, which means `reserve` never reaches its old (Auto-only) prune — so a
+/// dead reservation could wedge the contact (or, via the global cap, ALL Auto contacts) at Draft for
+/// ~24h instead of self-healing after 15min. We therefore also persist the pruned state on the
+/// non-Auto path whenever prune removed something.
 pub fn reserve(
     home: &Path,
     did: &str,
@@ -259,6 +278,7 @@ pub fn reserve(
 ) -> std::io::Result<Reservation> {
     let _g = POLICY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut p = load(home);
+    let pruned = prune(&mut p, now);
     let (decision, reason) = decide(&p, did, thread_id, received_at, now);
     if decision == Autonomy::Auto {
         let token = new_uuid();
@@ -273,13 +293,16 @@ pub fn reserve(
                 at: now.to_string(),
                 pending: true,
             });
-        prune(&mut p, now);
         write_atomic(home, &p)?;
         return Ok(Reservation {
             decision,
             reason: reason.into(),
             token: Some(token),
         });
+    }
+    // Not auto: still flush the prune so dead reservations self-heal (the wedge fix).
+    if pruned {
+        write_atomic(home, &p)?;
     }
     Ok(Reservation {
         decision,
@@ -303,24 +326,34 @@ pub fn confirm(
     let _g = POLICY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut p = load(home);
     let c = p.contacts.entry(did.to_string()).or_default();
-    match c.auto_sends.iter_mut().find(|a| a.token == token) {
+    // Only a real pending→confirmed transition (or a fresh re-insert) appends to the ledger, so a
+    // duplicate `inbox_send_ok` (delivery is at-least-once) is a ledger no-op — not a double-write.
+    let is_new_confirmation = match c.auto_sends.iter_mut().find(|a| a.token == token) {
         Some(a) => {
+            let was_pending = a.pending;
             a.pending = false;
             a.envelope_id = envelope_id.to_string();
+            was_pending
         }
-        // Pruned before the ack landed → restore a confirmed record (I-A).
-        None => c.auto_sends.push(AutoSend {
-            token: token.to_string(),
-            envelope_id: envelope_id.to_string(),
-            thread_id: thread_id.to_string(),
-            at: now.to_string(),
-            pending: false,
-        }),
-    }
-    c.auto_ledger.push(envelope_id.to_string());
-    if c.auto_ledger.len() > LEDGER_CAP {
-        let drop = c.auto_ledger.len() - LEDGER_CAP;
-        c.auto_ledger.drain(0..drop);
+        // Pruned before the ack landed → restore a confirmed record (I-A). Resurrecting a confirmed
+        // record is the safe direction: it can only over-restrict future sends, never enable one.
+        None => {
+            c.auto_sends.push(AutoSend {
+                token: token.to_string(),
+                envelope_id: envelope_id.to_string(),
+                thread_id: thread_id.to_string(),
+                at: now.to_string(),
+                pending: false,
+            });
+            true
+        }
+    };
+    if is_new_confirmation {
+        c.auto_ledger.push(envelope_id.to_string());
+        if c.auto_ledger.len() > LEDGER_CAP {
+            let drop = c.auto_ledger.len() - LEDGER_CAP;
+            c.auto_ledger.drain(0..drop);
+        }
     }
     write_atomic(home, &p)
 }
@@ -339,24 +372,35 @@ pub fn cancel(home: &Path, did: &str, token: &str) -> std::io::Result<()> {
 
 /// D2 retention + crash-safety: keep records ≤24h old, and additionally drop a PENDING record whose
 /// reservation has gone stale (>15m) — that's debris from a crash between reserve and confirm.
-fn prune(p: &mut Policy, now: &str) {
+/// Returns `true` if any record was removed (so the caller knows the on-disk state must be rewritten
+/// even when nothing else changed — this is what lets a wedged contact self-heal; see [`reserve`]).
+fn prune(p: &mut Policy, now: &str) -> bool {
+    let mut removed = false;
     for c in p.contacts.values_mut() {
+        let before = c.auto_sends.len();
         c.auto_sends.retain(|a| {
             let within_retention = within(&a.at, now, RETENTION_SECS);
             // A pending reservation only survives while it's still fresh; confirmed records always do.
             let not_stale_pending = !a.pending || within(&a.at, now, STALE_PENDING_SECS);
             within_retention && not_stale_pending
         });
+        removed |= c.auto_sends.len() != before;
     }
+    removed
 }
 
 fn write_atomic(home: &Path, p: &Policy) -> std::io::Result<()> {
     std::fs::create_dir_all(home)?;
     let path = policy_path(home);
-    let tmp = path.with_extension("json.tmp");
+    // Unique tmp per write (PID + uuid): if two writers overlap (two desktop instances — no
+    // single-instance guard yet) they no longer collide on a fixed `agent-policy.json.tmp`, which
+    // otherwise yields a torn file or an ENOENT rename. This does NOT make the cross-process
+    // read-modify-write atomic (that needs a single-instance guard, handled in Task 2) — it only
+    // prevents file corruption from the tmp collision.
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), new_uuid()));
     let json = serde_json::to_string_pretty(p).expect("policy serializes");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(json.as_bytes())?;
         f.flush()?;
     }
@@ -364,6 +408,24 @@ fn write_atomic(home: &Path, p: &Policy) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)?;
     set_0600(&path);
     Ok(())
+}
+
+/// Create the tmp file with owner-only (0600) permissions FROM THE START on unix, closing the brief
+/// window where a default-umask (often 0644) tmp would reveal exactly which contacts the AI
+/// auto-sends to. `set_0600` after the rename remains the cross-OS safety net.
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
 }
 
 #[cfg(unix)]
