@@ -30,7 +30,7 @@ test("rowToMessage: maps an archive row to the wire/live message shape, re-deriv
   assert.equal(m.relay_seq, 41);
   assert.equal(m.verified, true);
   assert.equal(m.key_changed, undefined);          // false in the row → field omitted (live shape)
-  assert.equal(m.received_at, "2026-06-10T00:00:00.000Z");
+  assert.equal(m.received_at, "2026-06-10T00:00:01.000Z"); // archived_at (daemon ingest time), NOT the sender-chosen timestamp (...00.000Z)
   assert.deepEqual(m.body, { type: "text", text: "hi" });
 });
 
