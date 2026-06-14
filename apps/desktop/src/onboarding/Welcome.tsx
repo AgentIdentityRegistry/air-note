@@ -12,12 +12,12 @@ export function Welcome() {
       </p>
       <p style={{ marginTop: "1.5rem", lineHeight: 1.5 }}>
         BossClaw is an open-source AI agent that acts on your behalf. To start,
-        we'll create a cryptographic identity for your agent and register it with{" "}
-        <a href="https://agentidentityregistry.org" target="_blank">AIR</a> (the
+        we&apos;ll create a cryptographic identity for your agent and register it with{" "}
+        <a href="https://agentidentityregistry.org" target="_blank" rel="noreferrer">AIR</a> (the
         Agent Identity Registry).
       </p>
       <p style={{ marginTop: 12, color: "#666", fontSize: 13 }}>
-        Your agent's private key stays on this device. We never see it.
+        Your agent&apos;s private key stays on this device. We never see it.
       </p>
       <div style={{ marginTop: 24 }}>
         <Button onClick={() => dispatch({ type: "next" })}>Continue</Button>

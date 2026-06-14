@@ -24,7 +24,7 @@ export function AirSettings() {
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #eee" }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Danger zone</div>
         <p style={{ color: "#666", fontSize: 13 }}>
-          Reset will delete your agent's identity and require re-onboarding.
+          Reset will delete your agent&apos;s identity and require re-onboarding.
         </p>
         <Button variant="secondary" onClick={handleReset} style={{ color: "#b00" }}>
           Reset agent
