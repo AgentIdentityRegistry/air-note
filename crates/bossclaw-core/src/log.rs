@@ -20,6 +20,7 @@ use crate::store::Store;
 
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+const POISON: &str = "event log mutex poisoned";
 
 /// The serialized, signed event log.
 pub struct EventLog {
@@ -59,7 +60,7 @@ impl EventLog {
             }
         }
 
-        let store = self.inner.lock().expect("event log mutex poisoned");
+        let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let tx = conn.unchecked_transaction()?;
 
@@ -91,7 +92,7 @@ impl EventLog {
 
     /// Number of events in the log.
     pub fn count(&self) -> Result<i64, BossclawError> {
-        let store = self.inner.lock().expect("poisoned");
+        let store = self.inner.lock().expect(POISON);
         let n = store.conn().query_row("SELECT count(*) FROM events", [], |r| r.get(0))?;
         Ok(n)
     }
@@ -99,7 +100,7 @@ impl EventLog {
     /// Re-verify the whole chain: every row's hash recomputes from its canonical
     /// bytes + prev_hash, links to the prior row, and its signature verifies.
     pub fn verify_chain(&self) -> Result<(), BossclawError> {
-        let store = self.inner.lock().expect("poisoned");
+        let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare("SELECT payload, prev_hash, hash FROM events ORDER BY seq ASC")?;
         let rows = stmt.query_map([], |r| {
@@ -115,7 +116,8 @@ impl EventLog {
                 )));
             }
             let event: Event = serde_json::from_str(&payload)?;
-            let recomputed = hex::encode(compute_hash(&event)?);
+            let hash_bytes = compute_hash(&event)?;
+            let recomputed = hex::encode(hash_bytes);
             if recomputed != hash_hex {
                 return Err(BossclawError::Chain(format!(
                     "hash mismatch at {}: stored {hash_hex}, recomputed {recomputed}",
@@ -126,7 +128,6 @@ impl EventLog {
                 .signature
                 .as_deref()
                 .ok_or_else(|| BossclawError::Chain("missing signature".into()))?;
-            let hash_bytes = compute_hash(&event)?;
             verify_hash(&hash_bytes, sig, &self.key.verifying_key())?;
             expected_prev = hash_hex;
         }
@@ -156,7 +157,7 @@ impl EventLog {
 
     /// Return every event in chain order (M1: full scan; M2 adds `since`).
     pub fn stream_all(&self) -> Result<Vec<Event>, BossclawError> {
-        let store = self.inner.lock().expect("event log mutex poisoned");
+        let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare("SELECT payload FROM events ORDER BY seq ASC")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -174,7 +175,7 @@ impl EventLog {
             Some(h) => h,
             None => return Ok(()),
         };
-        let store = self.inner.lock().expect("event log mutex poisoned");
+        let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let count: i64 = conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0))?;
         let tip_hash: String = conn
