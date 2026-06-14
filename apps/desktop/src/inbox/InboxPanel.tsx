@@ -55,7 +55,7 @@ export function InboxPanel() {
       ) : null}
       {archiveError ? (
         <div style={{ marginTop: 8, padding: "8px 12px", borderRadius: 8, background: "#FFF8EC", color: "#A57C42", fontSize: 13 }}>
-          Couldn't read the local archive — showing the live feed only.
+          Couldn&apos;t read the local archive — showing the live feed only.
         </div>
       ) : null}
 
