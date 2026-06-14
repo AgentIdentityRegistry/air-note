@@ -8,6 +8,7 @@ import { MessageThread } from "./MessageThread";
 import { Composer } from "./Composer";
 import { DialControl } from "./DialControl";
 import { NeedsDaemon } from "./NeedsDaemon";
+import { AIPanel } from "./AIPanel";
 import type { ThreadItem } from "./model";
 
 const short = (did: string) => did.replace(/^did:wba:[^:]+:agents:/, "");
@@ -71,6 +72,7 @@ export function InboxPanel() {
                 </div>
               ) : <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>New message</div>}
               {showConv ? <MessageThread items={thread} onRetry={onRetry} /> : null}
+              {showConv ? <AIPanel selectedPeer={selected ?? null} /> : null}
               <Composer key={showNew ? "new" : selected} to={showNew ? null : selected} disabled={!online} onSend={handleSend} />
             </>
           ) : (

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { IdentityProvider, useIdentity } from "./state/identity";
 import { OnboardingProvider, useOnboarding } from "./state/onboarding";
 import { InboxProvider, useInbox } from "./state/inbox";
+import { AiLoopProvider } from "./state/aiLoop";
 import { Welcome } from "./onboarding/Welcome";
 import { NameAgent } from "./onboarding/NameAgent";
 import { GenerateAndRegister } from "./onboarding/GenerateAndRegister";
@@ -16,7 +17,9 @@ export default function App() {
     <IdentityProvider>
       <OnboardingProvider>
         <InboxProvider>
-          <Shell />
+          <AiLoopProvider>
+            <Shell />
+          </AiLoopProvider>
         </InboxProvider>
       </OnboardingProvider>
     </IdentityProvider>
