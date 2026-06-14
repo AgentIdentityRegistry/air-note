@@ -19,7 +19,22 @@ use std::sync::Arc;
 use tauri::Manager;
 
 fn main() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // CF2: single-instance guard. POLICY_LOCK is in-process only, so two desktop instances could
+    // each run a channel + AI loop and both reserve the same budget slot (cross-process race →
+    // budget bypass). Register this FIRST (Tauri 2 requirement) so a second launch hands off to the
+    // running process and exits; the callback focuses the existing main window.
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -67,6 +82,7 @@ fn main() {
             llm_stream::claude_generate,
             llm_stream::llm_stream_start,
             llm_stream::llm_stream_cancel,
+            llm_stream::inbox_default_agent,
             is_onboarded,
             get_identity,
             get_trust_score,
@@ -82,6 +98,11 @@ fn main() {
             commands::inbox::inbox_history,
             commands::inbox::inbox_policy_get,
             commands::inbox::inbox_policy_set,
+            commands::inbox::inbox_ai_reserve,
+            commands::inbox::inbox_ai_confirm,
+            commands::inbox::inbox_ai_cancel,
+            inbox::channel::inbox_channel_start,
+            inbox::channel::inbox_channel_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

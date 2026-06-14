@@ -251,6 +251,50 @@ fn read_agent(app: &AppHandle, agent_id: &str) -> Option<AgentRecord> {
     latest_record
 }
 
+/// The id of an `agents.json` entry, handling BOTH the wrapped (`{id, version, data}`) and flat
+/// (`AgentRecord`) shapes `read_agent` accepts. For the wrapped shape the object-level `id` wins,
+/// falling back to `data.id`; for the flat shape it's the record's `id`. None if neither yields a
+/// non-empty id.
+fn agent_entry_id(entry: &Value) -> Option<String> {
+    let object_id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(id) = object_id {
+        return Some(id.to_string());
+    }
+    // Flat shape, or wrapped with an empty object-level id: fall back to the record's own `id`.
+    let data = entry.get("data").unwrap_or(entry);
+    data.get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Is an `agents.json` entry archived? Reads `data.archived` for the wrapped shape, else the entry's
+/// own `archived`. Absent/malformed → treated as NOT archived (so a typo'd record stays selectable
+/// rather than silently dropping the user's only agent).
+fn agent_entry_archived(entry: &Value) -> bool {
+    let source = entry.get("data").unwrap_or(entry);
+    source
+        .get("archived")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// D4: the first NON-archived agent id from a raw `agents.json` string, in array order
+/// (deterministic). None when the file is malformed, empty, or every agent is archived — the UI then
+/// shows "configure a reply model" rather than crashing. Pure + unit-testable (no AppHandle).
+fn first_active_agent_id(raw: &str) -> Option<String> {
+    let entries = serde_json::from_str::<Vec<Value>>(raw).ok()?;
+    entries
+        .iter()
+        .find(|entry| !agent_entry_archived(entry))
+        .and_then(agent_entry_id)
+}
+
 fn effective_provider_base(app: &AppHandle, agent_id: &str) -> Result<String, String> {
     let settings = read_settings(app);
     let agent = read_agent(app, agent_id);
@@ -714,6 +758,7 @@ async fn stream_chat_completion(
     run_id: String,
     agent_id: String,
     prompt: String,
+    system_override: Option<String>,
     cancel_flag: Arc<AtomicBool>,
 ) {
     let mut usage: Option<UsagePayload> = None;
@@ -724,7 +769,12 @@ async fn stream_chat_completion(
         let base_url = effective_provider_base(&app, &agent_id)?;
         let endpoint = chat_completions_url(&base_url)?;
         let api_key = provider_api_key()?;
-        let system_prompt = system_prompt_for_agent(&app, &agent_id);
+        // I1: an explicit `system_override` (e.g. the fully-fenced AI-reply prompt from task 4) wins
+        // as the system-role content; otherwise fall back to the agent's derived system prompt. The
+        // user `prompt` is unchanged either way.
+        let system_prompt = system_override
+            .clone()
+            .unwrap_or_else(|| system_prompt_for_agent(&app, &agent_id));
 
         let client = Client::builder()
             .build()
@@ -850,6 +900,7 @@ pub async fn llm_stream_start(
     run_id: String,
     agent_id: String,
     prompt: String,
+    system_override: Option<String>,
 ) -> Result<(), String> {
     if run_id.trim().is_empty() {
         return Err("runId is required.".to_string());
@@ -875,6 +926,7 @@ pub async fn llm_stream_start(
             run_id_clone,
             agent_id_clone,
             prompt_clone,
+            system_override,
             cancel_flag,
         )
         .await;
@@ -1189,6 +1241,21 @@ pub async fn llm_openai_compat_list_models(app: AppHandle) -> Result<Vec<String>
     list_models_for_provider("openai_compat", &base_url).await
 }
 
+/// D4: the default reply agent for the AI loop — the first non-archived agent id from `agents.json`,
+/// deterministic in array order. Returns `None` (not an error) when there's no usable agent, so the
+/// UI can prompt "configure a reply model" without the command failing. File read/parse errors also
+/// collapse to `None` for the same reason.
+#[tauri::command]
+pub fn inbox_default_agent(app: AppHandle) -> Result<Option<String>, String> {
+    let Ok(dir) = app_data_dir(&app) else {
+        return Ok(None);
+    };
+    let Ok(raw) = fs::read_to_string(dir.join("agents.json")) else {
+        return Ok(None);
+    };
+    Ok(first_active_agent_id(&raw))
+}
+
 #[tauri::command]
 pub fn llm_stream_cancel(run_id: String) -> Result<(), String> {
     let streams = ACTIVE_STREAMS
@@ -1200,5 +1267,64 @@ pub fn llm_stream_cancel(run_id: String) -> Result<(), String> {
         Ok(())
     } else {
         Err("No active stream found for runId.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_active_agent_id;
+
+    #[test]
+    fn picks_first_non_archived_wrapped_in_array_order() {
+        // Wrapped shape ({id, version, data}); first entry archived, so the SECOND id wins.
+        let raw = r#"[
+            {"id":"a","version":2,"data":{"archived":true,"purpose":"x"}},
+            {"id":"b","version":1,"data":{"archived":false,"purpose":"y"}},
+            {"id":"c","version":1,"data":{"purpose":"z"}}
+        ]"#;
+        assert_eq!(first_active_agent_id(raw).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn picks_first_when_none_archived() {
+        let raw = r#"[
+            {"id":"first","version":1,"data":{"purpose":"x"}},
+            {"id":"second","version":1,"data":{"purpose":"y"}}
+        ]"#;
+        assert_eq!(first_active_agent_id(raw).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn flat_shape_is_supported() {
+        // Flat AgentRecord shape (no wrapping object): id + archived live at the top level.
+        let raw = r#"[
+            {"id":"flat-archived","archived":true},
+            {"id":"flat-live","archived":false}
+        ]"#;
+        assert_eq!(first_active_agent_id(raw).as_deref(), Some("flat-live"));
+    }
+
+    #[test]
+    fn falls_back_to_inner_id_when_object_id_empty() {
+        // Wrapped entry whose object-level id is blank falls back to data.id.
+        let raw = r#"[{"id":"","version":1,"data":{"id":"inner","purpose":"x"}}]"#;
+        assert_eq!(first_active_agent_id(raw).as_deref(), Some("inner"));
+    }
+
+    #[test]
+    fn all_archived_yields_none() {
+        let raw = r#"[
+            {"id":"a","data":{"archived":true}},
+            {"id":"b","data":{"archived":true}}
+        ]"#;
+        assert_eq!(first_active_agent_id(raw), None);
+    }
+
+    #[test]
+    fn malformed_or_empty_yields_none() {
+        assert_eq!(first_active_agent_id("not json"), None);
+        assert_eq!(first_active_agent_id("[]"), None);
+        // A non-archived entry with no usable id anywhere is skipped → None.
+        assert_eq!(first_active_agent_id(r#"[{"version":1,"data":{"purpose":"x"}}]"#), None);
     }
 }
