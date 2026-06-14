@@ -3,6 +3,7 @@
 mod air;
 mod commands;
 mod file_access;
+mod inbox;
 mod llm_stream;
 mod markitdown;
 mod secrets;
@@ -38,6 +39,7 @@ fn main() {
             app.manage(AppState {
                 air_client,
                 identity_store,
+                inbox: std::sync::Arc::new(crate::inbox::manager::InboxManager::new()),
             });
             Ok(())
         })
@@ -70,7 +72,16 @@ fn main() {
             get_trust_score,
             create_identity,
             reset_identity,
-            a2a_demo_round_trip
+            a2a_demo_round_trip,
+            commands::inbox::inbox_status,
+            commands::inbox::inbox_identity,
+            commands::inbox::inbox_start,
+            commands::inbox::inbox_stop,
+            commands::inbox::inbox_send,
+            commands::inbox::inbox_conversations,
+            commands::inbox::inbox_history,
+            commands::inbox::inbox_policy_get,
+            commands::inbox::inbox_policy_set,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

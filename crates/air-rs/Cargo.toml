@@ -50,11 +50,15 @@ thiserror = "1"
 # `transport` feature gates these so that the core envelope/signing types stay
 # usable in no-std / embedded contexts that don't need network IO.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"], optional = true }
 futures = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
 eventsource-stream = { version = "0.2", optional = true }
 url = { version = "2.5", optional = true }
+
+# Inbox (Phase A2) — read-only WAL reader for the daemon's archive.db. `bundled` vendors
+# SQLite so there is no system-lib dependency across macOS/Linux. Gated by `inbox`.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 # For conformance harness (`sha2` is now a regular dependency above, used by the
@@ -63,6 +67,7 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 # For transport integration tests
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tempfile = "3"
 
 [[test]]
 name = "jcs_vectors"
@@ -70,6 +75,7 @@ path = "tests/conformance/jcs_vectors.rs"
 required-features = ["conformance"]
 
 [features]
-default = ["transport"]
+default = ["transport", "inbox"]
 conformance = []  # Enables tests/conformance/jcs_vectors.rs against /specs/air/draft-1/test-vectors.json
 transport = ["reqwest", "tokio", "futures", "async-stream", "eventsource-stream", "url"]
+inbox = ["rusqlite", "tokio"]

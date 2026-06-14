@@ -3,7 +3,18 @@
 **Date:** 2026-06-11
 **Status:** v2 — second-opinion architect review returned APPROVE-WITH-CHANGES; all findings folded in
 (identity-collision rewrite, archive WAL, structural loop guard, grouping keys, send-err taxonomy,
-dial-scope truth, corrected citations). Pending Peter's approval.
+dial-scope truth, corrected citations). Approved 2026-06-11.
+
+**Phase A2 (Rust backend) — IMPLEMENTED 2026-06-11** on branch `feat/ai-inbox-a2-backend` (plan
+`docs/superpowers/plans/2026-06-11-desktop-ai-inbox-a2-backend.md`): the `air-rs::inbox` library —
+frames+fixtures, line parser, home-scoped stores, channel gate, read-only WAL archive reader (with a
+real separate-process soak), the 5-invariant replayer, identity adopter, policy-store dial, and the
+reconnecting two-role daemon client — plus the Tauri command/event surface (viewer feed, send, history,
+identity, dial). **59 air-rs tests pass; `cargo check -p bossclaw_desktop` clean; clippy `-D warnings`
+clean.** A whole-branch Opus review (SHIP-WITH-FIXES) found + fixed a send/recv frame-corruption bug at
+the `select!` cancellation seam (now regression-tested). The channel connection + replayer are
+library-built+tested but their Tauri wiring + the AI loop are **Phase B**. Next: **A3** (the React Inbox
+UI over these commands), then **Phase B** (the per-contact AI dial loop + guards).
 **Track:** BossClaw desktop (`~/air-note/apps/desktop`) + a small messaging-stack delta (`agent-bridge-mcp`)
 **Builds on:** receiver daemon Phases 1–4 (spec `agent-bridge-mcp/docs/superpowers/specs/2026-06-05-receiver-daemon-design.md`; merged PR #14, main `a78e0af`)
 
