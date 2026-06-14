@@ -110,9 +110,14 @@ pub async fn inbox_conversations() -> Result<Value, String> {
     .map_err(|e| e.to_string())?
 }
 
-/// History for one peer (or recent across peers when `peer` is None).
+/// History for one peer, one room, or recent across peers when both are None.
 #[tauri::command]
-pub async fn inbox_history(peer: Option<String>, limit: Option<i64>, include_spam: Option<bool>) -> Result<Value, String> {
+pub async fn inbox_history(
+    peer: Option<String>,
+    room: Option<String>,
+    limit: Option<i64>,
+    include_spam: Option<bool>,
+) -> Result<Value, String> {
     let home = bridge_home();
     if !home.join("archive.db").exists() {
         return Ok(json!([]));
@@ -120,7 +125,7 @@ pub async fn inbox_history(peer: Option<String>, limit: Option<i64>, include_spa
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
         let reader = ArchiveReader::open(&home).map_err(|e| e.to_string())?;
         let rows = reader
-            .history(peer.as_deref(), None, None, None, limit.unwrap_or(50), include_spam.unwrap_or(false))
+            .history(peer.as_deref(), None, room.as_deref(), None, limit.unwrap_or(50), include_spam.unwrap_or(false))
             .map_err(|e| e.to_string())?;
         serde_json::to_value(rows).map_err(|e| e.to_string())
     })
