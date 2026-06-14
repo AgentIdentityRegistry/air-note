@@ -1,4 +1,5 @@
 use bossclaw_core::event::Event;
+use bossclaw_core::highwater::FileHighWater;
 use bossclaw_core::log::EventLog;
 use bossclaw_core::store::Store;
 use ed25519_dalek::SigningKey;
@@ -73,6 +74,33 @@ fn tampering_a_row_breaks_verify_chain() {
     }
     let log = EventLog::open(&path, &[42u8; 32], key).unwrap();
     assert!(log.verify_chain().is_err(), "tamper must be detected");
+}
+
+#[test]
+fn tail_truncation_is_detected_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let db = dir.path().join("m.db");
+    let hw = dir.path().join("hw.json");
+
+    {
+        let log = EventLog::open_with_highwater(&db, &[42u8; 32], key.clone(),
+            Box::new(FileHighWater::new(&hw))).unwrap();
+        for t in ["a","b","c"] { log.append(mk_event(t)).unwrap(); }
+        log.checkpoint_highwater().unwrap(); // persist {count=3}
+    }
+
+    // Attacker deletes the last row (tail truncation); remaining rows still link.
+    {
+        let store = bossclaw_core::store::Store::open(&db, &[42u8; 32]).unwrap();
+        store.exec("DELETE FROM events WHERE seq = (SELECT max(seq) FROM events)").unwrap();
+    }
+
+    // Reopen: live count (2) is BEHIND the signed high-water (3) → detected.
+    let reopened = EventLog::open_with_highwater(&db, &[42u8; 32], key,
+        Box::new(FileHighWater::new(&hw)));
+    assert!(matches!(reopened, Err(bossclaw_core::BossclawError::Truncation(_))),
+        "tail truncation must be detected on open");
 }
 
 #[test]

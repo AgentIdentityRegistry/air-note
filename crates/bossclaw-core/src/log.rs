@@ -14,6 +14,7 @@ use ulid::Ulid;
 
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event};
+use crate::highwater::{HighWaterStore, Mark};
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
 
@@ -24,6 +25,7 @@ const GENESIS: &str =
 pub struct EventLog {
     inner: Mutex<Store>,
     key: SigningKey,
+    highwater: Option<Box<dyn HighWaterStore>>,
 }
 
 impl EventLog {
@@ -42,7 +44,7 @@ impl EventLog {
                 hash       TEXT NOT NULL UNIQUE
             )",
         )?;
-        Ok(Self { inner: Mutex::new(store), key })
+        Ok(Self { inner: Mutex::new(store), key, highwater: None })
     }
 
     /// Append an event. `id`, `ts`, `prev_hash`, `hash`, `signature` are
@@ -129,5 +131,42 @@ impl EventLog {
             expected_prev = hash_hex;
         }
         Ok(())
+    }
+
+    /// Open with a high-water store; checks truncation immediately.
+    pub fn open_with_highwater(
+        path: &Path,
+        dek: &[u8; 32],
+        key: SigningKey,
+        highwater: Box<dyn HighWaterStore>,
+    ) -> Result<Self, BossclawError> {
+        let mut log = Self::open(path, dek, key)?;
+        if let Some(mark) = highwater.load()? {
+            let live = log.count()?;
+            if live < mark.count {
+                return Err(BossclawError::Truncation(format!(
+                    "live count {live} < high-water {} (tail deleted)",
+                    mark.count
+                )));
+            }
+        }
+        log.highwater = Some(highwater);
+        Ok(log)
+    }
+
+    /// Persist the current tip as the signed high-water mark (debounced by the
+    /// caller — every K events / on idle / on clean shutdown, NOT per append).
+    pub fn checkpoint_highwater(&self) -> Result<(), BossclawError> {
+        let hw = match &self.highwater {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        let store = self.inner.lock().expect("event log mutex poisoned");
+        let conn = store.conn();
+        let count: i64 = conn.query_row("SELECT count(*) FROM events", [], |r| r.get(0))?;
+        let tip_hash: String = conn
+            .query_row("SELECT hash FROM events ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
+            .unwrap_or_else(|_| GENESIS.to_string());
+        hw.save(&Mark { count, tip_hash })
     }
 }
