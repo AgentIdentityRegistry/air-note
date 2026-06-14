@@ -56,8 +56,12 @@ describe("shouldSkip — pre-reservation gating", () => {
     expect(shouldSkip(msg({ room_id: "room-42", body: null }), empty)).toBe("room");
   });
 
-  it("skips an unreadable (absent) body (D12)", () => {
+  it("skips an unreadable (absent) body — undefined (D12)", () => {
     expect(shouldSkip(msg({ body: undefined }), empty)).toBe("unreadable");
+  });
+
+  it("skips an unreadable (absent) body — null (D12 spec: m.body == null) (M3)", () => {
+    expect(shouldSkip(msg({ body: null }), empty)).toBe("unreadable");
   });
 
   it("skips an explicit encrypted body", () => {

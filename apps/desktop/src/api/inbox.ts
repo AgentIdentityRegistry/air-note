@@ -110,6 +110,14 @@ export const llmStreamStart = (
   systemOverride?: string,
 ) => invoke<void>("llm_stream_start", { runId, agentId, prompt, systemOverride });
 
+/**
+ * Cancel an in-flight stream: sets the run's cancel flag; the run then emits `llm_stream_done`
+ * with `cancelled: true`. Rejects when no stream is active for `runId` (e.g. it already finished) —
+ * callers should treat that rejection as a safe no-op.
+ */
+export const llmStreamCancel = (runId: string) =>
+  invoke<void>("llm_stream_cancel", { runId });
+
 // ── Event payloads + a typed subscribe helper ───────────────────────────────────
 
 export type InboxEvents = {

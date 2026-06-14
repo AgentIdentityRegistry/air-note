@@ -30,13 +30,12 @@
 import {
   createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode,
 } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   inboxChannelStart, inboxChannelStop,
   inboxAiReserve, inboxAiConfirm, inboxAiCancel,
   inboxDefaultAgent, inboxSend, inboxHistory, inboxPolicySet,
-  llmStreamStart, onInboxEvent,
+  llmStreamStart, llmStreamCancel, onInboxEvent,
   type InboxMessage, type ArchiveRow,
 } from "../api/inbox";
 import { buildReplyPrompt, HARDENED_SYSTEM, type ReplyContext } from "../inbox/aiPrompt";
@@ -44,19 +43,28 @@ import { newDedupe, markProcessed } from "../inbox/aiDedupe";
 import { bodyText } from "../inbox/bodyText";
 import { shouldSkip } from "../inbox/aiSkip";
 
-/** Bounded history depth fed into the reply prompt (the prompt itself also clamps total bytes). */
+/** Bounded history depth fed into the reply prompt. The prompt builder ALSO hard-clamps the total
+ *  to D13's `MAX_TOTAL` (12000 bytes) — so 20 rows is a count ceiling, not the real limiter: it
+ *  keeps the request small/cheap while letting the byte cap do the final trimming. A future tuner
+ *  must NOT raise this expecting longer context — the byte cap silently wins past ~12 KB. */
 const HISTORY_LIMIT = 20;
 
-/** Panel status for a single drafted/sent reply, keyed by the *incoming* message's envelope id. */
-export type ReplyStatus = "drafting" | "drafted" | "auto-sent" | "failed" | "disabled";
+/** Panel status for a single drafted/sent reply, keyed by the *incoming* message's envelope id.
+ *  `auto-sent` = sent by the auto path; `sent` = a human-approved manual send (Task 7 renders
+ *  these distinctly — a human-approved send is NOT an auto-send). */
+export type ReplyStatus = "drafting" | "drafted" | "auto-sent" | "sent" | "failed" | "disabled";
 
-/** What the panel renders per incoming message. `token` lets a `discard` cancel a live reservation. */
+/** What the panel renders per incoming message. `token` is non-null ONLY while a still-reserved,
+ *  not-yet-dispatched auto reply is outstanding — that's the only state in which `discard` should
+ *  cancel the reservation; once dispatched it's cleared (the ack path owns it). */
 export type ReplyView = {
   status: ReplyStatus;
   text: string;
   reason: string;
   peer: string;
+  threadId: string | undefined; // thread to reply on (manual approve threads like the auto path)
   token: string | null;
+  retryable?: boolean;          // on a `failed` row: whether the send may be manually retried (I4)
 };
 
 type AiLoopCtx = {
@@ -113,7 +121,7 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
   const runs = useRef<Map<string, RunRecord>>(new Map());  // runId → run state
   const sends = useRef<Map<string, SendRecord>>(new Map()); // correlationId → send state
   const replyAgentId = useRef<string | null>(null);
-  const keyChangeDebounce = useRef<Set<string>>(new Set()); // DIDs whose key-change is in-flight (Step 3)
+  const keyChangePending = useRef<Set<string>>(new Set()); // DIDs with a key-change policy write in flight — one write per DID (Step 3)
 
   // ── tiny panel-state mutators (functional, immutable Map copies) ────────────────────────────
   const patchReply = useRef((envelopeId: string, patch: Partial<ReplyView>) => {
@@ -145,8 +153,13 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
     dedupe.current = set;
     if (!fresh) return;
 
-    // 2. pre-reservation skip: rooms (D6), unreadable bodies (D12/M-B), per-DID lock.
-    if (shouldSkip(m, inFlight.current)) return;
+    // 2. pre-reservation skip: rooms (D6), unreadable bodies (D12/M-B), per-DID lock. Surface the
+    //    typed reason so D6/D12/lock skips are observable in QA (I1).
+    const skip = shouldSkip(m, inFlight.current);
+    if (skip) {
+      console.debug(`[aiLoop] skip ${m.envelope_id} from ${m.from}: ${skip}`);
+      return;
+    }
 
     // 3. lock the DID, then reserve an AI slot (the atomic cross-message guard lives in Rust).
     inFlight.current.add(m.from);
@@ -195,17 +208,18 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
       text: "",
     });
     patchReply.current(m.envelope_id, {
-      status: "drafting", text: "", reason: reserved.reason, peer: m.from, token: reserved.token,
+      status: "drafting", text: "", reason: reserved.reason, peer: m.from,
+      threadId: m.thread_id, token: reserved.token,
     });
 
     try {
       await llmStreamStart(runId, agentId, prompt, HARDENED_SYSTEM);
     } catch (e) {
       // Stream failed to even start → treat exactly like llm_stream_error: cancel reservation,
-      // mark failed, unlock. NEVER auto-send (invariant 1).
+      // clear the token (no longer live), mark failed, unlock. NEVER auto-send (invariant 1).
       runs.current.delete(runId);
       if (reserved.token) inboxAiCancel(m.from, reserved.token).catch(() => {});
-      patchReply.current(m.envelope_id, { status: "failed", reason: errText(e) });
+      patchReply.current(m.envelope_id, { status: "failed", reason: errText(e), token: null });
       unlock.current(m.from);
     }
   });
@@ -229,38 +243,46 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
 
     const draft = rec.text; // authoritative accumulated text (read from the ref, not React state)
 
-    if (rec.decision === "auto" && rec.token) {
-      // Auto path: dispatch the send, stash it for the ack, then RELEASE THE LOCK HERE (I-B) —
-      // we must NOT hold the per-DID lock across the ack wait.
-      try {
-        const sentId = await inboxSend(rec.peer, { type: "text", text: draft }, rec.threadId, rec.envelopeId);
-        sends.current.set(sentId, {
-          peer: rec.peer, token: rec.token, threadId: rec.threadId, envelopeId: rec.envelopeId,
-        });
-        // Panel stays "drafting" visually until the ack flips it to auto-sent/failed; show the text.
-        patchReply.current(rec.envelopeId, { text: draft });
-      } catch (e) {
-        // Dispatch itself failed (no ack will ever come) → cancel the reservation, mark failed.
-        // NEVER auto-resend (invariant 1).
-        inboxAiCancel(rec.peer, rec.token).catch(() => {});
-        patchReply.current(rec.envelopeId, { status: "failed", reason: errText(e) });
+    // The per-DID lock MUST be released for every non-cancelled outcome (auto-dispatch, dispatch
+    // failure, or draft). A `finally` makes that unconditional (invariant 4 / C1) — no terminal
+    // branch can strand the DID even if it grows an early `return` later.
+    try {
+      if (rec.decision === "auto" && rec.token) {
+        // Auto path: dispatch the send, stash it for the ack. The lock is released by the `finally`
+        // below — we must NOT hold it across the ack wait (I-B); the Rust atomic reserve is the
+        // real cross-message guard.
+        try {
+          const sentId = await inboxSend(rec.peer, { type: "text", text: draft }, rec.threadId, rec.envelopeId);
+          sends.current.set(sentId, {
+            peer: rec.peer, token: rec.token, threadId: rec.threadId, envelopeId: rec.envelopeId,
+          });
+          // Once dispatched, the reservation is owned by the send_ok/err ack path. Clear the row's
+          // token so `discard` can no longer cancel it (#3): a discard now is a pure panel-clear,
+          // never a cancel that races the ack into a "sent but UI says discarded" state.
+          patchReply.current(rec.envelopeId, { text: draft, token: null });
+        } catch (e) {
+          // Dispatch itself failed (no ack will ever come) → cancel the reservation inline, mark
+          // failed, and clear the token (it's no longer live). NEVER auto-resend (invariant 1).
+          inboxAiCancel(rec.peer, rec.token).catch(() => {});
+          patchReply.current(rec.envelopeId, { status: "failed", reason: errText(e), token: null });
+        }
+      } else {
+        // Draft path (incl. a "degraded auto" the guard downgraded to draft): show for review.
+        patchReply.current(rec.envelopeId, { status: "drafted", text: draft, reason: rec.reason });
       }
-    } else {
-      // Draft path (incl. a "degraded auto" the guard downgraded to draft): show for review.
-      patchReply.current(rec.envelopeId, { status: "drafted", text: draft, reason: rec.reason });
+    } finally {
+      unlock.current(rec.peer);
     }
-
-    // Release the per-DID lock at end of done-handling for EVERY non-cancelled branch (invariant 4).
-    unlock.current(rec.peer);
   });
 
   const onError = useRef((p: { runId: string; message: string }) => {
     const rec = runs.current.get(p.runId);
     if (!rec) return;
     runs.current.delete(p.runId);
-    // Reservation (if any) must be released; the panel shows failed; NEVER auto-send (invariant 1).
+    // Reservation (if any) is cancelled inline and the token cleared (no longer live); the panel
+    // shows failed; NEVER auto-send (invariant 1).
     if (rec.token) inboxAiCancel(rec.peer, rec.token).catch(() => {});
-    patchReply.current(rec.envelopeId, { status: "failed", reason: p.message });
+    patchReply.current(rec.envelopeId, { status: "failed", reason: p.message, token: null });
     unlock.current(rec.peer);
   });
 
@@ -281,14 +303,16 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
     patchReply.current(rec.envelopeId, { status: "auto-sent" });
   });
 
-  const onSendErr = useRef((p: { id: string; reason: string }) => {
+  const onSendErr = useRef((p: { id: string; retryable: boolean; reason: string }) => {
     const rec = sends.current.get(p.id);
     if (!rec) return; // not ours — ignore
     sends.current.delete(p.id);
-    // The send failed → cancel the reservation (NEVER confirm — invariant 2); offer manual retry.
-    // NEVER auto-resend (invariant 1).
+    // The send failed → cancel the reservation (NEVER confirm — invariant 2). The token was already
+    // cleared at dispatch, so this is the ack-path's own cancel of the now-stashed reservation.
+    // We carry `retryable` to the panel (Task 7 shows retry vs permanent-failure) but NEVER
+    // auto-resend ourselves (invariant 1 / §8).
     inboxAiCancel(rec.peer, rec.token).catch(() => {});
-    patchReply.current(rec.envelopeId, { status: "failed", reason: p.reason });
+    patchReply.current(rec.envelopeId, { status: "failed", reason: p.reason, retryable: p.retryable });
   });
 
   // ── key-change (Step 3 / D7): force the DID to draft + cancel any in-flight draft/auto ────────
@@ -296,12 +320,13 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
     if (!m.key_changed) return;
     const did = m.from;
 
-    // Debounce per DID so a burst of key-change frames triggers exactly one policy write.
-    if (!keyChangeDebounce.current.has(did)) {
-      keyChangeDebounce.current.add(did);
+    // One policy write per DID: a burst of key-change frames triggers exactly one `inboxPolicySet`
+    // (the `keyChangePending` gate clears once the write settles).
+    if (!keyChangePending.current.has(did)) {
+      keyChangePending.current.add(did);
       inboxPolicySet(did, "draft")
         .catch(() => {})
-        .finally(() => { keyChangeDebounce.current.delete(did); });
+        .finally(() => { keyChangePending.current.delete(did); });
     }
 
     // Cancel any in-flight run(s) for this DID: stop the stream (M-D) and drop the reservation.
@@ -311,7 +336,9 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
       runs.current.delete(runId);
       cancelStream(runId);
       if (rec.token) inboxAiCancel(did, rec.token).catch(() => {});
-      patchReply.current(rec.envelopeId, { status: "failed", reason: "Contact's key changed — held for review." });
+      patchReply.current(rec.envelopeId, {
+        status: "failed", reason: "Contact's key changed — held for review.", token: null,
+      });
       unlock.current(did);
     }
   });
@@ -358,13 +385,19 @@ export function AiLoopProvider({ children }: { children: ReactNode }) {
 
   // ── exposed actions ──────────────────────────────────────────────────────────────────────────
   const approveSend = useRef(async (envelopeId: string) => {
-    // Manual approve of a reviewed draft. This is a plain user send — NOT an auto reservation —
-    // so it does not touch inboxAiReserve/Confirm. (A drafted row's token is null.)
+    // Manual approve of a HUMAN-REVIEWED draft. This is a plain user send — NOT an auto
+    // reservation — so it never touches inboxAiReserve/Confirm.
     const view = repliesRef.current.get(envelopeId);
     if (!view || !view.text) return;
+    // #8a: only a reviewable `drafted` row may be approved. Any other status (drafting / auto-sent /
+    // sent / failed) OR a non-null token (still owned by the auto/ack path) → refuse. This blocks a
+    // second inboxSend for an already-dispatched auto row, and a double-approve of the same draft.
+    if (view.status !== "drafted" || view.token !== null) return;
     try {
-      await inboxSend(view.peer, { type: "text", text: view.text }, undefined, envelopeId);
-      patchReply.current(envelopeId, { status: "auto-sent" });
+      // #8b: thread the manual reply on the same thread the auto path would have used (D2 structural
+      // + conversation threading), reusing the incoming envelope id as the in-reply-to.
+      await inboxSend(view.peer, { type: "text", text: view.text }, view.threadId, envelopeId);
+      patchReply.current(envelopeId, { status: "sent" }); // I2: human-approved, not an auto-send
     } catch (e) {
       patchReply.current(envelopeId, { status: "failed", reason: errText(e) });
     }
@@ -406,11 +439,10 @@ export function useAiLoop() {
 
 // ── helpers ────────────────────────────────────────────────────────────────────────────────────
 
-/** Best-effort cancel of a stream (Rust command `llm_stream_cancel`, M-D). Invoked directly rather
- *  than via an api/inbox wrapper so task 6 touches only its own files. The command rejects when no
- *  stream is active (already finished), which is a safe no-op for us — swallow it. */
+/** Best-effort cancel of a stream (M-D). The command rejects when no stream is active (already
+ *  finished), which is a safe no-op for us — swallow it. */
 function cancelStream(runId: string): void {
-  invoke<void>("llm_stream_cancel", { runId }).catch(() => {});
+  llmStreamCancel(runId).catch(() => {});
 }
 
 /** Normalize a thrown value (Tauri rejects with a string; guard against non-strings too). */
