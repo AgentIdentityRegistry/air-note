@@ -312,7 +312,13 @@ async fn connect_once(
                 }
                 for ev in parser.feed(&buf) {
                     if let FrameEvent::Frame(v) = ev {
-                        dispatch(v, events, max_seen);
+                        // D1: if the event receiver has been dropped (a caller that didn't `stop()`),
+                        // `dispatch` reports it on the Message/Gap paths and we tear the loop down
+                        // rather than reconnect-and-emit into the void forever. The channel client
+                        // depends on this — its pump owns the only receiver.
+                        if !dispatch(v, events, max_seen) {
+                            return ConnOutcome::Stopped;
+                        }
                     }
                 }
                 buf.clear(); // safe: read_until returned at a newline, so `buf` held one full line
@@ -324,25 +330,30 @@ async fn connect_once(
     }
 }
 
+/// Decode + forward one server frame. Returns `false` ONLY when the event receiver has been dropped
+/// on a Message/Gap emit (D1: the caller is gone, so the reconnect loop should terminate instead of
+/// emitting into the void). All other outcomes — decode failure, send-ack frames, ignored frames —
+/// return `true` (keep the loop alive).
 #[cfg(unix)]
 fn dispatch(
     v: Value,
     events: &mpsc::UnboundedSender<InboxEvent>,
     max_seen: &mut Option<i64>,
-) {
+) -> bool {
     let frame: ServerFrame = match serde_json::from_value(v) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return true,
     };
     match frame {
         ServerFrame::Message { message } => {
             if max_seen.is_none_or(|m| message.relay_seq > m) {
                 *max_seen = Some(message.relay_seq);
             }
-            let _ = events.send(InboxEvent::Message(message));
+            // A send error here means the receiver was dropped — signal terminate (D1).
+            events.send(InboxEvent::Message(message)).is_ok()
         }
         ServerFrame::Gap { after_seq } => {
-            let _ = events.send(InboxEvent::Gap { after_seq });
+            events.send(InboxEvent::Gap { after_seq }).is_ok()
         }
         ServerFrame::SendOk {
             id,
@@ -354,6 +365,7 @@ fn dispatch(
                 envelope_id,
                 encrypted,
             });
+            true
         }
         ServerFrame::SendErr {
             id,
@@ -365,12 +377,13 @@ fn dispatch(
                 retryable,
                 reason,
             });
+            true
         }
-        ServerFrame::Status { .. } => {}
+        ServerFrame::Status { .. } => true,
         ServerFrame::Pong
         | ServerFrame::HelloOk { .. }
         | ServerFrame::Error { .. }
-        | ServerFrame::Unknown => {}
+        | ServerFrame::Unknown => true,
     }
 }
 

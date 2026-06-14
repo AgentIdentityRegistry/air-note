@@ -70,3 +70,41 @@ fn unpinned_after_receipt_is_withheld_on_replay() {
     let out = r.gap(&reader, home.path(), 0).unwrap();
     assert!(out.is_empty(), "an unpinned-after-receipt sender must be withheld on replay");
 }
+
+/// CF3: the replayed `received_at` must be the daemon's INGEST time (`archived_at`), NOT the
+/// sender-chosen `timestamp` (which a verified sender can future-date). Seed one admitted row whose
+/// `timestamp` is far in the future but whose `archived_at` is a real past ingest time, and prove the
+/// replayed message carries the ingest time — so a forged future `timestamp` can't qualify a stale
+/// replayed message as "recent" for the D11 recency guard.
+#[test]
+fn replay_received_at_is_ingest_time_not_sender_timestamp() {
+    let home = TempDir::new().unwrap();
+    let conn = Connection::open(home.path().join("archive.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages (envelope_id TEXT,direction TEXT,thread_id TEXT,peer_did TEXT,from_did TEXT,to_did TEXT,timestamp TEXT,body_json TEXT,encrypted INT,verified INT,key_changed INT DEFAULT 0,relay_seq INT,spam INT DEFAULT 0,room_id TEXT,archived_at TEXT,PRIMARY KEY(envelope_id,direction));
+         CREATE TABLE meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);",
+    ).unwrap();
+    let future_sender_ts = "2999-01-01T00:00:00Z"; // attacker-controlled envelope.timestamp
+    let real_ingest_ts = "2026-06-11T00:00:01Z"; // daemon-set archived_at
+    conn.execute(
+        "INSERT INTO messages VALUES ('e1','received','th','did:pinned','did:pinned','me',?1,'{\"type\":\"text\",\"text\":\"hi\"}',1,1,0,1,0,NULL,?2)",
+        rusqlite::params![future_sender_ts, real_ingest_ts],
+    ).unwrap();
+    fs::write(home.path().join("contacts.json"),
+        r#"{"version":1,"contacts":{"did:pinned":{"alias":"pat"}}}"#).unwrap();
+
+    let reader = ArchiveReader::open(home.path()).unwrap();
+    let mut r = Replayer::new(HashSet::new());
+    let out = r.gap(&reader, home.path(), 0).unwrap();
+
+    assert_eq!(out.len(), 1, "the admitted row should replay");
+    assert_eq!(
+        out[0].received_at, real_ingest_ts,
+        "received_at must be the daemon ingest time (archived_at), not the sender timestamp"
+    );
+    assert_ne!(
+        out[0].received_at, future_sender_ts,
+        "a future-dated sender timestamp must NOT leak into received_at"
+    );
+}
