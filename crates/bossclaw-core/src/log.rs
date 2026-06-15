@@ -17,8 +17,6 @@ use ulid::Ulid;
 
 use rusqlite::OptionalExtension;
 
-use std::time::Instant as StdInstant;
-
 use crate::embed::Embedder;
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event};
@@ -1019,6 +1017,12 @@ impl EventLog {
     /// idempotent/resumable. A second run re-embeds 0 (nothing pending) and
     /// GCs 0 (stale rows already removed), leaving one consistent active model.
     ///
+    /// A crash after the GC (step 3) but before `rebuild_indexes` completes
+    /// (step 4) is also safe: the `vectors` table already contains only the new
+    /// model's rows (no data loss), and the in-memory index is simply stale or
+    /// absent. Recovery is a single call to `rebuild_indexes(embedder)`, which
+    /// is also what a normal reopen + rebuild does — no special handling needed.
+    ///
     /// # Lock discipline
     ///
     /// The single-store [`Mutex`] is never held across [`Embedder::embed`]
@@ -1034,7 +1038,7 @@ impl EventLog {
         &self,
         embedder: &dyn Embedder,
     ) -> Result<ReembedStats, BossclawError> {
-        let migration_start = StdInstant::now();
+        let migration_start = Instant::now();
 
         // Step 1: append a config event selecting the new active model.
         // Reuse the existing schema_version if a config already exists.
@@ -1078,24 +1082,29 @@ impl EventLog {
         // Step 4: rebuild the in-memory ANN + FTS indexes under the new model.
         self.rebuild_indexes(embedder)?;
 
+        // Count total events BEFORE stopping the clock so `elapsed_ms` spans
+        // the whole operation including this query.
+        let total_events = self.count()?;
         let elapsed_ms = migration_start.elapsed().as_millis();
 
-        let total_events = self.count()?;
-        // Avoid division by zero; migration with 0 events is valid (initial setup).
-        let events_per_sec = if elapsed_ms > 0 {
+        // Avoid division by zero; an idempotent re-run (reembedded == 0) or a
+        // migration on an empty store are both valid. Report the throughput label
+        // as "reembedded/sec" (not "events/sec") so a 0-reembed idempotent run
+        // prints "0 reembedded/sec" without ambiguity.
+        let reembedded_per_sec = if elapsed_ms > 0 {
             reembedded as f64 / (elapsed_ms as f64 / 1000.0)
         } else {
             f64::INFINITY
         };
         log::info!(
-            "reembed_migration: model={} reembedded={} gc_removed={} total_events={} \
-             elapsed_ms={} ({:.0} events/sec)",
-            embedder.model_id(),
+            "re-embed migration: {} vectors re-embedded in {}ms ({:.0} reembedded/sec); \
+             gc_removed={} total_events={} model={}",
             reembedded,
+            elapsed_ms,
+            reembedded_per_sec,
             gc_removed,
             total_events,
-            elapsed_ms,
-            events_per_sec,
+            embedder.model_id(),
         );
 
         Ok(ReembedStats { reembedded, gc_removed, elapsed_ms })
