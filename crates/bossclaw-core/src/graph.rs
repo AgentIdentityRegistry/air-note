@@ -5,6 +5,10 @@
 //! (folding events into tables, running graph queries) lives on
 //! [`crate::log::EventLog`]; everything here is data types and pure helpers.
 
+use std::collections::HashMap;
+
+use crate::event::Event;
+
 /// `model_id` recorded on a hand/test-asserted (non-LLM) `link`/`invalidate`
 /// event. M4's reasoner replaces this with its real model id. Kept as a named
 /// constant so the convention is single-sourced (no magic string).
@@ -82,6 +86,66 @@ pub fn normalize_ts(ts: &str) -> String {
             .to_string(),
         Err(_) => ts.to_string(),
     }
+}
+
+/// Extract `(src, relation, dst)` from a `link`/`invalidate` event's content,
+/// or `None` if any field is missing or non-string (malformed — skipped by the
+/// fold rather than failing it).
+pub fn parse_link_content(content: &serde_json::Value) -> Option<(String, String, String)> {
+    let src = content.get("src")?.as_str()?.to_string();
+    let relation = content.get("relation")?.as_str()?.to_string();
+    let dst = content.get("dst")?.as_str()?.to_string();
+    Some((src, relation, dst))
+}
+
+/// Fold `link`/`invalidate` events (which MUST already be in `seq` order) into
+/// the current edge set. Deterministic: edges are produced in link-event order;
+/// each `link` opens an assertion (`edge_id` = the link event id), each
+/// `invalidate` closes ALL currently-active assertions for its `(src, relation,
+/// dst)` key. Re-linking after an invalidate opens a fresh assertion (a new
+/// validity interval). Malformed events (no src/relation/dst) are skipped.
+pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
+    let mut edges: Vec<Edge> = Vec::new();
+    // edge-key → indices into `edges` that are still open for that key.
+    let mut active: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
+    for ev in events {
+        let (src, relation, dst) = match parse_link_content(&ev.content) {
+            Some(t) => t,
+            None => continue,
+        };
+        let key = (src.clone(), relation.clone(), dst.clone());
+        match ev.event_type.as_str() {
+            "link" => {
+                let valid_from = normalize_ts(ev.valid_time.as_deref().unwrap_or(&ev.ts));
+                let ingested_at = normalize_ts(&ev.ts);
+                edges.push(Edge {
+                    edge_id: ev.id.clone(),
+                    src,
+                    relation,
+                    dst,
+                    valid_from,
+                    valid_to: None,
+                    ingested_at,
+                    invalidated_at: None,
+                    invalidated_by: None,
+                });
+                active.entry(key).or_default().push(edges.len() - 1);
+            }
+            "invalidate" => {
+                if let Some(indices) = active.remove(&key) {
+                    let valid_to = normalize_ts(ev.valid_time.as_deref().unwrap_or(&ev.ts));
+                    let invalidated_at = normalize_ts(&ev.ts);
+                    for i in indices {
+                        edges[i].valid_to = Some(valid_to.clone());
+                        edges[i].invalidated_at = Some(invalidated_at.clone());
+                        edges[i].invalidated_by = Some(ev.id.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    edges
 }
 
 #[cfg(test)]

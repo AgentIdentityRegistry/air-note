@@ -65,6 +65,104 @@ fn invalidate_appends_event_with_edge_key() {
     assert_eq!(ev.model_meta.unwrap().source_event_ids, vec![a]);
 }
 
+// ── Task 2: rebuild_graph + all_edges + all_nodes ────────────────────────────
+
+use bossclaw_core::graph::Edge;
+
+#[test]
+fn rebuild_graph_is_byte_identical_across_rebuilds() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    let c = log.append(mk_memory("beta corp")).unwrap();
+    log.link(&a, "works_at", &b, None, &[]).unwrap();
+    log.link(&a, "knows", &c, None, &[]).unwrap();
+    log.invalidate(&a, "works_at", &b, None, std::slice::from_ref(&a)).unwrap();
+
+    log.rebuild_graph().unwrap();
+    let edges1 = log.all_edges().unwrap();
+    let nodes1 = log.all_nodes().unwrap();
+    log.rebuild_graph().unwrap();
+    let edges2 = log.all_edges().unwrap();
+    let nodes2 = log.all_nodes().unwrap();
+
+    assert_eq!(edges1, edges2, "edges fold must be byte-identical across rebuilds");
+    assert_eq!(nodes1, nodes2, "nodes fold must be byte-identical across rebuilds");
+    assert_eq!(edges1.len(), 2, "two link events → two edge rows");
+    assert_eq!(nodes1.len(), 3, "three distinct endpoints → three nodes");
+}
+
+#[test]
+fn invalidate_closes_not_deletes_and_relink_opens_new_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+
+    log.link(&a, "works_at", &b, None, &[]).unwrap();
+    log.invalidate(&a, "works_at", &b, None, std::slice::from_ref(&a)).unwrap();
+    log.link(&a, "works_at", &b, None, &[]).unwrap(); // re-link → new interval
+    log.rebuild_graph().unwrap();
+
+    let edges = log.all_edges().unwrap();
+    assert_eq!(edges.len(), 2, "invalidate closes (not deletes); re-link adds a 2nd row");
+    let closed: Vec<&Edge> = edges.iter().filter(|e| e.invalidated_at.is_some()).collect();
+    let open: Vec<&Edge> = edges.iter().filter(|e| e.is_current()).collect();
+    assert_eq!(closed.len(), 1, "exactly one closed assertion");
+    assert_eq!(open.len(), 1, "exactly one re-opened current assertion");
+    assert!(closed[0].valid_to.is_some(), "closed edge carries a world-clock end");
+    assert!(closed[0].invalidated_by.is_some(), "closed edge records its invalidator");
+}
+
+#[test]
+fn nodes_kind_is_memory_for_memory_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    // dst is an id that does NOT exist as a memory event → "external".
+    log.link(&a, "mentions", "entity:acme", None, std::slice::from_ref(&a)).unwrap();
+    log.rebuild_graph().unwrap();
+
+    let nodes = log.all_nodes().unwrap();
+    let kind_of = |id: &str| nodes.iter().find(|n| n.node_id == id).map(|n| n.kind.clone());
+    assert_eq!(kind_of(&a).as_deref(), Some("memory"));
+    assert_eq!(kind_of("entity:acme").as_deref(), Some("external"));
+}
+
+// ── Rev 2 T-A: invalidate closes ALL active assertions for a key ─────────────
+
+#[test]
+fn invalidate_closes_all_active_assertions_for_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    log.link(&a, "works_at", &b, None, &[]).unwrap();
+    log.link(&a, "works_at", &b, None, &[]).unwrap(); // two concurrent assertions, same key
+    log.invalidate(&a, "works_at", &b, None, std::slice::from_ref(&a)).unwrap();
+    log.rebuild_graph().unwrap();
+    let edges = log.all_edges().unwrap();
+    assert_eq!(edges.len(), 2, "both assertions persist (close-not-delete)");
+    assert!(
+        edges.iter().all(|e| e.invalidated_at.is_some()),
+        "one invalidate closes ALL active assertions for the key"
+    );
+}
+
+// ── Rev 2 T-C: invalidate with no active assertion is a no-op ────────────────
+
+#[test]
+fn invalidate_with_no_active_assertion_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    log.invalidate(&a, "works_at", &b, None, std::slice::from_ref(&a)).unwrap(); // before any link
+    log.rebuild_graph().unwrap();
+    assert!(log.all_edges().unwrap().is_empty(), "invalidate with no matching link adds no edge");
+}
+
 #[test]
 fn append_rejects_empty_source_event_ids_for_tier_b() {
     // This exercises M1's pre-existing append guard (NOT the F2 gate): any Tier-B

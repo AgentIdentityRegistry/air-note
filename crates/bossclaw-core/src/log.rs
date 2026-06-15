@@ -5,7 +5,7 @@
 //! never fork (spec §4 single-writer invariant). The evolve loop (M4) is NOT a
 //! privileged writer — it calls `append` like everyone else.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -415,6 +415,7 @@ impl EventLog {
     ) -> Result<Self, BossclawError> {
         let log = Self::open(path, dek, key)?;
         log.rebuild_indexes(embedder)?;
+        log.rebuild_graph()?; // graph (+ its recall boost) live on open; persisted edges survive reopen
         Ok(log)
     }
 
@@ -1295,6 +1296,169 @@ impl EventLog {
     /// make this dynamic — the user's real DID, looked up per call.
     fn signer_did(&self) -> String {
         ENGINE_SIGNER_DID.to_string()
+    }
+
+    /// Rebuild the persisted `edges`/`nodes` tables as a deterministic fold over
+    /// every `link`/`invalidate` event (`ORDER BY seq ASC`). Tier-A: byte-
+    /// identical across rebuilds (spec §4/§9). Wipes both tables and re-inserts
+    /// under one transaction. Cheap (graph events are few). Call after appending
+    /// `link`/`invalidate` events to refresh `neighbors`/`as_of`/the recall boost.
+    ///
+    /// **Lifecycle:** graph queries and the recall boost reflect the `edges`
+    /// table as of the last `rebuild_graph` / [`EventLog::open_with_recall`].
+    /// After appending `link`/`invalidate` events WITHIN a session, call
+    /// `rebuild_graph` again — the same append→rebuild lifecycle as
+    /// [`EventLog::rebuild_indexes`].
+    pub fn rebuild_graph(&self) -> Result<(), BossclawError> {
+        let started = Instant::now();
+        let events = self.graph_events_ordered()?;
+        let edges = crate::graph::fold_edges(&events);
+        // F4: a signed link/invalidate with malformed content is silently
+        // dropped by the fold (it never becomes an edge). Surface the count so
+        // malformed-but-signed events are not invisible.
+        let malformed = events
+            .iter()
+            .filter(|e| crate::graph::parse_link_content(&e.content).is_none())
+            .count();
+        if malformed > 0 {
+            log::warn!(
+                "rebuild_graph: {malformed} link/invalidate event(s) had malformed content \
+                 and were skipped"
+            );
+        }
+        let memory_ids = self.memory_page_ids()?;
+
+        // Distinct endpoints → nodes (BTreeMap = deterministic node order).
+        let mut node_kinds: BTreeMap<String, String> = BTreeMap::new();
+        for e in &edges {
+            for endpoint in [&e.src, &e.dst] {
+                node_kinds.entry(endpoint.clone()).or_insert_with(|| {
+                    if memory_ids.contains(endpoint) {
+                        "memory".to_string()
+                    } else {
+                        "external".to_string()
+                    }
+                });
+            }
+        }
+
+        let edge_count = edges.len();
+        let node_count = node_kinds.len();
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM edges", [])?;
+        tx.execute("DELETE FROM nodes", [])?;
+        for e in &edges {
+            tx.execute(
+                "INSERT INTO edges
+                   (edge_id, src, relation, dst, valid_from, valid_to,
+                    ingested_at, invalidated_at, invalidated_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    e.edge_id, e.src, e.relation, e.dst, e.valid_from, e.valid_to,
+                    e.ingested_at, e.invalidated_at, e.invalidated_by
+                ],
+            )?;
+        }
+        for (node_id, kind) in &node_kinds {
+            tx.execute(
+                "INSERT INTO nodes (node_id, kind) VALUES (?1, ?2)",
+                rusqlite::params![node_id, kind],
+            )?;
+        }
+        tx.commit()?;
+        log::info!(
+            "rebuilt graph: {edge_count} edges, {node_count} nodes in {}ms",
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    /// All `link`/`invalidate` events, payload-parsed, in chain (`seq ASC`) order.
+    fn graph_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE event_type IN ('link', 'invalidate') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Set of event ids whose type is `memory`/`page` — used to label node kinds.
+    fn memory_page_ids(&self) -> Result<HashSet<String>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt =
+            conn.prepare("SELECT id FROM events WHERE event_type IN ('memory', 'page')")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every edge, `ORDER BY edge_id ASC` (deterministic). Tier-A read.
+    pub fn all_edges(&self) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        self.query_edges(
+            "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
+                ingested_at, invalidated_at, invalidated_by FROM edges ORDER BY edge_id ASC",
+            &[],
+        )
+    }
+
+    /// Every node, `ORDER BY node_id ASC`.
+    pub fn all_nodes(&self) -> Result<Vec<crate::graph::Node>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare("SELECT node_id, kind FROM nodes ORDER BY node_id ASC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::graph::Node { node_id: r.get(0)?, kind: r.get(1)? })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Run a SELECT that returns the full edge column list (in the fixed order
+    /// used by [`EventLog::all_edges`]) and map rows to [`crate::graph::Edge`].
+    /// Shared by `all_edges` (and, in later tasks, `neighbors`/`as_of`) so the
+    /// column→field mapping is single-sourced.
+    fn query_edges(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |r| {
+            Ok(crate::graph::Edge {
+                edge_id: r.get(0)?,
+                src: r.get(1)?,
+                relation: r.get(2)?,
+                dst: r.get(3)?,
+                valid_from: r.get(4)?,
+                valid_to: r.get(5)?,
+                ingested_at: r.get(6)?,
+                invalidated_at: r.get(7)?,
+                invalidated_by: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Persist the current tip as the signed high-water mark (debounced by the
