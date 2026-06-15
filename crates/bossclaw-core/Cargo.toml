@@ -7,7 +7,7 @@ description = "Local-first, signed, encrypted memory engine for BossClaw."
 repository = "https://github.com/AgentIdentityRegistry/air-note"
 
 [dependencies]
-model2vec-rs = { version = "0.2.1", default-features = false }
+model2vec-rs = { version = "0.2", default-features = false }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 ed25519-dalek = "2.1"
 serde_jcs = "0.1.0"

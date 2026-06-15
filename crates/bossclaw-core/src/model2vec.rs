@@ -66,6 +66,11 @@ impl Model2Vec {
         let inner = StaticModel::from_pretrained(dir, None, Some(true), None)
             .map_err(|e| BossclawError::Embed(e.to_string()))?;
         let dim = Self::probe_dim(&inner);
+        if dim == 0 {
+            return Err(BossclawError::Embed(
+                "probe embedding has zero length — model may be corrupt".into(),
+            ));
+        }
         Ok(Self {
             inner,
             model_id: model_id.into(),
@@ -107,7 +112,7 @@ impl Model2Vec {
         model_id: impl Into<String>,
     ) -> Result<Self, BossclawError> {
         let inner =
-            StaticModel::from_borrowed(tokenizer, embeddings, rows, cols, true, weights, token_mapping)
+            StaticModel::from_borrowed(tokenizer, embeddings, rows, cols, /* normalize */ true, weights, token_mapping)
                 .map_err(|e| BossclawError::Embed(e.to_string()))?;
         // cols is the authoritative dim; no probe needed here.
         Ok(Self {
@@ -130,8 +135,7 @@ impl Model2Vec {
 impl Embedder for Model2Vec {
     /// Embed a batch of texts. Each returned vector has length `self.dim()`.
     ///
-    /// # Errors
-    /// Returns [`BossclawError::InvalidInput`] if `texts` is empty.
+    /// Returns an empty `Vec` if `texts` is empty.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, BossclawError> {
         if texts.is_empty() {
             return Ok(Vec::new());
