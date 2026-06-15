@@ -66,23 +66,19 @@ fn invalidate_appends_event_with_edge_key() {
 }
 
 #[test]
-fn non_manual_producer_with_empty_source_ids_is_rejected() {
-    // F2 gate: a non-manual producer must supply explicit source_event_ids;
-    // the [src, dst] convenience default is ONLY for the manual producer.
+fn append_rejects_empty_source_event_ids_for_tier_b() {
+    // This exercises M1's pre-existing append guard (NOT the F2 gate): any Tier-B
+    // event — one carrying `model_meta` — must have a non-empty `source_event_ids`,
+    // else `append` rejects it. (The F2 producer gate inside `append_graph_event`
+    // is proven separately by the unit test in `src/log.rs`, since the public
+    // `link`/`invalidate` helpers always pass the manual producer and so can never
+    // reach the [src,dst]-default reject arm.)
     let dir = tempfile::tempdir().unwrap();
     let log = open_log(dir.path());
     let a = log.append(mk_memory("kenny")).unwrap();
     let b = log.append(mk_memory("acme")).unwrap();
 
-    // The public helpers always pass MANUAL_LINK_PRODUCER so they always succeed.
-    // We cannot call append_graph_event directly (it's private), so we verify
-    // the gate indirectly: link() with empty sources succeeds (manual path),
-    // but a Tier-B append with empty source_event_ids via append() is rejected.
-    log.link(&a, "works_at", &b, None, &[]).unwrap(); // empty → defaults to [a, b], OK
-
-    // Direct Tier-B append with empty source_event_ids must fail (this is the
-    // same check that F2 relies on for non-manual producers).
-    let result = log.append(bossclaw_core::event::Event {
+    let result = log.append(Event {
         id: String::new(),
         ts: String::new(),
         valid_time: None,
@@ -91,12 +87,15 @@ fn non_manual_producer_with_empty_source_ids_is_rejected() {
         model_meta: Some(bossclaw_core::event::ModelMeta {
             model_id: "some-llm".to_string(),
             prompt_hash: String::new(),
-            source_event_ids: vec![], // empty — must be rejected
+            source_event_ids: vec![], // empty — tripped by the append guard
         }),
         prev_hash: String::new(),
         hash: None,
         signed_by_did: DID.to_string(),
         signature: None,
     });
-    assert!(result.is_err(), "non-manual empty source_event_ids must be rejected by append");
+    assert!(
+        result.is_err(),
+        "append must reject a Tier-B event with empty source_event_ids"
+    );
 }

@@ -1395,3 +1395,53 @@ pub fn resolve_arms(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEK: [u8; 32] = [42u8; 32];
+    const KEY_BYTES: [u8; 32] = [7u8; 32];
+
+    fn open_log(dir: &Path) -> EventLog {
+        let key = SigningKey::from_bytes(&KEY_BYTES);
+        EventLog::open(&dir.join("m.db"), &DEK, key).unwrap()
+    }
+
+    /// F2 security gate (parent §5.11): the private `append_graph_event` defaults
+    /// `source_event_ids` to `[src, dst]` ONLY for the manual producer; a
+    /// non-manual producer with an empty source set is REJECTED so taint cannot be
+    /// laundered past the lineage walk. This unit test reaches the private helper
+    /// directly (the public `link`/`invalidate` always pass `MANUAL_LINK_PRODUCER`,
+    /// so they can never trigger the reject arm).
+    #[test]
+    fn append_graph_event_rejects_non_manual_producer_with_empty_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+
+        // Non-manual producer + empty sources → the F2 reject arm fires.
+        let err = log
+            .append_graph_event("link", "m4-reasoner", "a", "works_at", "b", None, &[])
+            .expect_err("non-manual producer with empty sources must be rejected");
+        match err {
+            BossclawError::Chain(msg) => assert!(
+                msg.contains("non-manual"),
+                "reject message should name the non-manual gate, got: {msg}"
+            ),
+            other => panic!("expected BossclawError::Chain, got {other:?}"),
+        }
+
+        // Manual producer + empty sources → succeeds, defaulting to [src, dst].
+        let id = log
+            .append_graph_event("link", MANUAL_LINK_PRODUCER, "a", "works_at", "b", None, &[])
+            .expect("manual producer with empty sources must succeed");
+        let ev = log.stream_all().unwrap().into_iter().find(|e| e.id == id).unwrap();
+        let meta = ev.model_meta.expect("link is Tier-B");
+        assert_eq!(meta.model_id, MANUAL_LINK_PRODUCER);
+        assert_eq!(
+            meta.source_event_ids,
+            vec!["a".to_string(), "b".to_string()],
+            "manual empty-source link defaults to [src, dst]"
+        );
+    }
+}
