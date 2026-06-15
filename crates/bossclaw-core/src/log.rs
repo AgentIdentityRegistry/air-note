@@ -1429,9 +1429,30 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Current edges touching `node` in either direction (`invalidated_at IS
+    /// NULL`). The result includes:
+    ///
+    /// - **Outgoing** edges where `src == node`.
+    /// - **Incoming** (backlink) edges where `dst == node`.
+    /// - **Self-loops** where `src == dst == node` (appear exactly once, not
+    ///   twice — `OR` on a single row is still one row).
+    ///
+    /// Caller can filter for backlinks with `.iter().filter(|e| e.dst == node)`.
+    /// `ORDER BY edge_id ASC` for deterministic output.
+    pub fn neighbors(&self, node: &str) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        self.query_edges(
+            "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
+                ingested_at, invalidated_at, invalidated_by \
+             FROM edges \
+             WHERE (src = ?1 OR dst = ?1) AND invalidated_at IS NULL \
+             ORDER BY edge_id ASC",
+            &[&node as &dyn rusqlite::ToSql],
+        )
+    }
+
     /// Run a SELECT that returns the full edge column list (in the fixed order
     /// used by [`EventLog::all_edges`]) and map rows to [`crate::graph::Edge`].
-    /// Shared by `all_edges` (and, in later tasks, `neighbors`/`as_of`) so the
+    /// Shared by `all_edges`, `neighbors` (and, in later tasks, `as_of`) so the
     /// column→field mapping is single-sourced.
     fn query_edges(
         &self,

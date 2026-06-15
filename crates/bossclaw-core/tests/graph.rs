@@ -163,6 +163,67 @@ fn invalidate_with_no_active_assertion_is_noop() {
     assert!(log.all_edges().unwrap().is_empty(), "invalidate with no matching link adds no edge");
 }
 
+// ── Task 3: neighbors + backlinks ────────────────────────────────────────────
+
+#[test]
+fn neighbors_returns_current_edges_both_directions_backlinks_filterable() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    let c = log.append(mk_memory("carol")).unwrap();
+    log.link(&a, "works_at", &b, None, &[]).unwrap(); // a → b (outgoing from a)
+    log.link(&c, "manages", &a, None, &[]).unwrap();   // c → a (incoming to a = backlink)
+    let stale = log.link(&a, "old", &b, None, &[]).unwrap();
+    log.invalidate(&a, "old", &b, None, std::slice::from_ref(&a)).unwrap(); // closed → excluded
+    log.rebuild_graph().unwrap();
+
+    let n = log.neighbors(&a).unwrap();
+    assert_eq!(n.len(), 2, "two current edges touch a (the invalidated 'old' edge is excluded)");
+    assert!(n.iter().all(|e| e.edge_id != stale), "invalidated edge must not appear");
+
+    // Backlinks = the subset whose dst == a (incoming).
+    let backlinks: Vec<&_> = n.iter().filter(|e| e.dst == a).collect();
+    assert_eq!(backlinks.len(), 1);
+    assert_eq!(backlinks[0].src, c);
+    assert_eq!(backlinks[0].relation, "manages");
+}
+
+// ── Rev 2 T-E: SQL-injection regression ──────────────────────────────────────
+
+#[test]
+fn malicious_relation_label_is_inert_data_not_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    let evil = "x\") OR 1=1 --";
+    log.link(&a, evil, &b, None, &[]).unwrap();
+    log.rebuild_graph().unwrap();
+    let n = log.neighbors(&a).unwrap();
+    assert_eq!(n.len(), 1, "one edge; the label did not alter query semantics");
+    assert_eq!(n[0].relation, evil, "relation round-trips as literal data");
+}
+
+// ── Self-loop test (rider from T2 code review) ────────────────────────────────
+
+#[test]
+fn self_loop_is_one_edge_one_node_one_neighbor() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("self-referential")).unwrap();
+    log.link(&a, "refers_to", &a, None, std::slice::from_ref(&a)).unwrap();
+    log.rebuild_graph().unwrap();
+
+    assert_eq!(log.all_edges().unwrap().len(), 1, "one link event → one edge row");
+    assert_eq!(log.all_nodes().unwrap().len(), 1, "self-loop: endpoint deduplicates to one node");
+    assert_eq!(
+        log.neighbors(&a).unwrap().len(),
+        1,
+        "self-loop appears exactly once in neighbors, not twice"
+    );
+}
+
 #[test]
 fn append_rejects_empty_source_event_ids_for_tier_b() {
     // This exercises M1's pre-existing append guard (NOT the F2 gate): any Tier-B
