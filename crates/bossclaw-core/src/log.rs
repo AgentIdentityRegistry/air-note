@@ -17,6 +17,8 @@ use ulid::Ulid;
 
 use rusqlite::OptionalExtension;
 
+use std::time::Instant as StdInstant;
+
 use crate::embed::Embedder;
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event};
@@ -29,6 +31,30 @@ use crate::recall::{
 };
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
+
+/// Reserved store-format version recorded in every `config` event.
+///
+/// Format-gating logic (refusing to open a store written by a future version)
+/// is deferred to a later milestone. This constant is the single authoritative
+/// source for what value gets written today.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Statistics returned by [`EventLog::reembed_migration`].
+///
+/// Provides the §15 time-budget observability signal: callers (and handoff
+/// records) use `elapsed_ms` to gauge migration cost before scheduling re-index
+/// in production.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReembedStats {
+    /// Number of events that had no vector for the new model and were
+    /// successfully re-embedded during this migration.
+    pub reembedded: usize,
+    /// Number of stale `vectors` rows (under the old model) that were
+    /// garbage-collected.
+    pub gc_removed: usize,
+    /// Wall-clock duration of the entire migration in milliseconds.
+    pub elapsed_ms: u128,
+}
 
 /// The parsed content of the latest `config` event.
 ///
@@ -954,6 +980,125 @@ impl EventLog {
             }
         }
         Ok(out)
+    }
+
+    /// Switch the active embedding model, re-embed all events, GC stale vectors,
+    /// and rebuild the in-memory indexes.
+    ///
+    /// # Steps (order is load-bearing for resumability)
+    ///
+    /// 1. **Config event** — append a `config` event naming `embedder` as the
+    ///    new active model. The `schema_version` is inherited from the most
+    ///    recent existing config, or [`SCHEMA_VERSION`] if no config exists yet.
+    ///
+    /// 2. **Re-embed** — [`EventLog::rederive_pending`] backfills every event
+    ///    that lacks a vector for `embedder.model_id()`. Best-effort: individual
+    ///    embed failures are logged and skipped.
+    ///
+    /// 3. **GC** — `DELETE FROM vectors WHERE model_id != embedder.model_id()`.
+    ///    All rows for every other model are removed. The count of removed rows is
+    ///    recorded in [`ReembedStats::gc_removed`].
+    ///
+    /// 4. **Rebuild** — [`EventLog::rebuild_indexes`] rebuilds both the ANN
+    ///    vector index and the FTS5 keyword index under the new model.
+    ///
+    /// # Integrity note
+    ///
+    /// The active-model switch is recorded as a `config` event that is
+    /// Ed25519-signed and hash-chained (M1), so a forged or replayed
+    /// model-switch is tamper-evident via `verify_chain` / `verify_chain_since`.
+    /// Surfacing a model-switch to the user as a recall-integrity alert is
+    /// deferred to the desktop (M7).
+    ///
+    /// # Resumability
+    ///
+    /// A crash between the config switch (step 1) and the GC (step 3) is
+    /// correctness-safe: recall is active-model-filtered, so stale rows for
+    /// the old model are simply ignored. Re-running `reembed_migration` (or
+    /// the next migration) completes the GC, making this operation
+    /// idempotent/resumable. A second run re-embeds 0 (nothing pending) and
+    /// GCs 0 (stale rows already removed), leaving one consistent active model.
+    ///
+    /// # Lock discipline
+    ///
+    /// The single-store [`Mutex`] is never held across [`Embedder::embed`]
+    /// calls. Re-embedding is delegated to [`EventLog::rederive_pending`] which
+    /// already implements that discipline. The GC `DELETE` is a short, bounded
+    /// operation and holds the lock only for that one statement.
+    ///
+    /// # Returns
+    ///
+    /// [`ReembedStats`] carrying `reembedded`, `gc_removed`, and `elapsed_ms`
+    /// — the §15 time-budget observability signal.
+    pub fn reembed_migration(
+        &self,
+        embedder: &dyn Embedder,
+    ) -> Result<ReembedStats, BossclawError> {
+        let migration_start = StdInstant::now();
+
+        // Step 1: append a config event selecting the new active model.
+        // Reuse the existing schema_version if a config already exists.
+        let schema_version = self
+            .active_model()?
+            .map(|m| m.schema_version)
+            .unwrap_or(SCHEMA_VERSION);
+
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: "config".to_string(),
+            content: serde_json::json!({
+                "active_model_id": embedder.model_id(),
+                "dim": embedder.dim() as u32,
+                "schema_version": schema_version,
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: "did:wba:bossclaw-migration".to_string(),
+            signature: None,
+        })?;
+
+        // Step 2: re-embed every event missing a vector for the new model.
+        let reembedded = self.rederive_pending(embedder)?;
+
+        // Step 3: GC — delete all vectors for every model OTHER than the new one.
+        // Hold the lock only for this short DELETE statement.
+        let gc_removed = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.execute(
+                "DELETE FROM vectors WHERE model_id != ?1",
+                rusqlite::params![embedder.model_id()],
+            )?;
+            conn.changes() as usize
+        };
+
+        // Step 4: rebuild the in-memory ANN + FTS indexes under the new model.
+        self.rebuild_indexes(embedder)?;
+
+        let elapsed_ms = migration_start.elapsed().as_millis();
+
+        let total_events = self.count()?;
+        // Avoid division by zero; migration with 0 events is valid (initial setup).
+        let events_per_sec = if elapsed_ms > 0 {
+            reembedded as f64 / (elapsed_ms as f64 / 1000.0)
+        } else {
+            f64::INFINITY
+        };
+        log::info!(
+            "reembed_migration: model={} reembedded={} gc_removed={} total_events={} \
+             elapsed_ms={} ({:.0} events/sec)",
+            embedder.model_id(),
+            reembedded,
+            gc_removed,
+            total_events,
+            elapsed_ms,
+            events_per_sec,
+        );
+
+        Ok(ReembedStats { reembedded, gc_removed, elapsed_ms })
     }
 
     /// Persist the current tip as the signed high-water mark (debounced by the

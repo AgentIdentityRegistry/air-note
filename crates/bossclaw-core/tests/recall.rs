@@ -3,7 +3,7 @@ use bossclaw_core::index::{HnswIndex, VectorIndex};
 use bossclaw_core::model2vec::Model2Vec;
 use bossclaw_core::event::Event;
 use bossclaw_core::log::EventLog;
-use bossclaw_core::BossclawError;
+use bossclaw_core::{BossclawError, SCHEMA_VERSION};
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 
@@ -1282,4 +1282,182 @@ fn rrf_fuse_id_in_both_arms_scores_higher_than_single_arm() {
         (vec_only - kw_only).abs() < 1e-9,
         "two ids each ranked #1 in one arm must tie: {vec_only} vs {kw_only}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: re-embed migration + timing budget + integrity note
+// ---------------------------------------------------------------------------
+
+/// A second test embedder with a distinct `model_id` ("mock-v2") and the same
+/// FNV-1a bag-of-words logic as `MockEmbedder` (via delegation). Used to
+/// exercise the model-switch path without any shared `model_id` constant.
+struct MockEmbedderV2 {
+    inner: MockEmbedder,
+}
+
+/// Stable `model_id` for the second test model.
+const MOCK_V2_MODEL_ID: &str = "mock-v2";
+
+impl MockEmbedderV2 {
+    fn new(dim: usize) -> Self {
+        Self { inner: MockEmbedder::new(dim) }
+    }
+}
+
+impl Embedder for MockEmbedderV2 {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, BossclawError> {
+        self.inner.embed(texts)
+    }
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+    fn model_id(&self) -> &str {
+        MOCK_V2_MODEL_ID
+    }
+}
+
+/// Migration happy path:
+/// 1. Seed events and derive vectors under mock-v1.
+/// 2. `reembed_migration(&v2)` switches to mock-v2.
+/// 3. Assert: active model is mock-v2; mock-v1 vectors are GC'd; mock-v2
+///    vectors count == event_count; recall works; stats are correct.
+#[test]
+fn reembed_migration_happy_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    // Seed 3 memory events and derive under mock-v1.
+    let event_count = 3usize;
+    for t in ["ocean waves crashing", "forest trees rustling", "mountain peaks snowy"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+    let v1 = MockEmbedder::new(MID_DIM);
+    let backfilled = log.rederive_pending(&v1).unwrap();
+    assert_eq!(backfilled, event_count, "all events backfilled under v1");
+
+    let old_count = log.vectors_for_model(MOCK_MODEL_ID).unwrap().len();
+    assert_eq!(old_count, event_count);
+
+    // Run migration to mock-v2.
+    let v2 = MockEmbedderV2::new(MID_DIM);
+    let stats = log.reembed_migration(&v2).unwrap();
+
+    // Active model must now be mock-v2.
+    let active = log.active_model().unwrap().expect("active model present after migration");
+    assert_eq!(active.active_model_id, MOCK_V2_MODEL_ID);
+    assert_eq!(active.dim, MID_DIM as u32);
+    assert_eq!(active.schema_version, SCHEMA_VERSION);
+
+    // mock-v1 vectors must be GC'd.
+    assert!(
+        log.vectors_for_model(MOCK_MODEL_ID).unwrap().is_empty(),
+        "v1 vectors must be GC'd after migration"
+    );
+
+    // mock-v2 vectors must cover all events.
+    assert_eq!(
+        log.vectors_for_model(MOCK_V2_MODEL_ID).unwrap().len(),
+        event_count,
+        "v2 vectors must cover all events"
+    );
+
+    // Stats.
+    assert_eq!(stats.reembedded, event_count, "stats.reembedded must equal event_count");
+    assert_eq!(stats.gc_removed, old_count, "stats.gc_removed must equal old v1 count");
+
+    // Recall works under the new model (rebuild_indexes was called by migration).
+    let hits = log
+        .recall(&v2, "ocean waves", MID_DIM, &RecallOptions::default())
+        .unwrap();
+    assert!(!hits.is_empty(), "recall must return results after migration");
+}
+
+/// Resumability / idempotency:
+/// Running `reembed_migration` TWICE leaves a single consistent active model,
+/// re-embeds 0 events the second time, GCs 0 rows, and verify_chain passes.
+#[test]
+fn reembed_migration_idempotent_second_run_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    for t in ["apple pie recipe", "cherry tart filling"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+    let v1 = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&v1).unwrap();
+
+    let v2 = MockEmbedderV2::new(MID_DIM);
+
+    // First run.
+    let stats1 = log.reembed_migration(&v2).unwrap();
+    assert_eq!(stats1.reembedded, 2);
+    assert_eq!(stats1.gc_removed, 2); // 2 v1 rows removed
+
+    // Second run: nothing to embed, nothing to GC.
+    let stats2 = log.reembed_migration(&v2).unwrap();
+    assert_eq!(stats2.reembedded, 0, "second run must re-embed nothing");
+    assert_eq!(stats2.gc_removed, 0, "second run must GC nothing");
+
+    // Active model is still mock-v2.
+    let active = log.active_model().unwrap().unwrap();
+    assert_eq!(active.active_model_id, MOCK_V2_MODEL_ID);
+
+    // The chain remains valid after two config events.
+    log.verify_chain().expect("verify_chain must pass after two migrations");
+}
+
+/// Integrity: after a migration, `verify_chain()` returns Ok (the config event
+/// appended by reembed_migration is in the signed chain and validates).
+#[test]
+fn reembed_migration_config_event_is_in_signed_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    log.append(mk_memory_event("signed integrity test")).unwrap();
+    let v1 = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&v1).unwrap();
+
+    let v2 = MockEmbedderV2::new(MID_DIM);
+    log.reembed_migration(&v2).unwrap();
+
+    // The config event written by migration must be in the signed chain.
+    log.verify_chain().expect("chain must verify after migration");
+
+    // Latest config reflects the new model.
+    let active = log.active_model().unwrap().unwrap();
+    assert_eq!(active.active_model_id, MOCK_V2_MODEL_ID);
+}
+
+/// Initial setup: on a fresh store with NO prior config event,
+/// `reembed_migration` correctly sets the active model, embeds all events,
+/// and GCs nothing (there are no stale vectors).
+#[test]
+fn reembed_migration_initial_setup_no_prior_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    // No config event yet.
+    assert!(log.active_model().unwrap().is_none(), "fresh store must have no active model");
+
+    for t in ["sunrise morning light", "sunset evening glow"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+
+    let v1 = MockEmbedder::new(MID_DIM);
+    // Do NOT call rederive_pending — migration must embed everything itself.
+    let stats = log.reembed_migration(&v1).unwrap();
+
+    assert_eq!(stats.reembedded, 2, "initial migration must embed all events");
+    assert_eq!(stats.gc_removed, 0, "no stale vectors on fresh store");
+
+    let active = log.active_model().unwrap().expect("config must exist after migration");
+    assert_eq!(active.active_model_id, MOCK_MODEL_ID);
+    assert_eq!(active.schema_version, SCHEMA_VERSION);
+
+    // Chain verifies (config event is properly signed + chained).
+    log.verify_chain().expect("chain must verify after initial migration");
 }

@@ -32,6 +32,6 @@ pub use event::{Event, ModelMeta};
 pub use index::{HnswIndex, VectorIndex};
 #[cfg(feature = "fastembed")]
 pub use fastembed::FastEmbed;
-pub use log::{ActiveModel, EventLog};
+pub use log::{ActiveModel, EventLog, ReembedStats, SCHEMA_VERSION};
 pub use model2vec::Model2Vec;
 pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};
