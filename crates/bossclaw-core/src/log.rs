@@ -19,6 +19,7 @@ use crate::error::BossclawError;
 use crate::event::{compute_hash, Event};
 use crate::highwater::{HighWaterStore, Mark};
 use crate::index::{HnswIndex, VectorIndex};
+use crate::keyword;
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
 
@@ -99,6 +100,28 @@ impl EventLog {
                 PRIMARY KEY(event_id, model_id)
             )",
         )?;
+        // FTS5 full-text index (contentless — the event log is the content of
+        // record). The `fts` virtual table stores only the indexed tokens; the
+        // `fts_map` side-table maps FTS rowids back to event_ids because a
+        // contentless FTS5 table cannot expose a readable payload column.
+        //
+        // Both tables live INSIDE the SQLCipher DB, so their on-disk bytes are
+        // encrypted alongside every other table. `PRAGMA temp_store = MEMORY`
+        // below ensures that FTS5 index-merge temporary files are never written to
+        // disk as plaintext — they stay in process memory.
+        store.exec(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body, content='')",
+        )?;
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS fts_map (
+                rowid    INTEGER PRIMARY KEY,
+                event_id TEXT NOT NULL UNIQUE
+            )",
+        )?;
+        // Route FTS5 merge temporaries to memory, preventing any plaintext index
+        // spill to the filesystem. This is a connection-level setting; it must be
+        // re-applied on every open.
+        store.exec("PRAGMA temp_store = MEMORY")?;
         Ok(Self {
             inner: Mutex::new(store),
             key,
@@ -369,36 +392,74 @@ impl EventLog {
         Ok(out)
     }
 
-    /// Rebuild the in-memory vector index from the encrypted log for the active
-    /// embedding model.
+    /// Rebuild the in-memory vector index AND the FTS5 keyword index from the
+    /// encrypted log for the active embedding model.
     ///
-    /// Reads every persisted vector for `embedder.model_id()` (via
-    /// [`EventLog::vectors_for_model`], which returns rows `ORDER BY event_id
-    /// ASC`), builds a fresh [`HnswIndex`] sized to the exact row count, and
-    /// **serially** adds each `(event_id, vector)`. Serial insertion over a
-    /// deterministic row order is what makes the index reproducible across
-    /// re-opens (spec F2). The finished index replaces any previous one.
+    /// **Vector rebuild:** reads every persisted vector for `embedder.model_id()`
+    /// (via [`EventLog::vectors_for_model`], which returns rows `ORDER BY
+    /// event_id ASC`), builds a fresh [`HnswIndex`] sized to the exact row
+    /// count, and **serially** adds each `(event_id, vector)`.  Serial
+    /// insertion over a deterministic row order is what makes the index
+    /// reproducible across re-opens (spec F2).  The finished index replaces any
+    /// previous one.  Because only `model_id`-matching rows are read, the index
+    /// can only ever contain active-model vectors — cross-model bleed is
+    /// impossible by construction (spec C4).
     ///
-    /// Because only `model_id`-matching rows are read, the index can only ever
-    /// contain active-model vectors — cross-model bleed is impossible by
-    /// construction (spec C4).
+    /// **FTS rebuild:** wipes `fts` and `fts_map` entirely, then re-populates
+    /// from every `memory`/`page` event (the same embeddable types that feed the
+    /// vector index), scanned `ORDER BY seq ASC`.  No embedder is needed for
+    /// this half — FTS indexes the raw event text.
     ///
-    /// Emits a [`log::info!`] timing line so rebuild cost is visible before the
-    /// recall benchmark (T9). For now this rebuilds only the vector index; T6
-    /// will extend it to also rebuild the FTS index.
+    /// Both rebuilds are idempotent: calling this method twice leaves the indexes
+    /// in the same state as calling it once.
+    ///
+    /// Emits [`log::info!`] timing lines so rebuild cost is visible before the
+    /// recall benchmark (T9).
     pub fn rebuild_indexes(&self, embedder: &dyn Embedder) -> Result<(), BossclawError> {
-        let started = Instant::now();
+        // ── Vector index rebuild ──────────────────────────────────────────────
+        let vec_started = Instant::now();
         let rows = self.vectors_for_model(embedder.model_id())?;
-        let count = rows.len();
-        let mut index = HnswIndex::with_capacity(count);
+        let vec_count = rows.len();
+        let mut index = HnswIndex::with_capacity(vec_count);
         for (event_id, vec) in rows {
             index.add(&event_id, &vec);
         }
         let boxed: Box<dyn VectorIndex> = Box::new(index);
         *self.vector_index.lock().expect(POISON) = Some(boxed);
         log::info!(
-            "rebuilt vector index: {count} vectors in {}ms",
-            started.elapsed().as_millis()
+            "rebuilt vector index: {vec_count} vectors in {}ms",
+            vec_started.elapsed().as_millis()
+        );
+
+        // ── FTS5 keyword index rebuild ────────────────────────────────────────
+        let fts_started = Instant::now();
+        // Collect the events to index before taking the store lock (same
+        // pattern as collect_pending — never hold the lock across I/O or
+        // expensive work).
+        let events_to_index = self.collect_embeddable_events_ordered()?;
+        let fts_count = events_to_index.len();
+
+        {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            // Wipe the existing FTS index so this call is fully idempotent.
+            // A contentless FTS5 table does not support plain `DELETE FROM
+            // fts`; the FTS5 `delete-all` auxiliary command is the correct
+            // API for clearing all indexed content.
+            conn.execute_batch(
+                "INSERT INTO fts(fts) VALUES('delete-all'); DELETE FROM fts_map;",
+            )?;
+        }
+
+        // Re-populate row by row. Each keyword_add call takes and releases the
+        // lock internally, keeping the lock-hold time minimal.
+        for (event_id, text) in events_to_index {
+            self.keyword_add(&event_id, &text)?;
+        }
+
+        log::info!(
+            "rebuilt fts index: {fts_count} entries in {}ms",
+            fts_started.elapsed().as_millis()
         );
         Ok(())
     }
@@ -423,6 +484,84 @@ impl EventLog {
                 "vector index not built — call rebuild_indexes".into(),
             )),
         }
+    }
+
+    /// Index an event in the FTS5 keyword index.
+    ///
+    /// The `event_id` / `text` pair is inserted into the `fts` virtual table
+    /// (body column) and the corresponding rowid is recorded in `fts_map` so
+    /// that keyword searches can return `event_id` values.
+    ///
+    /// **Idempotent by event_id:** if `event_id` already has a row in
+    /// `fts_map` this method returns `Ok(())` immediately — no duplicate FTS
+    /// entry is created.  Both the `fts` insert and the `fts_map` insert are
+    /// performed in a single transaction to keep them consistent.
+    pub fn keyword_add(&self, event_id: &str, text: &str) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+
+        // Dedup check: if this event_id is already in fts_map, do nothing.
+        let already: i64 = conn.query_row(
+            "SELECT count(*) FROM fts_map WHERE event_id = ?1",
+            rusqlite::params![event_id],
+            |r| r.get(0),
+        )?;
+        if already > 0 {
+            return Ok(());
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("INSERT INTO fts(body) VALUES (?1)", rusqlite::params![text])?;
+        let rowid = conn.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO fts_map(rowid, event_id) VALUES (?1, ?2)",
+            rusqlite::params![rowid, event_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Search the FTS5 keyword index for events whose body matches `query`.
+    ///
+    /// The raw query string is escaped via [`keyword::escape_fts_query`] before
+    /// being passed to FTS5's `MATCH` operator, so user-supplied strings
+    /// containing FTS5 operators or unbalanced quotes cannot alter query
+    /// semantics or cause a parse error.
+    ///
+    /// Returns up to `k` `(event_id, score)` pairs ordered by BM25 rank
+    /// (lower BM25 score = more relevant; T7's RRF fusion will normalise by
+    /// rank position rather than raw score).
+    ///
+    /// An empty or whitespace-only `query` returns `Ok(vec![])` immediately —
+    /// passing an empty string to FTS5 `MATCH` is a parse error, so we guard
+    /// against it here.
+    pub fn keyword_search(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<(String, f32)>, BossclawError> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let escaped = keyword::escape_fts_query(query);
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT m.event_id, bm25(fts) AS score
+             FROM fts
+             JOIN fts_map m ON m.rowid = fts.rowid
+             WHERE fts MATCH ?1
+             ORDER BY score
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![escaped, k as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)? as f32))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Collect, under a single short-lived lock, the events of an embeddable
@@ -464,6 +603,44 @@ impl EventLog {
         let mut out = Vec::new();
         for row in rows {
             out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Collect `(event_id, text)` for every embeddable event, in `seq ASC`
+    /// order, under a single short-lived lock.
+    ///
+    /// Used by [`EventLog::rebuild_indexes`] to populate the FTS keyword index.
+    /// Only events whose `content["text"]` is a non-empty string are returned;
+    /// events with missing or non-string `text` are silently skipped (their
+    /// vectors would also be absent — see `embeddable_text`).
+    fn collect_embeddable_events_ordered(&self) -> Result<Vec<(String, String)>, BossclawError> {
+        let placeholders: String = EMBEDDABLE_EVENT_TYPES
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, payload FROM events WHERE event_type IN ({placeholders}) ORDER BY seq ASC"
+        );
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = EMBEDDABLE_EVENT_TYPES
+            .iter()
+            .map(|t| t as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (event_id, payload) = row?;
+            let event: Event = serde_json::from_str(&payload)?;
+            if let Some(text) = embeddable_text(&event) {
+                out.push((event_id, text));
+            }
         }
         Ok(out)
     }

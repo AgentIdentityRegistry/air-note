@@ -19,6 +19,7 @@ pub mod event;
 pub mod fastembed;
 pub mod highwater;
 pub mod index;
+pub mod keyword;
 pub mod log;
 pub mod model2vec;
 pub mod sign;

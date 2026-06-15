@@ -786,3 +786,147 @@ fn model2vec_real_model_embedding_shape_and_recall() {
          sentence-b vs unrelated ({sim_unrelated_b:.4})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 6: FTS5 keyword index — keyword_add / keyword_search / rebuild FTS
+// ---------------------------------------------------------------------------
+
+use bossclaw_core::keyword::escape_fts_query;
+
+/// Basic add + search: appending a memory event and calling keyword_add lets
+/// keyword_search return the event's id for a matching query.
+#[test]
+fn keyword_add_and_search_returns_matching_event_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let id = log.append(mk_memory_event("the quick brown fox")).unwrap();
+    log.keyword_add(&id, "the quick brown fox").unwrap();
+
+    let hits = log.keyword_search("quick brown", 5).unwrap();
+    assert!(!hits.is_empty(), "should find at least one hit");
+    assert_eq!(hits[0].0, id, "top hit must be the indexed event");
+}
+
+/// A query that does not match any indexed body returns an empty vec.
+#[test]
+fn keyword_search_non_matching_query_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let id = log.append(mk_memory_event("cats and dogs")).unwrap();
+    log.keyword_add(&id, "cats and dogs").unwrap();
+
+    let hits = log.keyword_search("rhinoceros", 5).unwrap();
+    assert!(hits.is_empty(), "no match expected, got {hits:?}");
+}
+
+/// An empty or whitespace-only query returns an empty vec immediately (FTS5
+/// would error on an empty MATCH string; we guard it in keyword_search).
+#[test]
+fn keyword_search_empty_query_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let id = log.append(mk_memory_event("something")).unwrap();
+    log.keyword_add(&id, "something").unwrap();
+
+    assert!(log.keyword_search("", 5).unwrap().is_empty());
+    assert!(log.keyword_search("   ", 5).unwrap().is_empty());
+}
+
+/// keyword_add is idempotent by event_id: adding the same event_id twice
+/// must produce exactly one row in fts_map and one searchable entry.
+#[test]
+fn keyword_add_dedup_same_event_id_produces_one_fts_map_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let id = log.append(mk_memory_event("unique content here")).unwrap();
+
+    // Add the same event_id twice.
+    log.keyword_add(&id, "unique content here").unwrap();
+    log.keyword_add(&id, "unique content here").unwrap();
+
+    // Should still find exactly one result.
+    let hits = log.keyword_search("unique content", 10).unwrap();
+    let count = hits.iter().filter(|(hit_id, _)| hit_id == &id).count();
+    assert_eq!(count, 1, "event_id must appear exactly once, got {hits:?}");
+}
+
+/// rebuild_indexes populates the FTS index from event log content; after
+/// rebuild, keyword_search finds the event without a prior keyword_add call.
+#[test]
+fn rebuild_indexes_populates_fts_from_event_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let id = log.append(mk_memory_event("rustacean memory store")).unwrap();
+    let embedder = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&embedder).unwrap();
+
+    // rebuild_indexes must populate FTS (no manual keyword_add).
+    log.rebuild_indexes(&embedder).unwrap();
+
+    let hits = log.keyword_search("rustacean", 5).unwrap();
+    assert!(!hits.is_empty(), "rebuild must populate FTS");
+    assert_eq!(hits[0].0, id);
+}
+
+/// rebuild_indexes is idempotent: calling it twice produces the same search
+/// results and does NOT duplicate entries in fts_map.
+#[test]
+fn rebuild_indexes_fts_is_idempotent_no_duplicate_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    for phrase in ["first memory", "second memory", "third memory"] {
+        log.append(mk_memory_event(phrase)).unwrap();
+    }
+    let embedder = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&embedder).unwrap();
+
+    log.rebuild_indexes(&embedder).unwrap();
+    let hits_first = log.keyword_search("memory", 10).unwrap();
+
+    // Second rebuild — results must be identical, no duplicates.
+    log.rebuild_indexes(&embedder).unwrap();
+    let hits_second = log.keyword_search("memory", 10).unwrap();
+
+    assert_eq!(
+        hits_first.len(),
+        hits_second.len(),
+        "duplicate entries after second rebuild: first={hits_first:?}, second={hits_second:?}"
+    );
+    assert_eq!(hits_second.len(), 3, "exactly 3 events indexed");
+}
+
+/// escape_fts_query: a query containing `"` and FTS5 operators does not panic
+/// and the escaped form is a valid quoted-phrase literal.
+#[test]
+fn escape_fts_query_sanitises_operators_and_quotes() {
+    // FTS5 operators that would break an unescaped MATCH.
+    let dangerous = r#"foo OR "bar"#;
+    let escaped = escape_fts_query(dangerous);
+
+    // Must be a quoted phrase (starts and ends with ").
+    assert!(escaped.starts_with('"'), "must start with quote");
+    assert!(escaped.ends_with('"'), "must end with quote");
+
+    // Must not panic when used in an actual query against a real index.
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+    let id = log.append(mk_memory_event("foo bar baz")).unwrap();
+    log.keyword_add(&id, "foo bar baz").unwrap();
+
+    // The escaped query is treated as a literal phrase — no parse error.
+    let result = log.keyword_search(dangerous, 5);
+    assert!(result.is_ok(), "escaped query must not error: {result:?}");
+}
