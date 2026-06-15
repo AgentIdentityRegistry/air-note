@@ -6,6 +6,7 @@
 **Addendum to:** `docs/superpowers/specs/2026-06-15-bossclaw-core-design.md` §5.6 (bi-temporal graph) + §12.3 (milestone 3). This file records the M3-specific decisions the parent left open; the parent remains the canonical overall design.
 
 ## Revision log
+- **Rev 2 (2026-06-15):** folded an independent two-reviewer pass (critic + security, both SHIP-WITH-FIXES). Added the provenance/integrity contracts in §12 (manual≠user-authored; `signed_by_did` is currently unverified; the `[src,dst]` `source_event_ids` default is gated to the manual producer; the boost has no edge-trust gate yet). No design-direction change — these harden the M3→M4 seam. The plan carries the matching code/test fixes (F1–F4, T-A–T-E).
 - **Rev 1 (2026-06-15):** initial M3 design from the brainstorm. Primary fork resolved by Peter — **Option 1: live graph-proximity boost over a general node graph.** Secondary forks (edge identity, `invalidate` targeting, `as_of` axes, boost mechanics, manual-link Tier-B handling) decided here and approved.
 
 ---
@@ -196,5 +197,11 @@ pub graph_seeds: Vec<String>, // explicit proximity seeds; empty => auto-seed (b
 - **Directed-relation semantics in the boost** (v1 treats adjacency as undirected for relatedness).
 
 ## 12. Honesty lines
-- The **end-user-visible** "feel it" dogfooding lands with the M7 desktop. The boost is nonetheless **functional and tested on real links in M3** — the live path, not dormant.
+- The **end-user-visible** "feel it" dogfooding lands with the M7 desktop. The boost is nonetheless **functional and tested on real links in M3** — the live path, not dormant. **But auto-seed fires on the top-1 hit only:** if the single strongest hit is unlinked, no boost fires (intra-result reinforcement is deferred, §11). M3 proves the *mechanism*; a meaningful hit-rate on an organically-linked corpus arrives with M4's auto-linking.
 - M3 links are **hand/test-asserted**; automatic, intelligent linking is M4. The graph's *correctness* (fold, bi-temporality, retraction) is fully proven in M3; its *population at scale* is M4's job.
+
+### 12.1 Provenance / integrity contracts (Rev 2 — second-opinion review)
+- **`model_id="manual"` is engine/test-asserted, NOT user-authored.** The future taint walk (§5.11) derives trust from `source_event_ids` lineage + the (future) user-DID signer, **never** from the literal string `"manual"`. No milestone may establish "manual ⇒ clean."
+- **The `[src,dst]` `source_event_ids` default is manual-only.** A non-manual producer (M4's reasoner) MUST pass its real read-set; the helper rejects a non-manual empty source set. Defaulting there would launder taint past the §5.11 fail-closed lineage walk.
+- **`signed_by_did` is currently UNVERIFIED.** `verify_chain` checks only the engine signing key; the parent design §5.2's "resolve pubkey from `signed_by_did`" step is **aspirational, not implemented**. M3 stamps a fixed `did:wba:bossclaw-engine` = engine-asserted, NOT user-owned. Before any user-facing ownership claim (M7), verify MUST resolve DID→pubkey and reject mismatches. *(Parent §5.2 wording to be reconciled separately.)*
+- **The proximity boost has no edge-trust gate.** Fine for M3 (hand-asserted links). Once links can be machine/ingest-derived (M4), an untrusted-origin edge must not boost a candidate into the actuator's reasoning set (§5.11 taint work).

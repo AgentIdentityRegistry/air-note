@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-15-bossclaw-core-m3-graph-design.md` (addendum to `...-bossclaw-core-design.md` §5.6/§12.3). Implements M3 §3 events, §4 fold, §5 queries, §6 boost, §9 tests.
 
+> ⚠️ **Rev 2 (2026-06-15):** two independent reviewers (critic + security) returned SHIP-WITH-FIXES. Read **"Rev 2 — folded review fixes"** below FIRST — its snippets SUPERSEDE the inline task snippets where they overlap.
+
 ---
 
 ## Design decisions (locked in the spec; do not re-derive)
@@ -19,6 +21,170 @@
 4. **`nodes`/`edges` are persisted Tier-A**, repopulated by `rebuild_graph` (wipe + refold `ORDER BY seq ASC`). Byte-identical on rebuild. **Lifecycle:** after appending `link`/`invalidate` events, call `rebuild_graph()` to refresh queries — the same "rebuild after append" lifecycle M2 documents for `rebuild_indexes`.
 5. **Two-axis `as_of`** via `AsOf { valid_time, known_as_of }`; both `None` == current (== `neighbors`).
 6. **Live recall boost:** one more multiplier in the recency/pin family; **auto-seeded** from the top fused hit (explicit `graph_seeds` override); **1 hop** (`GRAPH_MAX_HOPS`), **current edges only**.
+
+## Rev 2 — folded second-opinion review fixes (2026-06-15)
+
+Two independent adversarial reviewers (critic + security) returned **SHIP-WITH-FIXES**. Apply ALL of the following; where they overlap a task snippet below, **these supersede it.**
+
+### Code fixes (build-blocking)
+
+**F1 (critic MAJOR) — clippy `redundant_closure` trap in `as_of` (Task 4 Step 3).** `normalize_ts` takes `&str` but the closure arg is `&String`; under `-D warnings`, clippy suggests `.map(normalize_ts)` which then won't compile. Make the deref explicit:
+```rust
+let valid = as_of.valid_time.as_ref().map(|t| crate::graph::normalize_ts(t.as_str()));
+let known = as_of.known_as_of.as_ref().map(|t| crate::graph::normalize_ts(t.as_str()));
+```
+
+**F2 (security I1) — gate the `[src,dst]` `source_event_ids` default to the MANUAL producer only (Task 1 Step 6).** Defaulting for a non-manual producer (M4's reasoner) would launder taint past the §5.11 fail-closed lineage walk (the inducing, possibly-ingested event would vanish from the lineage). Parameterize the producer and reject a non-manual empty source set. Replace `link`/`invalidate`/`append_graph_event`:
+```rust
+    pub fn link(&self, src: &str, relation: &str, dst: &str, valid_time: Option<&str>, source_event_ids: &[String]) -> Result<String, BossclawError> {
+        self.append_graph_event("link", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
+    }
+    pub fn invalidate(&self, src: &str, relation: &str, dst: &str, valid_time: Option<&str>, source_event_ids: &[String]) -> Result<String, BossclawError> {
+        self.append_graph_event("invalidate", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
+    }
+    fn append_graph_event(&self, event_type: &str, producer: &str, src: &str, relation: &str, dst: &str, valid_time: Option<&str>, source_event_ids: &[String]) -> Result<String, BossclawError> {
+        // SECURITY (taint, parent §5.11): the [src,dst] convenience default is for
+        // MANUAL (engine/test) links only — there the two endpoints genuinely ARE
+        // the whole justification. A non-manual producer (the M4 reasoner) MUST pass
+        // its real read-set; defaulting there would erase the inducing event from
+        // the lineage the actuator walks fail-closed.
+        let sources = match (producer == MANUAL_LINK_PRODUCER, source_event_ids.is_empty()) {
+            (true, true) => vec![src.to_string(), dst.to_string()],
+            (false, true) => {
+                return Err(BossclawError::Chain(
+                    "non-manual graph link requires explicit source_event_ids (no [src,dst] \
+                     default — would launder taint past the §5.11 lineage walk)".into(),
+                ))
+            }
+            (_, false) => source_event_ids.to_vec(),
+        };
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: valid_time.map(String::from),
+            event_type: event_type.to_string(),
+            content: serde_json::json!({ "src": src, "relation": relation, "dst": dst }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(),
+                prompt_hash: String::new(),
+                source_event_ids: sources,
+            }),
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+```
+
+**F3 (critic IMPORTANT) — make the graph live on open (Task 2 Step 4).** `open_with_recall` builds the vector+FTS indexes but never the graph, so the recall boost silently no-ops on a fresh store. Add the call (the existing `open_with_recall` body becomes):
+```rust
+        let log = Self::open(path, dek, key)?;
+        log.rebuild_indexes(embedder)?;
+        log.rebuild_graph()?; // graph (+ its recall boost) live on open; persisted edges survive reopen
+        Ok(log)
+```
+…and add one sentence to `rebuild_graph`'s doc + the M3 DoD: *"Graph queries and the recall boost reflect the `edges` table as of the last `rebuild_graph`/`open_with_recall`. After appending `link`/`invalidate` WITHIN a session, call `rebuild_graph` again — same append→rebuild lifecycle as `rebuild_indexes`."*
+
+**F4 (security M2) — surface malformed graph events (Task 2 Step 4, in `rebuild_graph`).** A signed link/invalidate with malformed content is silently dropped by the fold. After `let edges = crate::graph::fold_edges(&events);` add:
+```rust
+        let malformed = events.iter().filter(|e| crate::graph::parse_link_content(&e.content).is_none()).count();
+        if malformed > 0 {
+            log::warn!("rebuild_graph: {malformed} link/invalidate event(s) had malformed content and were skipped");
+        }
+```
+
+### Additional required tests (hermetic; add in the noted task)
+
+**T-A (critic, highest value) — multi-active-assertion close-all (`tests/graph.rs`, Task 2):**
+```rust
+#[test]
+fn invalidate_closes_all_active_assertions_for_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    log.link(&a, "works_at", &b, None, &[]).unwrap();
+    log.link(&a, "works_at", &b, None, &[]).unwrap(); // two concurrent assertions, same key
+    log.invalidate(&a, "works_at", &b, None, &[a.clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let edges = log.all_edges().unwrap();
+    assert_eq!(edges.len(), 2, "both assertions persist (close-not-delete)");
+    assert!(edges.iter().all(|e| e.invalidated_at.is_some()), "one invalidate closes ALL active assertions for the key");
+}
+```
+
+**T-B (critic) — `as_of` with BOTH axes set (`tests/graph.rs`, Task 4):**
+```rust
+#[test]
+fn as_of_both_axes_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    log.link(&a, "works_at", &b, Some("2020-01-01T00:00:00Z"), &[]).unwrap();
+    log.rebuild_graph().unwrap();
+    // True in the world in 2021 AND already known by 2999 → 1 row.
+    let both = AsOf { valid_time: Some("2021-01-01T00:00:00Z".into()), known_as_of: Some("2999-01-01T00:00:00Z".into()) };
+    assert_eq!(log.as_of(&a, &both).unwrap().len(), 1);
+    // True in 2021 but NOT yet known in 1990 (ingested ~now) → 0 rows.
+    let too_early = AsOf { valid_time: Some("2021-01-01T00:00:00Z".into()), known_as_of: Some("1990-01-01T00:00:00Z".into()) };
+    assert!(log.as_of(&a, &too_early).unwrap().is_empty());
+}
+```
+
+**T-C (critic) — invalidate with no active assertion is a no-op (`tests/graph.rs`, Task 2):**
+```rust
+#[test]
+fn invalidate_with_no_active_assertion_is_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    log.invalidate(&a, "works_at", &b, None, &[a.clone()]).unwrap(); // before any link
+    log.rebuild_graph().unwrap();
+    assert!(log.all_edges().unwrap().is_empty(), "invalidate with no matching link adds no edge");
+}
+```
+
+**T-D (security M3) — never-forget: a memory stays recallable after its only edge is invalidated (`tests/recall.rs`, Task 5):**
+```rust
+#[test]
+fn invalidating_an_edge_does_not_suppress_the_memory_from_recall() {
+    let (log, _dir, ids) = seeded_log(&["ferris the rustacean crab", "unrelated tokens here"]);
+    log.link(&ids[0], "relates_to", &ids[1], None, &[]).unwrap();
+    log.invalidate(&ids[0], "relates_to", &ids[1], None, &[ids[0].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let embedder = MockEmbedder::new(MID_DIM);
+    let hits = log.recall(&embedder, "ferris the rustacean crab", RECALL_TOP_K, &RecallOptions::default()).unwrap();
+    assert!(find_hit(&hits, &ids[0]).is_some(), "memory must remain recallable after its edge is retired (never-forget)");
+}
+```
+
+**T-E (security M1) — SQL-injection regression: a malicious relation label is inert data (`tests/graph.rs`, Task 3):**
+```rust
+#[test]
+fn malicious_relation_label_is_inert_data_not_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    let evil = "x\") OR 1=1 --";
+    log.link(&a, evil, &b, None, &[]).unwrap();
+    log.rebuild_graph().unwrap();
+    let n = log.neighbors(&a).unwrap();
+    assert_eq!(n.len(), 1, "one edge; the label did not alter query semantics");
+    assert_eq!(n[0].relation, evil, "relation round-trips as literal data");
+}
+```
+
+### Provenance / integrity contracts (recorded here + in the design; carried to M4+)
+- **`model_id="manual"` ≠ user-authored** (security I2): the future taint walk derives trust from `source_event_ids` lineage + the (future) user-DID signer, NEVER from the literal string `"manual"`. No milestone may establish "manual ⇒ clean."
+- **`signed_by_did` is currently UNVERIFIED** (security I3): `verify_chain` checks only the engine key; the parent §5.2 "resolve pubkey from `signed_by_did`" step is aspirational/unimplemented. M3 stamps a fixed `did:wba:bossclaw-engine` = engine-asserted, NOT user-owned. Before any user-facing ownership claim (M7), verify MUST resolve DID→pubkey and reject mismatches. **Flag for Peter: reconcile the parent §5.2 wording separately.**
+- **Auto-seed fires on the top-1 hit only** (critic IMPORTANT-2): if the strongest hit is unlinked, no boost fires (intra-result reinforcement deferred §11). M3 proves the mechanism; meaningful hit-rate arrives with M4.
+- **The proximity boost has no edge-trust gate** (security M4): once links can be machine/ingest-derived (M4), an untrusted-origin edge must not boost a candidate into the actuator's reasoning set.
+
+---
 
 ## File structure
 | File | Responsibility |
@@ -1107,6 +1273,10 @@ git commit -m "docs(bossclaw-core): CHANGELOG M3 (Graph) + final gates (M3 T6)"
 - [ ] `as_of` filters both clocks independently; all-`None` == current; timestamps normalized so SQL comparison is chronological.
 - [ ] Live graph-proximity boost in `recall`: auto-seed + explicit seeds, 1-hop, **current edges only** (retired edges give no boost — proven), multiplicative, below recency/pin; degrades to no-boost on graph error.
 - [ ] Existing `RecallOptions` literal updated; whole `bossclaw-core` suite green (hermetic, temp homes only); `clippy -D warnings` clean; zero `unsafe`.
+- [ ] **(Rev 2)** Graph is live on open (`open_with_recall` calls `rebuild_graph`); the append→`rebuild_graph` lifecycle is documented on `rebuild_graph` + here.
+- [ ] **(Rev 2)** `source_event_ids` `[src,dst]` default is gated to the manual producer; a non-manual empty source set is rejected (taint-laundering guard, security I1).
+- [ ] **(Rev 2)** Added tests T-A..T-E: multi-active close-all, both-axes `as_of`, invalidate-no-op, memory-still-recallable-after-invalidate, malicious-relation-label-inert. Malformed graph events are logged (F4).
+- [ ] **(Rev 2)** Provenance contracts recorded (manual≠user, `signed_by_did` unverified, auto-seed top-1, boost no taint gate) — in this plan + design §12.
 
 ## Carried into later milestones
 - **LLM extraction** that auto-creates `link`/`invalidate` events → M4 (evolve); reuses these tables.
