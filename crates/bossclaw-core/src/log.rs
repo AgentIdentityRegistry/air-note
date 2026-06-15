@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -22,6 +22,10 @@ use crate::event::{compute_hash, Event};
 use crate::highwater::{HighWaterStore, Mark};
 use crate::index::{HnswIndex, VectorIndex};
 use crate::keyword;
+use crate::recall::{
+    fuse_scored_arms, Hit, NoopReranker, RecallOptions, RecallSource, Reranker, FUSION_FETCH,
+    HALF_LIFE_SECS, PIN_MULTIPLIER, RECENCY_WEIGHT,
+};
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
 
@@ -594,6 +598,128 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Hybrid recall: embed the query, run BOTH retrieval arms, fuse by
+    /// reciprocal rank, apply recency + pin boosts, rerank, and return the top-`k`
+    /// [`Hit`]s with provenance. This is the heart of M2 (spec §5.7).
+    ///
+    /// # Pipeline
+    /// 1. **Embed** `query` (one-item batch) → query vector.
+    /// 2. **Two arms**, each fetching [`FUSION_FETCH`] candidates (≥ `k`, so
+    ///    fusion sees enough tail to reorder): the vector arm
+    ///    ([`EventLog::vector_search`]) and the keyword arm
+    ///    ([`EventLog::keyword_search`]).
+    /// 3. **Fuse** the two ranked id-lists via [`rrf_fuse`] → base score per id,
+    ///    while recording which arm(s) surfaced each id (its [`RecallSource`]s).
+    /// 4. **Boost** multiplicatively, scaled to the RRF magnitude so the tilt
+    ///    never swamps fusion: recency `*= 1 + RECENCY_WEIGHT * exp(-age/HALF_LIFE)`
+    ///    (age = now − the event's `ts`), and pin `*= PIN_MULTIPLIER` for ids in
+    ///    `opts.pinned`.
+    /// 5. **Rerank** through the [`Reranker`] seam (v1: [`NoopReranker`]).
+    /// 6. **Sort** by final score DESC and return the top `k`.
+    ///
+    /// # Graceful degradation (spec §10)
+    /// Recall is robust to a missing or unbuilt index. If the **vector** arm fails
+    /// (embed error OR the index isn't built yet — [`BossclawError::InvalidInput`]),
+    /// it is logged via [`log::warn!`] and recall degrades to **keyword-only**.
+    /// Symmetrically, a failing **keyword** arm degrades to vector-only. Only if
+    /// BOTH arms fail does this return `Err` (the first arm's error).
+    pub fn recall(
+        &self,
+        embedder: &dyn Embedder,
+        query: &str,
+        k: usize,
+        opts: &RecallOptions,
+    ) -> Result<Vec<Hit>, BossclawError> {
+        // ── Arm 1: vector (semantic). Embed, then search; either step failing
+        //    degrades us to keyword-only rather than erroring (spec §10). The
+        //    arm returns (event_id, cosine distance) — lower distance is better. ──
+        let vector_hits: Result<Vec<(String, f32)>, BossclawError> = embed_one(embedder, query)
+            .and_then(|qv| self.vector_search(&qv, FUSION_FETCH));
+        let (vector_arm, vector_err) = match vector_hits {
+            Ok(hits) => (hits, None),
+            Err(e) => {
+                log::warn!("recall: vector arm unavailable, degrading to keyword-only: {e}");
+                (Vec::new(), Some(e))
+            }
+        };
+
+        // ── Arm 2: keyword (lexical). Returns (event_id, BM25 score) — lower
+        //    BM25 is better. ──
+        let (keyword_arm, keyword_err) = match self.keyword_search(query, FUSION_FETCH) {
+            Ok(hits) => (hits, None),
+            Err(e) => {
+                log::warn!("recall: keyword arm unavailable, degrading to vector-only: {e}");
+                (Vec::new(), Some(e))
+            }
+        };
+
+        // Both arms failed → surface the vector arm's error (the primary arm).
+        if let (Some(verr), Some(_)) = (&vector_err, &keyword_err) {
+            return Err(BossclawError::InvalidInput(format!(
+                "recall failed: both arms unavailable (vector: {verr})"
+            )));
+        }
+
+        // ── Provenance: which arm(s) surfaced each id (vector before keyword for
+        //    a stable evidence order). Membership sets keep this O(1) per id. ──
+        let vector_set: std::collections::HashSet<&String> =
+            vector_arm.iter().map(|(id, _)| id).collect();
+        let keyword_set: std::collections::HashSet<&String> =
+            keyword_arm.iter().map(|(id, _)| id).collect();
+
+        // ── Fuse both arms → base RRF score per id. Tie-aware: candidates with
+        //    an identical arm score share a rank, so identical-text events get an
+        //    EQUAL base and the recency/pin boost below is the deterministic
+        //    tie-break (both arms rank lower scores first → lower_is_better=true). ──
+        let fused = fuse_scored_arms(&[
+            (vector_arm.as_slice(), true),
+            (keyword_arm.as_slice(), true),
+        ]);
+
+        // ── Recency boost needs each candidate's ts; fetch them in one query. ──
+        let candidate_ids: Vec<String> = fused.keys().cloned().collect();
+        let timestamps = self.candidate_timestamps(&candidate_ids)?;
+        let now = Utc::now();
+        let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
+
+        // ── Assemble hits: base RRF score × recency × pin, with provenance. ──
+        let mut hits: Vec<Hit> = fused
+            .into_iter()
+            .map(|(id, base_score)| {
+                let mut score = base_score;
+                // Recency: 1 + WEIGHT * exp(-age/half_life). Multiplicative and
+                // bounded by (1 + RECENCY_WEIGHT), so it tilts but never swamps
+                // the ~1/RRF_K-scale fused score. A candidate with no parseable
+                // ts contributes no recency boost (factor 1.0) rather than erroring.
+                if let Some(ts) = timestamps.get(&id) {
+                    let age_secs = (now - *ts).num_milliseconds() as f64 / 1000.0;
+                    let decay = (-age_secs / HALF_LIFE_SECS).exp() as f32;
+                    score *= 1.0 + RECENCY_WEIGHT * decay;
+                }
+                // Pin: a hard multiplicative boost for explicitly-pinned ids.
+                if pinned.contains(&id) {
+                    score *= PIN_MULTIPLIER;
+                }
+                let mut sources = Vec::new();
+                if vector_set.contains(&id) {
+                    sources.push(RecallSource::Vector);
+                }
+                if keyword_set.contains(&id) {
+                    sources.push(RecallSource::Keyword);
+                }
+                Hit { event_id: id, score, sources }
+            })
+            .collect();
+
+        // ── Rerank (v1: identity) then take the top-k by final score DESC. ──
+        let reranker = NoopReranker;
+        let mut hits = reranker.rerank(query, std::mem::take(&mut hits));
+        // Sort by score DESC; `f32` is not `Ord`, so use total_cmp and reverse.
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(k);
+        Ok(hits)
+    }
+
     /// Collect, under a single short-lived lock, the events of an embeddable
     /// type that have no `vectors` row for `model_id`, in `seq` order. Returns
     /// owned `Event`s so the lock is released before any embedding happens.
@@ -670,6 +796,55 @@ impl EventLog {
             let event: Event = serde_json::from_str(&payload)?;
             if let Some(text) = embeddable_text(&event) {
                 out.push((event_id, text));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch the ingestion timestamp of each id in `ids`, parsed to
+    /// [`DateTime<Utc>`], under a single short-lived lock.
+    ///
+    /// Used by [`EventLog::recall`] for the recency boost. The SQL is a single
+    /// `SELECT id, ts FROM events WHERE id IN (...)` with one placeholder per id
+    /// (matching the dynamic-`IN` pattern used by the other collectors). Ids not
+    /// found in the log, or rows whose `ts` is not valid RFC 3339, are simply
+    /// absent from the returned map — recall treats a missing ts as "no recency
+    /// boost" rather than failing the whole query.
+    ///
+    /// An empty `ids` short-circuits to an empty map (an empty `IN ()` clause is
+    /// a SQL syntax error).
+    fn candidate_timestamps(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, DateTime<Utc>>, BossclawError> {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, ts FROM events WHERE id IN ({placeholders})");
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, ts) = row?;
+            // A malformed ts is non-fatal: skip it so the candidate just misses
+            // the recency boost (factor 1.0) instead of failing the whole recall.
+            match DateTime::parse_from_rfc3339(&ts) {
+                Ok(parsed) => {
+                    out.insert(id, parsed.with_timezone(&Utc));
+                }
+                Err(e) => {
+                    log::warn!("recall: event {id} has unparseable ts {ts:?}: {e}");
+                }
             }
         }
         Ok(out)

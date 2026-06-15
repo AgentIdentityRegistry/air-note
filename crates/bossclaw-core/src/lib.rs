@@ -22,6 +22,7 @@ pub mod index;
 pub mod keyword;
 pub mod log;
 pub mod model2vec;
+pub mod recall;
 pub mod sign;
 pub mod store;
 
@@ -33,3 +34,4 @@ pub use index::{HnswIndex, VectorIndex};
 pub use fastembed::FastEmbed;
 pub use log::{ActiveModel, EventLog};
 pub use model2vec::Model2Vec;
+pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};

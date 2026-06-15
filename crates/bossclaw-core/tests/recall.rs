@@ -930,3 +930,243 @@ fn escape_fts_query_sanitises_operators_and_quotes() {
     let result = log.keyword_search(dangerous, 5);
     assert!(result.is_ok(), "escaped query must not error: {result:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Task 7: hybrid recall — RRF fusion + recency/pin boosts + no-op reranker
+// ---------------------------------------------------------------------------
+
+use bossclaw_core::recall::{rrf_fuse, RecallOptions, RecallSource};
+
+/// Final top-k requested by the recall tests. Small (so assertions read
+/// naturally) but > 1 so "ranks above" comparisons are meaningful.
+const RECALL_TOP_K: usize = 5;
+
+/// Seed a fresh, fully-indexed `EventLog`: append each `(text)` as a memory
+/// event (in order), derive every vector, then build BOTH indexes. Returns the
+/// log, a held-open `tempdir` (kept alive by the caller), and the appended ids in
+/// append order so tests can refer to a specific event.
+fn seeded_log(texts: &[&str]) -> (EventLog, tempfile::TempDir, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+    let mut ids = Vec::with_capacity(texts.len());
+    for t in texts {
+        ids.push(log.append(mk_memory_event(t)).unwrap());
+    }
+    let embedder = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&embedder).unwrap();
+    log.rebuild_indexes(&embedder).unwrap();
+    (log, dir, ids)
+}
+
+/// `Hit` for a given event id, if present in the result set.
+fn find_hit<'a>(
+    hits: &'a [bossclaw_core::Hit],
+    id: &str,
+) -> Option<&'a bossclaw_core::Hit> {
+    hits.iter().find(|h| h.event_id == id)
+}
+
+/// Rank (0-based position) of an event id in the result set, if present.
+fn rank_of(hits: &[bossclaw_core::Hit], id: &str) -> Option<usize> {
+    hits.iter().position(|h| h.event_id == id)
+}
+
+/// Hybrid relevance: an event that matches the query BOTH semantically (shared
+/// bag-of-words tokens → near-zero cosine distance) and lexically (FTS5 match)
+/// must rank #1. The other corpus entries share no tokens with the query, so the
+/// target is the only id surfaced by both arms.
+#[test]
+fn recall_hybrid_match_ranks_first() {
+    // Disjoint vocabularies: only the "rustacean" entry overlaps the query.
+    let (log, _dir, ids) = seeded_log(&[
+        "quantum entanglement physics lecture",
+        "rustacean memory engine ferris crab",
+        "sourdough baking hydration levels",
+    ]);
+    let target = &ids[1];
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let hits = log
+        .recall(&embedder, "rustacean memory engine", RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+
+    assert!(!hits.is_empty(), "recall must return hits");
+    assert_eq!(
+        &hits[0].event_id, target,
+        "the doubly-matched event must rank first, got {hits:?}"
+    );
+    // It was surfaced by BOTH arms (the hybrid signal).
+    let target_hit = find_hit(&hits, target).expect("target present");
+    assert!(
+        target_hit.sources.contains(&RecallSource::Vector)
+            && target_hit.sources.contains(&RecallSource::Keyword),
+        "top hit must carry both Vector and Keyword provenance, got {:?}",
+        target_hit.sources
+    );
+}
+
+/// The keyword arm contributes: an event the query matches lexically appears in
+/// results with `RecallSource::Keyword` among its sources.
+#[test]
+fn recall_keyword_arm_contributes_keyword_source() {
+    let (log, _dir, ids) = seeded_log(&[
+        "alpha beta gamma delta",
+        "epsilon zeta eta theta",
+    ]);
+    let target = &ids[0];
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let hits = log
+        .recall(&embedder, "alpha beta", RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+
+    let target_hit = find_hit(&hits, target).expect("lexically-matched event must be present");
+    assert!(
+        target_hit.sources.contains(&RecallSource::Keyword),
+        "matched event must carry Keyword provenance, got {:?}",
+        target_hit.sources
+    );
+}
+
+/// The vector arm contributes: `RecallSource::Vector` appears for a
+/// semantically-matched event. The query vector equals the target's embedding
+/// (same tokens), so the ANN arm returns it; provenance must record that.
+#[test]
+fn recall_vector_arm_contributes_vector_source() {
+    let (log, _dir, ids) = seeded_log(&[
+        "neptune saturn jupiter mars",
+        "violin cello viola contrabass",
+    ]);
+    let target = &ids[0];
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let hits = log
+        .recall(&embedder, "neptune saturn jupiter mars", RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+
+    let target_hit = find_hit(&hits, target).expect("semantically-matched event must be present");
+    assert!(
+        target_hit.sources.contains(&RecallSource::Vector),
+        "matched event must carry Vector provenance, got {:?}",
+        target_hit.sources
+    );
+}
+
+/// Recency tie-break: two events with IDENTICAL text tie on both arms (identical
+/// embedding → identical cosine distance; identical body → identical BM25), so
+/// their fused RRF base score is exactly equal. The later-appended event (newer
+/// `ts`) must therefore rank above the older one — recency is the sole, and
+/// deterministic, decider regardless of the absolute `Utc::now()`.
+#[test]
+fn recall_recency_breaks_tie_newer_ranks_first() {
+    let text = "identical twins tie breaker phrase";
+    // Append the SAME text twice; ids[0] is older, ids[1] is newer.
+    let (log, _dir, ids) = seeded_log(&[text, text]);
+    let older = &ids[0];
+    let newer = &ids[1];
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let hits = log
+        .recall(&embedder, text, RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+
+    let newer_rank = rank_of(&hits, newer).expect("newer event present");
+    let older_rank = rank_of(&hits, older).expect("older event present");
+    assert!(
+        newer_rank < older_rank,
+        "newer event (rank {newer_rank}) must rank above older (rank {older_rank}); hits={hits:?}"
+    );
+}
+
+/// Pin boost: pinning an id raises it above an otherwise-equal non-pinned id.
+/// Two identical-text events tie on RRF; pinning the OLDER one (which recency
+/// would otherwise rank second) must flip it above the newer, unpinned event —
+/// proving the pin multiplier dominates the recency tilt.
+#[test]
+fn recall_pin_boost_raises_pinned_above_equal() {
+    let text = "pinned versus unpinned equal candidates";
+    let (log, _dir, ids) = seeded_log(&[text, text]);
+    let older = &ids[0];
+    let newer = &ids[1];
+
+    // Sanity: without a pin, the newer event wins the recency tie-break.
+    let embedder = MockEmbedder::new(MID_DIM);
+    let baseline = log
+        .recall(&embedder, text, RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+    assert!(
+        rank_of(&baseline, newer) < rank_of(&baseline, older),
+        "baseline: newer should lead before pinning; got {baseline:?}"
+    );
+
+    // Pin the OLDER event → it must now outrank the newer, unpinned one.
+    let opts = RecallOptions { pinned: vec![older.clone()] };
+    let hits = log.recall(&embedder, text, RECALL_TOP_K, &opts).unwrap();
+    let older_rank = rank_of(&hits, older).expect("older present");
+    let newer_rank = rank_of(&hits, newer).expect("newer present");
+    assert!(
+        older_rank < newer_rank,
+        "pinned older event (rank {older_rank}) must outrank unpinned newer (rank {newer_rank}); hits={hits:?}"
+    );
+}
+
+/// Degrade-to-keyword (spec §10): WITHOUT building the vector index, recall must
+/// still return keyword results and must NOT error. The vector arm fails with
+/// `InvalidInput` (index not built); recall logs a warning and falls back to the
+/// keyword arm.
+#[test]
+fn recall_degrades_to_keyword_when_vector_index_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let id = log.append(mk_memory_event("ferris the crab mascot")).unwrap();
+    // Build ONLY the keyword index (no vector index): add the FTS entry directly.
+    log.keyword_add(&id, "ferris the crab mascot").unwrap();
+
+    // The query is escaped to a literal FTS5 phrase, so its tokens must be
+    // adjacent in the body — "ferris the" matches "ferris the crab mascot".
+    let embedder = MockEmbedder::new(MID_DIM);
+    let result = log.recall(&embedder, "ferris the", RECALL_TOP_K, &RecallOptions::default());
+
+    let hits = result.expect("recall must not error when only the vector arm is unavailable");
+    let hit = find_hit(&hits, &id).expect("keyword-only result must surface the event");
+    assert!(
+        hit.sources.contains(&RecallSource::Keyword) && !hit.sources.contains(&RecallSource::Vector),
+        "degraded result must carry Keyword provenance only, got {:?}",
+        hit.sources
+    );
+}
+
+/// `rrf_fuse` unit test (pure): an id ranked #1 in BOTH arms must score strictly
+/// higher than one ranked #1 in only a single arm. This pins the RRF formula
+/// (Σ 1/(k + rank), 1-based) independently of any database wiring.
+#[test]
+fn rrf_fuse_id_in_both_arms_scores_higher_than_single_arm() {
+    let arms = vec![
+        // Arm 1: "both" #1, "vec_only" #2.
+        vec!["both".to_string(), "vec_only".to_string()],
+        // Arm 2: "both" #1, "kw_only" #2.
+        vec!["both".to_string(), "kw_only".to_string()],
+    ];
+    let scores = rrf_fuse(&arms);
+
+    let both = scores["both"];
+    let vec_only = scores["vec_only"];
+    let kw_only = scores["kw_only"];
+
+    assert!(
+        both > vec_only,
+        "id in both arms ({both}) must beat single-arm id ({vec_only})"
+    );
+    assert!(
+        both > kw_only,
+        "id in both arms ({both}) must beat single-arm id ({kw_only})"
+    );
+    // The two single-arm ids (each #1 in exactly one arm) tie.
+    assert!(
+        (vec_only - kw_only).abs() < 1e-9,
+        "two ids each ranked #1 in one arm must tie: {vec_only} vs {kw_only}"
+    );
+}
