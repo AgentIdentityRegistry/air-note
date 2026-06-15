@@ -15,6 +15,8 @@
 pub mod embed;
 pub mod error;
 pub mod event;
+#[cfg(feature = "fastembed")]
+pub mod fastembed;
 pub mod highwater;
 pub mod log;
 pub mod model2vec;
@@ -24,5 +26,7 @@ pub mod store;
 pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};
+#[cfg(feature = "fastembed")]
+pub use fastembed::FastEmbed;
 pub use log::{ActiveModel, EventLog};
 pub use model2vec::Model2Vec;
