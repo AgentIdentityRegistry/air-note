@@ -80,6 +80,11 @@ pub struct ActiveModel {
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// DID stamped on engine-authored events (`link`/`invalidate`) in v1. Named so
+/// the literal is single-sourced (like [`MANUAL_LINK_PRODUCER`]); M4/M7 will
+/// replace this with the user's real DID threaded through [`EventLog::signer_did`].
+const ENGINE_SIGNER_DID: &str = "did:wba:bossclaw-engine";
+
 /// `(event_id, arm_score)` pair returned by each retrieval arm. Used as the
 /// common type for both the vector arm (cosine distance, lower=better) and the
 /// keyword arm (BM25 score, lower=better) before fusion.
@@ -1233,8 +1238,9 @@ impl EventLog {
     /// pass its real read-set; defaulting there would erase the inducing event
     /// from the lineage the actuator walks fail-closed.
     ///
-    /// Eight parameters are required by the F2 security design; a builder struct
-    /// would add indirection without safety benefit for this private helper.
+    // The `producer` parameter is required by the F2 security gate; the remaining
+    // args are the event's intrinsic fields. A params struct would add indirection
+    // without safety benefit for this private, two-call-site helper.
     #[allow(clippy::too_many_arguments)]
     fn append_graph_event(
         &self,
@@ -1249,10 +1255,14 @@ impl EventLog {
         let sources = match (producer == MANUAL_LINK_PRODUCER, source_event_ids.is_empty()) {
             (true, true) => vec![src.to_string(), dst.to_string()],
             (false, true) => {
-                return Err(BossclawError::Chain(
+                // Caller-argument-policy rejection → InvalidInput (not Chain, which
+                // is for hash/chain-integrity failures). NB: M1's analogous empty-
+                // source guard in `append` uses Chain (pre-existing; a candidate for
+                // a later unify — do NOT change M1 here).
+                return Err(BossclawError::InvalidInput(
                     "non-manual graph link requires explicit source_event_ids (no [src,dst] \
                      default — would launder taint past the §5.11 lineage walk)".into(),
-                ))
+                ));
             }
             (_, false) => source_event_ids.to_vec(),
         };
@@ -1280,8 +1290,11 @@ impl EventLog {
     /// Note: `signed_by_did` is informational here (not verified against `key` at
     /// append). A fixed engine DID keeps the M3 surface small; threading the user
     /// DID is M4/M7 (carried, security I3).
+    ///
+    /// Returns an owned `String` (not the `&'static str` const) because M4/M7 will
+    /// make this dynamic — the user's real DID, looked up per call.
     fn signer_did(&self) -> String {
-        "did:wba:bossclaw-engine".to_string()
+        ENGINE_SIGNER_DID.to_string()
     }
 
     /// Persist the current tip as the signed high-water mark (debounced by the
@@ -1424,11 +1437,11 @@ mod tests {
             .append_graph_event("link", "m4-reasoner", "a", "works_at", "b", None, &[])
             .expect_err("non-manual producer with empty sources must be rejected");
         match err {
-            BossclawError::Chain(msg) => assert!(
+            BossclawError::InvalidInput(msg) => assert!(
                 msg.contains("non-manual"),
                 "reject message should name the non-manual gate, got: {msg}"
             ),
-            other => panic!("expected BossclawError::Chain, got {other:?}"),
+            other => panic!("expected BossclawError::InvalidInput, got {other:?}"),
         }
 
         // Manual producer + empty sources → succeeds, defaulting to [src, dst].

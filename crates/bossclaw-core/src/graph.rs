@@ -64,11 +64,16 @@ pub struct AsOf {
     pub known_as_of: Option<String>,
 }
 
-/// Normalize an RFC 3339 timestamp to fixed-width UTC microseconds + `Z`, so
-/// lexicographic (SQL `TEXT`) comparison equals chronological comparison
-/// regardless of the source offset or sub-second precision. Returns the input
-/// unchanged if it cannot be parsed (best-effort — an unparseable world-clock
-/// value degrades to raw-string compare rather than failing the fold).
+/// Normalize a **parseable RFC 3339** timestamp to a fixed-width (27-char) UTC
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ` string, so lexicographic (SQL `TEXT`) comparison
+/// equals chronological comparison regardless of the source offset or sub-second
+/// precision. The fixed-width / lexical-==-chronological guarantee holds **only**
+/// for input that parses as RFC 3339 (which always carries a 4-digit year).
+///
+/// An **unparseable** input is returned as the raw string unchanged (best-effort:
+/// it degrades to raw-string compare rather than failing the fold). Such a value
+/// is therefore **NOT** width- or ordering-normalized — that fallback is a
+/// documented degradation, not a guarantee.
 pub fn normalize_ts(ts: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
         Ok(dt) => dt
@@ -76,5 +81,37 @@ pub fn normalize_ts(ts: &str) -> String {
             .format("%Y-%m-%dT%H:%M:%S%.6fZ")
             .to_string(),
         Err(_) => ts.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_ts_preserves_chronological_order_lexically() {
+        // Across a 4-digit year range, the normalized strings sort the same way the
+        // instants do — the property the SQL TEXT comparisons rely on.
+        let early = normalize_ts("0099-01-01T00:00:00Z");
+        let mid = normalize_ts("2020-06-15T10:00:00Z");
+        let late = normalize_ts("9999-12-31T23:59:59Z");
+        assert!(early < mid, "{early} should sort before {mid}");
+        assert!(mid < late, "{mid} should sort before {late}");
+    }
+
+    #[test]
+    fn normalize_ts_converts_offset_to_utc() {
+        // Midnight in +09:00 is 15:00 the previous day in UTC; both normalize
+        // to the same instant string.
+        assert_eq!(
+            normalize_ts("2020-01-01T00:00:00+09:00"),
+            normalize_ts("2019-12-31T15:00:00Z"),
+        );
+    }
+
+    #[test]
+    fn normalize_ts_is_fixed_width_27_for_valid_rfc3339() {
+        // YYYY-MM-DDTHH:MM:SS.ffffffZ = 27 chars.
+        assert_eq!(normalize_ts("2020-06-15T10:00:00Z").len(), 27);
     }
 }
