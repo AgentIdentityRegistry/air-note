@@ -26,7 +26,8 @@ use crate::index::{HnswIndex, VectorIndex};
 use crate::keyword;
 use crate::recall::{
     fuse_scored_arms, Hit, NoopReranker, RecallOptions, RecallSource, Reranker, FUSION_FETCH,
-    HALF_LIFE_SECS, PIN_MULTIPLIER, RECENCY_WEIGHT,
+    GRAPH_AUTO_SEED_TOPK, GRAPH_HOP_DECAY, GRAPH_MAX_HOPS, GRAPH_WEIGHT, HALF_LIFE_SECS,
+    PIN_MULTIPLIER, RECENCY_WEIGHT,
 };
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
@@ -863,6 +864,23 @@ impl EventLog {
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
+        // ── Graph-proximity seeds: explicit, else auto-seed from the top fused
+        //    base score(s). Then BFS current-edge neighbors (best-effort: a graph
+        //    error degrades to no boost, never failing recall — spec §6/§10). ──
+        let seeds: Vec<String> = if !opts.graph_seeds.is_empty() {
+            opts.graph_seeds.clone()
+        } else {
+            let mut by_score: Vec<(&String, &f32)> = fused.iter().collect();
+            by_score.sort_by(|a, b| b.1.total_cmp(a.1).then_with(|| b.0.cmp(a.0)));
+            by_score.into_iter().take(GRAPH_AUTO_SEED_TOPK).map(|(id, _)| id.clone()).collect()
+        };
+        let graph_hops = self
+            .current_neighbors_with_hops(&seeds, GRAPH_MAX_HOPS)
+            .unwrap_or_else(|e| {
+                log::warn!("recall: graph-proximity boost skipped: {e}");
+                HashMap::new()
+            });
+
         // ── Assemble hits: compute the full-precision (f64) boosted score, store
         //    it alongside the Hit so the sort comparator can use it without
         //    re-computing. Hit.score is set from the f64 value (truncated to f32
@@ -885,6 +903,13 @@ impl EventLog {
                 // Pin: hard multiplicative boost for explicitly-pinned ids.
                 if pinned.contains(&id) {
                     score_f64 *= PIN_MULTIPLIER as f64;
+                }
+
+                // Graph-proximity tilt: a current-edge neighbour of a seed is
+                // boosted by 1 + GRAPH_WEIGHT * GRAPH_HOP_DECAY^(hops-1).
+                if let Some(&hop) = graph_hops.get(&id) {
+                    let decay = (GRAPH_HOP_DECAY as f64).powi(hop as i32 - 1);
+                    score_f64 *= 1.0 + GRAPH_WEIGHT as f64 * decay;
                 }
 
                 let mut sources = Vec::new();
@@ -1481,6 +1506,8 @@ impl EventLog {
         // Owned, normalized param strings kept alive for the bind slice below.
         let mut owned: Vec<String> = Vec::new();
 
+        // SQL params are 1-indexed; ?1 is `node`, so the k-th owned timestamp
+        // binds to ?{owned.len()+2}. Both `+2` sites below share this invariant.
         match (&valid, &known) {
             (None, None) => sql.push_str(" AND invalidated_at IS NULL"),
             _ => {
@@ -1538,6 +1565,73 @@ impl EventLog {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Map every node within `max_hops` of any `seed` (over CURRENT edges,
+    /// treated as undirected for relatedness) to its shortest hop distance
+    /// (1..=max_hops). Seeds themselves are excluded. Used by the recall
+    /// graph-proximity boost. A seed with no current edges contributes nothing.
+    fn current_neighbors_with_hops(
+        &self,
+        seeds: &[String],
+        max_hops: u32,
+    ) -> Result<HashMap<String, u32>, BossclawError> {
+        let mut hops: HashMap<String, u32> = HashMap::new();
+        let mut frontier: HashSet<String> = seeds.iter().cloned().collect();
+        let mut visited: HashSet<String> = seeds.iter().cloned().collect();
+        for hop in 1..=max_hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let next = self.current_adjacent(&frontier)?;
+            let mut new_frontier: HashSet<String> = HashSet::new();
+            for id in next {
+                if visited.insert(id.clone()) {
+                    hops.insert(id.clone(), hop);
+                    new_frontier.insert(id);
+                }
+            }
+            frontier = new_frontier;
+        }
+        Ok(hops)
+    }
+
+    /// Distinct opposite endpoints of CURRENT edges incident to any id in
+    /// `frontier` (undirected: returns both `dst` where `src ∈ frontier` and
+    /// `src` where `dst ∈ frontier`). Empty `frontier` → empty set.
+    ///
+    /// Both `IN` clauses share the same `?1..?n` placeholders, so the id list
+    /// is bound ONCE (n params, not 2n — binding 2n would exceed the
+    /// statement's parameter count and error at query time).
+    fn current_adjacent(
+        &self,
+        frontier: &HashSet<String>,
+    ) -> Result<HashSet<String>, BossclawError> {
+        if frontier.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids: Vec<&String> = frontier.iter().collect();
+        let placeholders: String =
+            (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        // dst where src ∈ frontier  UNION  src where dst ∈ frontier (current only).
+        // Both IN clauses reference the SAME ?1..?n placeholders; bind the id
+        // list ONCE (n params, not 2n).
+        let sql = format!(
+            "SELECT dst AS other FROM edges WHERE invalidated_at IS NULL AND src IN ({placeholders}) \
+             UNION \
+             SELECT src AS other FROM edges WHERE invalidated_at IS NULL AND dst IN ({placeholders})"
+        );
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| *id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
         }
         Ok(out)
     }

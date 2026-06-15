@@ -66,13 +66,18 @@ impl Reranker for NoopReranker {
 
 /// Caller knobs for recall.
 ///
-/// `Default` yields an empty pin list (no pinned ids), which is the common case.
+/// `Default` yields empty pin and seed lists (no pinned ids, auto-seeded graph
+/// proximity), which is the common case.
 #[derive(Default)]
 pub struct RecallOptions {
     /// Event ids to boost by [`PIN_MULTIPLIER`] regardless of their organic rank
     /// (e.g. a memory the user explicitly pinned). Ids not present in the fused
     /// candidate set are simply ignored.
     pub pinned: Vec<String>,
+    /// Explicit graph-proximity seed node ids. When non-empty, recall boosts
+    /// candidates within [`GRAPH_MAX_HOPS`] of these (current edges only). When
+    /// empty, recall auto-seeds from the top [`GRAPH_AUTO_SEED_TOPK`] fused hits.
+    pub graph_seeds: Vec<String>,
 }
 
 /// Reciprocal-rank-fusion constant `k` (Cormack et al., "Reciprocal Rank Fusion
@@ -108,6 +113,27 @@ pub const HALF_LIFE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
 /// ≤1.5× recency multiplier so a pin reliably wins ties even against the newest
 /// non-pinned candidate.
 pub const PIN_MULTIPLIER: f32 = 2.0;
+
+/// Max multiplicative graph-proximity boost at 1 hop, as a fraction of the fused
+/// score: a direct neighbour of a seed is boosted by `1 + GRAPH_WEIGHT`. Kept
+/// just below [`RECENCY_WEIGHT`] (0.5) and far below [`PIN_MULTIPLIER`] (2.0) so
+/// graph-relatedness is a *tilt* on ranking, not an override.
+pub const GRAPH_WEIGHT: f32 = 0.4;
+
+/// Per-hop decay of the graph boost: each extra hop multiplies the boost factor
+/// by this. With [`GRAPH_MAX_HOPS`] = 1 only direct neighbours are boosted, but
+/// the term is applied as `GRAPH_HOP_DECAY^(hops-1)` so raising the hop cap later
+/// needs no formula change.
+pub const GRAPH_HOP_DECAY: f32 = 0.5;
+
+/// How many hops out from a seed the proximity boost reaches. v1 = 1 (direct
+/// neighbours only); the BFS + decay term already support a larger cap.
+pub const GRAPH_MAX_HOPS: u32 = 1;
+
+/// When no explicit `graph_seeds` are supplied, auto-seed proximity from the top
+/// N fused candidates (their own node ids). 1 = "boost what's linked to the
+/// single strongest hit", which fires with zero caller input.
+pub const GRAPH_AUTO_SEED_TOPK: usize = 1;
 
 /// How many candidates each arm fetches before fusion. Over-fetching well beyond
 /// the caller's final `k` lets RRF see enough of each arm's tail to reorder

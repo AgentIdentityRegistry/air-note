@@ -1163,7 +1163,7 @@ fn recall_pin_boost_raises_pinned_above_equal() {
     );
 
     // Pin the OLDER event → it must now outrank the newer, unpinned one.
-    let opts = RecallOptions { pinned: vec![older.clone()] };
+    let opts = RecallOptions { pinned: vec![older.clone()], ..Default::default() };
     let hits = log.recall(&embedder, text, RECALL_TOP_K, &opts).unwrap();
     let older_rank = rank_of(&hits, older).expect("older present");
     let newer_rank = rank_of(&hits, newer).expect("newer present");
@@ -1520,4 +1520,88 @@ fn open_with_recall_on_empty_store_does_not_panic() {
         .recall(&embedder, "anything", 3, &bossclaw_core::recall::RecallOptions::default())
         .unwrap();
     assert!(results.is_empty(), "empty store yields no recall hits");
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: graph-proximity recall boost (M3 §6)
+// ---------------------------------------------------------------------------
+
+/// Auto-seed boost fires on a CURRENT edge and disappears when that edge is
+/// invalidated. Score-based (robust to the arbitrary base order of
+/// query-irrelevant candidates): the linked neighbour's score carries the ~1.4×
+/// graph multiplier while the edge is current, and reverts to its unboosted base
+/// once the edge is retired (current-edges-only gating, spec §6).
+#[test]
+fn recall_graph_proximity_auto_seed_boosts_only_current_edges() {
+    let (log, _dir, ids) = seeded_log(&[
+        "rustacean memory engine ferris",   // 0: query matches this → auto-seed
+        "completely unrelated tokens here", // 1: neighbour of the seed
+        "another disjoint vocabulary set",  // 2: unlinked bystander
+    ]);
+    log.link(&ids[0], "relates_to", &ids[1], None, &[]).unwrap();
+    log.rebuild_graph().unwrap();
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let query = "rustacean memory engine ferris";
+
+    let boosted = log.recall(&embedder, query, RECALL_TOP_K, &RecallOptions::default()).unwrap();
+    let s_boosted = find_hit(&boosted, &ids[1]).expect("neighbor present").score;
+
+    // Retire the edge → the neighbour must lose the boost.
+    log.invalidate(&ids[0], "relates_to", &ids[1], None, &[ids[0].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let retired = log.recall(&embedder, query, RECALL_TOP_K, &RecallOptions::default()).unwrap();
+    let s_retired = find_hit(&retired, &ids[1]).expect("neighbor present").score;
+
+    assert!(
+        s_boosted > s_retired * 1.2,
+        "current-edge neighbor must be boosted (~1.4x) vs the retired-edge baseline: \
+         boosted={s_boosted}, retired={s_retired}"
+    );
+}
+
+/// Explicit `graph_seeds` boost a chosen node's neighbour that auto-seeding would
+/// NOT reach. The link is seed(2) ↔ neighbour(1), but the query matches event 0,
+/// so auto-seed (top hit = 0) never touches event 1. Passing `graph_seeds=[2]`
+/// boosts event 1's score above its auto-seed (unboosted) score.
+#[test]
+fn recall_graph_proximity_explicit_seeds_boost_over_autoseed() {
+    let (log, _dir, ids) = seeded_log(&[
+        "rustacean memory engine ferris",
+        "completely unrelated tokens here",
+        "another disjoint vocabulary set",
+    ]);
+    log.link(&ids[2], "relates_to", &ids[1], None, &[]).unwrap();
+    log.rebuild_graph().unwrap();
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let query = "rustacean memory engine ferris";
+
+    let auto = log.recall(&embedder, query, RECALL_TOP_K, &RecallOptions::default()).unwrap();
+    let s_auto = find_hit(&auto, &ids[1]).expect("present").score;
+
+    let opts = RecallOptions { graph_seeds: vec![ids[2].clone()], ..Default::default() };
+    let seeded = log.recall(&embedder, query, RECALL_TOP_K, &opts).unwrap();
+    let s_seeded = find_hit(&seeded, &ids[1]).expect("present").score;
+
+    assert!(
+        s_seeded > s_auto * 1.2,
+        "explicit seed must boost its neighbor over the auto-seed baseline: \
+         seeded={s_seeded}, auto={s_auto}"
+    );
+}
+
+/// T-D (security M3) — never-forget: a memory stays recallable after its only
+/// edge is invalidated. Retiring a graph edge must NEVER suppress the memory
+/// from recall — the edge's absence removes the boost but not the memory itself.
+#[test]
+fn invalidating_an_edge_does_not_suppress_the_memory_from_recall() {
+    let (log, _dir, ids) = seeded_log(&["ferris the rustacean crab", "unrelated tokens here"]);
+    log.link(&ids[0], "relates_to", &ids[1], None, &[]).unwrap();
+    log.invalidate(&ids[0], "relates_to", &ids[1], None, &[ids[0].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let hits = log.recall(&embedder, "ferris the rustacean crab", RECALL_TOP_K, &RecallOptions::default()).unwrap();
+    assert!(find_hit(&hits, &ids[0]).is_some(), "memory must remain recallable after its edge is retired (never-forget)");
 }
