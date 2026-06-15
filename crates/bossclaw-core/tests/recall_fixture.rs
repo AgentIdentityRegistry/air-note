@@ -79,13 +79,15 @@ const K: usize = 3;
 
 /// Regression floor for Model2Vec (potion-base-8M) recall@K.
 ///
-/// This is calibrated a few points *below* the first observed run so the test
-/// catches genuine regressions without being brittle to minor model or
-/// RNG variations. It is NOT a quality target.
+/// This is calibrated below the observed range so the test catches genuine
+/// regressions without being brittle to HNSW reseed non-determinism on a
+/// small corpus (hnsw_rs re-seeds its level-assignment RNG from OS
+/// randomness at each `Hnsw::new` construction — same source of variation
+/// documented in T5). It is NOT a quality target.
 ///
-/// Observed on first run: 0.875 (7/8 queries hit in top-3).
-/// Floor set at 0.625 (5/8) — wide margin to avoid flakiness from HNSW
-/// non-determinism on tiny corpora.
+/// Observed across 5 consecutive runs: 1.0000 (8/8) every time.
+/// Floor set at 0.625 (5/8) — well below the lowest observed value,
+/// giving headroom for any run-to-run variation on tiny corpora.
 const FLOOR: f32 = 0.625;
 
 /// Regression floor for the FastEmbed (bge-small-en-v1.5) gate.
