@@ -152,3 +152,139 @@ fn stream_returns_events_in_order() {
         .collect();
     assert_eq!(texts, vec!["a", "b", "c"]);
 }
+
+// ── verify_chain_since tests ──────────────────────────────────────────────────
+
+/// Test 1: A valid tail after a trusted cursor verifies successfully.
+#[test]
+fn verify_chain_since_valid_tail_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let log = EventLog::open(&dir.path().join("m.db"), &[42u8; 32], key).unwrap();
+
+    // Append 6 events; capture the id of the 4th.
+    let mut ids = Vec::new();
+    for t in ["a", "b", "c", "d", "e", "f"] {
+        ids.push(log.append(mk_event(t)).unwrap());
+    }
+    let cursor_id = &ids[3]; // 4th event ("d")
+
+    log.verify_chain_since(Some(cursor_id.as_str()))
+        .expect("tail after cursor must verify");
+}
+
+/// Test 2: Tampering a post-cursor row is detected.
+#[test]
+fn verify_chain_since_detects_tail_tamper() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let path = dir.path().join("m.db");
+
+    let cursor_id;
+    {
+        let log = EventLog::open(&path, &[42u8; 32], key.clone()).unwrap();
+        // Append cursor + 2 post-cursor events.
+        cursor_id = log.append(mk_event("cursor")).unwrap();
+        log.append(mk_event("post-a")).unwrap();
+        log.append(mk_event("post-b")).unwrap();
+    }
+
+    // Tamper a post-cursor payload.
+    {
+        let store = bossclaw_core::store::Store::open(&path, &[42u8; 32]).unwrap();
+        store.exec(
+            "UPDATE events SET payload = replace(payload, '\"post-a\"', '\"HACKED\"') \
+             WHERE event_type='memory' AND payload LIKE '%\"post-a\"%'",
+        ).unwrap();
+    }
+
+    let log = EventLog::open(&path, &[42u8; 32], key).unwrap();
+    assert!(
+        log.verify_chain_since(Some(cursor_id.as_str())).is_err(),
+        "post-cursor tamper must be detected"
+    );
+}
+
+/// Test 3 (bounded proof): A pre-cursor tamper is INVISIBLE to verify_chain_since
+/// but VISIBLE to verify_chain (full), demonstrating the bounded behaviour.
+#[test]
+fn verify_chain_since_bounded_pre_cursor_tamper_invisible() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let path = dir.path().join("m.db");
+
+    let cursor_id;
+    {
+        let log = EventLog::open(&path, &[42u8; 32], key.clone()).unwrap();
+        log.append(mk_event("before")).unwrap(); // will be tampered
+        cursor_id = log.append(mk_event("cursor")).unwrap();
+        log.append(mk_event("after")).unwrap();
+    }
+
+    // Tamper the row BEFORE the cursor.
+    {
+        let store = bossclaw_core::store::Store::open(&path, &[42u8; 32]).unwrap();
+        store.exec(
+            "UPDATE events SET payload = replace(payload, '\"before\"', '\"HACKED\"') \
+             WHERE event_type='memory' AND payload LIKE '%\"before\"%'",
+        ).unwrap();
+    }
+
+    let log = EventLog::open(&path, &[42u8; 32], key).unwrap();
+
+    // Bounded tail check does NOT re-verify the trusted prefix → Ok.
+    log.verify_chain_since(Some(cursor_id.as_str()))
+        .expect("bounded check must not detect pre-cursor tamper");
+
+    // Full chain check DOES re-verify the prefix → Err.
+    assert!(
+        log.verify_chain().is_err(),
+        "full verify_chain must detect the pre-cursor tamper"
+    );
+}
+
+/// Test 4: verify_chain_since(None) behaves like verify_chain — detects a tamper.
+#[test]
+fn verify_chain_since_none_behaves_like_verify_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let path = dir.path().join("m.db");
+
+    {
+        let log = EventLog::open(&path, &[42u8; 32], key.clone()).unwrap();
+        log.append(mk_event("x")).unwrap();
+        log.append(mk_event("y")).unwrap();
+    }
+
+    // Tamper a row.
+    {
+        let store = bossclaw_core::store::Store::open(&path, &[42u8; 32]).unwrap();
+        store.exec(
+            "UPDATE events SET payload = replace(payload, '\"x\"', '\"HACKED\"') \
+             WHERE event_type='memory' AND payload LIKE '%\"x\"%'",
+        ).unwrap();
+    }
+
+    let log = EventLog::open(&path, &[42u8; 32], key).unwrap();
+    assert!(
+        log.verify_chain_since(None).is_err(),
+        "verify_chain_since(None) must detect the same tamper as verify_chain"
+    );
+}
+
+/// Test 5: An unknown cursor id returns Err.
+#[test]
+fn verify_chain_since_unknown_cursor_returns_err() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let log = EventLog::open(&dir.path().join("m.db"), &[42u8; 32], key).unwrap();
+    log.append(mk_event("only")).unwrap();
+
+    let result = log.verify_chain_since(Some("does-not-exist"));
+    assert!(result.is_err(), "unknown cursor id must return Err");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("cursor event") && msg.contains("does-not-exist"),
+        "error message must name the missing cursor: {msg}"
+    );
+}

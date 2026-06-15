@@ -215,12 +215,85 @@ impl EventLog {
     pub fn verify_chain(&self) -> Result<(), BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
-        let mut stmt = conn.prepare("SELECT payload, prev_hash, hash FROM events ORDER BY seq ASC")?;
+        let mut stmt =
+            conn.prepare("SELECT payload, prev_hash, hash FROM events ORDER BY seq ASC")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
         })?;
+        Self::verify_rows(rows, GENESIS.to_string(), &self.key)
+    }
 
-        let mut expected_prev = GENESIS.to_string();
+    /// Verify only the tail of the chain after a trusted cursor event.
+    ///
+    /// The cursor event and all events before it are trusted without re-checking.
+    /// Only the events whose `seq` is greater than the cursor's `seq` are
+    /// verified (hash recomputation, chain link, and signature).
+    ///
+    /// # Arguments
+    /// * `from_event_id` — `None` verifies the whole chain (identical to
+    ///   [`verify_chain`]). `Some(id)` verifies only the tail after the trusted
+    ///   cursor event identified by `id`.
+    ///
+    /// # Errors
+    /// * [`BossclawError::Chain`] if `from_event_id` is `Some` and the cursor
+    ///   event is not found in the log.
+    /// * [`BossclawError::Chain`] if any post-cursor row fails the link check,
+    ///   hash recomputation, or signature verification.
+    pub fn verify_chain_since(
+        &self,
+        from_event_id: Option<&str>,
+    ) -> Result<(), BossclawError> {
+        let cursor_id = match from_event_id {
+            None => return self.verify_chain(),
+            Some(id) => id,
+        };
+
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+
+        // Look up the cursor row; its hash is the trusted starting point.
+        let result = conn
+            .query_row(
+                "SELECT seq, hash FROM events WHERE id = ?1",
+                rusqlite::params![cursor_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        let (cursor_seq, cursor_hash) = result.ok_or_else(|| {
+            BossclawError::Chain(format!(
+                "verify_chain_since: cursor event {cursor_id} not found"
+            ))
+        })?;
+
+        // Scan only events strictly after the trusted cursor.
+        let mut stmt = conn.prepare(
+            "SELECT payload, prev_hash, hash FROM events WHERE seq > ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cursor_seq], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+
+        Self::verify_rows(rows, cursor_hash, &self.key)
+    }
+
+    /// Shared per-row verification loop used by both [`verify_chain`] and
+    /// [`verify_chain_since`].
+    ///
+    /// For each row (in the order produced by `rows`), this function:
+    /// 1. Checks that `prev_hash` equals `expected_prev` (chain link).
+    /// 2. Deserialises the payload into an [`Event`].
+    /// 3. Recomputes the canonical hash and compares it with the stored value.
+    /// 4. Verifies the Ed25519 signature over the hash bytes.
+    /// 5. Advances `expected_prev` to the current row's hash.
+    ///
+    /// Returns `Ok(())` when every row passes; propagates the first failure as
+    /// [`BossclawError::Chain`].
+    fn verify_rows(
+        rows: impl Iterator<Item = Result<(String, String, String), rusqlite::Error>>,
+        mut expected_prev: String,
+        key: &SigningKey,
+    ) -> Result<(), BossclawError> {
         for row in rows {
             let (payload, prev_hash, hash_hex) = row?;
             if prev_hash != expected_prev {
@@ -241,7 +314,7 @@ impl EventLog {
                 .signature
                 .as_deref()
                 .ok_or_else(|| BossclawError::Chain("missing signature".into()))?;
-            verify_hash(&hash_bytes, sig, &self.key.verifying_key())?;
+            verify_hash(&hash_bytes, sig, &key.verifying_key())?;
             expected_prev = hash_hex;
         }
         Ok(())
