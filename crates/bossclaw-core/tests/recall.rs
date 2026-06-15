@@ -365,6 +365,65 @@ fn derive_vector_upsert_is_idempotent_and_blob_round_trips() {
     assert_eq!(vectors[0].1, expected, "blob decode must match the embedding");
 }
 
+/// Test-only embedder that fails on one specific input text and succeeds on all
+/// others. Used to verify that `rederive_pending` correctly counts partial
+/// successes (the all-fail case is already covered by `FailingEmbedder`).
+struct MixedEmbedder {
+    fail_on: String,
+    inner: MockEmbedder,
+}
+
+impl MixedEmbedder {
+    fn new(fail_on: impl Into<String>) -> Self {
+        Self { fail_on: fail_on.into(), inner: MockEmbedder::new(MID_DIM) }
+    }
+}
+
+impl Embedder for MixedEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, BossclawError> {
+        // Only called as a one-item batch from embed_one; fail if that item
+        // matches the trigger text.
+        if texts.len() == 1 && texts[0] == self.fail_on {
+            return Err(BossclawError::Embed(format!(
+                "MixedEmbedder: intentional failure for {:?}",
+                self.fail_on
+            )));
+        }
+        self.inner.embed(texts)
+    }
+    fn dim(&self) -> usize {
+        MID_DIM
+    }
+    fn model_id(&self) -> &str {
+        MOCK_MODEL_ID
+    }
+}
+
+#[test]
+fn rederive_pending_partial_failure_skips_one_derives_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    for t in ["good one", "bad seed", "good two"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+
+    // "bad seed" will fail; the other two must succeed.
+    let embedder = MixedEmbedder::new("bad seed");
+    let derived = log.rederive_pending(&embedder).unwrap();
+    assert_eq!(derived, 2, "two successful, one skipped");
+
+    let vectors = log.vectors_for_model(MOCK_MODEL_ID).unwrap();
+    assert_eq!(vectors.len(), 2, "only the two good events have vectors");
+
+    // The failed event must still show up as pending on a subsequent pass
+    // with a working embedder, so the retry hook can recover it.
+    let working = MockEmbedder::new(MID_DIM);
+    assert_eq!(log.rederive_pending(&working).unwrap(), 1, "bad seed recovered on retry");
+    assert_eq!(log.vectors_for_model(MOCK_MODEL_ID).unwrap().len(), 3);
+}
+
 // ---------------------------------------------------------------------------
 // Real-model integration test (ignored in the hermetic suite)
 // ---------------------------------------------------------------------------

@@ -282,21 +282,34 @@ impl EventLog {
     /// upsert each result — never across [`Embedder::embed`], so the single
     /// store mutex cannot deadlock against the embedder.
     ///
-    /// BEST-EFFORT: an individual embed failure is logged to `eprintln!` and
-    /// skipped; the backfill continues. Returns the number of vectors
+    /// BEST-EFFORT: an individual embed failure is logged via [`log::warn!`]
+    /// and skipped; the backfill continues. Returns the number of vectors
     /// successfully derived.
     pub fn rederive_pending(&self, embedder: &dyn Embedder) -> Result<usize, BossclawError> {
         let pending = self.collect_pending(embedder.model_id())?;
         let mut derived = 0usize;
         for event in pending {
+            // `collect_pending` already filters to embeddable event types, but
+            // the individual event's `content["text"]` may still be absent or
+            // non-string (malformed data). Warn so the bad event is visible;
+            // do NOT insert a tombstone — a zero-length vector would corrupt
+            // T5 index reads.
             let text = match embeddable_text(&event) {
                 Some(t) => t,
-                None => continue,
+                None => {
+                    log::warn!(
+                        "rederive_pending: event {} (type={}) has no embeddable text; \
+                         skipping (malformed content)",
+                        event.id,
+                        event.event_type,
+                    );
+                    continue;
+                }
             };
             let embedding = match embed_one(embedder, &text) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
+                    log::warn!(
                         "rederive_pending: skipping event {} (embed failed): {e}",
                         event.id
                     );
@@ -345,16 +358,39 @@ impl EventLog {
     /// Collect, under a single short-lived lock, the events of an embeddable
     /// type that have no `vectors` row for `model_id`, in `seq` order. Returns
     /// owned `Event`s so the lock is released before any embedding happens.
+    ///
+    /// The SQL `IN (...)` filter is built from [`EMBEDDABLE_EVENT_TYPES`] so
+    /// there is a single authoritative list — the Rust const and the SQL clause
+    /// cannot drift independently.
     fn collect_pending(&self, model_id: &str) -> Result<Vec<Event>, BossclawError> {
-        let store = self.inner.lock().expect(POISON);
-        let conn = store.conn();
-        let mut stmt = conn.prepare(
+        // Build `?2,?3,...` placeholders (one per embeddable type; ?1 = model_id).
+        let placeholders: String = EMBEDDABLE_EVENT_TYPES
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
             "SELECT e.payload FROM events e
              LEFT JOIN vectors v ON v.event_id = e.id AND v.model_id = ?1
-             WHERE v.event_id IS NULL AND e.event_type IN ('memory','page')
-             ORDER BY e.seq ASC",
-        )?;
-        let rows = stmt.query_map([model_id], |r| r.get::<_, String>(0))?;
+             WHERE v.event_id IS NULL AND e.event_type IN ({placeholders})
+             ORDER BY e.seq ASC"
+        );
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        // Bind model_id first (?1), then each embeddable type (?2, ?3, …).
+        // `&&str` coerces to `&dyn ToSql`; `&model_id` produces `&&str` from
+        // `&str`, and `t` from `EMBEDDABLE_EVENT_TYPES` is already `&&str`.
+        let params: Vec<&dyn rusqlite::ToSql> =
+            std::iter::once(&model_id as &dyn rusqlite::ToSql)
+                .chain(
+                    EMBEDDABLE_EVENT_TYPES
+                        .iter()
+                        .map(|t| t as &dyn rusqlite::ToSql),
+                )
+                .collect();
+        let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(serde_json::from_str(&row?)?);
@@ -432,10 +468,9 @@ fn blob_to_vec(blob: &[u8]) -> Result<Vec<f32>, BossclawError> {
     }
     let mut out = Vec::with_capacity(blob.len() / F32_BYTES);
     for chunk in blob.chunks_exact(F32_BYTES) {
-        let bytes: [u8; F32_BYTES] = chunk
-            .try_into()
-            .map_err(|_| BossclawError::Store("chunk size mismatch decoding embedding".into()))?;
-        out.push(f32::from_le_bytes(bytes));
+        // `chunks_exact(4)` guarantees exactly 4 bytes; index directly rather
+        // than `try_into` (which is unreachable and confuses the reader).
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(out)
 }
