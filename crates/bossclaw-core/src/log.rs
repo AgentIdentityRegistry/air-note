@@ -19,7 +19,8 @@ use rusqlite::OptionalExtension;
 
 use crate::embed::Embedder;
 use crate::error::BossclawError;
-use crate::event::{compute_hash, Event};
+use crate::event::{compute_hash, Event, ModelMeta};
+use crate::graph::MANUAL_LINK_PRODUCER;
 use crate::highwater::{HighWaterStore, Mark};
 use crate::index::{HnswIndex, VectorIndex};
 use crate::keyword;
@@ -156,6 +157,31 @@ impl EventLog {
             "CREATE TABLE IF NOT EXISTS fts_map (
                 rowid    INTEGER PRIMARY KEY,
                 event_id TEXT NOT NULL UNIQUE
+            )",
+        )?;
+        // Bi-temporal graph projection (Tier-A; spec §5.6). One `edges` row per
+        // `link` event (PK = the link's ULID); `invalidate` closes rows by
+        // setting valid_to/invalidated_at. `nodes` = distinct endpoints. Both are
+        // a deterministic fold over link/invalidate events, rebuilt by
+        // `rebuild_graph`. Timestamps are stored normalized (fixed-width UTC) so
+        // SQL TEXT comparison equals chronological comparison.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS edges (
+                edge_id        TEXT PRIMARY KEY,
+                src            TEXT NOT NULL,
+                relation       TEXT NOT NULL,
+                dst            TEXT NOT NULL,
+                valid_from     TEXT NOT NULL,
+                valid_to       TEXT,
+                ingested_at    TEXT NOT NULL,
+                invalidated_at TEXT,
+                invalidated_by TEXT
+            )",
+        )?;
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS nodes (
+                node_id TEXT PRIMARY KEY,
+                kind    TEXT NOT NULL
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -1159,6 +1185,103 @@ impl EventLog {
         );
 
         Ok(ReembedStats { reembedded, gc_removed, elapsed_ms })
+    }
+
+    /// Append a signed Tier-B `link` event connecting `src` —`relation`→ `dst`.
+    ///
+    /// `valid_time` (optional, RFC 3339) is the world-clock start; absent means
+    /// "valid from when we learned it" (the event's ingestion `ts`). If
+    /// `source_event_ids` is empty it defaults to `[src, dst]` so the Tier-B
+    /// non-empty-provenance rule is satisfied honestly (the two endpoints justify
+    /// the link). Returns the new event id (which is also the edge's identity).
+    ///
+    /// The `edges` table is NOT updated here — call [`EventLog::rebuild_graph`]
+    /// to refresh `neighbors`/`as_of`/the recall boost (same "rebuild after
+    /// append" lifecycle as [`EventLog::rebuild_indexes`]).
+    pub fn link(
+        &self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        valid_time: Option<&str>,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        self.append_graph_event("link", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
+    }
+
+    /// Append a signed Tier-B `invalidate` event retiring the edge-key
+    /// `(src, relation, dst)`. `valid_time` (optional) is when the fact stopped
+    /// being true in the world. Same `source_event_ids` defaulting and lifecycle
+    /// as [`EventLog::link`].
+    pub fn invalidate(
+        &self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        valid_time: Option<&str>,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        self.append_graph_event("invalidate", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
+    }
+
+    /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
+    /// default for `source_event_ids` is gated to the manual producer only.
+    ///
+    /// **SECURITY (taint, parent §5.11):** the `[src, dst]` default is for
+    /// MANUAL (engine/test) links only — there the two endpoints genuinely ARE
+    /// the whole justification. A non-manual producer (the M4 reasoner) MUST
+    /// pass its real read-set; defaulting there would erase the inducing event
+    /// from the lineage the actuator walks fail-closed.
+    ///
+    /// Eight parameters are required by the F2 security design; a builder struct
+    /// would add indirection without safety benefit for this private helper.
+    #[allow(clippy::too_many_arguments)]
+    fn append_graph_event(
+        &self,
+        event_type: &str,
+        producer: &str,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        valid_time: Option<&str>,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        let sources = match (producer == MANUAL_LINK_PRODUCER, source_event_ids.is_empty()) {
+            (true, true) => vec![src.to_string(), dst.to_string()],
+            (false, true) => {
+                return Err(BossclawError::Chain(
+                    "non-manual graph link requires explicit source_event_ids (no [src,dst] \
+                     default — would launder taint past the §5.11 lineage walk)".into(),
+                ))
+            }
+            (_, false) => source_event_ids.to_vec(),
+        };
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: valid_time.map(String::from),
+            event_type: event_type.to_string(),
+            content: serde_json::json!({ "src": src, "relation": relation, "dst": dst }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(),
+                prompt_hash: String::new(),
+                source_event_ids: sources,
+            }),
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// The DID stamped on engine-authored events (`link`/`invalidate`). v1 uses a
+    /// fixed engine identity; M4/M7 will thread the user's real DID through here.
+    ///
+    /// Note: `signed_by_did` is informational here (not verified against `key` at
+    /// append). A fixed engine DID keeps the M3 surface small; threading the user
+    /// DID is M4/M7 (carried, security I3).
+    fn signer_did(&self) -> String {
+        "did:wba:bossclaw-engine".to_string()
     }
 
     /// Persist the current tip as the signed high-water mark (debounced by the
