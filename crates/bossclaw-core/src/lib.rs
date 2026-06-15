@@ -17,6 +17,7 @@ pub mod error;
 pub mod event;
 pub mod highwater;
 pub mod log;
+pub mod model2vec;
 pub mod sign;
 pub mod store;
 
@@ -24,3 +25,4 @@ pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};
 pub use log::{ActiveModel, EventLog};
+pub use model2vec::Model2Vec;

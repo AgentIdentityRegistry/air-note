@@ -1,4 +1,5 @@
 use bossclaw_core::embed::{Embedder, MockEmbedder};
+use bossclaw_core::model2vec::Model2Vec;
 use bossclaw_core::event::Event;
 use bossclaw_core::log::EventLog;
 use bossclaw_core::BossclawError;
@@ -178,5 +179,86 @@ fn mock_embedder_empty_text_returns_zero_vector() {
     assert!(
         vecs[0].iter().all(|&x| x == 0.0),
         "empty text must produce an all-zero vector"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Real-model integration test (ignored in the hermetic suite)
+// ---------------------------------------------------------------------------
+//
+// To run this test, first fetch the model:
+//
+//   pip install huggingface_hub
+//   python - <<'EOF'
+//   from huggingface_hub import snapshot_download
+//   path = snapshot_download("minishlab/potion-base-8M")
+//   print(path)
+//   EOF
+//
+// Then point the env var at the downloaded directory and run:
+//
+//   BOSSCLAW_TEST_MODEL_DIR=<path> \
+//     cargo test -p bossclaw-core -- --include-ignored model2vec_real_model
+//
+/// Integration test for [`Model2Vec`] against a real `minishlab/potion-base-8M`
+/// model directory.
+///
+/// Skipped automatically unless `BOSSCLAW_TEST_MODEL_DIR` is set in the
+/// environment. See module-level comment for download instructions.
+#[test]
+#[ignore = "requires BOSSCLAW_TEST_MODEL_DIR pointing at a local model dir"]
+fn model2vec_real_model_embedding_shape_and_recall() {
+    let dir = match std::env::var("BOSSCLAW_TEST_MODEL_DIR") {
+        Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => {
+            eprintln!(
+                "BOSSCLAW_TEST_MODEL_DIR not set — skipping real-model test. \
+                 See test doc-comment for download instructions."
+            );
+            return;
+        }
+    };
+
+    let model = Model2Vec::from_pretrained(&dir, "minishlab/potion-base-8M")
+        .expect("Model2Vec::from_pretrained failed");
+
+    assert!(model.dim() > 0, "dim must be positive after load");
+    assert_eq!(model.model_id(), "minishlab/potion-base-8M");
+
+    // Near-paraphrase pair and an unrelated sentence.
+    let paraphrase_a = "A cat sat on the mat.".to_string();
+    let paraphrase_b = "A feline rested on a rug.".to_string();
+    let unrelated = "The stock market fell sharply today.".to_string();
+
+    let vecs = model
+        .embed(&[paraphrase_a, paraphrase_b, unrelated])
+        .expect("embed failed");
+
+    assert_eq!(vecs.len(), 3);
+    assert_eq!(vecs[0].len(), model.dim());
+    assert_eq!(vecs[1].len(), model.dim());
+    assert_eq!(vecs[2].len(), model.dim());
+
+    let cos = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
+    };
+
+    let sim_paraphrase = cos(&vecs[0], &vecs[1]);
+    let sim_unrelated_a = cos(&vecs[0], &vecs[2]);
+    let sim_unrelated_b = cos(&vecs[1], &vecs[2]);
+
+    eprintln!("cosine(paraphrase pair)  = {sim_paraphrase:.4}");
+    eprintln!("cosine(a, unrelated)     = {sim_unrelated_a:.4}");
+    eprintln!("cosine(b, unrelated)     = {sim_unrelated_b:.4}");
+
+    assert!(
+        sim_paraphrase > sim_unrelated_a,
+        "paraphrase pair ({sim_paraphrase:.4}) should be closer than \
+         sentence-a vs unrelated ({sim_unrelated_a:.4})"
+    );
+    assert!(
+        sim_paraphrase > sim_unrelated_b,
+        "paraphrase pair ({sim_paraphrase:.4}) should be closer than \
+         sentence-b vs unrelated ({sim_unrelated_b:.4})"
     );
 }
