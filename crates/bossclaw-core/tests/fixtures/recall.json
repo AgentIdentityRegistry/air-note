@@ -1,0 +1,53 @@
+{
+  "docs": [
+    {"id": "d01", "text": "The mitochondria is the powerhouse of the cell."},
+    {"id": "d02", "text": "Photosynthesis converts sunlight into chemical energy in plants."},
+    {"id": "d03", "text": "Newton's third law states that every action has an equal and opposite reaction."},
+    {"id": "d04", "text": "The Eiffel Tower was built in Paris in 1889 as a temporary exhibition structure."},
+    {"id": "d05", "text": "Rust uses ownership and borrowing to guarantee memory safety without a garbage collector."},
+    {"id": "d06", "text": "Black holes are regions of spacetime where gravity is so strong that nothing can escape."},
+    {"id": "d07", "text": "The human genome contains approximately three billion base pairs of DNA."},
+    {"id": "d08", "text": "Classical music flourished during the Baroque period with composers like Bach and Vivaldi."},
+    {"id": "d09", "text": "A neural network learns by adjusting weights through backpropagation of error gradients."},
+    {"id": "d10", "text": "The Amazon rainforest produces about twenty percent of the world's oxygen."},
+    {"id": "d11", "text": "Fermentation is an anaerobic process used by yeast to produce alcohol and carbon dioxide."},
+    {"id": "d12", "text": "The speed of light in a vacuum is approximately 299,792 kilometres per second."},
+    {"id": "d13", "text": "Kubernetes orchestrates containerised applications across clusters of machines."},
+    {"id": "d14", "text": "Vincent van Gogh painted Starry Night while staying at a psychiatric hospital in 1889."},
+    {"id": "d15", "text": "Tectonic plates move a few centimetres per year, driving earthquakes and mountain formation."}
+  ],
+  "queries": [
+    {
+      "q": "cellular energy production organelle",
+      "relevant": ["d01"]
+    },
+    {
+      "q": "plants use sunlight to make food",
+      "relevant": ["d02"]
+    },
+    {
+      "q": "Rust programming language memory management",
+      "relevant": ["d05"]
+    },
+    {
+      "q": "machine learning gradient descent weight update",
+      "relevant": ["d09"]
+    },
+    {
+      "q": "Kubernetes containers cluster",
+      "relevant": ["d13"]
+    },
+    {
+      "q": "speed of light vacuum",
+      "relevant": ["d12"]
+    },
+    {
+      "q": "Van Gogh Starry Night painting",
+      "relevant": ["d14"]
+    },
+    {
+      "q": "regions of spacetime with extreme gravity from which light cannot escape",
+      "relevant": ["d06"]
+    }
+  ]
+}

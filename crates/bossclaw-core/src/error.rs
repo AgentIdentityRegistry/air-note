@@ -37,6 +37,14 @@ pub enum BossclawError {
     /// An IO failure (high-water file, etc.).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A caller supplied an invalid argument (e.g. `dim = 0`).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    /// A model load or encode operation failed (e.g. corrupt weights file).
+    #[error("embed error: {0}")]
+    Embed(String),
 }
 
 impl From<rusqlite::Error> for BossclawError {
