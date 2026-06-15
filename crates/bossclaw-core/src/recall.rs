@@ -84,10 +84,15 @@ pub const RRF_K: f32 = 60.0;
 /// How much a maximally-recent event can boost its fused score, as a fraction of
 /// that score. The recency multiplier is `1.0 + RECENCY_WEIGHT * decay` where
 /// `decay ∈ (0, 1]`, so a brand-new event is boosted by at most +50% and an
-/// ancient one by ~0%. Kept below 1.0 on purpose: recency is a *tilt* on the RRF
-/// ordering, never a strong enough force to swamp a genuinely better lexical or
-/// semantic match (an RRF score difference between adjacent ranks is roughly
-/// `1/RRF_K`, and a ≤1.5× multiplier preserves clear rank gaps).
+/// ancient one by ~0%. Kept below 1.0 on purpose: recency is a *tilt* on the
+/// RRF ordering that can reorder candidates with equal or near-equal fused base
+/// scores. It does not guarantee preservation of rank gaps between clearly
+/// distinct candidates (e.g. a single-arm hit may be re-ranked by a very recent
+/// two-arm hit if their RRF gap is smaller than the recency boost). For
+/// candidates with identical text (and therefore identical RRF base), the final
+/// ordering is determined by the explicit `ts`-DESC comparator in `recall`,
+/// not by the float recency multiplier, which may underflow to `0.0` in f32 for
+/// sub-millisecond age differences.
 pub const RECENCY_WEIGHT: f32 = 0.5;
 
 /// Recency-decay half-life, in seconds. At this age the recency `decay` term is

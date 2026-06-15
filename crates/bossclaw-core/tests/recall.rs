@@ -113,8 +113,8 @@ fn mock_embedder_dim_matches_dim_method() {
 fn mock_embedder_is_deterministic() {
     let embedder = MockEmbedder::new(32);
     let text = "the quick brown fox".to_string();
-    let v1 = embedder.embed(&[text.clone()]).unwrap();
-    let v2 = embedder.embed(&[text]).unwrap();
+    let v1 = embedder.embed(std::slice::from_ref(&text)).unwrap();
+    let v2 = embedder.embed(std::slice::from_ref(&text)).unwrap();
     assert_eq!(v1, v2, "same input must produce same output");
 }
 
@@ -558,11 +558,8 @@ fn rebuild_reproduces_top1_and_recall_stability_across_reopens() {
         .unwrap()
         .remove(0);
 
-    // Collect the known event_id for `known_idx` from the first rebuild.
-    let known_event_id: String;
-
     // --- Rebuild 1: establish top-1 and capture the target event_id. ---
-    let first_top1: String = {
+    let known_event_id: String = {
         let key = SigningKey::from_bytes(&KEY_BYTES);
         let log = EventLog::open(&db, &DEK, key).unwrap();
         log.rebuild_indexes(&embedder).unwrap();
@@ -575,7 +572,6 @@ fn rebuild_reproduces_top1_and_recall_stability_across_reopens() {
         );
         hits[0].0.clone()
     };
-    known_event_id = first_top1.clone();
 
     // --- Rebuild 2: re-open (fresh Hnsw, fresh OS-seeded RNG). ---
     {
@@ -1136,6 +1132,57 @@ fn recall_degrades_to_keyword_when_vector_index_missing() {
         hit.sources.contains(&RecallSource::Keyword) && !hit.sources.contains(&RecallSource::Vector),
         "degraded result must carry Keyword provenance only, got {:?}",
         hit.sources
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §10 arm-resolution pure unit tests (resolve_arms helper)
+// ---------------------------------------------------------------------------
+
+/// vector-fail → keyword-only: when the vector arm errors, recall degrades to
+/// keyword-only without propagating the error.
+#[test]
+fn resolve_arms_vector_fail_degrades_to_keyword_only() {
+    let kw: Vec<(String, f32)> = vec![("ev1".to_string(), -1.0)];
+    let (vec_arm, kw_arm) =
+        bossclaw_core::log::resolve_arms(
+            Err(BossclawError::InvalidInput("no index".into())),
+            Ok(kw.clone()),
+        )
+        .expect("should not error when keyword arm is ok");
+    assert!(vec_arm.is_empty(), "vector arm must be empty on failure");
+    assert_eq!(kw_arm, kw, "keyword arm must be returned unchanged");
+}
+
+/// keyword-fail → vector-only: when the keyword arm errors, recall degrades to
+/// vector-only without propagating the error.
+#[test]
+fn resolve_arms_keyword_fail_degrades_to_vector_only() {
+    let vec_hits: Vec<(String, f32)> = vec![("ev2".to_string(), 0.1)];
+    let (vec_arm, kw_arm) =
+        bossclaw_core::log::resolve_arms(
+            Ok(vec_hits.clone()),
+            Err(BossclawError::Store("fts gone".into())),
+        )
+        .expect("should not error when vector arm is ok");
+    assert_eq!(vec_arm, vec_hits, "vector arm must be returned unchanged");
+    assert!(kw_arm.is_empty(), "keyword arm must be empty on failure");
+}
+
+/// both-fail → Err: when both arms error, resolve_arms must propagate Err.
+#[test]
+fn resolve_arms_both_fail_returns_err() {
+    let result = bossclaw_core::log::resolve_arms(
+        Err(BossclawError::InvalidInput("no index".into())),
+        Err(BossclawError::Store("fts gone".into())),
+    );
+    assert!(
+        result.is_err(),
+        "both arms failed → must return Err, got {result:?}"
+    );
+    assert!(
+        matches!(result, Err(BossclawError::InvalidInput(_))),
+        "error variant must be InvalidInput (vector arm surfaced), got {result:?}"
     );
 }
 

@@ -5,6 +5,7 @@
 //! never fork (spec §4 single-writer invariant). The evolve loop (M4) is NOT a
 //! privileged writer — it calls `append` like everyone else.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -53,6 +54,15 @@ pub struct ActiveModel {
 
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// `(event_id, arm_score)` pair returned by each retrieval arm. Used as the
+/// common type for both the vector arm (cosine distance, lower=better) and the
+/// keyword arm (BM25 score, lower=better) before fusion.
+type ArmHit = (String, f32);
+
+/// Pair of live arm results (vector arm, keyword arm) returned by
+/// [`resolve_arms`] after applying §10 graceful degradation.
+type ArmPair = (Vec<ArmHit>, Vec<ArmHit>);
 const POISON: &str = "event log mutex poisoned";
 
 /// Number of bytes in a little-endian `f32`. Used to size and validate the
@@ -608,21 +618,36 @@ impl EventLog {
     ///    fusion sees enough tail to reorder): the vector arm
     ///    ([`EventLog::vector_search`]) and the keyword arm
     ///    ([`EventLog::keyword_search`]).
-    /// 3. **Fuse** the two ranked id-lists via [`rrf_fuse`] → base score per id,
-    ///    while recording which arm(s) surfaced each id (its [`RecallSource`]s).
-    /// 4. **Boost** multiplicatively, scaled to the RRF magnitude so the tilt
-    ///    never swamps fusion: recency `*= 1 + RECENCY_WEIGHT * exp(-age/HALF_LIFE)`
+    /// 3. **Fuse** both arms (tie-aware RRF) → base score per id, while recording
+    ///    which arm(s) surfaced each id (its [`RecallSource`]s).
+    /// 4. **Boost** multiplicatively using **f64** throughout to avoid f32
+    ///    precision underflow: recency `*= 1 + RECENCY_WEIGHT * exp(-age/HALF_LIFE)`
     ///    (age = now − the event's `ts`), and pin `*= PIN_MULTIPLIER` for ids in
-    ///    `opts.pinned`.
+    ///    `opts.pinned`. The recency tilt narrows but does not necessarily close
+    ///    every adjacent-rank gap; it reorders candidates with equal or near-equal
+    ///    fused base scores.
     /// 5. **Rerank** through the [`Reranker`] seam (v1: [`NoopReranker`]).
-    /// 6. **Sort** by final score DESC and return the top `k`.
+    /// 6. **Sort** by final score DESC, with **`ts` DESC** as the explicit
+    ///    recency tie-break and **`event_id` DESC** as the final deterministic
+    ///    backstop, then return the top `k`.
+    ///
+    /// ## Why the explicit `ts`-DESC tie-break is required
+    ///
+    /// The recency multiplier `1 + RECENCY_WEIGHT * exp(-age/HALF_LIFE_SECS)` is
+    /// computed in f64 and then stored in `Hit.score` as f32. For events that are
+    /// only milliseconds apart (common in tests), the f64 delta is on the order of
+    /// 1e-11, which underflows to exactly `0.0` when cast to f32 — leaving two
+    /// candidates with bit-identical f32 scores. A sort that breaks those ties by
+    /// HashMap iteration order (random per process via hashbrown's random seed)
+    /// would be non-deterministic ~30 % of runs. The `ts`-DESC comparator makes
+    /// "newer wins ties" a hard guarantee independent of float precision.
     ///
     /// # Graceful degradation (spec §10)
-    /// Recall is robust to a missing or unbuilt index. If the **vector** arm fails
-    /// (embed error OR the index isn't built yet — [`BossclawError::InvalidInput`]),
-    /// it is logged via [`log::warn!`] and recall degrades to **keyword-only**.
-    /// Symmetrically, a failing **keyword** arm degrades to vector-only. Only if
-    /// BOTH arms fail does this return `Err` (the first arm's error).
+    /// Recall is robust to a missing or unbuilt index. Arm resolution is handled
+    /// by [`resolve_arms`]: a failing vector arm (embed error OR index not built —
+    /// [`BossclawError::InvalidInput`]) is logged and recall degrades to
+    /// **keyword-only**; a failing keyword arm degrades to **vector-only**; only
+    /// when both fail is `Err` returned.
     pub fn recall(
         &self,
         embedder: &dyn Embedder,
@@ -630,35 +655,11 @@ impl EventLog {
         k: usize,
         opts: &RecallOptions,
     ) -> Result<Vec<Hit>, BossclawError> {
-        // ── Arm 1: vector (semantic). Embed, then search; either step failing
-        //    degrades us to keyword-only rather than erroring (spec §10). The
-        //    arm returns (event_id, cosine distance) — lower distance is better. ──
-        let vector_hits: Result<Vec<(String, f32)>, BossclawError> = embed_one(embedder, query)
+        // ── Run both arms, applying spec §10 graceful degradation. ──
+        let vector_result = embed_one(embedder, query)
             .and_then(|qv| self.vector_search(&qv, FUSION_FETCH));
-        let (vector_arm, vector_err) = match vector_hits {
-            Ok(hits) => (hits, None),
-            Err(e) => {
-                log::warn!("recall: vector arm unavailable, degrading to keyword-only: {e}");
-                (Vec::new(), Some(e))
-            }
-        };
-
-        // ── Arm 2: keyword (lexical). Returns (event_id, BM25 score) — lower
-        //    BM25 is better. ──
-        let (keyword_arm, keyword_err) = match self.keyword_search(query, FUSION_FETCH) {
-            Ok(hits) => (hits, None),
-            Err(e) => {
-                log::warn!("recall: keyword arm unavailable, degrading to vector-only: {e}");
-                (Vec::new(), Some(e))
-            }
-        };
-
-        // Both arms failed → surface the vector arm's error (the primary arm).
-        if let (Some(verr), Some(_)) = (&vector_err, &keyword_err) {
-            return Err(BossclawError::InvalidInput(format!(
-                "recall failed: both arms unavailable (vector: {verr})"
-            )));
-        }
+        let keyword_result = self.keyword_search(query, FUSION_FETCH);
+        let (vector_arm, keyword_arm) = resolve_arms(vector_result, keyword_result)?;
 
         // ── Provenance: which arm(s) surfaced each id (vector before keyword for
         //    a stable evidence order). Membership sets keep this O(1) per id. ──
@@ -667,9 +668,9 @@ impl EventLog {
         let keyword_set: std::collections::HashSet<&String> =
             keyword_arm.iter().map(|(id, _)| id).collect();
 
-        // ── Fuse both arms → base RRF score per id. Tie-aware: candidates with
-        //    an identical arm score share a rank, so identical-text events get an
-        //    EQUAL base and the recency/pin boost below is the deterministic
+        // ── Fuse both arms → base RRF score (f32) per id. Tie-aware: candidates
+        //    with an identical arm score share a rank, so identical-text events get
+        //    an EQUAL base, making the ts-DESC comparator below the deterministic
         //    tie-break (both arms rank lower scores first → lower_is_better=true). ──
         let fused = fuse_scored_arms(&[
             (vector_arm.as_slice(), true),
@@ -682,24 +683,30 @@ impl EventLog {
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
-        // ── Assemble hits: base RRF score × recency × pin, with provenance. ──
-        let mut hits: Vec<Hit> = fused
+        // ── Assemble hits: compute the full-precision (f64) boosted score, store
+        //    it alongside the Hit so the sort comparator can use it without
+        //    re-computing. Hit.score is set from the f64 value (truncated to f32
+        //    for the public field) so callers get a reasonably precise score. ──
+        let scored: Vec<(Hit, f64)> = fused
             .into_iter()
             .map(|(id, base_score)| {
-                let mut score = base_score;
-                // Recency: 1 + WEIGHT * exp(-age/half_life). Multiplicative and
-                // bounded by (1 + RECENCY_WEIGHT), so it tilts but never swamps
-                // the ~1/RRF_K-scale fused score. A candidate with no parseable
-                // ts contributes no recency boost (factor 1.0) rather than erroring.
+                // Carry base score in f64 to avoid sub-millisecond recency deltas
+                // underflowing when cast to f32 (see doc comment above).
+                let mut score_f64 = base_score as f64;
+
+                // Recency tilt: multiplicative, bounded by (1 + RECENCY_WEIGHT).
+                // A candidate with no parseable ts gets factor 1.0 (no boost).
                 if let Some(ts) = timestamps.get(&id) {
                     let age_secs = (now - *ts).num_milliseconds() as f64 / 1000.0;
-                    let decay = (-age_secs / HALF_LIFE_SECS).exp() as f32;
-                    score *= 1.0 + RECENCY_WEIGHT * decay;
+                    let decay = (-age_secs / HALF_LIFE_SECS).exp();
+                    score_f64 *= 1.0 + RECENCY_WEIGHT as f64 * decay;
                 }
-                // Pin: a hard multiplicative boost for explicitly-pinned ids.
+
+                // Pin: hard multiplicative boost for explicitly-pinned ids.
                 if pinned.contains(&id) {
-                    score *= PIN_MULTIPLIER;
+                    score_f64 *= PIN_MULTIPLIER as f64;
                 }
+
                 let mut sources = Vec::new();
                 if vector_set.contains(&id) {
                     sources.push(RecallSource::Vector);
@@ -707,15 +714,41 @@ impl EventLog {
                 if keyword_set.contains(&id) {
                     sources.push(RecallSource::Keyword);
                 }
-                Hit { event_id: id, score, sources }
+                let hit = Hit { event_id: id, score: score_f64 as f32, sources };
+                (hit, score_f64)
             })
             .collect();
 
-        // ── Rerank (v1: identity) then take the top-k by final score DESC. ──
+        // ── Rerank (v1: identity). Split scored into (Hit, f64) components;
+        //    keep the id→f64 map for the sort comparator. ──
         let reranker = NoopReranker;
-        let mut hits = reranker.rerank(query, std::mem::take(&mut hits));
-        // Sort by score DESC; `f32` is not `Ord`, so use total_cmp and reverse.
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut id_to_score: std::collections::HashMap<String, f64> =
+            HashMap::with_capacity(scored.len());
+        let hits_only: Vec<Hit> = scored
+            .into_iter()
+            .map(|(h, s)| {
+                id_to_score.insert(h.event_id.clone(), s);
+                h
+            })
+            .collect();
+        let mut hits = reranker.rerank(query, hits_only);
+
+        // ── Sort: score_f64 DESC → ts DESC (newer wins) → event_id DESC (backstop).
+        //    The ts-DESC key is the explicit recency tie-break that survives f32
+        //    underflow (see doc comment). event_id DESC is the final deterministic
+        //    backstop for candidates that genuinely share a ts (e.g. same-millisecond
+        //    appends in tests). ──
+        hits.sort_by(|a, b| {
+            let sa = id_to_score.get(&a.event_id).copied().unwrap_or(0.0);
+            let sb = id_to_score.get(&b.event_id).copied().unwrap_or(0.0);
+            sb.total_cmp(&sa)
+                .then_with(|| {
+                    let ta = timestamps.get(&a.event_id);
+                    let tb = timestamps.get(&b.event_id);
+                    tb.cmp(&ta) // newer (larger DateTime) first
+                })
+                .then_with(|| b.event_id.cmp(&a.event_id)) // lexicographic DESC backstop
+        });
         hits.truncate(k);
         Ok(hits)
     }
@@ -925,4 +958,39 @@ fn blob_to_vec(blob: &[u8]) -> Result<Vec<f32>, BossclawError> {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(out)
+}
+
+/// Resolve the raw results of the two recall arms into live arm data, applying
+/// spec §10 graceful degradation.
+///
+/// | vector result | keyword result | outcome |
+/// |---|---|---|
+/// | `Ok(hits)` | `Ok(hits)` | both arms active |
+/// | `Err(_)` | `Ok(hits)` | keyword-only (vector failure logged) |
+/// | `Ok(hits)` | `Err(_)` | vector-only (keyword failure logged) |
+/// | `Err(ve)` | `Err(_)` | `Err(InvalidInput(…ve…))` |
+///
+/// This is a **pure** function (no I/O, no `self`) so it can be unit-tested
+/// directly without a database. `recall` delegates the arm-failure logic here.
+pub fn resolve_arms(
+    vector: Result<Vec<ArmHit>, BossclawError>,
+    keyword: Result<Vec<ArmHit>, BossclawError>,
+) -> Result<ArmPair, BossclawError> {
+    match (vector, keyword) {
+        (Ok(v), Ok(k)) => Ok((v, k)),
+        (Err(ve), Ok(k)) => {
+            log::warn!("recall: vector arm unavailable, degrading to keyword-only: {ve}");
+            Ok((Vec::new(), k))
+        }
+        (Ok(v), Err(ke)) => {
+            log::warn!("recall: keyword arm unavailable, degrading to vector-only: {ke}");
+            Ok((v, Vec::new()))
+        }
+        (Err(ve), Err(ke)) => {
+            log::warn!("recall: both arms unavailable (keyword: {ke})");
+            Err(BossclawError::InvalidInput(format!(
+                "recall failed: both arms unavailable (vector: {ve})"
+            )))
+        }
+    }
 }
