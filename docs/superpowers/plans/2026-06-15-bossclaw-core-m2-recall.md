@@ -25,7 +25,7 @@ Both gating spikes from spec §14 passed empirically *before* this plan:
 
 ### Refinements adopted (deviations from the spec's default assumptions — blessed by the plan review)
 - **R1 — Embedder default = `model2vec` (pure-Rust), not `fastembed`.** `fastembed`/`bge-small` ships behind a `fastembed` cargo feature as the opt-in quality upgrade. **The §11 recall@k fixture + a per-platform offline-bundling CI check make the final default call at the end of M2** (spec §3.3: "the recall fixture is the empirical tiebreak").
-- **R2 — Vector index persistence = rebuild-in-memory-on-open** for v1 (no persisted sidecar). The spec's "encrypted sidecar" becomes a post-v1 startup optimization, gated on the Task-9 rebuild-time budget. **Scope note (critic):** for the in-memory hnsw graph, "Tier-A rebuildable" means **behaviorally-equivalent recall** (top-1 identity + top-k set equality), NOT the literal byte-identity spec §4/§11 (spec:260) requires of *persisted* Tier-A tables. The `vectors` TABLE itself IS byte-deterministic under a fixed model; only the un-persisted hnsw graph relaxes to behavioral equivalence. Task 5 also prints a rebuild-time line so the startup cost is visible before Task 9, not just at the end.
+- **R2 — Vector index persistence = rebuild-in-memory-on-open** for v1 (no persisted sidecar). The spec's "encrypted sidecar" becomes a post-v1 startup optimization, gated on the Task-9 rebuild-time budget. **Scope note (critic + T5 finding):** for the in-memory hnsw graph, "Tier-A rebuildable" means **behaviorally-equivalent recall** (top-1 identity + recall stability — a known item stays in top-k across rebuilds), NOT top-k set/order identity and NOT the literal byte-identity spec §4/§11 (spec:260) requires of *persisted* Tier-A tables. **Measured in T5:** `hnsw_rs` 0.3.4 reseeds level-assignment from OS randomness on every `Hnsw::new` (no seed API) — over 12 rebuilds top-1 was 12/12 identical but the deep-rank set varied (~half), so the index is rebuild-stable for *which* memory is most relevant, not for deep-rank order. Cross-session rank determinism is the deferred encrypted-sidecar's job. The `vectors` TABLE itself IS byte-deterministic under a fixed model; only the un-persisted hnsw graph relaxes to behavioral equivalence. Task 5 also prints a rebuild-time line so the startup cost is visible before Task 9, not just at the end.
 - **R3 — FTS5 stays inside SQLCipher** (proven no-plaintext; transactional with the log).
 
 ---
@@ -108,7 +108,7 @@ MockEmbedder MUST L2-normalize (so `DistCosine` math is consistent with the real
 
 **Files:** create `src/index.rs`; modify `src/log.rs`; test in `tests/recall.rs`.
 
-- [ ] **Step 1 — failing tests:** (a) `HnswIndex` add/search returns nearest event_ids; (b) **[critic F2]** after a fresh `EventLog::open_with_recall(...)`, `rebuild_indexes` reproduces **top-1 identity AND top-k SET equality** (NOT ranked-list identity — ANN is approximate); (c) **[critic F4]** `remove(event_id)` drops it from results; (d) **[critic gap]** feeding mixed-model rows, only active-model vectors are indexed (C4 at the index layer).
+- [ ] **Step 1 — failing tests:** (a) `HnswIndex` add/search returns nearest event_ids; (b) **[critic F2 / T5 finding]** after a fresh `EventLog::open(...)` + `rebuild_indexes(embedder)`, recall reproduces **top-1 identity** (use a query EQUAL to an inserted vector, distance ~0, so it can't flake) **AND recall stability** (a known item stays in top-k across 3 rebuilds) — NOT top-k set/order identity (hnsw_rs reseeds from OS randomness each build); (c) **[critic F4]** `remove(event_id)` drops it from results; (d) **[critic gap]** feeding mixed-model rows, only active-model vectors are indexed (C4 at the index layer).
 - [ ] **Step 2 — pure trait (no Store):**
 ```rust
 /// In-memory ANN over the ACTIVE model's vectors. NOT persisted in v1 — rebuilt
@@ -179,7 +179,7 @@ Recipe: embed query → `vector.search(qv, k)` + `keyword.search(q, k)` → **Re
 - [ ] `cargo build -p bossclaw-core` pulls **no ort**; `--features fastembed` does (R1/R3 verified).
 - [ ] `config` convention + `active_model()` defined (NOT assumed from M1); `schema_version` reserved in the config content.
 - [ ] vectors table Tier-A, active-model filtered; derive is best-effort; `rederive_pending` backfills gaps (§10 proven by test).
-- [ ] pure `VectorIndex` trait incl. `remove`; `HnswIndex` rebuilt by `EventLog` from `vectors ORDER BY event_id ASC`; rebuild reproduces **top-1 + top-k set** (not byte-identity — R2 scope note); rebuild-time line printed.
+- [ ] pure `VectorIndex` trait incl. `remove`; `HnswIndex` rebuilt by `EventLog` from `vectors ORDER BY event_id ASC`; rebuild reproduces **top-1 + recall stability** (NOT top-k set identity — hnsw_rs reseeds per build; R2 scope note); rebuild-time line printed.
 - [ ] FTS5 inside SQLCipher + `fts_map`; the **no-plaintext-on-disk** test is a permanent guard.
 - [ ] Hybrid recall (RRF + multiplicative recency/pin) returns provenance-tagged `Hit`s; reranker no-op-default trait.
 - [ ] `verify_chain_since` bounds verification; re-embed migration works, is resumable, and **a time-budget number is recorded**.
