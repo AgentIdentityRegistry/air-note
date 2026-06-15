@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::error::BossclawError;
@@ -17,6 +18,26 @@ use crate::event::{compute_hash, Event};
 use crate::highwater::{HighWaterStore, Mark};
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
+
+/// The parsed content of the latest `config` event.
+///
+/// A `config` event uses `event_type = "config"` and carries a `content`
+/// object with the following fields:
+/// - `active_model_id`: identifier of the active embedding model.
+/// - `dim`: vector dimensionality produced by that model.
+/// - `schema_version`: reserved for format-gating in later milestones.
+///
+/// Only the LATEST config event is authoritative. Appending a new config event
+/// is how the active model is rotated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveModel {
+    /// Identifier of the active embedding model (e.g. `"mock-v1"`).
+    pub active_model_id: String,
+    /// Dimensionality of the vectors produced by the active model.
+    pub dim: u32,
+    /// Reserved: format-gating logic is deferred to a later milestone.
+    pub schema_version: u32,
+}
 
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
@@ -153,6 +174,33 @@ impl EventLog {
         }
         log.highwater = Some(highwater);
         Ok(log)
+    }
+
+    /// Return the active embedding model configuration, parsed from the latest
+    /// `config` event in the log.
+    ///
+    /// A `config` event has `event_type = "config"` and a `content` object
+    /// with `active_model_id`, `dim`, and `schema_version`. Only the row with
+    /// the highest `seq` is used; earlier config events are superseded.
+    ///
+    /// Returns `Ok(None)` if no `config` event has ever been appended.
+    pub fn active_model(&self) -> Result<Option<ActiveModel>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let result = conn.query_row(
+            "SELECT payload FROM events WHERE event_type='config' ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        );
+        match result {
+            Ok(payload) => {
+                let event: Event = serde_json::from_str(&payload)?;
+                let model: ActiveModel = serde_json::from_value(event.content)?;
+                Ok(Some(model))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(BossclawError::Store(e.to_string())),
+        }
     }
 
     /// Return every event in chain order (M1: full scan; M2 adds `since`).

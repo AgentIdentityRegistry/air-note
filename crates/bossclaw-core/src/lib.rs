@@ -2,6 +2,8 @@
 //!
 //! Local-first, signed, encrypted memory engine for BossClaw.
 //! Milestone 1 (Bedrock): the encrypted, append-only, Ed25519-signed event log.
+//! Milestone 2 (Recall): config-event convention, active-model lookup, and the
+//! `Embedder` trait with a deterministic `MockEmbedder` for tests.
 //!
 //! The event log is the single source of truth; every other structure (M2+) is
 //! derived and rebuildable from it. See
@@ -10,6 +12,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod embed;
 pub mod error;
 pub mod event;
 pub mod highwater;
@@ -17,6 +20,7 @@ pub mod log;
 pub mod sign;
 pub mod store;
 
+pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};
-pub use log::EventLog;
+pub use log::{ActiveModel, EventLog};
