@@ -34,6 +34,8 @@ pub struct ActiveModel {
     /// Identifier of the active embedding model (e.g. `"mock-v1"`).
     pub active_model_id: String,
     /// Dimensionality of the vectors produced by the active model.
+    /// Callers feeding this into an `Embedder` should convert with
+    /// `usize::try_from(model.dim).expect("dim fits usize")`.
     pub dim: u32,
     /// Reserved: format-gating logic is deferred to a later milestone.
     pub schema_version: u32,

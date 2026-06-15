@@ -1,11 +1,17 @@
 use bossclaw_core::embed::{Embedder, MockEmbedder};
 use bossclaw_core::event::Event;
 use bossclaw_core::log::EventLog;
+use bossclaw_core::BossclawError;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 
 const DEK: [u8; 32] = [42u8; 32];
 const KEY_BYTES: [u8; 32] = [7u8; 32];
+
+/// Small dimension used for batch and basic-shape tests.
+const SMALL_DIM: usize = 16;
+/// Mid-range dimension used for norm and distinctness tests.
+const MID_DIM: usize = 64;
 
 fn mk_config_event(model_id: &str, dim: u32, schema_version: u32) -> Event {
     Event {
@@ -59,7 +65,7 @@ fn active_model_ignores_non_config_events() {
     let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
 
     // Append a config, then a non-config memory event.
-    log.append(mk_config_event("a", 64, 1)).unwrap();
+    log.append(mk_config_event("a", MID_DIM as u32, 1)).unwrap();
     log.append(Event {
         id: String::new(),
         ts: String::new(),
@@ -75,19 +81,22 @@ fn active_model_ignores_non_config_events() {
     .unwrap();
 
     // active_model() must still return "a" (the latest config), not None.
-    let model = log.active_model().unwrap().expect("should still have active model");
+    let model = log
+        .active_model()
+        .unwrap()
+        .expect("should still have active model");
     assert_eq!(model.active_model_id, "a");
-    assert_eq!(model.dim, 64);
+    assert_eq!(model.dim, MID_DIM as u32);
 }
 
 // --- MockEmbedder tests ---
 
 #[test]
 fn mock_embedder_returns_vectors_of_correct_dim() {
-    let embedder = MockEmbedder::new(64);
+    let embedder = MockEmbedder::new(MID_DIM);
     let vecs = embedder.embed(&["hello world".to_string()]).unwrap();
     assert_eq!(vecs.len(), 1);
-    assert_eq!(vecs[0].len(), 64);
+    assert_eq!(vecs[0].len(), MID_DIM);
 }
 
 #[test]
@@ -109,8 +118,10 @@ fn mock_embedder_is_deterministic() {
 
 #[test]
 fn mock_embedder_output_is_unit_norm_for_nonempty_text() {
-    let embedder = MockEmbedder::new(64);
-    let vecs = embedder.embed(&["hello world foo bar".to_string()]).unwrap();
+    let embedder = MockEmbedder::new(MID_DIM);
+    let vecs = embedder
+        .embed(&["hello world foo bar".to_string()])
+        .unwrap();
     let v = &vecs[0];
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
@@ -122,7 +133,7 @@ fn mock_embedder_output_is_unit_norm_for_nonempty_text() {
 #[test]
 fn mock_embedder_model_id_is_stable() {
     let e1 = MockEmbedder::new(32);
-    let e2 = MockEmbedder::new(64);
+    let e2 = MockEmbedder::new(MID_DIM);
     // model_id is "mock-v1" regardless of dim
     assert_eq!(e1.model_id(), "mock-v1");
     assert_eq!(e2.model_id(), "mock-v1");
@@ -130,20 +141,42 @@ fn mock_embedder_model_id_is_stable() {
 
 #[test]
 fn mock_embedder_batch_embed() {
-    let embedder = MockEmbedder::new(16);
+    let embedder = MockEmbedder::new(SMALL_DIM);
     let texts = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
     let vecs = embedder.embed(&texts).unwrap();
     assert_eq!(vecs.len(), 3);
     for v in &vecs {
-        assert_eq!(v.len(), 16);
+        assert_eq!(v.len(), SMALL_DIM);
     }
 }
 
 #[test]
 fn mock_embedder_different_texts_produce_different_vectors() {
-    let embedder = MockEmbedder::new(64);
+    let embedder = MockEmbedder::new(MID_DIM);
     let v1 = embedder.embed(&["alpha beta".to_string()]).unwrap();
     let v2 = embedder.embed(&["gamma delta".to_string()]).unwrap();
-    // Highly unlikely to collide with distinct tokens
+    // Highly unlikely to collide with distinct tokens under FNV-1a + 64 buckets.
     assert_ne!(v1[0], v2[0], "distinct input should produce distinct output");
+}
+
+#[test]
+fn mock_embedder_dim_zero_returns_invalid_input_error() {
+    let embedder = MockEmbedder::new(0);
+    let result = embedder.embed(&["x".to_string()]);
+    assert!(
+        matches!(result, Err(BossclawError::InvalidInput(_))),
+        "dim=0 must return InvalidInput, got {result:?}"
+    );
+}
+
+#[test]
+fn mock_embedder_empty_text_returns_zero_vector() {
+    let embedder = MockEmbedder::new(MID_DIM);
+    let vecs = embedder.embed(&[String::new()]).unwrap();
+    assert_eq!(vecs.len(), 1);
+    assert_eq!(vecs[0].len(), MID_DIM);
+    assert!(
+        vecs[0].iter().all(|&x| x == 0.0),
+        "empty text must produce an all-zero vector"
+    );
 }

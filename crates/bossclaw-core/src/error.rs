@@ -37,6 +37,10 @@ pub enum BossclawError {
     /// An IO failure (high-water file, etc.).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A caller supplied an invalid argument (e.g. `dim = 0`).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 impl From<rusqlite::Error> for BossclawError {
