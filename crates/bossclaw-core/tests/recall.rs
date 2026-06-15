@@ -182,6 +182,189 @@ fn mock_embedder_empty_text_returns_zero_vector() {
     );
 }
 
+// --- Tier-A vectors: derive / backfill / filtered read (Task 4) ---
+
+/// Model id produced by `MockEmbedder`, asserted directly so the active-model
+/// filter test reads naturally.
+const MOCK_MODEL_ID: &str = "mock-v1";
+
+fn mk_memory_event(text: &str) -> Event {
+    Event {
+        id: String::new(),
+        ts: String::new(),
+        valid_time: None,
+        event_type: "memory".to_string(),
+        content: json!({ "text": text }),
+        model_meta: None,
+        prev_hash: String::new(),
+        hash: None,
+        signed_by_did: "did:wba:AIR-TEST".to_string(),
+        signature: None,
+    }
+}
+
+/// Test-only embedder that always fails, to exercise the best-effort skip path.
+struct FailingEmbedder;
+
+impl Embedder for FailingEmbedder {
+    fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, BossclawError> {
+        Err(BossclawError::Embed("intentional test failure".to_string()))
+    }
+    fn dim(&self) -> usize {
+        MID_DIM
+    }
+    fn model_id(&self) -> &str {
+        MOCK_MODEL_ID
+    }
+}
+
+#[test]
+fn rederive_pending_derives_all_memory_events_in_event_id_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    for t in ["alpha one", "beta two", "gamma three"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    assert_eq!(log.rederive_pending(&embedder).unwrap(), 3);
+
+    let vectors = log.vectors_for_model(MOCK_MODEL_ID).unwrap();
+    assert_eq!(vectors.len(), 3, "one vector per memory event");
+
+    // Mandatory: rows must come back in event_id ASC order (T5 depends on it).
+    let mut sorted = vectors.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let ids: Vec<&String> = vectors.iter().map(|(id, _)| id).collect();
+    let sorted_ids: Vec<&String> = sorted.iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, sorted_ids, "vectors_for_model must be event_id ASC");
+
+    for (_, v) in &vectors {
+        assert_eq!(v.len(), MID_DIM, "decoded vector length == embedder dim");
+    }
+}
+
+#[test]
+fn rederive_pending_is_idempotent_no_duplicate_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    for t in ["one", "two"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+    let embedder = MockEmbedder::new(MID_DIM);
+    assert_eq!(log.rederive_pending(&embedder).unwrap(), 2);
+    // Second pass: everything already has a vector → nothing pending.
+    assert_eq!(log.rederive_pending(&embedder).unwrap(), 0);
+    assert_eq!(log.vectors_for_model(MOCK_MODEL_ID).unwrap().len(), 2);
+}
+
+#[test]
+fn vectors_for_model_filters_by_model_id_no_cross_model_bleed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    log.append(mk_memory_event("hello")).unwrap();
+    let embedder = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&embedder).unwrap();
+
+    // Same store, different model id → must see nothing (C4 active-model filter).
+    assert!(
+        log.vectors_for_model("other-model").unwrap().is_empty(),
+        "no cross-model bleed"
+    );
+}
+
+#[test]
+fn rederive_pending_skips_failing_embeds_best_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    for t in ["a", "b", "c"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+
+    // Failing embedder: best-effort skip → Ok(0), no panic, no rows.
+    let failing = FailingEmbedder;
+    assert_eq!(log.rederive_pending(&failing).unwrap(), 0);
+    assert!(log.vectors_for_model(MOCK_MODEL_ID).unwrap().is_empty());
+
+    // A working embedder for the same model id backfills everything.
+    let working = MockEmbedder::new(MID_DIM);
+    assert_eq!(log.rederive_pending(&working).unwrap(), 3);
+    assert_eq!(log.vectors_for_model(MOCK_MODEL_ID).unwrap().len(), 3);
+}
+
+#[test]
+fn rederive_pending_skips_non_embeddable_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    log.append(mk_memory_event("real text")).unwrap();
+    // A config event is not embeddable and must not count toward the backfill.
+    log.append(mk_config_event("cfg", MID_DIM as u32, 1)).unwrap();
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    assert_eq!(
+        log.rederive_pending(&embedder).unwrap(),
+        1,
+        "only the memory event is embeddable; config is skipped"
+    );
+    assert_eq!(log.vectors_for_model(MOCK_MODEL_ID).unwrap().len(), 1);
+}
+
+#[test]
+fn derive_vector_returns_false_for_non_embeddable_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let mut config = mk_config_event("cfg", MID_DIM as u32, 1);
+    config.id = "01J0000000000000000000000C".to_string();
+    assert!(
+        !log.derive_vector(&embedder, &config).unwrap(),
+        "config events are not embeddable → Ok(false)"
+    );
+    assert!(log.vectors_for_model(MOCK_MODEL_ID).unwrap().is_empty());
+}
+
+#[test]
+fn derive_vector_upsert_is_idempotent_and_blob_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let id = log.append(mk_memory_event("round trip me")).unwrap();
+    let stored = log.stream_all().unwrap();
+    let event = stored
+        .into_iter()
+        .find(|e| e.id == id)
+        .expect("appended event present");
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    assert!(log.derive_vector(&embedder, &event).unwrap());
+    // Calling twice (INSERT OR REPLACE) must not duplicate the row.
+    assert!(log.derive_vector(&embedder, &event).unwrap());
+
+    let vectors = log.vectors_for_model(MOCK_MODEL_ID).unwrap();
+    assert_eq!(vectors.len(), 1, "upsert, not duplicate insert");
+    assert_eq!(vectors[0].0, id);
+
+    // The decoded vector must equal a fresh embed of the same text (blob round-trip).
+    let expected = embedder
+        .embed(&["round trip me".to_string()])
+        .unwrap()
+        .remove(0);
+    assert_eq!(vectors[0].1, expected, "blob decode must match the embedding");
+}
+
 // ---------------------------------------------------------------------------
 // Real-model integration test (ignored in the hermetic suite)
 // ---------------------------------------------------------------------------

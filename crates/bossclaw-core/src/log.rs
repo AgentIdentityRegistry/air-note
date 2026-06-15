@@ -13,6 +13,7 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::embed::Embedder;
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event};
 use crate::highwater::{HighWaterStore, Mark};
@@ -45,6 +46,14 @@ const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 const POISON: &str = "event log mutex poisoned";
 
+/// Number of bytes in a little-endian `f32`. Used to size and validate the
+/// `embedding` BLOB encoding in the `vectors` table.
+const F32_BYTES: usize = std::mem::size_of::<f32>();
+
+/// Event types whose `content["text"]` is fed to the embedder. `page` does not
+/// exist until M4 but is listed here so the seam is forward-compatible.
+const EMBEDDABLE_EVENT_TYPES: &[&str] = &["memory", "page"];
+
 /// The serialized, signed event log.
 pub struct EventLog {
     inner: Mutex<Store>,
@@ -66,6 +75,19 @@ impl EventLog {
                 payload    TEXT NOT NULL,
                 prev_hash  TEXT NOT NULL,
                 hash       TEXT NOT NULL UNIQUE
+            )",
+        )?;
+        // Tier-A derived vectors. One row per (event, model); the embedding is
+        // little-endian f32 bytes. Keyed on (event_id, model_id) so re-deriving
+        // under the same model is an idempotent upsert and different models can
+        // coexist for the same event without colliding.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS vectors (
+                event_id  TEXT NOT NULL,
+                model_id  TEXT NOT NULL,
+                dim       INTEGER NOT NULL,
+                embedding BLOB NOT NULL,
+                PRIMARY KEY(event_id, model_id)
             )",
         )?;
         Ok(Self { inner: Mutex::new(store), key, highwater: None })
@@ -218,6 +240,128 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Derive and store the Tier-A vector for a single event, if embeddable.
+    ///
+    /// If [`embeddable_text`] yields `Some(text)`, the text is embedded as a
+    /// one-item batch and upserted into the `vectors` table under
+    /// `(event.id, embedder.model_id())` (INSERT OR REPLACE), returning
+    /// `Ok(true)`. Non-embeddable events store nothing and return `Ok(false)`.
+    /// Embedder failures propagate as `Err`.
+    ///
+    /// Production calls this AFTER [`EventLog::append`] has committed and MAY
+    /// ignore the returned `Err`: vector derivation is best-effort (spec §10),
+    /// and a missing vector is repaired later by
+    /// [`EventLog::rederive_pending`]. The append itself is never blocked on
+    /// embedding success.
+    pub fn derive_vector(
+        &self,
+        embedder: &dyn Embedder,
+        event: &Event,
+    ) -> Result<bool, BossclawError> {
+        let text = match embeddable_text(event) {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+        let embedding = embed_one(embedder, &text)?;
+        let blob = vec_to_blob(&embedding);
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT OR REPLACE INTO vectors (event_id, model_id, dim, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![event.id, embedder.model_id(), embedder.dim() as i64, blob],
+        )?;
+        Ok(true)
+    }
+
+    /// Backfill every embeddable event that has no vector for this model.
+    ///
+    /// This is both the initial backfill and the spec §10 retry hook: it finds
+    /// events of an embeddable type that lack a `vectors` row for
+    /// `embedder.model_id()` (in `seq` order) and derives them. The store
+    /// `Mutex` is held only to collect the pending rows and (separately) to
+    /// upsert each result — never across [`Embedder::embed`], so the single
+    /// store mutex cannot deadlock against the embedder.
+    ///
+    /// BEST-EFFORT: an individual embed failure is logged to `eprintln!` and
+    /// skipped; the backfill continues. Returns the number of vectors
+    /// successfully derived.
+    pub fn rederive_pending(&self, embedder: &dyn Embedder) -> Result<usize, BossclawError> {
+        let pending = self.collect_pending(embedder.model_id())?;
+        let mut derived = 0usize;
+        for event in pending {
+            let text = match embeddable_text(&event) {
+                Some(t) => t,
+                None => continue,
+            };
+            let embedding = match embed_one(embedder, &text) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "rederive_pending: skipping event {} (embed failed): {e}",
+                        event.id
+                    );
+                    continue;
+                }
+            };
+            let blob = vec_to_blob(&embedding);
+            let store = self.inner.lock().expect(POISON);
+            store.conn().execute(
+                "INSERT OR REPLACE INTO vectors (event_id, model_id, dim, embedding)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![event.id, embedder.model_id(), embedder.dim() as i64, blob],
+            )?;
+            derived += 1;
+        }
+        Ok(derived)
+    }
+
+    /// All stored vectors for `model_id`, as `(event_id, vector)` pairs ordered
+    /// by `event_id ASC`.
+    ///
+    /// This is the active-model-filtered read: only vectors derived under the
+    /// given `model_id` are returned, so cross-model comparison is impossible by
+    /// construction. The `event_id ASC` ordering is mandatory — the T5
+    /// deterministic index rebuild depends on a stable row order.
+    pub fn vectors_for_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Vec<(String, Vec<f32>)>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT event_id, embedding FROM vectors WHERE model_id = ?1 ORDER BY event_id ASC",
+        )?;
+        let rows = stmt.query_map([model_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (event_id, blob) = row?;
+            out.push((event_id, blob_to_vec(&blob)?));
+        }
+        Ok(out)
+    }
+
+    /// Collect, under a single short-lived lock, the events of an embeddable
+    /// type that have no `vectors` row for `model_id`, in `seq` order. Returns
+    /// owned `Event`s so the lock is released before any embedding happens.
+    fn collect_pending(&self, model_id: &str) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT e.payload FROM events e
+             LEFT JOIN vectors v ON v.event_id = e.id AND v.model_id = ?1
+             WHERE v.event_id IS NULL AND e.event_type IN ('memory','page')
+             ORDER BY e.seq ASC",
+        )?;
+        let rows = stmt.query_map([model_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
     /// Persist the current tip as the signed high-water mark (debounced by the
     /// caller — every K events / on idle / on clean shutdown, NOT per append).
     pub fn checkpoint_highwater(&self) -> Result<(), BossclawError> {
@@ -233,4 +377,65 @@ impl EventLog {
             .unwrap_or_else(|_| GENESIS.to_string());
         hw.save(&Mark { count, tip_hash })
     }
+}
+
+/// The text fed to the embedder for an event, or `None` if the event is not
+/// embeddable.
+///
+/// Only `memory` and `page` events carry embeddable prose; both expose it at
+/// `content["text"]`. `config`, `grant`, and other control events return
+/// `None`. (`page` is reserved for M4 and produces nothing today, since no such
+/// events exist yet — listing it here keeps the derive seam forward-compatible.)
+fn embeddable_text(event: &Event) -> Option<String> {
+    if !EMBEDDABLE_EVENT_TYPES.contains(&event.event_type.as_str()) {
+        return None;
+    }
+    event.content["text"].as_str().map(String::from)
+}
+
+/// Embed a single text as a one-item batch and return its vector.
+///
+/// Centralises the batch-of-one call + the "exactly one vector back" invariant
+/// so both [`EventLog::derive_vector`] and [`EventLog::rederive_pending`] agree
+/// on the shape contract. A batch that returns the wrong count is surfaced as
+/// [`BossclawError::Embed`] rather than panicking.
+fn embed_one(embedder: &dyn Embedder, text: &str) -> Result<Vec<f32>, BossclawError> {
+    let mut batch = embedder.embed(&[text.to_string()])?;
+    if batch.len() != 1 {
+        return Err(BossclawError::Embed(format!(
+            "embedder returned {} vectors for a 1-item batch",
+            batch.len()
+        )));
+    }
+    Ok(batch.remove(0))
+}
+
+/// Encode a vector as little-endian `f32` bytes for the `embedding` BLOB.
+fn vec_to_blob(vec: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(vec.len() * F32_BYTES);
+    for &x in vec {
+        blob.extend_from_slice(&x.to_le_bytes());
+    }
+    blob
+}
+
+/// Decode little-endian `f32` bytes from an `embedding` BLOB.
+///
+/// Returns [`BossclawError::Store`] if the byte length is not a multiple of
+/// [`F32_BYTES`] (a corrupt or truncated blob).
+fn blob_to_vec(blob: &[u8]) -> Result<Vec<f32>, BossclawError> {
+    if !blob.len().is_multiple_of(F32_BYTES) {
+        return Err(BossclawError::Store(format!(
+            "embedding blob length {} is not a multiple of {F32_BYTES}",
+            blob.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(blob.len() / F32_BYTES);
+    for chunk in blob.chunks_exact(F32_BYTES) {
+        let bytes: [u8; F32_BYTES] = chunk
+            .try_into()
+            .map_err(|_| BossclawError::Store("chunk size mismatch decoding embedding".into()))?;
+        out.push(f32::from_le_bytes(bytes));
+    }
+    Ok(out)
 }
