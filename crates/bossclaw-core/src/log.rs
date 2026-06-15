@@ -870,8 +870,13 @@ impl EventLog {
         let seeds: Vec<String> = if !opts.graph_seeds.is_empty() {
             opts.graph_seeds.clone()
         } else {
+            // Auto-seed is top-1 only: if the strongest hit is unlinked, no seed
+            // → no boost (intra-result reinforcement deferred, design §11).
             let mut by_score: Vec<(&String, &f32)> = fused.iter().collect();
-            by_score.sort_by(|a, b| b.1.total_cmp(a.1).then_with(|| b.0.cmp(a.0)));
+            by_score.sort_by(|a, b| {
+                // id desc = deterministic tie-break only (not semantically meaningful).
+                b.1.total_cmp(a.1).then_with(|| b.0.cmp(a.0))
+            });
             by_score.into_iter().take(GRAPH_AUTO_SEED_TOPK).map(|(id, _)| id.clone()).collect()
         };
         let graph_hops = self
@@ -1794,6 +1799,48 @@ mod tests {
             meta.source_event_ids,
             vec!["a".to_string(), "b".to_string()],
             "manual empty-source link defaults to [src, dst]"
+        );
+    }
+
+    /// Minimal `memory` event for the graph-BFS unit test (mirrors the helper in
+    /// `tests/graph.rs`; kept local so this unit module stays self-contained).
+    fn mk_memory(text: &str) -> Event {
+        Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: "memory".to_string(),
+            content: serde_json::json!({ "text": text }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(),
+            signature: None,
+        }
+    }
+
+    /// The multi-hop BFS expands to `max_hops` and records the SHORTEST hop
+    /// distance per node. Exercises the hop≥2 branch that the shipped
+    /// `GRAPH_MAX_HOPS = 1` never reaches, so the `GRAPH_HOP_DECAY^(hop-1)` decay
+    /// term and the frontier expansion are proven rather than merely asserted.
+    /// Chain a→b→c: from seed `a`, `b` is a direct neighbor (hop 1) and `c` is
+    /// reachable only through `b` (hop 2); the seed itself is excluded.
+    #[test]
+    fn current_neighbors_with_hops_expands_to_max_hops_shortest_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let a = log.append(mk_memory("a")).unwrap();
+        let b = log.append(mk_memory("b")).unwrap();
+        let c = log.append(mk_memory("c")).unwrap();
+        log.link(&a, "x", &b, None, &[]).unwrap();
+        log.link(&b, "x", &c, None, &[]).unwrap();
+        log.rebuild_graph().unwrap();
+
+        let hops = log.current_neighbors_with_hops(std::slice::from_ref(&a), 2).unwrap();
+        let expected: HashMap<String, u32> = [(b, 1), (c, 2)].into_iter().collect();
+        assert_eq!(
+            hops, expected,
+            "BFS must reach b at hop 1 and c at hop 2, excluding the seed a"
         );
     }
 }
