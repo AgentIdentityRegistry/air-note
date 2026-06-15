@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
@@ -17,6 +18,7 @@ use crate::embed::Embedder;
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event};
 use crate::highwater::{HighWaterStore, Mark};
+use crate::index::{HnswIndex, VectorIndex};
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
 
@@ -59,6 +61,13 @@ pub struct EventLog {
     inner: Mutex<Store>,
     key: SigningKey,
     highwater: Option<Box<dyn HighWaterStore>>,
+    /// In-memory ANN index over the active model's vectors. `None` until
+    /// [`EventLog::rebuild_indexes`] builds it. Never persisted — rebuilt from
+    /// the encrypted log on open (zero plaintext index on disk). Guarded by its
+    /// own `Mutex` so a rebuild never blocks log appends. The boxed trait is
+    /// `Send + Sync` (the [`VectorIndex`] bound guarantees it), so `EventLog`
+    /// stays `Send + Sync` and shareable as `Arc<EventLog>`.
+    vector_index: Mutex<Option<Box<dyn VectorIndex>>>,
 }
 
 impl EventLog {
@@ -90,7 +99,12 @@ impl EventLog {
                 PRIMARY KEY(event_id, model_id)
             )",
         )?;
-        Ok(Self { inner: Mutex::new(store), key, highwater: None })
+        Ok(Self {
+            inner: Mutex::new(store),
+            key,
+            highwater: None,
+            vector_index: Mutex::new(None),
+        })
     }
 
     /// Append an event. `id`, `ts`, `prev_hash`, `hash`, `signature` are
@@ -353,6 +367,62 @@ impl EventLog {
             out.push((event_id, blob_to_vec(&blob)?));
         }
         Ok(out)
+    }
+
+    /// Rebuild the in-memory vector index from the encrypted log for the active
+    /// embedding model.
+    ///
+    /// Reads every persisted vector for `embedder.model_id()` (via
+    /// [`EventLog::vectors_for_model`], which returns rows `ORDER BY event_id
+    /// ASC`), builds a fresh [`HnswIndex`] sized to the exact row count, and
+    /// **serially** adds each `(event_id, vector)`. Serial insertion over a
+    /// deterministic row order is what makes the index reproducible across
+    /// re-opens (spec F2). The finished index replaces any previous one.
+    ///
+    /// Because only `model_id`-matching rows are read, the index can only ever
+    /// contain active-model vectors — cross-model bleed is impossible by
+    /// construction (spec C4).
+    ///
+    /// Emits a [`log::info!`] timing line so rebuild cost is visible before the
+    /// recall benchmark (T9). For now this rebuilds only the vector index; T6
+    /// will extend it to also rebuild the FTS index.
+    pub fn rebuild_indexes(&self, embedder: &dyn Embedder) -> Result<(), BossclawError> {
+        let started = Instant::now();
+        let rows = self.vectors_for_model(embedder.model_id())?;
+        let count = rows.len();
+        let mut index = HnswIndex::with_capacity(count);
+        for (event_id, vec) in rows {
+            index.add(&event_id, &vec);
+        }
+        let boxed: Box<dyn VectorIndex> = Box::new(index);
+        *self.vector_index.lock().expect(POISON) = Some(boxed);
+        log::info!(
+            "rebuilt vector index: {count} vectors in {}ms",
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    /// Search the in-memory vector index for the `k` nearest `(event_id,
+    /// distance)` pairs to `query_vec`, ascending by distance.
+    ///
+    /// Returns [`BossclawError::InvalidInput`] if the index has not been built
+    /// yet (no [`EventLog::rebuild_indexes`] call since open) — recall cannot run
+    /// against a missing index. Tombstoned ids are excluded by the index itself.
+    ///
+    /// T7's `recall()` will embed the query text and then call this.
+    pub fn vector_search(
+        &self,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, f32)>, BossclawError> {
+        let guard = self.vector_index.lock().expect(POISON);
+        match guard.as_ref() {
+            Some(index) => Ok(index.search(query_vec, k)),
+            None => Err(BossclawError::InvalidInput(
+                "vector index not built — call rebuild_indexes".into(),
+            )),
+        }
     }
 
     /// Collect, under a single short-lived lock, the events of an embeddable

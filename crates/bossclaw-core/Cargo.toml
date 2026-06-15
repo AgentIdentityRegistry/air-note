@@ -23,6 +23,7 @@ thiserror = "1"
 hex = "0.4"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 log = "0.4"
+hnsw_rs = "0.3.4"
 
 [features]
 fastembed = ["dep:fastembed"]
