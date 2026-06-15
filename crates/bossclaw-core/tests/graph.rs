@@ -224,6 +224,58 @@ fn self_loop_is_one_edge_one_node_one_neighbor() {
     );
 }
 
+// ── Task 4: as_of (both clocks) ──────────────────────────────────────────────
+
+use bossclaw_core::graph::AsOf;
+
+#[test]
+fn as_of_valid_time_shows_world_truth_then_known_as_of_shows_belief_then() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+
+    // Kenny worked at Acme in the world from 2020 until 2022.
+    log.link(&a, "works_at", &b, Some("2020-01-01T00:00:00Z"), &[]).unwrap();
+    log.invalidate(&a, "works_at", &b, Some("2022-01-01T00:00:00Z"), std::slice::from_ref(&a)).unwrap();
+    log.rebuild_graph().unwrap();
+
+    // all-None == current: the edge is invalidated, so nothing current.
+    assert!(log.as_of(&a, &AsOf::default()).unwrap().is_empty(), "edge is retired → not current");
+
+    // valid_time inside [2020, 2022): the fact WAS true in the world.
+    let mid = AsOf { valid_time: Some("2021-06-01T00:00:00Z".into()), known_as_of: None };
+    assert_eq!(log.as_of(&a, &mid).unwrap().len(), 1, "true in the world in 2021");
+
+    // valid_time after 2022: no longer true.
+    let after = AsOf { valid_time: Some("2023-01-01T00:00:00Z".into()), known_as_of: None };
+    assert!(log.as_of(&a, &after).unwrap().is_empty(), "not true in the world in 2023");
+
+    // known_as_of in the far future: we learned (and then un-learned) it — the
+    // invalidate's ingested time is "now", so a far-future known_as_of sees it as
+    // already-retracted; a known_as_of BEFORE the invalidate ingested would see it
+    // as still-believed. Both ingestion times are ~now, so assert the retracted side.
+    let known_future = AsOf { valid_time: None, known_as_of: Some("2999-01-01T00:00:00Z".into()) };
+    assert!(log.as_of(&a, &known_future).unwrap().is_empty(), "by 2999 we had retracted it");
+}
+
+// Rev 2 T-B: as_of with BOTH axes set.
+#[test]
+fn as_of_both_axes_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let a = log.append(mk_memory("kenny")).unwrap();
+    let b = log.append(mk_memory("acme")).unwrap();
+    log.link(&a, "works_at", &b, Some("2020-01-01T00:00:00Z"), &[]).unwrap();
+    log.rebuild_graph().unwrap();
+    // True in the world in 2021 AND already known by 2999 → 1 row.
+    let both = AsOf { valid_time: Some("2021-01-01T00:00:00Z".into()), known_as_of: Some("2999-01-01T00:00:00Z".into()) };
+    assert_eq!(log.as_of(&a, &both).unwrap().len(), 1);
+    // True in 2021 but NOT yet known in 1990 (ingested ~now) → 0 rows.
+    let too_early = AsOf { valid_time: Some("2021-01-01T00:00:00Z".into()), known_as_of: Some("1990-01-01T00:00:00Z".into()) };
+    assert!(log.as_of(&a, &too_early).unwrap().is_empty());
+}
+
 #[test]
 fn append_rejects_empty_source_event_ids_for_tier_b() {
     // This exercises M1's pre-existing append guard (NOT the F2 gate): any Tier-B

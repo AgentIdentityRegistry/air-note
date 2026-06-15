@@ -1450,10 +1450,70 @@ impl EventLog {
         )
     }
 
+    /// Bi-temporal edge query for `node` (spec §5). Both `AsOf` axes are optional
+    /// `WHERE` filters layered on the persisted edges:
+    /// - `valid_time` t → `valid_from <= t AND (valid_to IS NULL OR t < valid_to)`
+    ///   ("true in the world at t").
+    /// - `known_as_of` t → `ingested_at <= t AND (invalidated_at IS NULL OR
+    ///   t < invalidated_at)` ("known at t").
+    ///
+    /// When BOTH axes are `None`, returns the current graph (`invalidated_at IS
+    /// NULL`), identical to [`EventLog::neighbors`]. Query timestamps are
+    /// normalized with [`crate::graph::normalize_ts`] so TEXT comparison is
+    /// chronological. `ORDER BY edge_id ASC`.
+    pub fn as_of(
+        &self,
+        node: &str,
+        as_of: &crate::graph::AsOf,
+    ) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        let mut sql = String::from(
+            "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
+                ingested_at, invalidated_at, invalidated_by \
+             FROM edges WHERE (src = ?1 OR dst = ?1)",
+        );
+
+        // F1 (clippy `redundant_closure` trap): normalize_ts takes `&str` but
+        // the closure arg is `&String`; `.as_str()` makes the deref explicit so
+        // clippy does NOT suggest `.map(normalize_ts)` (which would compile-fail).
+        let valid = as_of.valid_time.as_ref().map(|t| crate::graph::normalize_ts(t.as_str()));
+        let known = as_of.known_as_of.as_ref().map(|t| crate::graph::normalize_ts(t.as_str()));
+
+        // Owned, normalized param strings kept alive for the bind slice below.
+        let mut owned: Vec<String> = Vec::new();
+
+        match (&valid, &known) {
+            (None, None) => sql.push_str(" AND invalidated_at IS NULL"),
+            _ => {
+                if let Some(t) = &valid {
+                    let i = owned.len() + 2; // ?1 is node
+                    sql.push_str(&format!(
+                        " AND valid_from <= ?{i} AND (valid_to IS NULL OR ?{i} < valid_to)"
+                    ));
+                    owned.push(t.clone());
+                }
+                if let Some(t) = &known {
+                    let i = owned.len() + 2;
+                    sql.push_str(&format!(
+                        " AND ingested_at <= ?{i} AND (invalidated_at IS NULL OR ?{i} < invalidated_at)"
+                    ));
+                    owned.push(t.clone());
+                }
+            }
+        }
+        sql.push_str(" ORDER BY edge_id ASC");
+
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + owned.len());
+        params.push(&node as &dyn rusqlite::ToSql);
+        for t in &owned {
+            params.push(t as &dyn rusqlite::ToSql);
+        }
+        self.query_edges(&sql, &params)
+    }
+
     /// Run a SELECT that returns the full edge column list (in the fixed order
     /// used by [`EventLog::all_edges`]) and map rows to [`crate::graph::Edge`].
-    /// Shared by `all_edges`, `neighbors` (and, in later tasks, `as_of`) so the
-    /// column→field mapping is single-sourced.
+    /// Shared by `all_edges`, `neighbors`, and `as_of` so the column→field
+    /// mapping is single-sourced.
     fn query_edges(
         &self,
         sql: &str,
