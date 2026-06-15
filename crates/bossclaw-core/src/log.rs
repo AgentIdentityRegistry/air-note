@@ -344,6 +344,49 @@ impl EventLog {
         Ok(())
     }
 
+    /// Open an event log and immediately build the in-memory recall indexes.
+    ///
+    /// Convenience constructor that calls [`EventLog::open`] then
+    /// [`EventLog::rebuild_indexes`] in one step, so the returned `EventLog` is
+    /// **recall-ready**: [`EventLog::recall`] and [`EventLog::vector_search`]
+    /// work without a separate `rebuild_indexes` call.
+    ///
+    /// # Lifecycle
+    ///
+    /// The in-memory vector index reflects the state of the `vectors` table at
+    /// the moment [`EventLog::rebuild_indexes`] last ran (either here during
+    /// open, or in a later explicit call). **After appending new events and
+    /// deriving their vectors, call `rebuild_indexes(embedder)` again to make
+    /// those events recallable via the semantic (vector) arm.** Until then,
+    /// [`EventLog::recall`] degrades gracefully to keyword-only for the new
+    /// events — this is the spec §10 intentional behaviour, but it must be
+    /// explicit rather than a silent surprise.
+    ///
+    /// An incremental single-event `index_event` path (so appends don't require
+    /// a full rebuild) is deferred to M7: the desktop decides the
+    /// rebuild-vs-incremental policy once startup cost is profiled at scale.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`EventLog::open`] (wrong key, I/O) or from
+    /// [`EventLog::rebuild_indexes`] (embed failure, SQL error).
+    ///
+    /// # Note on highwater
+    ///
+    /// If you need both recall-ready open and truncation detection, open with
+    /// [`EventLog::open_with_highwater`] then call `rebuild_indexes(embedder)`
+    /// separately. A combined constructor is deferred to M7.
+    pub fn open_with_recall(
+        path: &Path,
+        dek: &[u8; 32],
+        key: SigningKey,
+        embedder: &dyn Embedder,
+    ) -> Result<Self, BossclawError> {
+        let log = Self::open(path, dek, key)?;
+        log.rebuild_indexes(embedder)?;
+        Ok(log)
+    }
+
     /// Open with a high-water store; checks truncation immediately.
     pub fn open_with_highwater(
         path: &Path,
@@ -745,6 +788,14 @@ impl EventLog {
     /// [`BossclawError::InvalidInput`]) is logged and recall degrades to
     /// **keyword-only**; a failing keyword arm degrades to **vector-only**; only
     /// when both fail is `Err` returned.
+    ///
+    /// # Lifecycle note
+    /// The semantic (vector) arm reflects the index state at the last
+    /// [`EventLog::rebuild_indexes`] / [`EventLog::open_with_recall`] call.
+    /// **Events appended after that call are not yet in the vector index** and
+    /// will only surface via the keyword arm until `rebuild_indexes(embedder)`
+    /// is called again. This is intentional spec §10 graceful degradation, not a
+    /// bug — but callers should be aware of the gap.
     pub fn recall(
         &self,
         embedder: &dyn Embedder,

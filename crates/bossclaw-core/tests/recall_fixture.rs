@@ -329,3 +329,63 @@ fn fastembed_recall_at_k() {
          {FASTEMBED_FLOOR:.4} ({hits}/{total} queries hit)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §15 re-embed time budget (Model2Vec)
+// ---------------------------------------------------------------------------
+
+/// Measures `reembed_migration` throughput over the fixture corpus with the
+/// default Model2Vec backend — the spec §15 re-embed time-budget figure.
+///
+/// `#[ignore]` (needs `BOSSCLAW_TEST_MODEL_DIR`). Prints `ReembedStats` so the
+/// throughput can be recorded in the CHANGELOG and extrapolated to real corpus
+/// sizes ("re-embedding N memories ≈ N / throughput seconds").
+#[test]
+#[ignore = "requires BOSSCLAW_TEST_MODEL_DIR pointing at a local potion-base-8M model dir"]
+fn model2vec_reembed_budget() {
+    use bossclaw_core::Model2Vec;
+
+    let model_dir = match std::env::var("BOSSCLAW_TEST_MODEL_DIR") {
+        Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => {
+            eprintln!("BOSSCLAW_TEST_MODEL_DIR not set — skipping model2vec_reembed_budget.");
+            return;
+        }
+    };
+
+    let embedder = Model2Vec::from_pretrained(&model_dir, "potion-base-8M")
+        .expect("Model2Vec::from_pretrained must succeed");
+
+    let fixture = load_fixture();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&tmp.path().join("reembed_budget.db"), &DEK, key)
+        .expect("EventLog::open must succeed");
+
+    // Append the corpus (no vectors yet); the migration embeds everything.
+    let _ = seed_log(&log, &fixture);
+
+    let stats = log
+        .reembed_migration(&embedder)
+        .expect("reembed_migration must succeed");
+
+    let per_sec = if stats.elapsed_ms > 0 {
+        (stats.reembedded as f64) * 1000.0 / (stats.elapsed_ms as f64)
+    } else {
+        f64::INFINITY
+    };
+
+    println!(
+        "\n=== model2vec re-embed budget (§15) ===\n\
+         reembedded: {} docs\n\
+         elapsed:    {} ms\n\
+         throughput: {per_sec:.0} events/sec\n",
+        stats.reembedded, stats.elapsed_ms,
+    );
+
+    assert_eq!(
+        stats.reembedded,
+        fixture.docs.len(),
+        "all fixture docs must be re-embedded"
+    );
+}

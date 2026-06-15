@@ -34,36 +34,48 @@ rebuildable from the log; nothing in M2 adds a second source of truth.
   (384-dim, ONNX Runtime). Downloads weights on first use; subsequent calls are
   purely local. Wrapped in a `Mutex` to satisfy `Send + Sync`.
 
-- **Tier-A vectors table** (`src/store.rs`) — `vectors(event_id, model_id,
-  vec_blob)` stored inside the existing SQLCipher database. Blobs are
-  little-endian `f32` arrays (no additional encryption layer; the page-level
-  SQLCipher AES-256 protects them). `rederive_pending(embedder)` backfills
-  missing rows; `derive_vector(embedder, event)` upserts a single row.
-  `vectors_for_model(model_id)` returns rows in `event_id ASC` order (C4
+- **Tier-A vectors table** (`src/log.rs`) — `vectors(event_id, model_id, dim,
+  embedding)` created inside `EventLog::open` alongside the rest of the log
+  schema. Blobs are little-endian `f32` arrays (no additional encryption layer;
+  the page-level SQLCipher AES-256 protects them). `rederive_pending(embedder)`
+  backfills missing rows; `derive_vector(embedder, event)` upserts a single
+  row. `vectors_for_model(model_id)` returns rows in `event_id ASC` order (C4
   active-model filter, no cross-model bleed).
 
 - **In-memory HNSW index** (`src/index.rs`) — `HnswIndex` wraps `hnsw_rs
   0.3.4`. Rebuilt from the `vectors` table on every open via
   `rebuild_indexes(embedder)` — no plaintext index file is ever written to
   disk (verified by `tests/no_plaintext.rs`). Supports `add`, `search`,
-  `remove` (tombstone), and `last_indexed` cursor for incremental updates.
+  `remove` (tombstone), and `last_indexed` (tracks the most recently added
+  event id; no incremental-index path exists in v1 — rebuilds are full).
 
-- **FTS5 keyword index** (`src/keyword.rs`) — `fts_bodies` virtual table +
-  `fts_map(event_id, rowid)` inside the SQLCipher store. `keyword_add(id,
-  body)` is idempotent (INSERT OR REPLACE); `keyword_search(q, k)` escapes
-  the query to a quoted FTS5 phrase via `escape_fts_query`. `rebuild_indexes`
-  repopulates FTS from event content, also idempotent.
+- **FTS5 keyword index** (`src/log.rs`) — `fts` virtual table
+  (`USING fts5(body, content='')`, contentless) plus `fts_map(rowid, event_id)`
+  side-table, both created inside `EventLog::open`. `keyword_add(id, body)` is
+  idempotent via a **transactional dedup-check** (checks `fts_map` inside a
+  transaction, skips if already present — `INSERT OR REPLACE` is impossible on
+  a contentless FTS5 table). `keyword_search(q, k)` escapes the query to a
+  quoted FTS5 phrase via `escape_fts_query` (in `src/keyword.rs`).
+  `rebuild_indexes` wipes and repopulates both `fts` and `fts_map` in
+  `seq ASC` order, also idempotent.
 
 - **Hybrid recall** (`src/log.rs`, `src/recall.rs`) — `EventLog::recall(
-  embedder, query, k, &RecallOptions)` runs both arms in parallel, fuses with
+  embedder, query, k, &RecallOptions)` runs both arms, fuses with
   Reciprocal Rank Fusion (`rrf_fuse`), applies a recency-decay boost
-  (`HALF_LIFE_SECS = 7 days`) and a pin multiplier (`PIN_MULTIPLIER = 3.0`),
+  (`HALF_LIFE_SECS = 7 days`) and a pin multiplier (`PIN_MULTIPLIER = 2.0`),
   then returns `Vec<Hit>` with per-hit `sources` provenance
   (`RecallSource::Vector`, `RecallSource::Keyword`, or both). Degrades
   gracefully: vector-arm failure falls back to keyword-only; keyword-arm
   failure falls back to vector-only; both failing returns `Err`.
   `NoopReranker` wires the reranker seam end-to-end; a real cross-encoder
   lands in a later milestone.
+
+- **`open_with_recall(path, dek, key, embedder)`** (`src/log.rs`) —
+  convenience constructor that calls `open` then `rebuild_indexes` in one step,
+  returning a recall-ready `EventLog`. Events appended after this call are not
+  in the vector index until `rebuild_indexes(embedder)` is called again
+  (spec §10 graceful degradation: keyword arm still finds them). An incremental
+  `index_event` path is deferred to M7.
 
 - **`verify_chain_since(cursor)`** (`src/log.rs`) — bounded chain
   verification starting from a known-good event id. Identical cryptographic
@@ -75,6 +87,11 @@ rebuildable from the log; nothing in M2 adds a second source of truth.
   events under the new model, garbage-collects stale rows from the old model,
   rebuilds both indexes, and returns `ReembedStats { reembedded, gc_removed,
   elapsed_ms }`. Idempotent: a second call on the same model is a no-op.
+  Re-embed throughput: **~1250 events/sec** (model2vec/potion-base-8M — measured
+  over the 15-doc fixture: 15 docs re-embedded in 12 ms via the
+  `model2vec_reembed_budget` `#[ignore]` test) → re-embedding ~10k memories ≈ 8 s.
+  `reembed_migration` emits this figure (`ReembedStats.elapsed_ms` + a `log::info!`
+  line) at real corpus sizes.
 
 - **`config` event convention** — active model is the content of the latest
   `config`-typed event (`active_model_id`, `dim`, `schema_version`). Parsed
@@ -84,11 +101,12 @@ rebuildable from the log; nothing in M2 adds a second source of truth.
 
 #### Tests
 
-- **Hermetic suite** (`tests/recall.rs`) — 47 tests, all passing, no network
+- **Hermetic suite** (`tests/recall.rs`) — 49 tests, all passing, no network
   access. Covers every public API path: embedder trait, Tier-A vectors,
   HNSW index, FTS5 index, hybrid recall, RRF fusion, recency/pin boosts,
   keyword-only degradation, `resolve_arms` unit tests, re-embed migration
-  (happy path, idempotency, integrity, initial setup), `verify_chain_since`.
+  (happy path, idempotency, integrity, initial setup), `verify_chain_since`,
+  and the new `open_with_recall` lifecycle tests.
 
 - **Recall@K empirical gate** (`tests/recall_fixture.rs`, `#[ignore]`) —
   labelled corpus of 15 short distinct-topic memory documents and 8 queries

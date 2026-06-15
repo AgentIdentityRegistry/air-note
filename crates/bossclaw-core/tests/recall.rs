@@ -1461,3 +1461,63 @@ fn reembed_migration_initial_setup_no_prior_config() {
     // Chain verifies (config event is properly signed + chained).
     log.verify_chain().expect("chain must verify after initial migration");
 }
+
+// ---------------------------------------------------------------------------
+// open_with_recall lifecycle (whole-impl review fix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn open_with_recall_builds_index_so_recall_is_semantic_without_manual_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("m.db");
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let embedder = MockEmbedder::new(MID_DIM);
+
+    // Seed a store with derived vectors, then close it (the in-memory index dies).
+    {
+        let log = EventLog::open(&db, &DEK, key.clone()).unwrap();
+        for t in ["alpha topic one", "beta topic two", "gamma topic three"] {
+            log.append(mk_memory_event(t)).unwrap();
+        }
+        assert_eq!(log.rederive_pending(&embedder).unwrap(), 3);
+    }
+
+    // open_with_recall must rebuild the in-memory index during open — no manual
+    // rebuild_indexes call needed for recall to use the semantic arm.
+    let log = EventLog::open_with_recall(&db, &DEK, key, &embedder).unwrap();
+
+    // vector_search succeeds (it would be Err(InvalidInput) if the index were
+    // not built), proving open_with_recall built it.
+    let qv = &embedder.embed(&["beta topic two".to_string()]).unwrap()[0];
+    let hits = log
+        .vector_search(qv, 3)
+        .expect("open_with_recall must have built the vector index");
+    assert!(!hits.is_empty(), "vector index returns results after open_with_recall");
+
+    // recall surfaces the Vector arm — not degraded to keyword-only.
+    let results = log
+        .recall(&embedder, "beta topic two", 3, &bossclaw_core::recall::RecallOptions::default())
+        .unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|h| h.sources.contains(&bossclaw_core::recall::RecallSource::Vector)),
+        "recall after open_with_recall must include a Vector-sourced hit"
+    );
+}
+
+#[test]
+fn open_with_recall_on_empty_store_does_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let embedder = MockEmbedder::new(MID_DIM);
+
+    // Fresh store, no events: open_with_recall builds an empty index, no panic.
+    let log =
+        EventLog::open_with_recall(&dir.path().join("empty.db"), &DEK, key, &embedder).unwrap();
+
+    let results = log
+        .recall(&embedder, "anything", 3, &bossclaw_core::recall::RecallOptions::default())
+        .unwrap();
+    assert!(results.is_empty(), "empty store yields no recall hits");
+}
