@@ -467,6 +467,44 @@ fn hnsw_index_add_then_search_returns_inserted_vector_as_top1() {
     assert_eq!(index.last_indexed().as_deref(), Some("id-3"));
 }
 
+/// Re-add / dedup invariant: the rebuild path calls `add` for every persisted
+/// vector, which may include the same `event_id` twice on a stray double-call.
+/// The contract is: first vector wins, no slot is double-consumed, and
+/// `last_indexed` is NOT advanced by the no-op second call.
+#[test]
+fn hnsw_index_readd_same_id_is_a_noop_first_vector_wins() {
+    let embedder = MockEmbedder::new(MID_DIM);
+    // Two distinct vectors for the same id, plus a bystander.
+    let v_first = embedder.embed(&["first unique tokens".to_string()]).unwrap().remove(0);
+    let v_second = embedder.embed(&["second different words".to_string()]).unwrap().remove(0);
+    let v_other = embedder.embed(&["other bystander phrase".to_string()]).unwrap().remove(0);
+
+    let mut index = HnswIndex::with_capacity(3);
+    index.add("anchor", &v_other); // inserted first so last_indexed = "anchor"
+    index.add("id-x", &v_first);  // first add: v_first wins; last_indexed = "id-x"
+    index.add("id-x", &v_second); // duplicate: must be a no-op
+
+    // (a) Only one slot consumed: searching returns "id-x" exactly once.
+    let hits = index.search(&v_first, 3);
+    let count = hits.iter().filter(|(id, _)| id == "id-x").count();
+    assert_eq!(count, 1, "id-x must appear exactly once, got {hits:?}");
+
+    // (b) First vector wins: querying with v_first ranks id-x as top-1.
+    assert_eq!(hits[0].0, "id-x", "first-added vector must be top-1 on self-query");
+    assert!(
+        hits[0].1 <= EXACT_MATCH_MAX_DISTANCE,
+        "self-query on first vector must be ≈0 distance, got {}",
+        hits[0].1
+    );
+
+    // (c) last_indexed not advanced by the no-op second add.
+    assert_eq!(
+        index.last_indexed().as_deref(),
+        Some("id-x"),
+        "last_indexed must be id-x (set by the first add, not changed by the duplicate)"
+    );
+}
+
 /// (b) F2 — rebuild is stable across re-opens: two tests in one function.
 ///
 /// **Top-1 identity:** a query vector *equal* to one of the inserted vectors
@@ -510,10 +548,13 @@ fn rebuild_reproduces_top1_and_recall_stability_across_reopens() {
         .unwrap()
         .remove(0);
 
-    // A query phrased differently but semantically aligned with `known_idx` —
-    // used for the recall-stability check across 3 independent rebuilds.
+    // A near-but-not-identical query for the recall-stability check: different
+    // tokens from `self_query` but still closest to `known_idx` in the corpus.
+    // MockEmbedder is a bag-of-words model, so different token sets produce
+    // genuinely different vectors — this exercises the ANN index rather than
+    // merely repeating the self-query.
     let recall_query = embedder
-        .embed(&[format!("memory entry number {known_idx} about topic {known_idx}")])
+        .embed(&[format!("topic {known_idx} entry")])
         .unwrap()
         .remove(0);
 

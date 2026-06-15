@@ -51,6 +51,15 @@ pub trait VectorIndex: Send + Sync {
 
     /// Return up to `k` nearest `(event_id, distance)` pairs, ascending by
     /// distance. Tombstoned ids (see [`VectorIndex::remove`]) are excluded.
+    ///
+    /// The implementation over-fetches `k + tombstones.len()` candidates from
+    /// the underlying HNSW graph so that live hits can refill positions vacated
+    /// by tombstone filtering. If more than `tombstones.len()` tombstoned ids
+    /// happen to rank among the nearest HNSW candidates — which occurs when
+    /// tombstoned vectors cluster around the query — the result MAY contain
+    /// fewer than `k` pairs. Callers must tolerate a short result. Full
+    /// compaction (physically dropping tombstoned nodes) happens on the next
+    /// `rebuild_indexes` call.
     fn search(&self, vec: &[f32], k: usize) -> Vec<(String, f32)>;
 
     /// Tombstone `event_id` so it is filtered out of future searches.
@@ -61,7 +70,8 @@ pub trait VectorIndex: Send + Sync {
     fn remove(&mut self, event_id: &str);
 
     /// The `event_id` of the most recently [`add`](VectorIndex::add)ed vector, or
-    /// `None` if nothing has been added.
+    /// `None` if nothing has been added. A duplicate `add` (same `event_id`, a
+    /// documented no-op) does NOT advance `last_indexed`.
     fn last_indexed(&self) -> Option<String>;
 }
 
@@ -190,3 +200,11 @@ impl VectorIndex for HnswIndex {
         self.last_indexed.clone()
     }
 }
+
+/// Zero-dep compile-time guard: if a future field breaks `Send + Sync` on
+/// `HnswIndex`, this fails at the definition site rather than at a distant
+/// call site that boxes it as `Box<dyn VectorIndex>`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<HnswIndex>();
+};
