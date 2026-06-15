@@ -64,7 +64,8 @@ fn scan_dir_for_bytes(dir: &std::path::Path, needle: &[u8]) -> usize {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
-            let data = fs::read(&path).unwrap_or_default();
+            let data = fs::read(&path)
+                .unwrap_or_else(|e| panic!("could not read file during plaintext scan: {path:?}: {e}"));
             // Count non-overlapping occurrences of `needle`.
             let mut pos = 0;
             while pos + needle.len() <= data.len() {

@@ -14,6 +14,8 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use rusqlite::OptionalExtension;
+
 use crate::embed::Embedder;
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event};
@@ -122,6 +124,21 @@ impl EventLog {
         // spill to the filesystem. This is a connection-level setting; it must be
         // re-applied on every open.
         store.exec("PRAGMA temp_store = MEMORY")?;
+        // Verify the pragma actually took effect. SQLCipher builds compiled
+        // with certain options can silently ignore temp_store; if that happened
+        // FTS5 index-merge files would be written as plaintext to the OS temp
+        // directory and the no-plaintext-on-disk guarantee would be void. We
+        // surface the failure loudly at open rather than letting it slip past
+        // the security test's dir-scan (which only covers the DB directory).
+        let temp_store_val: i64 = store
+            .conn()
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))?;
+        if temp_store_val != 2 {
+            return Err(BossclawError::Store(format!(
+                "PRAGMA temp_store = MEMORY did not take effect (got {temp_store_val}, want 2); \
+                 FTS5 index-merge files would spill to the OS temp dir as plaintext"
+            )));
+        }
         Ok(Self {
             inner: Mutex::new(store),
             key,
@@ -500,19 +517,32 @@ impl EventLog {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
 
-        // Dedup check: if this event_id is already in fts_map, do nothing.
-        let already: i64 = conn.query_row(
-            "SELECT count(*) FROM fts_map WHERE event_id = ?1",
-            rusqlite::params![event_id],
-            |r| r.get(0),
-        )?;
-        if already > 0 {
+        // Open the transaction first so the dedup check AND both inserts are
+        // one atomic unit. The process-wide Mutex serializes all callers, so
+        // the rowid captured immediately after the fts insert is unambiguous —
+        // no other writer can have interleaved between the two statements.
+        let tx = conn.unchecked_transaction()?;
+
+        // Dedup check inside the transaction — eliminates the TOCTOU window
+        // that would exist between a pre-tx read and the subsequent writes.
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM fts_map WHERE event_id = ?1",
+                rusqlite::params![event_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            // tx drops here, rolling back (nothing was written).
             return Ok(());
         }
 
-        let tx = conn.unchecked_transaction()?;
         tx.execute("INSERT INTO fts(body) VALUES (?1)", rusqlite::params![text])?;
-        let rowid = conn.last_insert_rowid();
+        // last_insert_rowid is read from the same transaction object immediately
+        // after the fts insert; Transaction derefs to Connection so the call is
+        // identical in shape to conn.last_insert_rowid().
+        let rowid = tx.last_insert_rowid();
         tx.execute(
             "INSERT INTO fts_map(rowid, event_id) VALUES (?1, ?2)",
             rusqlite::params![rowid, event_id],
