@@ -53,6 +53,10 @@ pub enum ResolveDecision {
 ///
 /// Cosine similarity here is `1 - distance` (the vector index returns distance);
 /// the caller converts before calling so this function speaks one scale.
+///
+/// Similarity is expected in `[-1, 1]` (the cosine distance `d` from `DistCosine`
+/// on unit-norm vectors, converted by `1.0 - d`); a value below 0 (an obtuse
+/// angle) is safely `<= RESOLVE_LOW`, so it mints — no special-casing needed.
 pub fn resolve_decision(candidates: &[(String, f32)]) -> ResolveDecision {
     let mut sorted: Vec<&(String, f32)> = candidates.iter().collect();
     // Best (highest similarity) first; id as a deterministic tie-break.

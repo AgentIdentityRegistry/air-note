@@ -7,6 +7,7 @@ use bossclaw_core::event::Event;
 use bossclaw_core::extract::ResolveDecision;
 use bossclaw_core::log::EventLog;
 use bossclaw_core::reason::ScriptedReasoner;
+use bossclaw_core::recall::RecallOptions;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 
@@ -66,18 +67,48 @@ fn resolving_a_disjoint_mention_mints_a_new_entity() {
 }
 
 #[test]
-fn entity_vectors_are_not_returned_by_recall() {
-    // The locked constraint: entity events are embedded for resolution but recall
-    // must EXCLUDE entity-kind. (Full recall-exclusion is wired in T8; here we
-    // assert the dedicated entity index is separate from the recall index.)
+fn entity_is_reachable_via_entity_index_but_never_via_recall() {
+    // T-G (locked constraint #8): entity events are embedded for resolution but
+    // recall must EXCLUDE entity-kind — BY CONSTRUCTION, because entity events are
+    // not in EMBEDDABLE_EVENT_TYPES (so they never enter the recall `vectors` table
+    // or the recall index). The entity's label is a VERBATIM copy of the query, so
+    // any leak would surface here. We prove BOTH halves: the entity is reachable
+    // via the dedicated entity index, and recall(query) returns the memory but
+    // never the entity:<ulid> node id.
     let dir = tempfile::tempdir().unwrap();
-    let log = open_log(dir.path());
     let embedder = MockEmbedder::new(MID_DIM);
-    let m = log.append(mk_memory("kenny")).unwrap();
-    let kenny = log.entity("kenny ferris", &[], "person", "m4-reasoner", &[m]).unwrap();
-    log.derive_entity_vector(&embedder, &kenny, "kenny ferris").unwrap();
+    // open_with_recall builds the recall (vector + FTS) index on open; we also
+    // build the separate entity index. The memory's text IS the query, so recall
+    // has a real memory to return.
+    let query = "kenny ferris";
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open_with_recall(&dir.path().join("m.db"), &DEK, key, &embedder).unwrap();
+    let m = log.append(mk_memory(query)).unwrap();
+    // The entity label is a verbatim copy of the query string.
+    let kenny = log
+        .entity(query, &[], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    log.derive_entity_vector(&embedder, &kenny, query).unwrap();
+    // Rebuild BOTH indexes after the appends so the memory is recallable and the
+    // entity is resolvable.
+    log.rebuild_indexes(&embedder).unwrap();
     log.rebuild_entity_index(&embedder).unwrap();
-    // entity_search finds the entity…
-    let hits = log.entity_search(&embedder, "kenny ferris", 5).unwrap();
-    assert!(hits.iter().any(|(id, _)| id == &kenny), "entity index finds the entity node");
+
+    // Half 1: the entity IS reachable via the dedicated entity index.
+    let entity_hits = log.entity_search(&embedder, query, 5).unwrap();
+    assert!(
+        entity_hits.iter().any(|(id, _)| id == &kenny),
+        "entity index finds the entity node"
+    );
+
+    // Half 2: recall returns the memory but NEVER the entity:<ulid> node id.
+    let recall_hits = log.recall(&embedder, query, 5, &RecallOptions::default()).unwrap();
+    assert!(
+        recall_hits.iter().any(|h| h.event_id == m),
+        "recall surfaces the matching memory"
+    );
+    assert!(
+        recall_hits.iter().all(|h| h.event_id != kenny),
+        "recall must NEVER return the entity node id {kenny} (by-construction exclusion)"
+    );
 }
