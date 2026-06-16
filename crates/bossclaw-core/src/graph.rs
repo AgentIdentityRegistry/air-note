@@ -98,6 +98,62 @@ pub fn parse_link_content(content: &serde_json::Value) -> Option<(String, String
     Some((src, relation, dst))
 }
 
+/// A folded entity record: one `entity` Tier-B event projected into the
+/// `entities` table (spec §4). The id is `entity:<the entity event's ULID>` —
+/// stable, mint-once; the `label` is a property, never the id (names collide and
+/// change, the id does not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    /// The stable namespaced node id, `entity:<ulid>`.
+    pub entity_id: String,
+    /// Human-readable label (display name).
+    pub label: String,
+    /// Known aliases (other surface forms that resolve to this entity).
+    pub aliases: Vec<String>,
+    /// Coarse type discriminator (e.g. `"person"`, `"org"`).
+    pub entity_type: String,
+}
+
+/// Extract `(label, aliases, entity_type)` from an `entity` event's content, or
+/// `None` if `label`/`entity_type` are missing or non-string (malformed —
+/// skipped by the fold rather than failing it). `aliases` defaults to empty when
+/// absent or non-array; non-string alias items are dropped.
+pub fn parse_entity_content(
+    content: &serde_json::Value,
+) -> Option<(String, Vec<String>, String)> {
+    let label = content.get("label")?.as_str()?.to_string();
+    let entity_type = content.get("entity_type")?.as_str()?.to_string();
+    let aliases = content
+        .get("aliases")
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Some((label, aliases, entity_type))
+}
+
+/// Fold `entity` events (which MUST already be in `seq` order) into the entity
+/// set. Deterministic: one [`Entity`] per well-formed `entity` event, in event
+/// order, id = `entity:<event id>`. Malformed events (no label/entity_type) are
+/// skipped. Mint-once: an entity event id is unique, so there is no merge here —
+/// resolution (spec §6) decides reuse-vs-mint BEFORE an event is appended.
+pub fn fold_entities(events: &[Event]) -> Vec<Entity> {
+    let mut out = Vec::new();
+    for ev in events {
+        if ev.event_type != "entity" {
+            continue;
+        }
+        if let Some((label, aliases, entity_type)) = parse_entity_content(&ev.content) {
+            out.push(Entity {
+                entity_id: format!("entity:{}", ev.id),
+                label,
+                aliases,
+                entity_type,
+            });
+        }
+    }
+    out
+}
+
 /// Fold `link`/`invalidate` events (which MUST already be in `seq` order) into
 /// the current edge set. Deterministic: edges are produced in link-event order;
 /// each `link` opens an assertion (`edge_id` = the link event id), each

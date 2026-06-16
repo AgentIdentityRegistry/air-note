@@ -190,6 +190,17 @@ impl EventLog {
                 kind    TEXT NOT NULL
             )",
         )?;
+        // Entity projection (Tier-A; spec §4). One row per `entity` event,
+        // id = "entity:<event ulid>". A deterministic fold over entity events,
+        // rebuilt by `rebuild_graph`. The label is a property, never the id.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS entities (
+                entity_id   TEXT PRIMARY KEY,
+                label       TEXT NOT NULL,
+                aliases     TEXT NOT NULL,
+                entity_type TEXT NOT NULL
+            )",
+        )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
         // spill to the filesystem. This is a connection-level setting; it must be
         // re-applied on every open.
@@ -1260,6 +1271,87 @@ impl EventLog {
         self.append_graph_event("invalidate", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
     }
 
+    /// Append a signed Tier-B `entity` event minting a stable `entity:<ulid>`
+    /// node carrying `{label, aliases, entity_type}` (spec §4). Returns the
+    /// namespaced node id `entity:<event id>` (NOT the bare event id) — the form
+    /// links reference.
+    ///
+    /// `entity` is a NON-MANUAL producer: `source_event_ids` MUST be non-empty
+    /// (the memory/-ies that introduced the entity). An empty source set is
+    /// rejected (the M3 F2 taint guard, parent §5.11) — defaulting here would
+    /// erase the inducing memory from the lineage the actuator walks fail-closed.
+    ///
+    /// The `entities` table is NOT updated here — call [`EventLog::rebuild_graph`]
+    /// to refresh it (same append→rebuild lifecycle as [`EventLog::link`]).
+    pub fn entity(
+        &self,
+        label: &str,
+        aliases: &[String],
+        entity_type: &str,
+        producer: &str,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        if source_event_ids.is_empty() {
+            // entity is never the manual producer; an empty source set is always
+            // a taint-laundering reject (mirrors `append_graph_event`'s F2 arm).
+            return Err(BossclawError::InvalidInput(
+                "entity event requires explicit non-empty source_event_ids (the inducing \
+                 memory) — an empty default would erase it from the §5.11 lineage walk"
+                    .into(),
+            ));
+        }
+        let event_id = self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: "entity".to_string(),
+            content: serde_json::json!({
+                "label": label,
+                "aliases": aliases,
+                "entity_type": entity_type,
+            }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(),
+                prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(format!("entity:{event_id}"))
+    }
+
+    /// Every entity, `ORDER BY entity_id ASC` (deterministic). Tier-A read.
+    pub fn all_entities(&self) -> Result<Vec<crate::graph::Entity>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT entity_id, label, aliases, entity_type \
+             FROM entities ORDER BY entity_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let aliases_json: String = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                aliases_json,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (entity_id, label, aliases_json, entity_type) = row?;
+            // aliases is stored as a JSON array string; a malformed value degrades
+            // to empty rather than failing the read (best-effort, matches the fold).
+            let aliases: Vec<String> =
+                serde_json::from_str(&aliases_json).unwrap_or_default();
+            out.push(crate::graph::Entity { entity_id, label, aliases, entity_type });
+        }
+        Ok(out)
+    }
+
     /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
     /// default for `source_event_ids` is gated to the manual producer only.
     ///
@@ -1356,6 +1448,16 @@ impl EventLog {
                  and were skipped"
             );
         }
+
+        // Fold entity events → entities projection + the set of entity node ids
+        // (used to label node kind "entity" rather than "external").
+        let entity_events = self.entity_events_ordered()?;
+        let entities = crate::graph::fold_entities(&entity_events);
+        // Set of entity node ids → used to mark node kind "entity" (overrides
+        // the "external" default for ids the edges reference).
+        let entity_ids: HashSet<String> =
+            entities.iter().map(|e| e.entity_id.clone()).collect();
+
         let memory_ids = self.memory_page_ids()?;
 
         // Distinct endpoints → nodes (BTreeMap = deterministic node order).
@@ -1363,7 +1465,9 @@ impl EventLog {
         for e in &edges {
             for endpoint in [&e.src, &e.dst] {
                 node_kinds.entry(endpoint.clone()).or_insert_with(|| {
-                    if memory_ids.contains(endpoint) {
+                    if entity_ids.contains(endpoint) {
+                        "entity".to_string()
+                    } else if memory_ids.contains(endpoint) {
                         "memory".to_string()
                     } else {
                         "external".to_string()
@@ -1374,11 +1478,13 @@ impl EventLog {
 
         let edge_count = edges.len();
         let node_count = node_kinds.len();
+        let entity_count = entities.len();
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM edges", [])?;
         tx.execute("DELETE FROM nodes", [])?;
+        tx.execute("DELETE FROM entities", [])?;
         for e in &edges {
             tx.execute(
                 "INSERT INTO edges
@@ -1397,9 +1503,25 @@ impl EventLog {
                 rusqlite::params![node_id, kind],
             )?;
         }
+        for e in &entities {
+            tx.execute(
+                "INSERT INTO entities (entity_id, label, aliases, entity_type)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    e.entity_id,
+                    e.label,
+                    // JSON array string — serde_json Vec<String> serialization is
+                    // deterministic (array order preserved), so the stored string
+                    // is byte-stable across rebuilds (byte-identical-rebuild holds).
+                    serde_json::to_string(&e.aliases)?,
+                    e.entity_type
+                ],
+            )?;
+        }
         tx.commit()?;
         log::info!(
-            "rebuilt graph: {edge_count} edges, {node_count} nodes in {}ms",
+            "rebuilt graph: {edge_count} edges, {node_count} nodes, \
+             {entity_count} entities in {}ms",
             started.elapsed().as_millis()
         );
         Ok(())
@@ -1412,6 +1534,24 @@ impl EventLog {
         let mut stmt = conn.prepare(
             "SELECT payload FROM events
              WHERE event_type IN ('link', 'invalidate') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// All `entity` events, payload-parsed, in chain (`seq ASC`) order.
+    ///
+    /// Used by [`EventLog::rebuild_graph`] to fold entity events into the
+    /// `entities` projection. Parameterised query only — no string interpolation.
+    fn entity_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = 'entity' ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();

@@ -205,6 +205,114 @@ fn malicious_relation_label_is_inert_data_not_sql() {
     assert_eq!(n[0].relation, evil, "relation round-trips as literal data");
 }
 
+// ── Task 2 (M4a): entity event + entities projection + entity-node fold ──────
+
+#[test]
+fn entity_appends_tier_b_event_with_explicit_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("kenny works at acme")).unwrap();
+
+    // entity() is a NON-manual producer → MUST pass explicit non-empty sources.
+    let entity_id = log
+        .entity("Kenny", &["Ken".to_string()], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+
+    assert!(entity_id.starts_with("entity:"), "node id is namespaced: {entity_id}");
+    let ev = log.stream_all().unwrap().into_iter()
+        .find(|e| format!("entity:{}", e.id) == entity_id).unwrap();
+    assert_eq!(ev.event_type, "entity");
+    assert_eq!(ev.content["label"], json!("Kenny"));
+    assert_eq!(ev.content["aliases"], json!(["Ken"]));
+    assert_eq!(ev.content["entity_type"], json!("person"));
+    let meta = ev.model_meta.expect("entity is Tier-B");
+    assert_eq!(meta.model_id, "m4-reasoner");
+    assert_eq!(meta.source_event_ids, vec![m]);
+}
+
+#[test]
+fn entity_rejects_non_manual_producer_with_empty_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    // F2 guard extended to entity: a non-manual producer with empty sources is
+    // rejected (an empty default would erase the inducing memory from lineage).
+    let err = log
+        .entity("Kenny", &[], "person", "m4-reasoner", &[])
+        .expect_err("non-manual entity with empty sources must be rejected");
+    assert!(matches!(err, bossclaw_core::BossclawError::InvalidInput(_)));
+}
+
+#[test]
+fn rebuild_graph_folds_entities_and_marks_entity_node_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("kenny")).unwrap();
+    let kenny = log
+        .entity("Kenny", &["Ken".to_string()], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    // A link from the memory to the entity node.
+    log.link(&m, "mentions", &kenny, None, std::slice::from_ref(&m)).unwrap();
+    log.rebuild_graph().unwrap();
+
+    // entities projection populated from the entity event.
+    let entities = log.all_entities().unwrap();
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].entity_id, kenny);
+    assert_eq!(entities[0].label, "Kenny");
+    assert_eq!(entities[0].aliases, vec!["Ken".to_string()]);
+    assert_eq!(entities[0].entity_type, "person");
+
+    // The entity endpoint is marked kind="entity" (NOT "external"), the memory
+    // endpoint stays "memory".
+    let nodes = log.all_nodes().unwrap();
+    let kind_of = |id: &str| nodes.iter().find(|n| n.node_id == id).map(|n| n.kind.clone());
+    assert_eq!(kind_of(&kenny).as_deref(), Some("entity"));
+    assert_eq!(kind_of(&m).as_deref(), Some("memory"));
+}
+
+#[test]
+fn rebuild_graph_is_byte_identical_with_entities() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("kenny at acme")).unwrap();
+    let kenny = log.entity("Kenny", &[], "person", "m4-reasoner", std::slice::from_ref(&m)).unwrap();
+    let acme = log.entity("Acme", &[], "org", "m4-reasoner", std::slice::from_ref(&m)).unwrap();
+    log.link(&kenny, "works_at", &acme, None, std::slice::from_ref(&m)).unwrap();
+
+    log.rebuild_graph().unwrap();
+    let (e1, n1, ent1) = (log.all_edges().unwrap(), log.all_nodes().unwrap(), log.all_entities().unwrap());
+    log.rebuild_graph().unwrap();
+    let (e2, n2, ent2) = (log.all_edges().unwrap(), log.all_nodes().unwrap(), log.all_entities().unwrap());
+
+    assert_eq!(e1, e2, "edges fold byte-identical with entities present");
+    assert_eq!(n1, n2, "nodes fold byte-identical with entities present");
+    assert_eq!(ent1, ent2, "entities fold byte-identical across rebuilds");
+    assert_eq!(ent1.len(), 2, "two entity events → two entities rows");
+}
+
+// ── Rev 2 T-F: SQLi regression on entity label + alias paths ─────────────────
+
+#[test]
+fn malicious_entity_label_and_alias_are_inert_data_not_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("bobby tables")).unwrap();
+    let evil_label = r#"Robert"); DROP TABLE entities; --"#;
+    let evil_alias = r#"Bobby'); DROP TABLE nodes; --"#;
+    let entity_id = log
+        .entity(evil_label, &[evil_alias.to_string()], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    log.rebuild_graph().unwrap();
+
+    let entities = log.all_entities().unwrap();
+    assert_eq!(entities.len(), 1, "one entity — malicious label did not alter query semantics");
+    assert_eq!(entities[0].entity_id, entity_id);
+    assert_eq!(entities[0].label, evil_label, "label round-trips as inert literal data");
+    assert_eq!(entities[0].aliases, vec![evil_alias.to_string()], "alias round-trips as inert literal data");
+    // The tables still exist and query successfully — the DROP was inert.
+    assert!(log.all_edges().unwrap().is_empty(), "edges table still exists and is queryable");
+}
+
 // ── Self-loop test (rider from T2 code review) ────────────────────────────────
 
 #[test]
