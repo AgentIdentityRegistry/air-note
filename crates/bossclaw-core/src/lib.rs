@@ -5,6 +5,8 @@
 //! Milestone 2 (Recall): config-event convention, active-model lookup, and the
 //! `Embedder` trait with a deterministic `MockEmbedder` for tests.
 //! Milestone 3 (Graph): bi-temporal link/invalidate fold + graph-proximity recall boost.
+//! Milestone 4a (Clever Linker): the Reasoner seam + LLM auto-linker (entity/link/invalidate
+//! from memories), the evolve-loop runtime, the edge-trust gate.
 //!
 //! The event log is the single source of truth; every other structure (M2+) is
 //! derived and rebuildable from it. See
@@ -24,6 +26,9 @@ pub mod index;
 pub mod keyword;
 pub mod log;
 pub mod model2vec;
+#[cfg(feature = "ollama")]
+pub mod ollama;
+pub mod reason;
 pub mod recall;
 pub mod sign;
 pub mod store;
@@ -37,4 +42,7 @@ pub use graph::{AsOf, Edge, Node};
 pub use index::{HnswIndex, VectorIndex};
 pub use log::{ActiveModel, EventLog, ReembedStats, SCHEMA_VERSION};
 pub use model2vec::Model2Vec;
+#[cfg(feature = "ollama")]
+pub use ollama::OllamaReasoner;
+pub use reason::{Reasoner, ScriptedReasoner};
 pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};

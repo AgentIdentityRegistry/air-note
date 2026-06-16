@@ -45,6 +45,14 @@ pub enum BossclawError {
     /// A model load or encode operation failed (e.g. corrupt weights file).
     #[error("embed error: {0}")]
     Embed(String),
+
+    /// A reasoner (LLM) backend failed: transport error, a non-loopback host was
+    /// refused, malformed/un-decodable JSON, or (for the scripted test double) an
+    /// unscripted `(system, prompt)`. The reasoner's output is data, never
+    /// authority — this error makes the evolve tick a retryable no-op (spec §10),
+    /// never corrupting the log.
+    #[error("reasoner error: {0}")]
+    Reasoner(String),
 }
 
 impl From<rusqlite::Error> for BossclawError {
