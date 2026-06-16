@@ -20,7 +20,10 @@ use rusqlite::OptionalExtension;
 use crate::embed::Embedder;
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event, ModelMeta};
-use crate::graph::MANUAL_LINK_PRODUCER;
+use crate::graph::{
+    entity_node_id, ENTITY_EVENT_TYPE, ENTITY_NODE_KIND, EXTERNAL_NODE_KIND, MANUAL_LINK_PRODUCER,
+    MEMORY_NODE_KIND,
+};
 use crate::highwater::{HighWaterStore, Mark};
 use crate::index::{HnswIndex, VectorIndex};
 use crate::keyword;
@@ -1304,7 +1307,7 @@ impl EventLog {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
-            event_type: "entity".to_string(),
+            event_type: ENTITY_EVENT_TYPE.to_string(),
             content: serde_json::json!({
                 "label": label,
                 "aliases": aliases,
@@ -1320,7 +1323,7 @@ impl EventLog {
             signed_by_did: self.signer_did(),
             signature: None,
         })?;
-        Ok(format!("entity:{event_id}"))
+        Ok(entity_node_id(&event_id))
     }
 
     /// Every entity, `ORDER BY entity_id ASC` (deterministic). Tier-A read.
@@ -1466,11 +1469,11 @@ impl EventLog {
             for endpoint in [&e.src, &e.dst] {
                 node_kinds.entry(endpoint.clone()).or_insert_with(|| {
                     if entity_ids.contains(endpoint) {
-                        "entity".to_string()
+                        ENTITY_NODE_KIND.to_string()
                     } else if memory_ids.contains(endpoint) {
-                        "memory".to_string()
+                        MEMORY_NODE_KIND.to_string()
                     } else {
-                        "external".to_string()
+                        EXTERNAL_NODE_KIND.to_string()
                     }
                 });
             }

@@ -218,7 +218,10 @@ fn entity_appends_tier_b_event_with_explicit_sources() {
         .entity("Kenny", &["Ken".to_string()], "person", "m4-reasoner", std::slice::from_ref(&m))
         .unwrap();
 
-    assert!(entity_id.starts_with("entity:"), "node id is namespaced: {entity_id}");
+    assert!(
+        entity_id.starts_with(bossclaw_core::graph::ENTITY_NODE_PREFIX),
+        "node id is namespaced: {entity_id}"
+    );
     let ev = log.stream_all().unwrap().into_iter()
         .find(|e| format!("entity:{}", e.id) == entity_id).unwrap();
     assert_eq!(ev.event_type, "entity");
@@ -313,7 +316,7 @@ fn malicious_entity_label_and_alias_are_inert_data_not_sql() {
     assert!(log.all_edges().unwrap().is_empty(), "edges table still exists and is queryable");
 }
 
-// ── Self-loop test (rider from T2 code review) ────────────────────────────────
+// ── Self-loop dedup in fold_edges/neighbors (M3 edge fold; gap found in T2 review) ──
 
 #[test]
 fn self_loop_is_one_edge_one_node_one_neighbor() {

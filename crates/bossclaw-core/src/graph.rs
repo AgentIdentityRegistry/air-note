@@ -14,6 +14,24 @@ use crate::event::Event;
 /// constant so the convention is single-sourced (no magic string).
 pub const MANUAL_LINK_PRODUCER: &str = "manual";
 
+/// The `event_type` discriminator for entity events (the fold filters on it and
+/// `EventLog::entity` stamps it — single-sourced so they cannot drift).
+pub const ENTITY_EVENT_TYPE: &str = "entity";
+/// `nodes.kind` for an entity-backed node (precedence over memory/external).
+pub const ENTITY_NODE_KIND: &str = "entity";
+/// `nodes.kind` for a node that resolves to a memory/page event.
+pub const MEMORY_NODE_KIND: &str = "memory";
+/// `nodes.kind` for a node that resolves to no known event.
+pub const EXTERNAL_NODE_KIND: &str = "external";
+
+/// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
+/// links reference this exact form, so it is single-sourced.
+pub const ENTITY_NODE_PREFIX: &str = "entity:";
+/// Build the namespaced entity node id for an entity event id.
+pub fn entity_node_id(event_id: &str) -> String {
+    format!("{ENTITY_NODE_PREFIX}{event_id}")
+}
+
 /// A folded graph edge: one assertion from a `link` event, possibly closed by a
 /// later `invalidate`. Two clocks (spec §5): `valid_*` is world-time ("true in
 /// the world"); `ingested_at`/`invalidated_at` is learned-time ("when we knew").
@@ -139,12 +157,12 @@ pub fn parse_entity_content(
 pub fn fold_entities(events: &[Event]) -> Vec<Entity> {
     let mut out = Vec::new();
     for ev in events {
-        if ev.event_type != "entity" {
+        if ev.event_type != ENTITY_EVENT_TYPE {
             continue;
         }
         if let Some((label, aliases, entity_type)) = parse_entity_content(&ev.content) {
             out.push(Entity {
-                entity_id: format!("entity:{}", ev.id),
+                entity_id: entity_node_id(&ev.id),
                 label,
                 aliases,
                 entity_type,
@@ -233,5 +251,43 @@ mod tests {
     fn normalize_ts_is_fixed_width_27_for_valid_rfc3339() {
         // YYYY-MM-DDTHH:MM:SS.ffffffZ = 27 chars.
         assert_eq!(normalize_ts("2020-06-15T10:00:00Z").len(), 27);
+    }
+
+    /// Minimal `entity` event for the fold unit test (no signing/hashing needed —
+    /// `fold_entities` reads only `id`/`event_type`/`content`).
+    fn mk_entity_event(id: &str, content: serde_json::Value) -> Event {
+        Event {
+            id: id.to_string(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: ENTITY_EVENT_TYPE.to_string(),
+            content,
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: String::new(),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn fold_entities_skips_malformed_events_not_fatal() {
+        // A well-formed entity folds; ones missing `label` or `entity_type` are
+        // SKIPPED (the degrade path the spec emphasizes) — never panic, never a row.
+        let events = vec![
+            mk_entity_event(
+                "01GOOD",
+                serde_json::json!({ "label": "Kenny", "aliases": [], "entity_type": "person" }),
+            ),
+            // Missing `entity_type` → skipped.
+            mk_entity_event("01NOTYPE", serde_json::json!({ "label": "Acme" })),
+            // Missing `label` → skipped.
+            mk_entity_event("01NOLABEL", serde_json::json!({ "entity_type": "org" })),
+        ];
+        let folded = fold_entities(&events);
+        assert_eq!(folded.len(), 1, "only the well-formed entity becomes a row");
+        assert_eq!(folded[0].entity_id, entity_node_id("01GOOD"));
+        assert_eq!(folded[0].label, "Kenny");
+        assert_eq!(folded[0].entity_type, "person");
     }
 }
