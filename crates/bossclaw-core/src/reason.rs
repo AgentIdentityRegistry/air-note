@@ -99,14 +99,14 @@ impl Reasoner for ScriptedReasoner {
         // The schema is intentionally ignored by the double — it exercises the
         // SAME parse path the real backend feeds, so a scripted value that the
         // parser rejects fails the test exactly as a bad real completion would.
+        let key = Self::key(system, prompt);
         self.responses
-            .get(&Self::key(system, prompt))
+            .get(&key)
             .cloned()
             .ok_or_else(|| {
                 BossclawError::Reasoner(format!(
                     "ScriptedReasoner: no canned response for this (system, prompt) \
-                     [key={}]",
-                    Self::key(system, prompt)
+                     [key={key}]",
                 ))
             })
     }

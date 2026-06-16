@@ -56,6 +56,10 @@ impl OllamaReasoner {
     /// host at request time** (see [`is_loopback_url`]) so a misconfiguration can
     /// never cause egress. Primarily for tests that run a loopback stub on a
     /// chosen port; production should use [`OllamaReasoner::new`].
+    ///
+    /// The `url` is NOT validated here — the loopback guard runs in
+    /// [`OllamaReasoner::complete_json`], so a non-loopback URL constructs fine
+    /// but fails (closed) on the first request.
     pub fn with_url(model_tag: &str, url: &str) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(OLLAMA_TIMEOUT_SECS))
