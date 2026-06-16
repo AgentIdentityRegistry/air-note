@@ -7,6 +7,15 @@
 
 ## Revision log
 - **Rev 1 (2026-06-16):** initial M4a design from the brainstorm. Milestone 4 is **split** into **M4a (Clever Linker — this spec)** and **M4b (Summarizer — a later spec)**. Primary forks resolved by Peter: scope = **full minimal curator** (split a/b); LLM wiring = **real backend, first-class** (Ollama `qwen2.5:7b-instruct`); cleverness = **maximal** (retrieval-augmented extraction + embedding entity-resolution + multi-pass reflexion + typed relation ontology + intra-result reinforcement + confidence/trust-gate).
+- **Rev 2 (2026-06-16):** folded an independent two-reviewer pass (critic → SHIP-WITH-FIXES; security → NO-SHIP-until-3-criticals). The detailed fixes live in the **plan's "Rev 2 — folded second-opinion review fixes"** section; the contract-level deltas are in **"Rev 2 contract updates"** below and SUPERSEDE the inline text where they overlap. Peter's decision on the Pass B fork: **model-driven critique + pure fail-closed floor + lineage invariant**.
+
+## Rev 2 contract updates (folded review — supersede inline text where they overlap)
+- **Confidence is an integer `confidence_milli` (0–1000) in the signed `link` content, NOT a raw `f32`** (§4/§7/§11). Integers have one canonical JCS form — a raw `f32` risks `verify_chain` breaking across `serde_jcs` versions on an append-only signed store. The trust gate compares integers (`confidence_milli >= 600`) with the threshold **bound as a SQL parameter**, never string-formatted. `TRUST_MIN` (0.6) only derives that integer.
+- **`config` is a privilege, not data** (§8/§16). The `evolve_enabled` off-switch is **sticky / fail-closed** (an explicit `false` latches until a *later explicit* authorized `true`; a flag-less newer config does not flip it) and is written ONLY via a typed setter. M7 MUST verify a control config's signer DID == the resolved user owner before honoring an enable or active-model change (forged/replayed config = recall-integrity attack, parent §15).
+- **Pass B is a model critique over a pure fail-closed floor** (§3 step 5 / §6): the pure span-verify runs first; the model critique may only DROP or down-confidence — it can never add an edge the floor did not support. `MAX_REFLECT` bounds the propose↔critique turns.
+- **`source_event_ids` are EVENT ids, never `entity:<ulid>` node ids** (§16) — enforced by a lineage-invariant test; the §5.11 taint walk fails CLOSED on an unresolvable id (M6 DoD).
+- **In-crate resource fail-safes ship in M4a** (§8/§11): `MAX_ENTITIES_PER_MEMORY = 32` + an input-size cap fed to the reasoner + entity-index rebuild once per batch. The *running scheduler / idle-charging-thermal throttle enforcement* is **M7** (M4a ships `evolve_once()` + the pure `debounce_due` + the off-switch + the batch cap).
+- **Mandatory new tests** (§12): injection/confused-deputy containment; the lineage invariant; SQLi regression on the new entity-label/alias + machine-relation-label paths; confidence-is-signed (`verify_chain` breaks on tamper); within-tick idempotency; resolved-id retraction → `invalidate`; recall entity-exclusion e2e; trust-gate zero-contribution.
 
 ---
 

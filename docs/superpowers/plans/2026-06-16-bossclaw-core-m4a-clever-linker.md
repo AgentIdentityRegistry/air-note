@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-16-bossclaw-core-m4a-clever-linker-design.md` (addendum to `...-bossclaw-core-design.md` §5.8 reasoner + §5.9 evolve + §12.4 milestone 4). Implements M4a §3 closed loop, §4 events/data model, §5 reasoner seam, §6 cleverness mechanics, §7 confidence/trust-gate/reinforcement, §8 evolve runtime, §11 constants, §12 testing, §13 build sequence.
 
+> ⚠️ **Rev 2 (2026-06-16):** two independent reviewers (critic → SHIP-WITH-FIXES; security → NO-SHIP-until-3-criticals → then SHIP-WITH-FIXES) reviewed this plan. Read **"Rev 2 — folded second-opinion review fixes"** below FIRST — its snippets SUPERSEDE the inline task snippets where they overlap. Peter's decision on the one reviewer fork (Pass B): **model-driven critique + pure fail-closed floor + lineage invariant** (F1).
+
 ---
 
 ## Design decisions (locked in the spec; do not re-derive)
@@ -41,6 +43,86 @@ All live in `src/extract.rs` (resolution/reflexion) or `src/evolve.rs` (loop), r
 | `GRAPH_CONTEXT_K` | `8` | `extract` | Recalled neighbors fed as the Pass-A cheat sheet. |
 | `EVOLVE_BATCH` | `16` | `evolve` | Max memories processed per tick (bounds tick latency). |
 | `EVOLVE_DEBOUNCE` | `2000` (ms) | `evolve` | Debounce after an append before a tick (coalesce bursts). |
+
+---
+
+## Rev 2 — folded second-opinion review fixes (2026-06-16)
+
+Two independent adversarial reviewers (critic + security) reviewed the pre-review plan (`3674d37`). Apply ALL of the following; where a fix overlaps an inline task snippet below, **the Rev 2 snippet supersedes it.** Severity tags: 🔴 Critical (blocks execution), 🟠 Major/Important, 🟡 Minor.
+
+### Code fixes
+
+**F1 🔴 (critic C1 — Pass B is real reflexion + a pure floor) [Task 5 + Task 7].** As drafted, Pass B is a substring check (`source.contains(&supported_by)`) and `PASS_B_SYSTEM`/`MAX_REFLECT` are dead code — the "maximal clever" headline is hollow. Peter's decision: **model-driven Pass B over a pure fail-closed floor.** Keep the pure span-verify (it can only DROP), then run ONE model critique turn and INTERSECT: the model may remove or down-confidence a proposal but can NEVER add an edge the floor didn't already support.
+```rust
+// extract.rs — pure: the model's critique may only subtract from the floor-verified set.
+/// Keep a relation iff BOTH the pure floor verified it AND the model's critique
+/// returned it (by (src,relation,dst) identity). The model can down-confidence
+/// (take the min) but never introduce an unsupported edge. Same for retractions.
+pub fn intersect_keep_floor(floor: &Extraction, critique: &Extraction) -> Extraction { /* … */ }
+
+// evolve_once — after `verified` (pure floor), before resolution→emit:
+let critique = self.reasoner.complete_json(
+    extract::PASS_B_SYSTEM,
+    &extract::build_pass_b_prompt(&mem_text, &verified, &neighborhood),
+    &extract::extraction_schema(),
+)?;
+let refined = extract::intersect_keep_floor(&verified, &extract::parse_extraction(&critique)?);
+```
+`MAX_REFLECT` now bounds the propose↔critique turns (v1 = 1 propose + 1 critique). Tests (Task 5): a `ScriptedReasoner` keyed on the Pass-B `(system,prompt)` — (a) a model DROP is honored; (b) a model-INVENTED relation is rejected by the floor (never emitted). No dead code remains.
+
+**F2 🔴 (security C1 — the off-switch + active-model are a privilege, not data) [Task 7].** `evolve_enabled` and `active_model` live in `config` events that the generic `append` accepts from anyone, and `evolve_enabled()` is default-open + last-writer-wins → a flag-less or forged newer `config` silently re-arms the autonomous loop or swaps the model (parent §15 recall-integrity attack).
+- **(a) Sticky / fail-closed off-switch.** Once an explicit `evolve_enabled=false` exists with no *later explicit* `true`, stay disabled — a flag-less newer config must NOT flip it. Default-open only when the flag was never set.
+- **(b) Typed-setter-only control config.** Add `EventLog::set_evolve_enabled(bool)` as the ONLY writer of that key (alongside the existing `set_active_model`). Document that control config must not go through a generic append in v1.
+- **(c) Tolerant `active_model()`.** A `config` carrying only `evolve_enabled` must not make `active_model()` error (it currently `serde_from_value`s the whole content as `ActiveModel`, `log.rs:463`) — make the off-switch its own key-scan and make `active_model()` ignore configs lacking its fields.
+- **(d) Carried code-DoD (M7):** `evolve_enabled()`/`active_model()` MUST reject a control `config` whose signer DID ≠ the resolved user owner (today `signed_by_did` is unverified — M3 §12.1). Surface enable/model changes in `EvolveStatus`.
+
+**F3 🔴 (critic C3 + M4 — integer-milli confidence, never a raw f32) [Tasks 5/6/7].** Signing a raw `f32` into JCS content is a cross-version determinism hazard (`json!(f32)`→f64→JCS shortest-round-trip): a future `serde_jcs` could change the canonical bytes and break `verify_chain` on an append-only signed store. Store confidence as an integer 0–1000 in the signed content:
+```rust
+// link_machine content: integer milli — ONE canonical JCS form, no f32/f64 ambiguity.
+content["confidence_milli"] = json!((conf.clamp(0.0, 1.0) * 1000.0).round() as i64);
+```
+The fold reads it to `edges.confidence_milli INTEGER` (NULL for manual). The trust gate compares integers with the threshold **bound as a parameter** (never `format!`-ed into SQL): `WHERE origin='manual' OR (origin='machine' AND confidence_milli >= ?)` with `(TRUST_MIN*1000.0) as i64` = `600`. `TRUST_MIN` stays a documented `f32` used only to derive that integer. (Resolves M4's float-into-SQL fragility too.)
+
+**F4 🔴 (critic M2+M3 — resolve mention→id BEFORE any graph-key comparison) [Tasks 5/7].** The drafted `confirm_retractions` compares the model's raw mention strings against `active_edge_keys()` (resolved `entity:<ulid>` ids) → they never match → **no `invalidate` ever fires and the live gate fails.** Build `mention_to_id` over EVERY distinct `src`/`dst` in `relations` AND `retractions` (not just `entities[]`), resolve each through the SAME resolver, and remap every relation/retraction endpoint to its resolved id BEFORE `confirm_retractions` and before `link_machine`. (Test T-D.)
+
+**F5 🟠 (critic M1 / security #9 — within-tick idempotency) [Task 7].** `active` (the dedup set) is snapshotted once before the batch loop and never updated, so two memories in one tick asserting the same edge both emit. Seed an in-loop `HashSet` from `active` and `insert` each emitted key; dedup against it. (Test T-C.)
+
+**F6 🟠 (security #5 — in-crate resource fail-safes) [Task 7 + const].** A huge/booby-trapped memory must not flood the loop. Add `MAX_ENTITIES_PER_MEMORY = 32` (cap entities accepted from one memory), cap the input text length fed to the reasoner (truncate a >N-byte memory), and call `rebuild_entity_index` ONCE after the batch (or incremental `add`) — not per-memory (it's currently O(memories×entities) inside the loop). The *running scheduler / battery-thermal throttle* stays M7; these caps ship in M4a.
+
+**F7 🟠 (critic C2 — fix the M3 recall test the reinforcement change breaks) [Task 6].** Widening auto-seed top-1→`GRAPH_REINFORCE_TOPK=3` makes `recall_graph_proximity_explicit_seeds_boost_over_autoseed` (`recall.rs`) fail: with a 3-memory corpus all three become seeds, so the explicit-seed-over-autoseed premise collapses. Enlarge that test's corpus to ≥6 memories so the explicit seed is OUTSIDE the top-`GRAPH_REINFORCE_TOPK` fused hits — preserve the contract, don't weaken the assertion.
+
+**F8 🟠 (security #10/#11 — loopback + digest hardening) [Task 1].** (a) Drop bare `"localhost"` from the loopback allowlist (hosts-file/DNS-rebind risk) — require a numeric loopback IP or resolve-and-assert `.is_loopback()`. (b) Surface the resolved model **digest** into `model_id()` (provenance records which blob produced each event; makes the 7b→14b "non-destructive upgrade" honest) and document the `qwen2.5:7b-instruct@sha256:…` production form. (c) Add a WIRED refusal test (`with_url("http://10.0.0.5:11434")` + `complete_json` → `Err(Reasoner)`) — the pure `is_loopback_url` unit test does not prove the guard is on the request path.
+
+**F9 🟡 (critic m2/m3/m4 — prompt fidelity + scope) [Task 4].** (a) Actually include the few-shot exemplars in `build_pass_a_prompt` (the spec promises them; they materially help a 7b) and assert their presence in the prompt test. (b) Teach the prompt when to use `works_at` vs single-valued `works_at_primary` (fold cardinality into the relation explanations) or contradictions rarely trigger. (c) State explicitly that M4a processes `memory` events only; `file_ingested` extraction is deferred.
+
+### Additional required tests (hermetic unless noted)
+
+**T-A 🔴 (security C2 — injection / confused-deputy containment) [Task 7, `tests/evolve.rs`].** The first LLM-over-untrusted-content path MUST prove containment (parent §8.4/§11). A `ScriptedReasoner` simulates a model that "obeyed" an injected instruction in the memory text; assert the emitted edge is (1) `origin='machine'` (never manual), (2) its `source_event_ids` lineage REACHES the malicious memory (visible to the §5.11 walk), (3) it does NOT contribute the recall boost unless ≥`TRUST_MIN`, and (4) NO `config`/control event was emitted (no privilege escalation).
+
+**T-B 🔴 (security C3 — lineage invariant) [Task 7].** For every emitted `entity`/`link`/`invalidate`, assert every `source_event_ids` entry resolves to a real `events` row AND none start with `entity:` (event ids, never node ids). Carried code-DoD (M6): the §5.11 taint walk fails CLOSED (untrusted-origin) on an unresolvable lineage id — never skips it.
+
+**T-C 🟠 (within-tick idempotency, F5) [Task 7].** Two memories asserting the same edge in one `evolve_once` → exactly one edge.
+
+**T-D 🔴 (resolved-id retraction, F4) [Task 7].** Seed an active machine edge on resolved ids; script a retraction whose mentions resolve to those ids → exactly one `invalidate` fires. (Guards the contradiction-retirement the live gate asserts.)
+
+**T-E 🟠 (security #7 — confidence is signed) [Task 6].** Append a machine `link` (`confidence_milli=900`); directly UPDATE the stored payload's confidence to `100`; assert `verify_chain()` → `Err`.
+
+**T-F 🟠 (security #6 — SQLi regression on the new label paths) [Tasks 2/6].** A malicious entity label + alias (`Robert"); DROP TABLE entities; --`) and a malicious machine relation label round-trip as inert literal data (mirrors M3's T-E for `entities` + the machine-`link` path).
+
+**T-G 🟠 (security #8 — recall entity-exclusion e2e) [Tasks 3/8].** Mint an `entity` whose label is a verbatim copy of a query; rebuild the recall + entity indexes; assert `recall(query)` returns the memory and NEVER the `entity:<ulid>`. **Also fix the plan prose:** entity-exclusion is **by construction** (entity events are non-embeddable per `EMBEDDABLE_EVENT_TYPES`, verified in `log.rs:105`) — NOT a new post-hoc filter. Don't claim a filter that isn't added; prove the by-construction property instead.
+
+**T-H 🟠 (security #4 — trust-gate ZERO contribution) [Task 6].** Strengthen the trust-gate test: assert a low-confidence machine edge's neighbor scores EXACTLY its no-edge baseline (retire the edge → compare equal), proving zero contribution — not merely "less than `s_high*1.2`".
+
+### Provenance / integrity contracts (recorded here + spec §16; carried to M4b/M6/M7)
+- **Node ids ≠ event ids.** `source_event_ids` are always EVENT ids; an `entity:<ulid>` node id must never enter lineage (T-B). A later `EventId`/`NodeId` newtype would make this a compile error (carried).
+- **`config` is a privilege.** The evolve on-switch + active model live in `config`; v1 = typed-setter-only; M7 MUST verify the control config's signer DID == the resolved user owner before honoring it (forged/replayed config = recall-integrity attack, parent §15).
+- **Trust = `origin` + `confidence_milli` + lineage, NEVER the literal `model_id` string** (continues M3 §12.1). "machine ⇒ untrusted-until-gated."
+- **Pass B can only subtract** (F1): the model critique drops/down-confidences; it never fabricates an edge the pure floor didn't support. Reflexion improves precision, never invents.
+- **`signed_by_did` still UNVERIFIED** (carried): M4a adds no user-facing ownership claim; M7 resolves DID→pubkey.
+
+### DoD honesty adjustments
+- `EvolveStatus`: `queue_depth` + `enabled` are live in M4a; `last_tick_ms`/`error_count`/`last_error` are wired by M7's loop driver (the spec §8 resource-policy *enforcement* — running scheduler, idle/charging/thermal throttle — is M7; M4a ships the batch cap, the pure `debounce_due` decision, the off-switch, and the in-crate resource fail-safes F6).
+- New const for §11: `MAX_ENTITIES_PER_MEMORY = 32` (`extract`).
 
 ---
 
