@@ -10,6 +10,84 @@ pre-1.0 and not yet published to crates.io).
 
 ## [Unreleased]
 
+### M3 — Graph (2026-06-16)
+
+Bi-temporal link graph layered on top of the M1/M2 append-only encrypted
+event log. Every structure below is derived and rebuildable from the log;
+the `edges`/`nodes` tables are a deterministic Tier-A projection, just as
+`vectors`/`fts` are in M2.
+
+#### Added
+
+- **`link`/`invalidate` Tier-B events** — `EventLog::link(src, relation,
+  dst, valid_time, source_event_ids)` and `EventLog::invalidate(…)` append
+  signed events through the single-writer `append` path. `model_id =
+  "manual"` (named const `MANUAL_LINK_PRODUCER`). When `source_event_ids`
+  is empty the helper defaults to `[src, dst]` for the manual producer only;
+  a non-manual caller with an empty source set is rejected (taint-laundering
+  guard — an empty default there would erase the inducing event from the §5.11
+  lineage walk). Each `link` event ULID is the edge's stable identity.
+
+- **Deterministic bi-temporal fold — `rebuild_graph`** (`src/log.rs`) —
+  wipes `edges`/`nodes` and refolds every `link`/`invalidate` event in
+  `seq ASC` order under one transaction. Byte-identical across rebuilds
+  (proven by hermetic test). Timestamps are normalized to fixed-width UTC
+  microseconds + `Z` (`normalize_ts` in `src/graph.rs`) so SQL `TEXT`
+  comparison equals chronological comparison. Malformed graph events (missing
+  `src`/`relation`/`dst`) are skipped and logged as a warning rather than
+  failing the fold. `open_with_recall` calls `rebuild_graph` so the graph
+  and its recall boost are live on open.
+
+- **`invalidate` closes, never deletes** — each closed assertion row keeps
+  `valid_to` (world-clock end) and `invalidated_at`/`invalidated_by` (learned-
+  clock end + closing event id). Re-linking after an invalidate opens a fresh
+  assertion (new edge row, new validity interval). One `invalidate` closes
+  *all* currently-active assertions for the same `(src, relation, dst)` key.
+
+- **`neighbors(node)`** — current edges touching `node` in either direction
+  (`invalidated_at IS NULL`). Backlinks are the subset with `dst == node`.
+  `ORDER BY edge_id ASC` for deterministic output.
+
+- **`as_of(node, AsOf)`** — two-axis bi-temporal query. `valid_time` filters
+  world-clock (`valid_from ≤ t < valid_to`); `known_as_of` filters learned-
+  clock (`ingested_at ≤ t < invalidated_at`). Both `None` = current (identical
+  to `neighbors`). Query timestamps are normalized before comparison.
+
+- **`all_edges` / `all_nodes`** — full Tier-A table reads in `edge_id` /
+  `node_id` ASC order (deterministic; used in rebuild-idempotency tests).
+
+- **Live graph-proximity recall boost** (`src/log.rs`, `src/recall.rs`) —
+  after computing the fused RRF scores, `recall` runs a 1-hop BFS over the
+  current `edges` table (undirected) seeded from either the caller-supplied
+  `RecallOptions::graph_seeds` or (when empty) the top-1 fused hit
+  (`GRAPH_AUTO_SEED_TOPK = 1`). Each neighbor within `GRAPH_MAX_HOPS = 1`
+  is multiplied by `1 + GRAPH_WEIGHT × GRAPH_HOP_DECAY^(hops-1)` where
+  `GRAPH_WEIGHT = 0.4` and `GRAPH_HOP_DECAY = 0.5`. Only *current* edges
+  contribute (retired edges give no boost — proven by test). A graph error
+  degrades to no boost, never fails recall.
+
+- **Pure types + helpers** (`src/graph.rs`) — `Edge`, `Node`, `AsOf`,
+  `MANUAL_LINK_PRODUCER`, `normalize_ts`, `parse_link_content`, `fold_edges`.
+  No SQL, no I/O — mirrors the `recall`/`keyword` module split.
+
+#### Tests
+
+- **Hermetic graph suite** (`tests/graph.rs`, 13 tests) — fold determinism
+  (byte-identical rebuild); invalidate-closes-not-deletes + re-link opens new
+  interval; `invalidate` with no active assertion is a no-op; one `invalidate`
+  closes *all* active assertions for a key; `neighbors` + backlinks;
+  `as_of` valid-time axis, `as_of` known-as-of axis, `as_of` both axes
+  together; `nodes` kind (`"memory"` vs `"external"`); self-loop edge/node
+  count; malicious relation label is inert data (SQL-injection regression).
+
+- **Recall boost tests** (`tests/recall.rs`, +3 tests, total 53) — auto-seed
+  boost fires on a current edge and disappears after invalidation (score-based,
+  not rank-based); explicit `graph_seeds` boost their neighbor above the auto-
+  seed baseline; invalidating an edge does not suppress the memory from recall
+  (never-forget contract).
+
+---
+
 ### M2 — Recall (2026-06-15)
 
 The full semantic + lexical hybrid recall stack, built entirely on top of the

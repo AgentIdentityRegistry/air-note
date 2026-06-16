@@ -5,7 +5,7 @@
 //! never fork (spec §4 single-writer invariant). The evolve loop (M4) is NOT a
 //! privileged writer — it calls `append` like everyone else.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -19,13 +19,15 @@ use rusqlite::OptionalExtension;
 
 use crate::embed::Embedder;
 use crate::error::BossclawError;
-use crate::event::{compute_hash, Event};
+use crate::event::{compute_hash, Event, ModelMeta};
+use crate::graph::MANUAL_LINK_PRODUCER;
 use crate::highwater::{HighWaterStore, Mark};
 use crate::index::{HnswIndex, VectorIndex};
 use crate::keyword;
 use crate::recall::{
     fuse_scored_arms, Hit, NoopReranker, RecallOptions, RecallSource, Reranker, FUSION_FETCH,
-    HALF_LIFE_SECS, PIN_MULTIPLIER, RECENCY_WEIGHT,
+    GRAPH_AUTO_SEED_TOPK, GRAPH_HOP_DECAY, GRAPH_MAX_HOPS, GRAPH_WEIGHT, HALF_LIFE_SECS,
+    PIN_MULTIPLIER, RECENCY_WEIGHT,
 };
 use crate::sign::{sign_hash, verify_hash};
 use crate::store::Store;
@@ -78,6 +80,11 @@ pub struct ActiveModel {
 
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// DID stamped on engine-authored events (`link`/`invalidate`) in v1. Named so
+/// the literal is single-sourced (like [`MANUAL_LINK_PRODUCER`]); M4/M7 will
+/// replace this with the user's real DID threaded through [`EventLog::signer_did`].
+const ENGINE_SIGNER_DID: &str = "did:wba:bossclaw-engine";
 
 /// `(event_id, arm_score)` pair returned by each retrieval arm. Used as the
 /// common type for both the vector arm (cosine distance, lower=better) and the
@@ -156,6 +163,31 @@ impl EventLog {
             "CREATE TABLE IF NOT EXISTS fts_map (
                 rowid    INTEGER PRIMARY KEY,
                 event_id TEXT NOT NULL UNIQUE
+            )",
+        )?;
+        // Bi-temporal graph projection (Tier-A; spec §5.6). One `edges` row per
+        // `link` event (PK = the link's ULID); `invalidate` closes rows by
+        // setting valid_to/invalidated_at. `nodes` = distinct endpoints. Both are
+        // a deterministic fold over link/invalidate events, rebuilt by
+        // `rebuild_graph`. Timestamps are stored normalized (fixed-width UTC) so
+        // SQL TEXT comparison equals chronological comparison.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS edges (
+                edge_id        TEXT PRIMARY KEY,
+                src            TEXT NOT NULL,
+                relation       TEXT NOT NULL,
+                dst            TEXT NOT NULL,
+                valid_from     TEXT NOT NULL,
+                valid_to       TEXT,
+                ingested_at    TEXT NOT NULL,
+                invalidated_at TEXT,
+                invalidated_by TEXT
+            )",
+        )?;
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS nodes (
+                node_id TEXT PRIMARY KEY,
+                kind    TEXT NOT NULL
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -384,6 +416,7 @@ impl EventLog {
     ) -> Result<Self, BossclawError> {
         let log = Self::open(path, dek, key)?;
         log.rebuild_indexes(embedder)?;
+        log.rebuild_graph()?; // graph (+ its recall boost) live on open; persisted edges survive reopen
         Ok(log)
     }
 
@@ -831,6 +864,28 @@ impl EventLog {
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
+        // ── Graph-proximity seeds: explicit, else auto-seed from the top fused
+        //    base score(s). Then BFS current-edge neighbors (best-effort: a graph
+        //    error degrades to no boost, never failing recall — spec §6/§10). ──
+        let seeds: Vec<String> = if !opts.graph_seeds.is_empty() {
+            opts.graph_seeds.clone()
+        } else {
+            // Auto-seed is top-1 only: if the strongest hit is unlinked, no seed
+            // → no boost (intra-result reinforcement deferred, design §11).
+            let mut by_score: Vec<(&String, &f32)> = fused.iter().collect();
+            by_score.sort_by(|a, b| {
+                // id desc = deterministic tie-break only (not semantically meaningful).
+                b.1.total_cmp(a.1).then_with(|| b.0.cmp(a.0))
+            });
+            by_score.into_iter().take(GRAPH_AUTO_SEED_TOPK).map(|(id, _)| id.clone()).collect()
+        };
+        let graph_hops = self
+            .current_neighbors_with_hops(&seeds, GRAPH_MAX_HOPS)
+            .unwrap_or_else(|e| {
+                log::warn!("recall: graph-proximity boost skipped: {e}");
+                HashMap::new()
+            });
+
         // ── Assemble hits: compute the full-precision (f64) boosted score, store
         //    it alongside the Hit so the sort comparator can use it without
         //    re-computing. Hit.score is set from the f64 value (truncated to f32
@@ -853,6 +908,13 @@ impl EventLog {
                 // Pin: hard multiplicative boost for explicitly-pinned ids.
                 if pinned.contains(&id) {
                     score_f64 *= PIN_MULTIPLIER as f64;
+                }
+
+                // Graph-proximity tilt: a current-edge neighbour of a seed is
+                // boosted by 1 + GRAPH_WEIGHT * GRAPH_HOP_DECAY^(hops-1).
+                if let Some(&hop) = graph_hops.get(&id) {
+                    let decay = (GRAPH_HOP_DECAY as f64).powi(hop as i32 - 1);
+                    score_f64 *= 1.0 + GRAPH_WEIGHT as f64 * decay;
                 }
 
                 let mut sources = Vec::new();
@@ -1161,6 +1223,424 @@ impl EventLog {
         Ok(ReembedStats { reembedded, gc_removed, elapsed_ms })
     }
 
+    /// Append a signed Tier-B `link` event connecting `src` —`relation`→ `dst`.
+    ///
+    /// `valid_time` (optional, RFC 3339) is the world-clock start; absent means
+    /// "valid from when we learned it" (the event's ingestion `ts`). If
+    /// `source_event_ids` is empty it defaults to `[src, dst]` so the Tier-B
+    /// non-empty-provenance rule is satisfied honestly (the two endpoints justify
+    /// the link). Returns the new event id (which is also the edge's identity).
+    ///
+    /// The `edges` table is NOT updated here — call [`EventLog::rebuild_graph`]
+    /// to refresh `neighbors`/`as_of`/the recall boost (same "rebuild after
+    /// append" lifecycle as [`EventLog::rebuild_indexes`]).
+    pub fn link(
+        &self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        valid_time: Option<&str>,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        self.append_graph_event("link", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
+    }
+
+    /// Append a signed Tier-B `invalidate` event retiring the edge-key
+    /// `(src, relation, dst)`. `valid_time` (optional) is when the fact stopped
+    /// being true in the world. Same `source_event_ids` defaulting and lifecycle
+    /// as [`EventLog::link`].
+    pub fn invalidate(
+        &self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        valid_time: Option<&str>,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        self.append_graph_event("invalidate", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
+    }
+
+    /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
+    /// default for `source_event_ids` is gated to the manual producer only.
+    ///
+    /// **SECURITY (taint, parent §5.11):** the `[src, dst]` default is for
+    /// MANUAL (engine/test) links only — there the two endpoints genuinely ARE
+    /// the whole justification. A non-manual producer (the M4 reasoner) MUST
+    /// pass its real read-set; defaulting there would erase the inducing event
+    /// from the lineage the actuator walks fail-closed.
+    ///
+    // The `producer` parameter is required by the F2 security gate; the remaining
+    // args are the event's intrinsic fields. A params struct would add indirection
+    // without safety benefit for this private, two-call-site helper.
+    #[allow(clippy::too_many_arguments)]
+    fn append_graph_event(
+        &self,
+        event_type: &str,
+        producer: &str,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        valid_time: Option<&str>,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        let sources = match (producer == MANUAL_LINK_PRODUCER, source_event_ids.is_empty()) {
+            (true, true) => vec![src.to_string(), dst.to_string()],
+            (false, true) => {
+                // Caller-argument-policy rejection → InvalidInput (not Chain, which
+                // is for hash/chain-integrity failures). NB: M1's analogous empty-
+                // source guard in `append` uses Chain (pre-existing; a candidate for
+                // a later unify — do NOT change M1 here).
+                return Err(BossclawError::InvalidInput(
+                    "non-manual graph link requires explicit source_event_ids (no [src,dst] \
+                     default — would launder taint past the §5.11 lineage walk)".into(),
+                ));
+            }
+            (_, false) => source_event_ids.to_vec(),
+        };
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: valid_time.map(String::from),
+            event_type: event_type.to_string(),
+            content: serde_json::json!({ "src": src, "relation": relation, "dst": dst }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(),
+                prompt_hash: String::new(),
+                source_event_ids: sources,
+            }),
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// The DID stamped on engine-authored events (`link`/`invalidate`). v1 uses a
+    /// fixed engine identity; M4/M7 will thread the user's real DID through here.
+    ///
+    /// Note: `signed_by_did` is informational here (not verified against `key` at
+    /// append). A fixed engine DID keeps the M3 surface small; threading the user
+    /// DID is M4/M7 (carried, security I3).
+    ///
+    /// Returns an owned `String` (not the `&'static str` const) because M4/M7 will
+    /// make this dynamic — the user's real DID, looked up per call.
+    fn signer_did(&self) -> String {
+        ENGINE_SIGNER_DID.to_string()
+    }
+
+    /// Rebuild the persisted `edges`/`nodes` tables as a deterministic fold over
+    /// every `link`/`invalidate` event (`ORDER BY seq ASC`). Tier-A: byte-
+    /// identical across rebuilds (spec §4/§9). Wipes both tables and re-inserts
+    /// under one transaction. Cheap (graph events are few). Call after appending
+    /// `link`/`invalidate` events to refresh `neighbors`/`as_of`/the recall boost.
+    ///
+    /// **Lifecycle:** graph queries and the recall boost reflect the `edges`
+    /// table as of the last `rebuild_graph` / [`EventLog::open_with_recall`].
+    /// After appending `link`/`invalidate` events WITHIN a session, call
+    /// `rebuild_graph` again — the same append→rebuild lifecycle as
+    /// [`EventLog::rebuild_indexes`].
+    pub fn rebuild_graph(&self) -> Result<(), BossclawError> {
+        let started = Instant::now();
+        let events = self.graph_events_ordered()?;
+        let edges = crate::graph::fold_edges(&events);
+        // F4: a signed link/invalidate with malformed content is silently
+        // dropped by the fold (it never becomes an edge). Surface the count so
+        // malformed-but-signed events are not invisible.
+        let malformed = events
+            .iter()
+            .filter(|e| crate::graph::parse_link_content(&e.content).is_none())
+            .count();
+        if malformed > 0 {
+            log::warn!(
+                "rebuild_graph: {malformed} link/invalidate event(s) had malformed content \
+                 and were skipped"
+            );
+        }
+        let memory_ids = self.memory_page_ids()?;
+
+        // Distinct endpoints → nodes (BTreeMap = deterministic node order).
+        let mut node_kinds: BTreeMap<String, String> = BTreeMap::new();
+        for e in &edges {
+            for endpoint in [&e.src, &e.dst] {
+                node_kinds.entry(endpoint.clone()).or_insert_with(|| {
+                    if memory_ids.contains(endpoint) {
+                        "memory".to_string()
+                    } else {
+                        "external".to_string()
+                    }
+                });
+            }
+        }
+
+        let edge_count = edges.len();
+        let node_count = node_kinds.len();
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM edges", [])?;
+        tx.execute("DELETE FROM nodes", [])?;
+        for e in &edges {
+            tx.execute(
+                "INSERT INTO edges
+                   (edge_id, src, relation, dst, valid_from, valid_to,
+                    ingested_at, invalidated_at, invalidated_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    e.edge_id, e.src, e.relation, e.dst, e.valid_from, e.valid_to,
+                    e.ingested_at, e.invalidated_at, e.invalidated_by
+                ],
+            )?;
+        }
+        for (node_id, kind) in &node_kinds {
+            tx.execute(
+                "INSERT INTO nodes (node_id, kind) VALUES (?1, ?2)",
+                rusqlite::params![node_id, kind],
+            )?;
+        }
+        tx.commit()?;
+        log::info!(
+            "rebuilt graph: {edge_count} edges, {node_count} nodes in {}ms",
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    /// All `link`/`invalidate` events, payload-parsed, in chain (`seq ASC`) order.
+    fn graph_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE event_type IN ('link', 'invalidate') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Set of event ids whose type is `memory`/`page` — used to label node kinds.
+    fn memory_page_ids(&self) -> Result<HashSet<String>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt =
+            conn.prepare("SELECT id FROM events WHERE event_type IN ('memory', 'page')")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every edge, `ORDER BY edge_id ASC` (deterministic). Tier-A read.
+    pub fn all_edges(&self) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        self.query_edges(
+            "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
+                ingested_at, invalidated_at, invalidated_by FROM edges ORDER BY edge_id ASC",
+            &[],
+        )
+    }
+
+    /// Every node, `ORDER BY node_id ASC`.
+    pub fn all_nodes(&self) -> Result<Vec<crate::graph::Node>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare("SELECT node_id, kind FROM nodes ORDER BY node_id ASC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::graph::Node { node_id: r.get(0)?, kind: r.get(1)? })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Current edges touching `node` in either direction (`invalidated_at IS
+    /// NULL`). The result includes:
+    ///
+    /// - **Outgoing** edges where `src == node`.
+    /// - **Incoming** (backlink) edges where `dst == node`.
+    /// - **Self-loops** where `src == dst == node` (appear exactly once, not
+    ///   twice — `OR` on a single row is still one row).
+    ///
+    /// Caller can filter for backlinks with `.iter().filter(|e| e.dst == node)`.
+    /// `ORDER BY edge_id ASC` for deterministic output.
+    pub fn neighbors(&self, node: &str) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        self.query_edges(
+            "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
+                ingested_at, invalidated_at, invalidated_by \
+             FROM edges \
+             WHERE (src = ?1 OR dst = ?1) AND invalidated_at IS NULL \
+             ORDER BY edge_id ASC",
+            &[&node as &dyn rusqlite::ToSql],
+        )
+    }
+
+    /// Bi-temporal edge query for `node` (spec §5). Both `AsOf` axes are optional
+    /// `WHERE` filters layered on the persisted edges:
+    /// - `valid_time` t → `valid_from <= t AND (valid_to IS NULL OR t < valid_to)`
+    ///   ("true in the world at t").
+    /// - `known_as_of` t → `ingested_at <= t AND (invalidated_at IS NULL OR
+    ///   t < invalidated_at)` ("known at t").
+    ///
+    /// When BOTH axes are `None`, returns the current graph (`invalidated_at IS
+    /// NULL`), identical to [`EventLog::neighbors`]. Query timestamps are
+    /// normalized with [`crate::graph::normalize_ts`] so TEXT comparison is
+    /// chronological. `ORDER BY edge_id ASC`.
+    pub fn as_of(
+        &self,
+        node: &str,
+        as_of: &crate::graph::AsOf,
+    ) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        let mut sql = String::from(
+            "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
+                ingested_at, invalidated_at, invalidated_by \
+             FROM edges WHERE (src = ?1 OR dst = ?1)",
+        );
+
+        // F1 (clippy `redundant_closure` trap): normalize_ts takes `&str` but
+        // the closure arg is `&String`; `.as_str()` makes the deref explicit so
+        // clippy does NOT suggest `.map(normalize_ts)` (which would compile-fail).
+        let valid = as_of.valid_time.as_ref().map(|t| crate::graph::normalize_ts(t.as_str()));
+        let known = as_of.known_as_of.as_ref().map(|t| crate::graph::normalize_ts(t.as_str()));
+
+        // Owned, normalized param strings kept alive for the bind slice below.
+        let mut owned: Vec<String> = Vec::new();
+
+        // SQL params are 1-indexed; ?1 is `node`, so the k-th owned timestamp
+        // binds to ?{owned.len()+2}. Both `+2` sites below share this invariant.
+        match (&valid, &known) {
+            (None, None) => sql.push_str(" AND invalidated_at IS NULL"),
+            _ => {
+                if let Some(t) = &valid {
+                    let i = owned.len() + 2; // ?1 is node
+                    sql.push_str(&format!(
+                        " AND valid_from <= ?{i} AND (valid_to IS NULL OR ?{i} < valid_to)"
+                    ));
+                    owned.push(t.clone());
+                }
+                if let Some(t) = &known {
+                    let i = owned.len() + 2;
+                    sql.push_str(&format!(
+                        " AND ingested_at <= ?{i} AND (invalidated_at IS NULL OR ?{i} < invalidated_at)"
+                    ));
+                    owned.push(t.clone());
+                }
+            }
+        }
+        sql.push_str(" ORDER BY edge_id ASC");
+
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + owned.len());
+        params.push(&node as &dyn rusqlite::ToSql);
+        for t in &owned {
+            params.push(t as &dyn rusqlite::ToSql);
+        }
+        self.query_edges(&sql, &params)
+    }
+
+    /// Run a SELECT that returns the full edge column list (in the fixed order
+    /// used by [`EventLog::all_edges`]) and map rows to [`crate::graph::Edge`].
+    /// Shared by `all_edges`, `neighbors`, and `as_of` so the column→field
+    /// mapping is single-sourced.
+    fn query_edges(
+        &self,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<crate::graph::Edge>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |r| {
+            Ok(crate::graph::Edge {
+                edge_id: r.get(0)?,
+                src: r.get(1)?,
+                relation: r.get(2)?,
+                dst: r.get(3)?,
+                valid_from: r.get(4)?,
+                valid_to: r.get(5)?,
+                ingested_at: r.get(6)?,
+                invalidated_at: r.get(7)?,
+                invalidated_by: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Map every node within `max_hops` of any `seed` (over CURRENT edges,
+    /// treated as undirected for relatedness) to its shortest hop distance
+    /// (1..=max_hops). Seeds themselves are excluded. Used by the recall
+    /// graph-proximity boost. A seed with no current edges contributes nothing.
+    fn current_neighbors_with_hops(
+        &self,
+        seeds: &[String],
+        max_hops: u32,
+    ) -> Result<HashMap<String, u32>, BossclawError> {
+        let mut hops: HashMap<String, u32> = HashMap::new();
+        let mut frontier: HashSet<String> = seeds.iter().cloned().collect();
+        let mut visited: HashSet<String> = seeds.iter().cloned().collect();
+        for hop in 1..=max_hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let next = self.current_adjacent(&frontier)?;
+            let mut new_frontier: HashSet<String> = HashSet::new();
+            for id in next {
+                if visited.insert(id.clone()) {
+                    hops.insert(id.clone(), hop);
+                    new_frontier.insert(id);
+                }
+            }
+            frontier = new_frontier;
+        }
+        Ok(hops)
+    }
+
+    /// Distinct opposite endpoints of CURRENT edges incident to any id in
+    /// `frontier` (undirected: returns both `dst` where `src ∈ frontier` and
+    /// `src` where `dst ∈ frontier`). Empty `frontier` → empty set.
+    ///
+    /// Both `IN` clauses share the same `?1..?n` placeholders, so the id list
+    /// is bound ONCE (n params, not 2n — binding 2n would exceed the
+    /// statement's parameter count and error at query time).
+    fn current_adjacent(
+        &self,
+        frontier: &HashSet<String>,
+    ) -> Result<HashSet<String>, BossclawError> {
+        if frontier.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids: Vec<&String> = frontier.iter().collect();
+        let placeholders: String =
+            (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        // dst where src ∈ frontier  UNION  src where dst ∈ frontier (current only).
+        // Both IN clauses reference the SAME ?1..?n placeholders; bind the id
+        // list ONCE (n params, not 2n).
+        let sql = format!(
+            "SELECT dst AS other FROM edges WHERE invalidated_at IS NULL AND src IN ({placeholders}) \
+             UNION \
+             SELECT src AS other FROM edges WHERE invalidated_at IS NULL AND dst IN ({placeholders})"
+        );
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| *id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
     /// Persist the current tip as the signed high-water mark (debounced by the
     /// caller — every K events / on idle / on clean shutdown, NOT per append).
     pub fn checkpoint_highwater(&self) -> Result<(), BossclawError> {
@@ -1270,5 +1750,97 @@ pub fn resolve_arms(
                 "recall failed: both arms unavailable (vector: {ve})"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEK: [u8; 32] = [42u8; 32];
+    const KEY_BYTES: [u8; 32] = [7u8; 32];
+
+    fn open_log(dir: &Path) -> EventLog {
+        let key = SigningKey::from_bytes(&KEY_BYTES);
+        EventLog::open(&dir.join("m.db"), &DEK, key).unwrap()
+    }
+
+    /// F2 security gate (parent §5.11): the private `append_graph_event` defaults
+    /// `source_event_ids` to `[src, dst]` ONLY for the manual producer; a
+    /// non-manual producer with an empty source set is REJECTED so taint cannot be
+    /// laundered past the lineage walk. This unit test reaches the private helper
+    /// directly (the public `link`/`invalidate` always pass `MANUAL_LINK_PRODUCER`,
+    /// so they can never trigger the reject arm).
+    #[test]
+    fn append_graph_event_rejects_non_manual_producer_with_empty_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+
+        // Non-manual producer + empty sources → the F2 reject arm fires.
+        let err = log
+            .append_graph_event("link", "m4-reasoner", "a", "works_at", "b", None, &[])
+            .expect_err("non-manual producer with empty sources must be rejected");
+        match err {
+            BossclawError::InvalidInput(msg) => assert!(
+                msg.contains("non-manual"),
+                "reject message should name the non-manual gate, got: {msg}"
+            ),
+            other => panic!("expected BossclawError::InvalidInput, got {other:?}"),
+        }
+
+        // Manual producer + empty sources → succeeds, defaulting to [src, dst].
+        let id = log
+            .append_graph_event("link", MANUAL_LINK_PRODUCER, "a", "works_at", "b", None, &[])
+            .expect("manual producer with empty sources must succeed");
+        let ev = log.stream_all().unwrap().into_iter().find(|e| e.id == id).unwrap();
+        let meta = ev.model_meta.expect("link is Tier-B");
+        assert_eq!(meta.model_id, MANUAL_LINK_PRODUCER);
+        assert_eq!(
+            meta.source_event_ids,
+            vec!["a".to_string(), "b".to_string()],
+            "manual empty-source link defaults to [src, dst]"
+        );
+    }
+
+    /// Minimal `memory` event for the graph-BFS unit test (mirrors the helper in
+    /// `tests/graph.rs`; kept local so this unit module stays self-contained).
+    fn mk_memory(text: &str) -> Event {
+        Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: "memory".to_string(),
+            content: serde_json::json!({ "text": text }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(),
+            signature: None,
+        }
+    }
+
+    /// The multi-hop BFS expands to `max_hops` and records the SHORTEST hop
+    /// distance per node. Exercises the hop≥2 branch that the shipped
+    /// `GRAPH_MAX_HOPS = 1` never reaches, so the `GRAPH_HOP_DECAY^(hop-1)` decay
+    /// term and the frontier expansion are proven rather than merely asserted.
+    /// Chain a→b→c: from seed `a`, `b` is a direct neighbor (hop 1) and `c` is
+    /// reachable only through `b` (hop 2); the seed itself is excluded.
+    #[test]
+    fn current_neighbors_with_hops_expands_to_max_hops_shortest_distance() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let a = log.append(mk_memory("a")).unwrap();
+        let b = log.append(mk_memory("b")).unwrap();
+        let c = log.append(mk_memory("c")).unwrap();
+        log.link(&a, "x", &b, None, &[]).unwrap();
+        log.link(&b, "x", &c, None, &[]).unwrap();
+        log.rebuild_graph().unwrap();
+
+        let hops = log.current_neighbors_with_hops(std::slice::from_ref(&a), 2).unwrap();
+        let expected: HashMap<String, u32> = [(b, 1), (c, 2)].into_iter().collect();
+        assert_eq!(
+            hops, expected,
+            "BFS must reach b at hop 1 and c at hop 2, excluding the seed a"
+        );
     }
 }
