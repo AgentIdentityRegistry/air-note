@@ -6,7 +6,7 @@ use bossclaw_core::extract::{
     build_pass_a_prompt, parse_proposals, propose, resolve_decision, Proposals, ResolveDecision,
     PASS_A_SYSTEM, RELATION_VOCAB, RESOLVE_HIGH, RESOLVE_LOW,
 };
-use bossclaw_core::reason::{extraction_schema, ScriptedReasoner};
+use bossclaw_core::reason::ScriptedReasoner;
 use serde_json::json;
 
 #[test]
@@ -60,10 +60,16 @@ fn pass_a_prompt_carries_source_recalled_vocabulary_cardinality_and_exemplars() 
         prompt.contains("works_at_primary"),
         "prompt must teach cardinality: works_at_primary is single-valued"
     );
-    // F9(a): at least one hand-written few-shot exemplar is embedded.
+    // F9(a): the exemplar BODY (not just the section header) is rendered — this
+    // substring only exists if PASS_A_EXEMPLARS was actually pushed.
     assert!(
-        prompt.contains("EXAMPLE"),
-        "prompt must contain few-shot exemplars (F9a)"
+        prompt.contains("Alice joined Umbrella Corp"),
+        "prompt must embed exemplar BODY, not just the header (F9a)"
+    );
+    // I-3: the untrusted source text is wrapped in explicit fence markers.
+    assert!(
+        prompt.contains("<<<SOURCE_BEGIN>>>") && prompt.contains("<<<SOURCE_END>>>"),
+        "source memory must be fenced (untrusted-content fence, design §8.4)"
     );
 }
 
@@ -123,6 +129,21 @@ fn propose_runs_pass_a_through_the_reasoner() {
     let p = propose(&reasoner, source, &recalled).unwrap();
     assert_eq!(p.entities[0].mention, "Kenny");
     assert_eq!(p.relations[0].dst, "Acme");
-    // Sanity: the schema builder is the one propose() passes.
-    assert_eq!(extraction_schema()["type"], json!("object"));
+}
+
+#[test]
+fn parse_proposals_clamps_out_of_range_confidence() {
+    // I-2: a model can emit confidences outside [0, 1]; the parser clamps them so
+    // Proposals honors the documented invariant before Task 6's trust gate reads it.
+    let raw = json!({
+        "entities": [{ "mention": "X", "entity_type": "person", "confidence": 1.5 }],
+        "relations": [{
+            "src": "X", "relation": "knows", "dst": "Y",
+            "confidence": -0.3, "supported_by": "X knows Y."
+        }],
+        "retractions": []
+    });
+    let p = parse_proposals(&raw).unwrap();
+    assert!((p.entities[0].confidence - 1.0).abs() < 1e-6, "1.5 clamps to 1.0");
+    assert!((p.relations[0].confidence - 0.0).abs() < 1e-6, "-0.3 clamps to 0.0");
 }
