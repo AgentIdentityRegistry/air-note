@@ -135,6 +135,13 @@ pub const GRAPH_MAX_HOPS: u32 = 1;
 /// single strongest hit", which fires with zero caller input.
 pub const GRAPH_AUTO_SEED_TOPK: usize = 1;
 
+/// Intra-result reinforcement seed count (spec §7): auto-seed proximity from the
+/// top N fused hits, not just the single top-1 (the M3 [`GRAPH_AUTO_SEED_TOPK`]).
+/// A memory linked to several of the result set's strong hits gets the tilt. 3 is
+/// conservative — enough to catch a cluster, small enough that the boost stays a
+/// tilt (a deep hit is unlikely to seed). Tunable in dogfooding.
+pub const GRAPH_REINFORCE_TOPK: usize = 3;
+
 /// How many candidates each arm fetches before fusion. Over-fetching well beyond
 /// the caller's final `k` lets RRF see enough of each arm's tail to reorder
 /// correctly (an id ranked, say, #20 by keyword but #1 by vector should still be

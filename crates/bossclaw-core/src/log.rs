@@ -29,7 +29,7 @@ use crate::index::{HnswIndex, VectorIndex};
 use crate::keyword;
 use crate::recall::{
     fuse_scored_arms, Hit, NoopReranker, RecallOptions, RecallSource, Reranker, FUSION_FETCH,
-    GRAPH_AUTO_SEED_TOPK, GRAPH_HOP_DECAY, GRAPH_MAX_HOPS, GRAPH_WEIGHT, HALF_LIFE_SECS,
+    GRAPH_HOP_DECAY, GRAPH_MAX_HOPS, GRAPH_REINFORCE_TOPK, GRAPH_WEIGHT, HALF_LIFE_SECS,
     PIN_MULTIPLIER, RECENCY_WEIGHT,
 };
 use crate::sign::{sign_hash, verify_hash};
@@ -182,15 +182,17 @@ impl EventLog {
         // SQL TEXT comparison equals chronological comparison.
         store.exec(
             "CREATE TABLE IF NOT EXISTS edges (
-                edge_id        TEXT PRIMARY KEY,
-                src            TEXT NOT NULL,
-                relation       TEXT NOT NULL,
-                dst            TEXT NOT NULL,
-                valid_from     TEXT NOT NULL,
-                valid_to       TEXT,
-                ingested_at    TEXT NOT NULL,
-                invalidated_at TEXT,
-                invalidated_by TEXT
+                edge_id          TEXT PRIMARY KEY,
+                src              TEXT NOT NULL,
+                relation         TEXT NOT NULL,
+                dst              TEXT NOT NULL,
+                valid_from       TEXT NOT NULL,
+                valid_to         TEXT,
+                ingested_at      TEXT NOT NULL,
+                invalidated_at   TEXT,
+                invalidated_by   TEXT,
+                origin           TEXT NOT NULL DEFAULT 'manual',
+                confidence_milli INTEGER
             )",
         )?;
         store.exec(
@@ -903,14 +905,17 @@ impl EventLog {
         let seeds: Vec<String> = if !opts.graph_seeds.is_empty() {
             opts.graph_seeds.clone()
         } else {
-            // Auto-seed is top-1 only: if the strongest hit is unlinked, no seed
-            // → no boost (intra-result reinforcement deferred, design §11).
+            // Intra-result reinforcement (spec §7 / Rev 2): auto-seed expands from
+            // the single top-1 hit (M3's GRAPH_AUTO_SEED_TOPK) to the top
+            // GRAPH_REINFORCE_TOPK fused hits — a memory linked to ANY of the
+            // result set's strong hits gets the proximity tilt, not only neighbors
+            // of the single strongest hit.
             let mut by_score: Vec<(&String, &f32)> = fused.iter().collect();
             by_score.sort_by(|a, b| {
                 // id desc = deterministic tie-break only (not semantically meaningful).
                 b.1.total_cmp(a.1).then_with(|| b.0.cmp(a.0))
             });
-            by_score.into_iter().take(GRAPH_AUTO_SEED_TOPK).map(|(id, _)| id.clone()).collect()
+            by_score.into_iter().take(GRAPH_REINFORCE_TOPK).map(|(id, _)| id.clone()).collect()
         };
         let graph_hops = self
             .current_neighbors_with_hops(&seeds, GRAPH_MAX_HOPS)
@@ -1278,6 +1283,67 @@ impl EventLog {
         self.append_graph_event("link", MANUAL_LINK_PRODUCER, src, relation, dst, valid_time, source_event_ids)
     }
 
+    /// Append a signed Tier-B MACHINE `link` carrying its `confidence` as an
+    /// INTEGER `confidence_milli` (0..=1000) in the signed CONTENT (spec §4/§7;
+    /// Rev 2 F3 — never a raw `f32`, never in `ModelMeta`). For the M4a reasoner:
+    /// a NON-MANUAL producer, so `source_event_ids` MUST be non-empty (the F2
+    /// taint guard rejects an empty set — an empty default would launder taint
+    /// past the §5.11 lineage walk).
+    ///
+    /// `confidence` is clamped to `[0.0, 1.0]` then quantized to integer milli
+    /// (`(c.clamp(0.0,1.0) * 1000.0).round() as i64`) so the JCS-canonical signed
+    /// bytes have ONE deterministic form — a float would risk
+    /// [`EventLog::verify_chain`] breaking across `serde_jcs` versions on this
+    /// append-only signed store. The value projects to `edges.confidence_milli`
+    /// and gates the recall boost (spec §7): a machine edge below
+    /// [`crate::extract::TRUST_MIN`] is recorded + queryable but does NOT tilt
+    /// recall. The `producer` MUST NOT be [`MANUAL_LINK_PRODUCER`] (a machine link
+    /// is, by definition, non-manual — that is what makes `origin = "machine"`).
+    /// Returns the new edge event's id.
+    ///
+    /// The `edges` table is NOT updated here — call [`EventLog::rebuild_graph`].
+    pub fn link_machine(
+        &self,
+        src: &str,
+        relation: &str,
+        dst: &str,
+        confidence: f32,
+        producer: &str,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput(
+                "machine link requires explicit non-empty source_event_ids (the cheat-sheet \
+                 read-set) — an empty default would launder taint past the §5.11 lineage walk"
+                    .into(),
+            ));
+        }
+        // Integer milli (Rev 2 F3): clamp to [0,1] then quantize. ONE canonical JCS
+        // form — no f32/f64 round-trip ambiguity in the SIGNED content.
+        let confidence_milli = (f64::from(confidence.clamp(0.0, 1.0)) * 1000.0).round() as i64;
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: "link".to_string(),
+            content: serde_json::json!({
+                "src": src,
+                "relation": relation,
+                "dst": dst,
+                "confidence_milli": confidence_milli,
+            }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(),
+                prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
     /// Append a signed Tier-B `invalidate` event retiring the edge-key
     /// `(src, relation, dst)`. `valid_time` (optional) is when the fact stopped
     /// being true in the world. Same `source_event_ids` defaulting and lifecycle
@@ -1511,11 +1577,11 @@ impl EventLog {
             tx.execute(
                 "INSERT INTO edges
                    (edge_id, src, relation, dst, valid_from, valid_to,
-                    ingested_at, invalidated_at, invalidated_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    ingested_at, invalidated_at, invalidated_by, origin, confidence_milli)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     e.edge_id, e.src, e.relation, e.dst, e.valid_from, e.valid_to,
-                    e.ingested_at, e.invalidated_at, e.invalidated_by
+                    e.ingested_at, e.invalidated_at, e.invalidated_by, e.origin, e.confidence_milli
                 ],
             )?;
         }
@@ -1601,7 +1667,8 @@ impl EventLog {
     pub fn all_edges(&self) -> Result<Vec<crate::graph::Edge>, BossclawError> {
         self.query_edges(
             "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
-                ingested_at, invalidated_at, invalidated_by FROM edges ORDER BY edge_id ASC",
+                ingested_at, invalidated_at, invalidated_by, origin, confidence_milli \
+             FROM edges ORDER BY edge_id ASC",
             &[],
         )
     }
@@ -1634,7 +1701,7 @@ impl EventLog {
     pub fn neighbors(&self, node: &str) -> Result<Vec<crate::graph::Edge>, BossclawError> {
         self.query_edges(
             "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
-                ingested_at, invalidated_at, invalidated_by \
+                ingested_at, invalidated_at, invalidated_by, origin, confidence_milli \
              FROM edges \
              WHERE (src = ?1 OR dst = ?1) AND invalidated_at IS NULL \
              ORDER BY edge_id ASC",
@@ -1660,7 +1727,7 @@ impl EventLog {
     ) -> Result<Vec<crate::graph::Edge>, BossclawError> {
         let mut sql = String::from(
             "SELECT edge_id, src, relation, dst, valid_from, valid_to, \
-                ingested_at, invalidated_at, invalidated_by \
+                ingested_at, invalidated_at, invalidated_by, origin, confidence_milli \
              FROM edges WHERE (src = ?1 OR dst = ?1)",
         );
 
@@ -1727,6 +1794,8 @@ impl EventLog {
                 ingested_at: r.get(6)?,
                 invalidated_at: r.get(7)?,
                 invalidated_by: r.get(8)?,
+                origin: r.get(9)?,
+                confidence_milli: r.get(10)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1769,9 +1838,22 @@ impl EventLog {
     /// `frontier` (undirected: returns both `dst` where `src ∈ frontier` and
     /// `src` where `dst ∈ frontier`). Empty `frontier` → empty set.
     ///
-    /// Both `IN` clauses share the same `?1..?n` placeholders, so the id list
-    /// is bound ONCE (n params, not 2n — binding 2n would exceed the
-    /// statement's parameter count and error at query time).
+    /// **Trust gate (spec §7 / Rev 2 M4+F3):** only edges that pass
+    /// `origin = 'manual' OR (origin = 'machine' AND confidence_milli >= ?)`
+    /// contribute the proximity boost — manual edges always, machine edges only
+    /// when their integer `confidence_milli` clears the threshold derived from
+    /// [`crate::extract::TRUST_MIN`] (= 600). Low-confidence machine edges are
+    /// still recorded + queryable (never-forget), but do NOT tilt recall. The
+    /// threshold is an INTEGER **bound as a SQL parameter** (never `format!`-ed
+    /// into the SQL) — both the F3 signing-integrity contract and SQLi hygiene.
+    /// `confidence_milli` is NULL for manual edges, so the `origin = 'manual'` arm
+    /// matches them regardless (NULL never satisfies `>= ?`, which is why the OR
+    /// is structured this way).
+    ///
+    /// Both `IN` clauses share the same `?1..?n` placeholders (the id list bound
+    /// ONCE — n params, not 2n, which would exceed the statement's parameter
+    /// count); the trust threshold is bound ONCE at `?{n+1}` and referenced in
+    /// both halves of the `UNION`.
     fn current_adjacent(
         &self,
         frontier: &HashSet<String>,
@@ -1782,19 +1864,30 @@ impl EventLog {
         let ids: Vec<&String> = frontier.iter().collect();
         let placeholders: String =
             (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
-        // dst where src ∈ frontier  UNION  src where dst ∈ frontier (current only).
-        // Both IN clauses reference the SAME ?1..?n placeholders; bind the id
-        // list ONCE (n params, not 2n).
-        let sql = format!(
-            "SELECT dst AS other FROM edges WHERE invalidated_at IS NULL AND src IN ({placeholders}) \
-             UNION \
-             SELECT src AS other FROM edges WHERE invalidated_at IS NULL AND dst IN ({placeholders})"
+        // Trust threshold bound as the parameter AFTER the id placeholders.
+        let trust_param = format!("?{}", ids.len() + 1);
+        let trust = format!(
+            "(origin = 'manual' OR (origin = 'machine' AND confidence_milli >= {trust_param}))"
         );
+        // dst where src ∈ frontier  UNION  src where dst ∈ frontier (current +
+        // trust-gated only). Both IN clauses reference the SAME ?1..?n
+        // placeholders; the trust threshold is the SAME ?{n+1} in both halves.
+        let sql = format!(
+            "SELECT dst AS other FROM edges \
+               WHERE invalidated_at IS NULL AND {trust} AND src IN ({placeholders}) \
+             UNION \
+             SELECT src AS other FROM edges \
+               WHERE invalidated_at IS NULL AND {trust} AND dst IN ({placeholders})"
+        );
+        // Integer trust threshold derived from the documented f32 TRUST_MIN
+        // (Rev 2 F3): TRUST_MIN stays an f32 used ONLY to derive this integer = 600.
+        let trust_min_milli = (f64::from(crate::extract::TRUST_MIN) * 1000.0).round() as i64;
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> =
+        let mut params: Vec<&dyn rusqlite::ToSql> =
             ids.iter().map(|id| *id as &dyn rusqlite::ToSql).collect();
+        params.push(&trust_min_milli as &dyn rusqlite::ToSql);
         let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
         let mut out = HashSet::new();
         for row in rows {

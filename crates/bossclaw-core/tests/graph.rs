@@ -421,3 +421,139 @@ fn append_rejects_empty_source_event_ids_for_tier_b() {
         "append must reject a Tier-B event with empty source_event_ids"
     );
 }
+
+// ── Task 6: edges origin + integer-milli confidence (Rev 2 F3) ───────────────
+
+#[test]
+fn edges_carry_origin_and_confidence_milli_from_the_producing_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("kenny at acme")).unwrap();
+    let kenny = log
+        .entity("Kenny", &[], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    let acme = log
+        .entity("Acme", &[], "org", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+
+    // A MACHINE link WITH confidence (the M4a reasoner producer). 0.83 → 830 milli
+    // (Rev 2 F3 — the SIGNED content carries the INTEGER, never a raw f32).
+    log.link_machine(&kenny, "works_at", &acme, 0.83, "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    // A MANUAL link (no confidence).
+    let other = log.append(mk_memory("note")).unwrap();
+    log.link(&m, "relates_to", &other, None, std::slice::from_ref(&m)).unwrap();
+    log.rebuild_graph().unwrap();
+
+    let edges = log.all_edges().unwrap();
+    let machine = edges.iter().find(|e| e.relation == "works_at").unwrap();
+    assert_eq!(machine.origin, "machine");
+    assert_eq!(
+        machine.confidence_milli,
+        Some(830),
+        "0.83 quantizes to 830 integer-milli in the signed content"
+    );
+    let manual = edges.iter().find(|e| e.relation == "relates_to").unwrap();
+    assert_eq!(manual.origin, "manual");
+    assert_eq!(manual.confidence_milli, None, "manual links carry NULL confidence");
+}
+
+#[test]
+fn edges_origin_confidence_rebuild_is_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("kenny at acme")).unwrap();
+    let kenny = log
+        .entity("Kenny", &[], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    let acme = log
+        .entity("Acme", &[], "org", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    log.link_machine(&kenny, "works_at", &acme, 0.42, "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    log.rebuild_graph().unwrap();
+    let e1 = log.all_edges().unwrap();
+    log.rebuild_graph().unwrap();
+    let e2 = log.all_edges().unwrap();
+    assert_eq!(
+        e1, e2,
+        "origin/confidence_milli columns are pure functions of event fields → byte-identical rebuild holds"
+    );
+}
+
+// ── Rev 2 T-E: machine-link confidence is SIGNED (tamper-evident) ────────────
+
+/// T-E (security #7): the integer `confidence_milli` lives inside the SIGNED
+/// `link` content. Directly UPDATEing the stored payload's confidence to a
+/// different value must break the hash chain — `verify_chain()` returns `Err`.
+/// This freezes the "confidence is signed / tamper-evident" contract.
+#[test]
+fn machine_link_confidence_milli_is_signed_tamper_breaks_verify_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let path = dir.path().join("m.db");
+    {
+        let log = EventLog::open(&path, &DEK, key.clone()).unwrap();
+        let m = log.append(mk_memory("kenny at acme")).unwrap();
+        let kenny = log
+            .entity("Kenny", &[], "person", "m4-reasoner", std::slice::from_ref(&m))
+            .unwrap();
+        let acme = log
+            .entity("Acme", &[], "org", "m4-reasoner", std::slice::from_ref(&m))
+            .unwrap();
+        // confidence 0.9 → confidence_milli 900 in the signed content.
+        log.link_machine(&kenny, "works_at", &acme, 0.9, "m4-reasoner", std::slice::from_ref(&m))
+            .unwrap();
+        log.verify_chain().expect("chain verifies before tamper");
+    }
+    {
+        // Tamper the stored payload: rewrite confidence_milli 900 → 100 directly,
+        // bypassing the signed-append path.
+        let store = bossclaw_core::store::Store::open(&path, &DEK).unwrap();
+        store
+            .exec(
+                "UPDATE events \
+                 SET payload = replace(payload, '\"confidence_milli\":900', '\"confidence_milli\":100') \
+                 WHERE event_type='link' AND payload LIKE '%\"confidence_milli\":900%'",
+            )
+            .unwrap();
+    }
+    let log = EventLog::open(&path, &DEK, key).unwrap();
+    assert!(
+        log.verify_chain().is_err(),
+        "tampering the signed confidence_milli must break verify_chain (confidence is signed)"
+    );
+}
+
+// ── Rev 2 T-F (machine path): malicious relation label is inert data, not SQL ─
+
+/// T-F (security #6, machine-link path): a malicious relation label on a MACHINE
+/// link round-trips as inert literal data (the M3/Task-2 T-E covered the manual
+/// relation + entity-label paths; this covers `link_machine`). Confirms the
+/// parameterized INSERT/SELECT treats the label as data even on the new path.
+#[test]
+fn malicious_machine_relation_label_is_inert_data_not_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("bobby tables")).unwrap();
+    let kenny = log
+        .entity("Kenny", &[], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    let acme = log
+        .entity("Acme", &[], "org", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    let evil_relation = r#"works_at"); DROP TABLE edges; --"#;
+    log.link_machine(&kenny, evil_relation, &acme, 0.95, "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    log.rebuild_graph().unwrap();
+
+    let edges = log.all_edges().unwrap();
+    // The edges table still exists and is queryable — the DROP was inert.
+    assert_eq!(edges.len(), 1, "one edge — malicious relation did not alter query semantics");
+    assert_eq!(
+        edges[0].relation, evil_relation,
+        "machine relation label round-trips as inert literal data"
+    );
+    assert_eq!(edges[0].origin, "machine");
+    assert_eq!(edges[0].confidence_milli, Some(950));
+}

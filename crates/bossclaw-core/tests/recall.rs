@@ -1531,27 +1531,44 @@ fn open_with_recall_on_empty_store_does_not_panic() {
 /// query-irrelevant candidates): the linked neighbour's score carries the ~1.4×
 /// graph multiplier while the edge is current, and reverts to its unboosted base
 /// once the edge is retired (current-edges-only gating, spec §6).
+///
+/// Corpus sized ≥6 (Rev 2 F7): intra-result reinforcement widens auto-seed from
+/// top-1 to the top [`GRAPH_REINFORCE_TOPK`] (= 3) fused hits, and a seed is
+/// EXCLUDED from being its own boost target. The neighbour must therefore sit
+/// OUTSIDE the top-3 (it shares no query tokens → ranks last) so it is boosted
+/// purely as the top hit's neighbour, not because it is itself a seed — the
+/// partial-overlap fillers (events 1–4) hold the middle ranks. This preserves the
+/// original "current-edge neighbour is boosted, retired-edge baseline is not"
+/// contract under reinforcement.
 #[test]
 fn recall_graph_proximity_auto_seed_boosts_only_current_edges() {
     let (log, _dir, ids) = seeded_log(&[
-        "rustacean memory engine ferris",   // 0: query matches this → auto-seed
-        "completely unrelated tokens here", // 1: neighbour of the seed
-        "another disjoint vocabulary set",  // 2: unlinked bystander
+        "rustacean memory engine ferris crab", // 0: full query match → top auto-seed
+        "rustacean memory engine ferris",       // 1: partial (4/5) — fills a top rank
+        "rustacean memory engine",              // 2: partial (3/5) — fills a top rank
+        "rustacean memory",                     // 3: partial (2/5)
+        "rustacean",                            // 4: partial (1/5)
+        "completely unrelated tokens here",     // 5: NEIGHBOUR — disjoint, ranks last
     ]);
-    log.link(&ids[0], "relates_to", &ids[1], None, &[]).unwrap();
+    // Link the top hit (0) to the out-of-top-3 neighbour (5).
+    log.link(&ids[0], "relates_to", &ids[5], None, &[]).unwrap();
     log.rebuild_graph().unwrap();
 
     let embedder = MockEmbedder::new(MID_DIM);
-    let query = "rustacean memory engine ferris";
+    let query = "rustacean memory engine ferris crab";
+    // Request the whole corpus so the last-ranked neighbour is always present in
+    // BOTH result sets (its boost would otherwise lift it in/out of a small top-k,
+    // confounding the score comparison with a presence change).
+    let k = ids.len();
 
-    let boosted = log.recall(&embedder, query, RECALL_TOP_K, &RecallOptions::default()).unwrap();
-    let s_boosted = find_hit(&boosted, &ids[1]).expect("neighbor present").score;
+    let boosted = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_boosted = find_hit(&boosted, &ids[5]).expect("neighbor present").score;
 
     // Retire the edge → the neighbour must lose the boost.
-    log.invalidate(&ids[0], "relates_to", &ids[1], None, &[ids[0].clone()]).unwrap();
+    log.invalidate(&ids[0], "relates_to", &ids[5], None, &[ids[0].clone()]).unwrap();
     log.rebuild_graph().unwrap();
-    let retired = log.recall(&embedder, query, RECALL_TOP_K, &RecallOptions::default()).unwrap();
-    let s_retired = find_hit(&retired, &ids[1]).expect("neighbor present").score;
+    let retired = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_retired = find_hit(&retired, &ids[5]).expect("neighbor present").score;
 
     assert!(
         s_boosted > s_retired * 1.2,
@@ -1604,4 +1621,123 @@ fn invalidating_an_edge_does_not_suppress_the_memory_from_recall() {
     let embedder = MockEmbedder::new(MID_DIM);
     let hits = log.recall(&embedder, "ferris the rustacean crab", RECALL_TOP_K, &RecallOptions::default()).unwrap();
     assert!(find_hit(&hits, &ids[0]).is_some(), "memory must remain recallable after its edge is retired (never-forget)");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: trust-gated boost + intra-result reinforcement (Rev 2 T-H, F3, F7)
+// ---------------------------------------------------------------------------
+
+/// T-H (security #4) — trust gate is ZERO contribution, not merely "less than".
+/// A LOW-confidence machine edge (`confidence_milli` 100 < 600) must contribute
+/// EXACTLY ZERO recall boost: its neighbour scores bit-identically to the no-edge
+/// baseline (retire the edge → compare EQUAL). A `≥600` machine edge — and a
+/// `manual` edge — DOES boost. Low-confidence machine edges remain recorded +
+/// queryable (never-forget); they just do not tilt recall (spec §7).
+///
+/// Corpus sized ≥6 (Rev 2 F7): with top-[`GRAPH_REINFORCE_TOPK`] auto-seeding and
+/// seed-self-exclusion, the boosted neighbour must sit OUTSIDE the top-3 (it
+/// shares no query tokens → ranks last) so it is boosted ONLY via the trusted
+/// edge to the top hit, never because it is itself a seed.
+#[test]
+fn recall_trust_gate_low_confidence_machine_edge_contributes_exactly_zero() {
+    let texts: &[&str] = &[
+        "rustacean memory engine ferris crab", // 0: full match → top auto-seed
+        "rustacean memory engine ferris",       // 1: partial (4/5) — top rank
+        "rustacean memory engine",              // 2: partial (3/5) — top rank
+        "rustacean memory",                     // 3: partial (2/5)
+        "rustacean",                            // 4: partial (1/5)
+        "completely unrelated tokens here",     // 5: NEIGHBOUR — disjoint, ranks last
+    ];
+    let (log, _dir, ids) = seeded_log(texts);
+    let embedder = MockEmbedder::new(MID_DIM);
+    let query = "rustacean memory engine ferris crab";
+    let k = ids.len();
+
+    // ── (1) LOW-confidence machine edge (100 milli < 600): gated OUT. ──
+    log.link_machine(&ids[0], "relates_to", &ids[5], 0.10, "m4-reasoner", &[ids[0].clone()])
+        .unwrap();
+    log.rebuild_graph().unwrap();
+    let low = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_low = find_hit(&low, &ids[5]).expect("neighbor present").score;
+
+    // The low-confidence edge still EXISTS + is queryable (never-forget)…
+    assert_eq!(log.all_edges().unwrap().len(), 1, "low-confidence edge is still recorded");
+
+    // …and is retired to establish the true no-edge baseline.
+    log.invalidate(&ids[0], "relates_to", &ids[5], None, &[ids[0].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let base = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_base = find_hit(&base, &ids[5]).expect("neighbor present").score;
+
+    assert_eq!(
+        s_low, s_base,
+        "a <600 machine edge must contribute EXACTLY ZERO boost (equal to the no-edge baseline), \
+         got low={s_low}, baseline={s_base}"
+    );
+
+    // ── (2) HIGH-confidence machine edge (950 milli ≥ 600): DOES boost. ──
+    log.link_machine(&ids[0], "relates_to", &ids[5], 0.95, "m4-reasoner", &[ids[0].clone()])
+        .unwrap();
+    log.rebuild_graph().unwrap();
+    let high = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_high = find_hit(&high, &ids[5]).expect("neighbor present").score;
+    assert!(
+        s_high > s_base * 1.2,
+        "a ≥600 machine edge must boost the neighbour over the no-edge baseline: \
+         high={s_high}, baseline={s_base}"
+    );
+
+    // ── (3) A MANUAL edge also boosts (origin='manual' always passes the gate). ──
+    log.invalidate(&ids[0], "relates_to", &ids[5], None, &[ids[0].clone()]).unwrap();
+    log.link(&ids[0], "relates_to", &ids[5], None, &[ids[0].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let manual = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_manual = find_hit(&manual, &ids[5]).expect("neighbor present").score;
+    assert!(
+        s_manual > s_base * 1.2,
+        "a manual edge must boost the neighbour over the no-edge baseline: \
+         manual={s_manual}, baseline={s_base}"
+    );
+}
+
+/// Intra-result reinforcement (spec §7 / Rev 2): a memory that neighbours a
+/// NON-top strong fused hit still gets the proximity tilt. M3 auto-seeded only
+/// the single top-1 hit, so a neighbour of the #2/#3 hit got nothing; widening to
+/// the top-[`GRAPH_REINFORCE_TOPK`] (= 3) fused hits lights it up.
+///
+/// Corpus: event 0 is the strongest (rank 1), event 1 is a strong NON-top hit
+/// (rank 2, within top-3), event 2 fills the 3rd seed slot, and event 3 — the
+/// neighbour of event 1 — shares no query tokens so it ranks LAST (outside the
+/// top-3, hence NOT a seed itself). Under M3 (top-1) event 3 is unboosted (it is
+/// not the top hit's neighbour); under reinforcement it is boosted because its
+/// neighbour (event 1) is now a seed. Score-based: edge present vs. edge retired.
+#[test]
+fn recall_intra_result_reinforcement_boosts_neighbor_of_a_non_top_hit() {
+    let texts: &[&str] = &[
+        "rustacean memory engine ferris crab", // 0: strongest (rank 1)
+        "rustacean memory engine ferris",       // 1: strong NON-top hit (rank 2)
+        "rustacean memory engine",              // 2: fills the 3rd top seed slot
+        "completely unrelated tokens here",     // 3: neighbour of 1 — ranks last
+    ];
+    let (log, _dir, ids) = seeded_log(texts);
+    let embedder = MockEmbedder::new(MID_DIM);
+    let query = "rustacean memory engine ferris crab";
+    let k = ids.len();
+
+    // Edge from the NON-top hit (1) to the out-of-top-3 neighbour (3).
+    log.link(&ids[1], "relates_to", &ids[3], None, &[ids[1].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let hits = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s3 = find_hit(&hits, &ids[3]).expect("neighbor present").score;
+
+    // Retire the edge → event 3 loses the reinforcement boost (baseline).
+    log.invalidate(&ids[1], "relates_to", &ids[3], None, &[ids[1].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let base = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s3_base = find_hit(&base, &ids[3]).expect("neighbor present").score;
+
+    assert!(
+        s3 > s3_base * 1.2,
+        "neighbour of a non-top strong hit must be reinforced: boosted={s3}, base={s3_base}"
+    );
 }

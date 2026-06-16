@@ -55,6 +55,18 @@ pub struct Edge {
     pub invalidated_at: Option<String>,
     /// The `invalidate` event id that closed this edge, if any.
     pub invalidated_by: Option<String>,
+    /// Edge origin: `"manual"` iff the producing `link`'s `model_id ==
+    /// [`MANUAL_LINK_PRODUCER`], else `"machine"` (spec §4). A pure function of the
+    /// signed event field → the byte-identical-rebuild gate holds.
+    pub origin: String,
+    /// Machine-link confidence as an INTEGER milli-unit in `0..=1000` read from the
+    /// signed `link` content's `confidence_milli` field; `None` for a manual link
+    /// (spec §4 / Rev 2 F3). Stored as an integer — never a raw `f32` — because a
+    /// float in JCS-canonicalized signed content is a cross-`serde_jcs`-version
+    /// determinism hazard that could break [`crate::log::EventLog::verify_chain`].
+    /// The recall trust gate (spec §7) compares it against the integer threshold
+    /// derived from [`crate::extract::TRUST_MIN`].
+    pub confidence_milli: Option<i64>,
 }
 
 impl Edge {
@@ -106,14 +118,35 @@ pub fn normalize_ts(ts: &str) -> String {
     }
 }
 
-/// Extract `(src, relation, dst)` from a `link`/`invalidate` event's content,
-/// or `None` if any field is missing or non-string (malformed — skipped by the
-/// fold rather than failing it).
-pub fn parse_link_content(content: &serde_json::Value) -> Option<(String, String, String)> {
+/// Extract `(src, relation, dst, confidence_milli?)` from a `link`/`invalidate`
+/// event's content, or `None` if `src`/`relation`/`dst` are missing or non-string
+/// (malformed — skipped by the fold rather than failing it).
+///
+/// `confidence_milli` is OPTIONAL and INTEGER (Rev 2 F3): absent or non-integer ⇒
+/// `None`. Back-compatible — M3 manual links have no confidence and keep
+/// byte-identical rebuilds. The value is an integer milli-unit (0..=1000) and is
+/// read tolerantly; the fold (and the trust gate) treat `None` as "no machine
+/// confidence". `confidence` lives in the signed content, never in `ModelMeta`
+/// (spec §4) — and as an integer, never a raw `f32` (Rev 2 F3 signing-integrity).
+pub fn parse_link_content(
+    content: &serde_json::Value,
+) -> Option<(String, String, String, Option<i64>)> {
     let src = content.get("src")?.as_str()?.to_string();
     let relation = content.get("relation")?.as_str()?.to_string();
     let dst = content.get("dst")?.as_str()?.to_string();
-    Some((src, relation, dst))
+    let confidence_milli = content.get("confidence_milli").and_then(|c| c.as_i64());
+    Some((src, relation, dst, confidence_milli))
+}
+
+/// Edge origin from a producing link's `model_id` (spec §4): `"manual"` iff it
+/// equals [`MANUAL_LINK_PRODUCER`], else `"machine"`. Single-sourced so the
+/// derivation is identical everywhere (the fold, the trust gate's expectations).
+pub fn origin_of(model_id: &str) -> String {
+    if model_id == MANUAL_LINK_PRODUCER {
+        "manual".to_string()
+    } else {
+        "machine".to_string()
+    }
 }
 
 /// A folded entity record: one `entity` Tier-B event projected into the
@@ -183,7 +216,7 @@ pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
     // edge-key → indices into `edges` that are still open for that key.
     let mut active: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     for ev in events {
-        let (src, relation, dst) = match parse_link_content(&ev.content) {
+        let (src, relation, dst, confidence_milli) = match parse_link_content(&ev.content) {
             Some(t) => t,
             None => continue,
         };
@@ -192,6 +225,16 @@ pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
             "link" => {
                 let valid_from = normalize_ts(ev.valid_time.as_deref().unwrap_or(&ev.ts));
                 let ingested_at = normalize_ts(&ev.ts);
+                // origin from the signed model_id; a link with no model_meta is
+                // treated as manual (M3 hand-links always had model_meta, so this
+                // is a defensive default, not a normal path).
+                let origin = ev
+                    .model_meta
+                    .as_ref()
+                    .map(|m| origin_of(&m.model_id))
+                    .unwrap_or_else(|| "manual".to_string());
+                // Manual links carry NULL confidence even if a stray value appears.
+                let confidence_milli = if origin == "manual" { None } else { confidence_milli };
                 edges.push(Edge {
                     edge_id: ev.id.clone(),
                     src,
@@ -202,6 +245,8 @@ pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
                     ingested_at,
                     invalidated_at: None,
                     invalidated_by: None,
+                    origin,
+                    confidence_milli,
                 });
                 active.entry(key).or_default().push(edges.len() - 1);
             }
