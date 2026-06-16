@@ -119,6 +119,12 @@ pub struct EventLog {
     /// `Send + Sync` (the [`VectorIndex`] bound guarantees it), so `EventLog`
     /// stays `Send + Sync` and shareable as `Arc<EventLog>`.
     vector_index: Mutex<Option<Box<dyn VectorIndex>>>,
+    /// In-memory ANN index over `entity`-event vectors ONLY, for entity
+    /// resolution (spec §6). Physically separate from `vector_index` so recall
+    /// can never surface an entity node and resolution can never match a memory.
+    /// `None` until [`EventLog::rebuild_entity_index`]; rebuilt from the encrypted
+    /// log on open (zero plaintext index on disk, like the recall index).
+    entity_index: Mutex<Option<Box<dyn VectorIndex>>>,
 }
 
 impl EventLog {
@@ -204,6 +210,18 @@ impl EventLog {
                 entity_type TEXT NOT NULL
             )",
         )?;
+        // Entity-resolution vectors (Tier-A derived; spec §6). Separate from
+        // `vectors` so the resolution index NEVER mixes with the recall index —
+        // recall must exclude entity-kind, resolution searches only entity-kind.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS entity_vectors (
+                entity_id TEXT NOT NULL,
+                model_id  TEXT NOT NULL,
+                dim       INTEGER NOT NULL,
+                embedding BLOB NOT NULL,
+                PRIMARY KEY(entity_id, model_id)
+            )",
+        )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
         // spill to the filesystem. This is a connection-level setting; it must be
         // re-applied on every open.
@@ -228,6 +246,7 @@ impl EventLog {
             key,
             highwater: None,
             vector_index: Mutex::new(None),
+            entity_index: Mutex::new(None),
         })
     }
 
@@ -1782,6 +1801,142 @@ impl EventLog {
             out.insert(row?);
         }
         Ok(out)
+    }
+
+    /// Derive + store the resolution vector for an `entity` node under
+    /// `(entity_id, model_id)` in a dedicated `entity_vectors` table. Separate
+    /// from `vectors` (which feeds recall) so the two indexes never bleed. The
+    /// `text` is the entity's label (+ optionally aliases) — what future mentions
+    /// are matched against. Idempotent upsert.
+    pub fn derive_entity_vector(
+        &self,
+        embedder: &dyn Embedder,
+        entity_id: &str,
+        text: &str,
+    ) -> Result<(), BossclawError> {
+        let embedding = embed_one(embedder, text)?;
+        let blob = vec_to_blob(&embedding);
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT OR REPLACE INTO entity_vectors (entity_id, model_id, dim, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![entity_id, embedder.model_id(), embedder.dim() as i64, blob],
+        )?;
+        Ok(())
+    }
+
+    /// Rebuild the in-memory entity-resolution index from `entity_vectors` for
+    /// the active model (zero plaintext index on disk; rebuilt on open — same
+    /// mechanism as [`EventLog::rebuild_indexes`]). Serial insertion over
+    /// `entity_id ASC` for reproducibility.
+    pub fn rebuild_entity_index(&self, embedder: &dyn Embedder) -> Result<(), BossclawError> {
+        let rows = self.entity_vectors_for_model(embedder.model_id())?;
+        let mut index = HnswIndex::with_capacity(rows.len());
+        for (entity_id, vec) in rows {
+            index.add(&entity_id, &vec);
+        }
+        let boxed: Box<dyn VectorIndex> = Box::new(index);
+        *self.entity_index.lock().expect(POISON) = Some(boxed);
+        Ok(())
+    }
+
+    /// All entity vectors for `model_id` as `(entity_id, vector)` pairs, ordered
+    /// `entity_id ASC` (deterministic rebuild order). Mirrors
+    /// [`EventLog::vectors_for_model`] but over the `entity_vectors` table.
+    fn entity_vectors_for_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Vec<(String, Vec<f32>)>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT entity_id, embedding FROM entity_vectors WHERE model_id = ?1 \
+             ORDER BY entity_id ASC",
+        )?;
+        let rows = stmt.query_map([model_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, blob) = row?;
+            out.push((id, blob_to_vec(&blob)?));
+        }
+        Ok(out)
+    }
+
+    /// Search the entity-resolution index for the `k` nearest `(entity_id,
+    /// distance)` pairs to `mention`'s embedding. ONLY entity nodes are searched
+    /// (the index holds only `entity_vectors`). Returns [`BossclawError::InvalidInput`]
+    /// if the entity index was never built.
+    pub fn entity_search(
+        &self,
+        embedder: &dyn Embedder,
+        mention: &str,
+        k: usize,
+    ) -> Result<Vec<(String, f32)>, BossclawError> {
+        let query = embed_one(embedder, mention)?;
+        let guard = self.entity_index.lock().expect(POISON);
+        match guard.as_ref() {
+            Some(index) => Ok(index.search(&query, k)),
+            None => Err(BossclawError::InvalidInput(
+                "entity index not built — call rebuild_entity_index".into(),
+            )),
+        }
+    }
+
+    /// Resolve one entity `mention` against the existing entity nodes (spec §6):
+    /// embed → search the entity index → convert distance to cosine similarity →
+    /// [`crate::extract::resolve_decision`]; for the mid-band, ask `reasoner` to
+    /// adjudicate and collapse its answer to a final [`crate::extract::ResolveDecision::Merge`]
+    /// (a chosen candidate) or [`crate::extract::ResolveDecision::Mint`] (`"none"` / unknown id).
+    ///
+    /// The adjudication call is the ONLY model use here; merge/mint short-circuit
+    /// without a model call (cheap + deterministic at the thresholds).
+    pub fn resolve_mention(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+        mention: &str,
+    ) -> Result<crate::extract::ResolveDecision, BossclawError> {
+        use crate::extract::ResolveDecision;
+        // DistCosine returns distance in [0, 2]; similarity = 1 - distance.
+        let candidates: Vec<(String, f32)> = self
+            .entity_search(embedder, mention, crate::extract::GRAPH_CONTEXT_K)?
+            .into_iter()
+            .map(|(id, dist)| (id, 1.0 - dist))
+            .collect();
+        match crate::extract::resolve_decision(&candidates) {
+            ResolveDecision::Adjudicate(ids) => {
+                let decided = self.adjudicate_entity(reasoner, mention, &ids)?;
+                match decided {
+                    Some(id) => Ok(ResolveDecision::Merge(id)),
+                    None => Ok(ResolveDecision::Mint),
+                }
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Ask `reasoner` which of `candidate_ids` (if any) the `mention` refers to.
+    /// Returns `Some(id)` for a chosen candidate that is actually in the list,
+    /// `None` for `"none"` OR any id the model invented (defensive: a hallucinated
+    /// id must not become a merge target). Uses the adjudication schema.
+    fn adjudicate_entity(
+        &self,
+        reasoner: &dyn crate::reason::Reasoner,
+        mention: &str,
+        candidate_ids: &[String],
+    ) -> Result<Option<String>, BossclawError> {
+        let system = "You resolve entity coreference. Answer ONLY with the JSON the schema \
+                      describes: the id of the candidate the mention refers to, or \"none\".";
+        let prompt = crate::extract::build_adjudication_prompt(mention, candidate_ids);
+        let answer = reasoner.complete_json(system, &prompt, &crate::reason::adjudication_schema())?;
+        let chosen = answer.get("match").and_then(|m| m.as_str()).unwrap_or("none");
+        if chosen == "none" {
+            return Ok(None);
+        }
+        // Fail-closed: only accept an id the model was actually offered.
+        Ok(candidate_ids.iter().find(|id| id.as_str() == chosen).cloned())
     }
 
     /// Persist the current tip as the signed high-water mark (debounced by the

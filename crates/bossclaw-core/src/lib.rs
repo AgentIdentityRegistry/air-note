@@ -18,6 +18,7 @@
 pub mod embed;
 pub mod error;
 pub mod event;
+pub mod extract;
 #[cfg(feature = "fastembed")]
 pub mod fastembed;
 pub mod graph;
