@@ -25,9 +25,9 @@ impl IdentityStore {
         Self { vault, data_dir }
     }
 
-    pub(crate) const SIGNING_KEY: &'static str = "air-agent.agent.signing_key";
-    pub(crate) const AIR_SECRET: &'static str = "air-agent.agent.air_secret";
-    pub(crate) const METADATA_FILE: &'static str = "identity.json";
+    const SIGNING_KEY: &'static str = "air-agent.agent.signing_key";
+    const AIR_SECRET: &'static str = "air-agent.agent.air_secret";
+    const METADATA_FILE: &'static str = "identity.json";
 
     pub fn save_signing_key(&self, bytes: &[u8; 32]) -> Result<(), String> {
         self.vault.set(Self::SIGNING_KEY, &hex::encode(bytes))

@@ -200,8 +200,10 @@ fn migrate_blob_between(
     new_key: &str,
 ) -> Result<(), String> {
     let new_entry = Entry::new(new_service, new_key).map_err(|_| "vault".to_string())?;
-    if new_entry.get_password().is_ok() {
-        return Ok(());
+    match new_entry.get_password() {
+        Ok(_) => return Ok(()),                  // destination populated — never clobber
+        Err(KeyringError::NoEntry) => {}         // empty — proceed with migration
+        Err(_) => return Ok(()),                 // keychain error — best-effort, skip
     }
     let old_entry = Entry::new(old_service, old_key).map_err(|_| "vault".to_string())?;
     match old_entry.get_password() {
@@ -216,6 +218,8 @@ fn migrate_blob_between(
 }
 
 /// One-time rename migration: adopt the pre-rename API-key blob into the renamed location.
+/// MUST be called at startup BEFORE the first `ensure_loaded_blob`/`secret_get_cached`, so the
+/// in-process SECRET_CACHE is populated from the migrated (new) blob, not the empty new slot.
 pub fn migrate_legacy_blob_once() {
     let _ = migrate_blob_between(LEGACY_BLOB_SERVICE, LEGACY_BLOB_KEY, BLOB_SERVICE, BLOB_KEY);
 }
