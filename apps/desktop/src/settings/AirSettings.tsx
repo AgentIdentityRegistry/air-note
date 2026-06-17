@@ -17,7 +17,7 @@ export function AirSettings() {
       <h2 style={{ margin: 0 }}>Settings</h2>
 
       <p style={{ marginTop: 16, color: "#666", lineHeight: 1.5 }}>
-        AIR endpoint is configured via the <code>BOSSCLAW_USE_REAL_AIR</code>{" "}
+        AIR endpoint is configured via the <code>AIR_AGENT_USE_REAL_AIR</code>{" "}
         environment variable at launch. (Settings UI for this comes in v1.1.)
       </p>
 
