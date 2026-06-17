@@ -10,6 +10,87 @@ pre-1.0 and not yet published to crates.io).
 
 ## [Unreleased]
 
+### M4a — Clever Linker (2026-06-16)
+
+The LLM auto-linker that *populates* the M3 graph. A local model
+(`qwen2.5:7b-instruct` via Ollama) reads each new memory, extracts entities +
+typed relationships, resolves entities against the existing graph, retires
+contradicted facts, and appends signed Tier-B `entity`/`link`/`invalidate`
+events through the single-writer `append` — feeding the M3 fold, which makes
+the next recall smarter. The closed loop (recall → extract → graph → recall) is
+the architecture; the model's output is data, never authority
+(invalidate-not-delete, confidence/trust-gating, every emit serialized).
+
+#### Added
+
+- **Reasoner seam** (`src/reason.rs`) — the `Reasoner` trait
+  (`complete_json` + `model_id`); a deterministic `ScriptedReasoner` test double
+  (canned JSON keyed by SHA-256 of `(system, prompt)`); the extraction +
+  adjudication JSON-schema builders. Pure — no I/O.
+- **`OllamaReasoner`** (`src/ollama.rs`, feature `ollama`) — POSTs `/api/chat`
+  to loopback `127.0.0.1:11434`, `format` = the schema, `options.temperature =
+  0`, a digest-pinnable model tag, refusing any non-numeric-loopback host
+  (no egress; bare `localhost` rejected — DNS-rebind hazard). Behind the feature
+  so the default build stays pure (no network dep). The structured output is
+  parsed from a JSON string in `message.content` (verified against the live
+  Ollama response shape).
+- **`entity` Tier-B event + `entities` projection** (`src/graph.rs`,
+  `src/log.rs`) — `EventLog::entity(label, aliases, entity_type, producer,
+  source_event_ids)` mints a stable `entity:<ulid>` node; a NON-manual producer
+  → `source_event_ids` MUST be non-empty (the F2 taint guard, extended).
+  `rebuild_graph` folds entities into an `entities` table + marks those node ids
+  `kind="entity"`. Byte-identical on rebuild.
+- **Embedding entity resolution** (`src/extract.rs`, `src/log.rs`) — embed the
+  mention, search a dedicated entity vector index (`entity_vectors`,
+  kind-isolated from recall), apply `RESOLVE_HIGH`/`RESOLVE_LOW`, route the
+  mid-band to the reasoner to adjudicate. No duplicate entities.
+- **Retrieval-augmented extraction** (`src/extract.rs`, PURE) — Pass A (propose:
+  cheat-sheet prompt + seed relation vocabulary + few-shot → parse to
+  `{entities, relations, retractions}` each with confidence + a mandatory
+  `supported_by` span); Pass B (critique: a pure span-verify floor the model
+  can never override, then one model critique turn that may only subtract via
+  `intersect_keep_floor`, confirming contradictions against a relation-
+  cardinality table). The Pass-B prompt lists the proposed **retractions** as
+  well as the relations and renders the graph neighborhood by human-readable
+  entity name (not the opaque `entity:<ulid>`), so a small local model can
+  confirm a contradiction without mangling the endpoint identifiers. Bounded by
+  `MAX_REFLECT`.
+- **`edges` origin/confidence + trust-gated boost + intra-result reinforcement**
+  (`src/graph.rs`, `src/log.rs`, `src/recall.rs`) — the M3 `edges` fold gains
+  `origin` (`'manual'` iff `model_id == MANUAL_LINK_PRODUCER`, else `'machine'`)
+  + `confidence_milli` (from the `link` content, NULL for manual). `link.content`
+  extends to `{src, relation, dst, confidence_milli?}`; confidence lives in the
+  signed content as an INTEGER milli-unit (never a raw float, never in
+  `ModelMeta`). The recall proximity boost now gates on `origin='manual' OR
+  confidence ≥ TRUST_MIN`, and auto-seeds from the top `GRAPH_REINFORCE_TOPK`
+  fused hits (not just top-1).
+- **Evolve runtime** (`src/evolve.rs`, `src/log.rs`) — a persistent
+  `evolve_cursor` (progress state, NOT a fold); `evolve_once()` runs the full
+  tick (recall → Pass A → resolve → augment → Pass B → emit via `append` →
+  advance cursor), idempotent (skip active edge-keys, reuse resolved entities);
+  a hard off-switch (`config` `evolve_enabled=false`, honored before any model
+  call); a pure `debounce_due` scheduler decision; an `EvolveStatus`
+  observability surface (queue depth, last tick, error counts, enabled).
+
+#### Tests
+
+- **Hermetic suite (CI, `ScriptedReasoner` + `MockEmbedder`)** — reasoner
+  determinism + schema shape (`tests/reason.rs`); resolution thresholds + Pass A
+  parse + Pass B critique/cardinality (`tests/extract.rs`); entity resolution
+  merge/mint/adjudicate (`tests/entity_resolution.rs`); evolve `evolve_once`
+  end-to-end + idempotency + cursor persistence + off-switch + provenance +
+  injection containment + resolved-id contradiction retirement
+  (`tests/evolve.rs`); entity fold + byte-identical-rebuild-with-entities +
+  `edges` origin/confidence (`tests/graph.rs`); trust-gate boost + intra-result
+  reinforcement (`tests/recall.rs`).
+- **Live-Ollama behavioral gate** (`tests/live_ollama.rs`, `#[ignore]`, feature
+  `ollama`) — asserts properties not bytes against the real model: a person →
+  ≥1 entity; a relationship → a machine link carrying confidence; a
+  contradiction across two ticks → an `invalidate` retiring the prior
+  `works_at_primary` edge (the F4 path, proven LIVE); re-run is idempotent. Run
+  locally with `cargo test -p bossclaw-core --features ollama --test live_ollama
+  -- --ignored`; never part of the hermetic CI suite.
+
 ### M3 — Graph (2026-06-16)
 
 Bi-temporal link graph layered on top of the M1/M2 append-only encrypted

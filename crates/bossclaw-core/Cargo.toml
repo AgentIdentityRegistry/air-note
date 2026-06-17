@@ -27,10 +27,20 @@ hnsw_rs = "0.3.4"
 
 [features]
 fastembed = ["dep:fastembed"]
+# The `ollama` feature adds `OllamaReasoner` (loopback HTTP POST to a local
+# Ollama server). The default build is pure (no network dep). Enable this
+# feature in production binaries that ship the real LLM backend.
+ollama = ["dep:ureq"]
 
 [dependencies.fastembed]
 version = "5.16"
 optional = true
+
+[dependencies.ureq]
+version = "2"
+optional = true
+default-features = false
+features = ["json", "tls"]
 
 [dev-dependencies]
 tempfile = "3"

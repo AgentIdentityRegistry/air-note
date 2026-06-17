@@ -14,6 +14,36 @@ use crate::event::Event;
 /// constant so the convention is single-sourced (no magic string).
 pub const MANUAL_LINK_PRODUCER: &str = "manual";
 
+/// The `event_type` discriminator for entity events (the fold filters on it and
+/// `EventLog::entity` stamps it — single-sourced so they cannot drift).
+pub const ENTITY_EVENT_TYPE: &str = "entity";
+/// The `event_type` discriminator for memory events — the evolve unit of work
+/// (the loop's `unprocessed_memories_since` / queue-depth queries filter on it).
+/// Single-sourced so the SQL filters cannot drift from what `append` stamps.
+pub const MEMORY_EVENT_TYPE: &str = "memory";
+/// The `event_type` discriminator for control `config` events (active-model
+/// rotation + the evolve on/off switch). Single-sourced so the config reads and
+/// writes in the [`crate::log::EventLog`] config cluster cannot drift.
+pub const CONFIG_EVENT_TYPE: &str = "config";
+/// The neutral entity type stamped on an entity the model named ONLY as a bare
+/// relation/retraction endpoint (never listed in `entities[]`, so it carries no
+/// declared type). Single-sourced so the endpoint-mint site has no magic string.
+pub const UNRESOLVED_ENTITY_TYPE: &str = "unknown";
+/// `nodes.kind` for an entity-backed node (precedence over memory/external).
+pub const ENTITY_NODE_KIND: &str = "entity";
+/// `nodes.kind` for a node that resolves to a memory/page event.
+pub const MEMORY_NODE_KIND: &str = "memory";
+/// `nodes.kind` for a node that resolves to no known event.
+pub const EXTERNAL_NODE_KIND: &str = "external";
+
+/// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
+/// links reference this exact form, so it is single-sourced.
+pub const ENTITY_NODE_PREFIX: &str = "entity:";
+/// Build the namespaced entity node id for an entity event id.
+pub fn entity_node_id(event_id: &str) -> String {
+    format!("{ENTITY_NODE_PREFIX}{event_id}")
+}
+
 /// A folded graph edge: one assertion from a `link` event, possibly closed by a
 /// later `invalidate`. Two clocks (spec §5): `valid_*` is world-time ("true in
 /// the world"); `ingested_at`/`invalidated_at` is learned-time ("when we knew").
@@ -37,6 +67,18 @@ pub struct Edge {
     pub invalidated_at: Option<String>,
     /// The `invalidate` event id that closed this edge, if any.
     pub invalidated_by: Option<String>,
+    /// Edge origin: `"manual"` iff the producing `link`'s `model_id ==
+    /// [`MANUAL_LINK_PRODUCER`], else `"machine"` (spec §4). A pure function of the
+    /// signed event field → the byte-identical-rebuild gate holds.
+    pub origin: String,
+    /// Machine-link confidence as an INTEGER milli-unit in `0..=1000` read from the
+    /// signed `link` content's `confidence_milli` field; `None` for a manual link
+    /// (spec §4 / Rev 2 F3). Stored as an integer — never a raw `f32` — because a
+    /// float in JCS-canonicalized signed content is a cross-`serde_jcs`-version
+    /// determinism hazard that could break [`crate::log::EventLog::verify_chain`].
+    /// The recall trust gate (spec §7) compares it against the integer threshold
+    /// derived from [`crate::extract::TRUST_MIN`].
+    pub confidence_milli: Option<i64>,
 }
 
 impl Edge {
@@ -88,14 +130,91 @@ pub fn normalize_ts(ts: &str) -> String {
     }
 }
 
-/// Extract `(src, relation, dst)` from a `link`/`invalidate` event's content,
-/// or `None` if any field is missing or non-string (malformed — skipped by the
-/// fold rather than failing it).
-pub fn parse_link_content(content: &serde_json::Value) -> Option<(String, String, String)> {
+/// Extract `(src, relation, dst, confidence_milli?)` from a `link`/`invalidate`
+/// event's content, or `None` if `src`/`relation`/`dst` are missing or non-string
+/// (malformed — skipped by the fold rather than failing it).
+///
+/// `confidence_milli` is OPTIONAL and INTEGER (Rev 2 F3): absent or non-integer ⇒
+/// `None`. Back-compatible — M3 manual links have no confidence and keep
+/// byte-identical rebuilds. The value is an integer milli-unit (0..=1000) and is
+/// read tolerantly; the fold (and the trust gate) treat `None` as "no machine
+/// confidence". `confidence` lives in the signed content, never in `ModelMeta`
+/// (spec §4) — and as an integer, never a raw `f32` (Rev 2 F3 signing-integrity).
+pub fn parse_link_content(
+    content: &serde_json::Value,
+) -> Option<(String, String, String, Option<i64>)> {
     let src = content.get("src")?.as_str()?.to_string();
     let relation = content.get("relation")?.as_str()?.to_string();
     let dst = content.get("dst")?.as_str()?.to_string();
-    Some((src, relation, dst))
+    let confidence_milli = content.get("confidence_milli").and_then(|c| c.as_i64());
+    Some((src, relation, dst, confidence_milli))
+}
+
+/// Edge origin from a producing link's `model_id` (spec §4): `"manual"` iff it
+/// equals [`MANUAL_LINK_PRODUCER`], else `"machine"`. Single-sourced so the
+/// derivation is identical everywhere (the fold, the trust gate's expectations).
+pub fn origin_of(model_id: &str) -> String {
+    if model_id == MANUAL_LINK_PRODUCER {
+        "manual".to_string()
+    } else {
+        "machine".to_string()
+    }
+}
+
+/// A folded entity record: one `entity` Tier-B event projected into the
+/// `entities` table (spec §4). The id is `entity:<the entity event's ULID>` —
+/// stable, mint-once; the `label` is a property, never the id (names collide and
+/// change, the id does not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entity {
+    /// The stable namespaced node id, `entity:<ulid>`.
+    pub entity_id: String,
+    /// Human-readable label (display name).
+    pub label: String,
+    /// Known aliases (other surface forms that resolve to this entity).
+    pub aliases: Vec<String>,
+    /// Coarse type discriminator (e.g. `"person"`, `"org"`).
+    pub entity_type: String,
+}
+
+/// Extract `(label, aliases, entity_type)` from an `entity` event's content, or
+/// `None` if `label`/`entity_type` are missing or non-string (malformed —
+/// skipped by the fold rather than failing it). `aliases` defaults to empty when
+/// absent or non-array; non-string alias items are dropped.
+pub fn parse_entity_content(
+    content: &serde_json::Value,
+) -> Option<(String, Vec<String>, String)> {
+    let label = content.get("label")?.as_str()?.to_string();
+    let entity_type = content.get("entity_type")?.as_str()?.to_string();
+    let aliases = content
+        .get("aliases")
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Some((label, aliases, entity_type))
+}
+
+/// Fold `entity` events (which MUST already be in `seq` order) into the entity
+/// set. Deterministic: one [`Entity`] per well-formed `entity` event, in event
+/// order, id = `entity:<event id>`. Malformed events (no label/entity_type) are
+/// skipped. Mint-once: an entity event id is unique, so there is no merge here —
+/// resolution (spec §6) decides reuse-vs-mint BEFORE an event is appended.
+pub fn fold_entities(events: &[Event]) -> Vec<Entity> {
+    let mut out = Vec::new();
+    for ev in events {
+        if ev.event_type != ENTITY_EVENT_TYPE {
+            continue;
+        }
+        if let Some((label, aliases, entity_type)) = parse_entity_content(&ev.content) {
+            out.push(Entity {
+                entity_id: entity_node_id(&ev.id),
+                label,
+                aliases,
+                entity_type,
+            });
+        }
+    }
+    out
 }
 
 /// Fold `link`/`invalidate` events (which MUST already be in `seq` order) into
@@ -109,7 +228,7 @@ pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
     // edge-key → indices into `edges` that are still open for that key.
     let mut active: HashMap<(String, String, String), Vec<usize>> = HashMap::new();
     for ev in events {
-        let (src, relation, dst) = match parse_link_content(&ev.content) {
+        let (src, relation, dst, confidence_milli) = match parse_link_content(&ev.content) {
             Some(t) => t,
             None => continue,
         };
@@ -118,6 +237,16 @@ pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
             "link" => {
                 let valid_from = normalize_ts(ev.valid_time.as_deref().unwrap_or(&ev.ts));
                 let ingested_at = normalize_ts(&ev.ts);
+                // origin from the signed model_id; a link with no model_meta is
+                // treated as manual (M3 hand-links always had model_meta, so this
+                // is a defensive default, not a normal path).
+                let origin = ev
+                    .model_meta
+                    .as_ref()
+                    .map(|m| origin_of(&m.model_id))
+                    .unwrap_or_else(|| "manual".to_string());
+                // Manual links carry NULL confidence even if a stray value appears.
+                let confidence_milli = if origin == "manual" { None } else { confidence_milli };
                 edges.push(Edge {
                     edge_id: ev.id.clone(),
                     src,
@@ -128,6 +257,8 @@ pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
                     ingested_at,
                     invalidated_at: None,
                     invalidated_by: None,
+                    origin,
+                    confidence_milli,
                 });
                 active.entry(key).or_default().push(edges.len() - 1);
             }
@@ -177,5 +308,43 @@ mod tests {
     fn normalize_ts_is_fixed_width_27_for_valid_rfc3339() {
         // YYYY-MM-DDTHH:MM:SS.ffffffZ = 27 chars.
         assert_eq!(normalize_ts("2020-06-15T10:00:00Z").len(), 27);
+    }
+
+    /// Minimal `entity` event for the fold unit test (no signing/hashing needed —
+    /// `fold_entities` reads only `id`/`event_type`/`content`).
+    fn mk_entity_event(id: &str, content: serde_json::Value) -> Event {
+        Event {
+            id: id.to_string(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: ENTITY_EVENT_TYPE.to_string(),
+            content,
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: String::new(),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn fold_entities_skips_malformed_events_not_fatal() {
+        // A well-formed entity folds; ones missing `label` or `entity_type` are
+        // SKIPPED (the degrade path the spec emphasizes) — never panic, never a row.
+        let events = vec![
+            mk_entity_event(
+                "01GOOD",
+                serde_json::json!({ "label": "Kenny", "aliases": [], "entity_type": "person" }),
+            ),
+            // Missing `entity_type` → skipped.
+            mk_entity_event("01NOTYPE", serde_json::json!({ "label": "Acme" })),
+            // Missing `label` → skipped.
+            mk_entity_event("01NOLABEL", serde_json::json!({ "entity_type": "org" })),
+        ];
+        let folded = fold_entities(&events);
+        assert_eq!(folded.len(), 1, "only the well-formed entity becomes a row");
+        assert_eq!(folded[0].entity_id, entity_node_id("01GOOD"));
+        assert_eq!(folded[0].label, "Kenny");
+        assert_eq!(folded[0].entity_type, "person");
     }
 }
