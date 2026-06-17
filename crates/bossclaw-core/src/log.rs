@@ -2518,32 +2518,45 @@ impl EventLog {
     /// Like [`EventLog::texts_for_ids`], but DROPS any `page`-typed id by
     /// construction — the one-way rule enforced at fact-set materialization
     /// (spec §7 / M4b F3). A page id reaching the fact-set is a contract
-    /// violation, never silently summarized back into a summary. Parameterised
-    /// per-id lookup; the caller's id order is not load-bearing here (the gather
-    /// sorts the lineage first).
+    /// violation, never silently summarized back into a summary. One `IN (?,...)`
+    /// query (mirrors [`EventLog::texts_for_ids`]); caller id order is preserved
+    /// on the way out (the gather sorts lineage before calling, but preserving
+    /// order is a defensive courtesy and costs nothing).
     fn fact_texts_for_ids(&self, ids: &[String]) -> Result<Vec<(String, String)>, BossclawError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String =
+            (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql =
+            format!("SELECT id, event_type, payload FROM events WHERE id IN ({placeholders})");
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
-        let mut out = Vec::new();
-        for id in ids {
-            let row = conn
-                .query_row(
-                    "SELECT event_type, payload FROM events WHERE id = ?1",
-                    rusqlite::params![id],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            if let Some((etype, payload)) = row {
-                if etype == "page" {
-                    continue; // F3: a summary never feeds summary-generation.
-                }
-                let ev: Event = serde_json::from_str(&payload)?;
-                if let Some(t) = ev.content.get("text").and_then(|t| t.as_str()) {
-                    out.push((id.clone(), t.to_string()));
-                }
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        // Build a by-id map; skip page-typed rows (F3: a summary never feeds
+        // summary-generation).
+        let mut by_id: HashMap<String, String> = HashMap::new();
+        for row in rows {
+            let (id, etype, payload) = row?;
+            if etype == "page" {
+                continue;
+            }
+            let ev: Event = serde_json::from_str(&payload)?;
+            if let Some(t) = ev.content.get("text").and_then(|t| t.as_str()) {
+                by_id.insert(id, t.to_string());
             }
         }
-        Ok(out)
+        // Preserve the caller's id order, same as texts_for_ids.
+        Ok(ids.iter().filter_map(|id| by_id.get(id).map(|t| (id.clone(), t.clone()))).collect())
     }
 
     /// Read an event's `model_meta.source_event_ids` by its `entity:<ulid>` node
@@ -2685,7 +2698,12 @@ impl EventLog {
         for topic_id in dirty.iter().take(crate::extract::SUMMARY_BATCH) {
             let entity = match entities.iter().find(|e| &e.entity_id == topic_id) {
                 Some(e) => e.clone(),
-                None => continue, // a dirty endpoint with no folded entity (rare) → skip
+                None => continue, // a dirty endpoint with no folded entity (rare) → skip.
+                // Intentional F1 safe: the cursor may advance past this entity
+                // permanently — it has no entity record so it cannot be
+                // summarized. A future mint or repair event emits a NEW event
+                // with a seq PAST the advanced cursor, re-dirtying the topic
+                // for the next tick. Nothing is silently dropped forever.
             };
             let facts = match self.gather_fact_set(&entity) {
                 Ok(f) if f.fact_count() >= crate::summarize::PAGE_MIN_FACTS => f,
@@ -2724,10 +2742,13 @@ impl EventLog {
                     continue;
                 }
             }
-            // Canonicalize the claims for the signed content (F7): the floor is an
-            // order-preserving filter, and each claim's cites are already
-            // sorted+deduped by the model's draft only if it happened to be — so
-            // re-sort here defensively before signing. The cap precedes signing.
+            // Canonicalize each claim's own `cites` for F7 signed content. This
+            // is NOT removable and NOT a duplicate of assemble(): assemble() sorts
+            // the cites UNION to produce `source_event_ids` (the page-level set),
+            // while this block sorts each INDIVIDUAL claim's `cites` array (the
+            // per-claim attribution stored in `content.claims[].cites`). Removing
+            // this leaves per-claim cites in raw model order → JCS-canonical
+            // signing becomes non-deterministic. The cap precedes signing.
             let claims_json: Vec<serde_json::Value> = floored
                 .claims
                 .iter()
