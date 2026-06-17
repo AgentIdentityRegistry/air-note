@@ -644,3 +644,135 @@ fn t_a_below_gate_injection_edge_is_ignored_by_recall_trusted_edge_boosts() {
          baseline: high={s_high}, baseline={s_base}"
     );
 }
+
+// ── Degrade / cursor-safety: a mid-tick reasoner error stops the batch, does NOT
+//    advance the cursor past the failed memory, and the memory is RETRIED ────────
+
+/// Cursor-safety regression (spec §10 degrade-never-break). When a memory's
+/// reasoner call errors MID-batch, `evolve_once`:
+/// - returns `Ok` with a PARTIAL result (the implemented semantics: the error arm
+///   `break`s the batch loop, it does NOT propagate the `Err`) — the tick is a
+///   no-op for the failed memory, not a hard failure;
+/// - leaves the persistent cursor at the last FULLY-processed memory's seq (M1),
+///   NOT past the failed memory (M2);
+/// - so M2 is RETRIED on the next run (never silently skipped).
+///
+/// Determinism: a fresh store has no genesis/config row (`open` inserts no event),
+/// so append order == `seq` order — M1 is `seq` 1, M2 is `seq` 2. The first
+/// reasoner scripts ONLY M1's Pass-A + Pass-B pairs, so reaching M2 is an
+/// unscripted-prompt miss → `BossclawError::Reasoner`. M2's Pass A is scripted
+/// (in the retry reasoner) under BOTH recall contexts (empty / M1's text) because
+/// recall on a 2-memory store may surface M1 as M2's neighbour.
+#[test]
+fn reasoner_error_mid_tick_stops_batch_and_does_not_advance_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+
+    // Two memories in ONE store. Fresh store + append-only ⇒ M1 seq=1, M2 seq=2.
+    let src1 = "Kenny works at Acme.";
+    let src2 = "Dana works at Globex.";
+    let m1 = log.append(mk_memory(src1)).unwrap();
+    let m2 = log.append(mk_memory(src2)).unwrap();
+    log.rederive_pending(&embedder).unwrap();
+    log.rebuild_indexes(&embedder).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(&embedder).unwrap();
+    const M1_SEQ: i64 = 1;
+    const M2_SEQ: i64 = 2;
+
+    // ── Run 1: reasoner knows ONLY M1's passes → M2's Pass A misses → Err mid-tick.
+    //    M1's recall on a 2-memory store may surface M2 as a neighbour, so script
+    //    M1's Pass A under BOTH recall contexts (empty / M2's text). M2 is scripted
+    //    for NOTHING here, so reaching it is the unscripted-prompt miss that errors.
+    let kenny = kenny_acme_pass_a();
+    let floor1 = verify_floor(&parse_proposals(&kenny).unwrap(), src1);
+    let b_resp1 = json!({
+        "entities": [],
+        "relations": floor1.relations.iter().map(|r| json!({
+            "src": r.src, "relation": r.relation, "dst": r.dst,
+            "confidence": r.confidence, "supported_by": r.supported_by,
+        })).collect::<Vec<_>>(),
+        "retractions": [],
+    });
+    let mut reasoner_fail = ScriptedReasoner::new("scripted-evolve-v1")
+        .with_response(PASS_B_SYSTEM, &build_pass_b_prompt(src1, &floor1, &[]), b_resp1);
+    for recalled in [vec![], vec![src2.to_string()]] {
+        let a_prompt = build_pass_a_prompt(src1, &recalled);
+        reasoner_fail = reasoner_fail.with_response(PASS_A_SYSTEM, &a_prompt, kenny.clone());
+    }
+    let report = log
+        .evolve_once(&embedder, &reasoner_fail)
+        .expect("implemented semantics: Ok with a partial cursor (error arm breaks, never propagates)");
+
+    // (a) M1 processed FULLY before the failure: its entities + link were emitted.
+    assert_eq!(report.memories_processed, 1, "only M1 was fully processed");
+    assert!(report.entities_minted >= 1, "M1's entities were emitted");
+    assert!(report.links_emitted >= 1, "M1's works_at link was emitted");
+    assert!(!report.skipped_disabled, "the loop was enabled (not the off-switch path)");
+    log.rebuild_graph().unwrap();
+    assert!(
+        log.all_edges().unwrap().iter().any(|e| e.relation == "works_at" && e.origin == "machine"),
+        "M1's machine works_at edge is present"
+    );
+    // No Globex/Dana entity exists — M2 never committed anything.
+    assert!(
+        log.all_entities().unwrap().iter().all(|e| e.label != "Globex" && e.label != "Dana"),
+        "the failed memory M2 emitted nothing"
+    );
+
+    // (b) the cursor sits at M1's seq, NOT past the failed M2.
+    assert_eq!(log.evolve_cursor().unwrap(), M1_SEQ, "cursor advanced to M1 only");
+    assert!(log.evolve_cursor().unwrap() < M2_SEQ, "cursor did NOT advance past the failed M2");
+    assert_eq!(
+        log.evolve_status().unwrap().queue_depth,
+        1,
+        "M2 is still behind the cursor → queue depth 1 (it was not consumed)"
+    );
+
+    // ── Run 2: now script M2's passes too → M2 is RETRIED (not skipped) + cursor advances.
+    let dana_pass_a = json!({
+        "entities": [
+            { "mention": "Dana",   "entity_type": "person", "confidence": 0.95 },
+            { "mention": "Globex", "entity_type": "org",    "confidence": 0.95 }
+        ],
+        "relations": [{
+            "src": "Dana", "relation": "works_at", "dst": "Globex",
+            "confidence": 0.9, "supported_by": "Dana works at Globex."
+        }],
+        "retractions": []
+    });
+    // M2's Pass A may see an empty recall or M1's text as a neighbour — script both.
+    let mut reasoner_ok = ScriptedReasoner::new("scripted-evolve-v1");
+    let floor2 = verify_floor(&parse_proposals(&dana_pass_a).unwrap(), src2);
+    let b_resp2 = json!({
+        "entities": [],
+        "relations": floor2.relations.iter().map(|r| json!({
+            "src": r.src, "relation": r.relation, "dst": r.dst,
+            "confidence": r.confidence, "supported_by": r.supported_by,
+        })).collect::<Vec<_>>(),
+        "retractions": [],
+    });
+    // Pass B neighbourhood is empty within the tick (the just-minted Dana/Globex
+    // entities have no folded edges yet).
+    reasoner_ok = reasoner_ok
+        .with_response(PASS_B_SYSTEM, &build_pass_b_prompt(src2, &floor2, &[]), b_resp2);
+    for recalled in [vec![], vec![src1.to_string()]] {
+        let a_prompt = build_pass_a_prompt(src2, &recalled);
+        reasoner_ok = reasoner_ok.with_response(PASS_A_SYSTEM, &a_prompt, dana_pass_a.clone());
+    }
+
+    let report2 = log.evolve_once(&embedder, &reasoner_ok).unwrap();
+    assert_eq!(report2.memories_processed, 1, "M2 was retried and processed on the second run");
+    assert!(report2.links_emitted >= 1, "M2's works_at link was emitted on retry");
+    log.rebuild_graph().unwrap();
+    assert!(
+        log.all_entities().unwrap().iter().any(|e| e.label == "Globex"),
+        "M2's Globex entity now exists (retried, not skipped)"
+    );
+    assert_eq!(log.evolve_cursor().unwrap(), M2_SEQ, "cursor advanced past M2 after the retry");
+    assert_eq!(log.evolve_status().unwrap().queue_depth, 0, "queue drained");
+
+    let _ = (m1, m2);
+    log.verify_chain().unwrap();
+}
