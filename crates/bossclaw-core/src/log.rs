@@ -1318,9 +1318,19 @@ impl EventLog {
                     .into(),
             ));
         }
-        // Integer milli (Rev 2 F3): clamp to [0,1] then quantize. ONE canonical JCS
-        // form — no f32/f64 round-trip ambiguity in the SIGNED content.
-        let confidence_milli = (f64::from(confidence.clamp(0.0, 1.0)) * 1000.0).round() as i64;
+        // A machine link is, by definition, NON-manual — that is what makes
+        // origin = "machine" and keeps its confidence. A manual producer would
+        // silently fold as a manual edge with confidence discarded. The producer
+        // is engine-internal (never user input), so a debug_assert is the right
+        // guard: it catches a wiring mistake in tests/dev without a release cost.
+        debug_assert!(
+            producer != MANUAL_LINK_PRODUCER,
+            "link_machine producer must be non-manual"
+        );
+        // Integer milli (Rev 2 F3): clamp to [0,1] then quantize — single-sourced
+        // in extract so the encode side and the trust-gate threshold can never
+        // diverge. ONE canonical JCS form, no f32/f64 ambiguity in SIGNED content.
+        let confidence_milli = crate::extract::to_confidence_milli(confidence);
         self.append(Event {
             id: String::new(),
             ts: String::new(),
@@ -1879,9 +1889,11 @@ impl EventLog {
              SELECT src AS other FROM edges \
                WHERE invalidated_at IS NULL AND {trust} AND dst IN ({placeholders})"
         );
-        // Integer trust threshold derived from the documented f32 TRUST_MIN
-        // (Rev 2 F3): TRUST_MIN stays an f32 used ONLY to derive this integer = 600.
-        let trust_min_milli = (f64::from(crate::extract::TRUST_MIN) * 1000.0).round() as i64;
+        // Integer trust threshold derived from the documented f32 TRUST_MIN via the
+        // SAME single-sourced quantizer as the encode side (Rev 2 F3 / review I1):
+        // TRUST_MIN stays an f32 used ONLY to derive this integer = 600, and encode
+        // ⇄ threshold can never diverge.
+        let trust_min_milli = crate::extract::to_confidence_milli(crate::extract::TRUST_MIN);
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(&sql)?;

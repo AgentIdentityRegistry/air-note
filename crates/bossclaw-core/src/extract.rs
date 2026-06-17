@@ -32,6 +32,25 @@ pub const MAX_REFLECT: u32 = 2;
 /// (never-forget) and queryable, but does not tilt recall. Tunable.
 pub const TRUST_MIN: f32 = 0.6;
 
+/// Confidence quantization scale (Rev 2 F3): a model confidence in `[0, 1]` is
+/// stored in signed content as an integer in `0..=CONFIDENCE_MILLI_SCALE` so the
+/// JCS-canonical bytes have one deterministic form (no f32/f64 ambiguity that
+/// could break `verify_chain` across `serde_jcs` versions on the append-only
+/// signed store).
+pub const CONFIDENCE_MILLI_SCALE: f64 = 1000.0;
+
+/// Quantize a confidence to integer milli — the ONE signed form (Rev 2 F3).
+/// Clamps to `[0, 1]` first, then scales by [`CONFIDENCE_MILLI_SCALE`] and rounds.
+///
+/// Single-sources the conversion so the encode side
+/// ([`crate::log::EventLog::link_machine`]) and the trust-gate threshold
+/// derivation can never diverge — a silent mismatch would leak low-confidence
+/// machine edges into recall with no compile error. The `TRUST_MIN`-derived
+/// threshold (`to_confidence_milli(TRUST_MIN)` = 600) thus has one provable source.
+pub fn to_confidence_milli(confidence: f32) -> i64 {
+    (f64::from(confidence.clamp(0.0, 1.0)) * CONFIDENCE_MILLI_SCALE).round() as i64
+}
+
 /// How many recalled neighbors are fed as the Pass-A cheat sheet (spec §11). The
 /// retrieval-augmented context that lets a 7b reconcile against KNOWN facts
 /// rather than recall everything. Tunable.
