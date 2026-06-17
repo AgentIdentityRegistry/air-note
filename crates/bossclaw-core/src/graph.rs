@@ -17,6 +17,18 @@ pub const MANUAL_LINK_PRODUCER: &str = "manual";
 /// The `event_type` discriminator for entity events (the fold filters on it and
 /// `EventLog::entity` stamps it — single-sourced so they cannot drift).
 pub const ENTITY_EVENT_TYPE: &str = "entity";
+/// The `event_type` discriminator for memory events — the evolve unit of work
+/// (the loop's `unprocessed_memories_since` / queue-depth queries filter on it).
+/// Single-sourced so the SQL filters cannot drift from what `append` stamps.
+pub const MEMORY_EVENT_TYPE: &str = "memory";
+/// The `event_type` discriminator for control `config` events (active-model
+/// rotation + the evolve on/off switch). Single-sourced so the config reads and
+/// writes in the [`crate::log::EventLog`] config cluster cannot drift.
+pub const CONFIG_EVENT_TYPE: &str = "config";
+/// The neutral entity type stamped on an entity the model named ONLY as a bare
+/// relation/retraction endpoint (never listed in `entities[]`, so it carries no
+/// declared type). Single-sourced so the endpoint-mint site has no magic string.
+pub const UNRESOLVED_ENTITY_TYPE: &str = "unknown";
 /// `nodes.kind` for an entity-backed node (precedence over memory/external).
 pub const ENTITY_NODE_KIND: &str = "entity";
 /// `nodes.kind` for a node that resolves to a memory/page event.

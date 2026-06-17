@@ -23,8 +23,8 @@ use crate::event::{compute_hash, Event, ModelMeta};
 use crate::evolve::{EvolveReport, EvolveStatus};
 use crate::extract::{ResolveDecision, EVOLVE_BATCH, MAX_ENTITIES_PER_MEMORY, MAX_REFLECT};
 use crate::graph::{
-    entity_node_id, ENTITY_EVENT_TYPE, ENTITY_NODE_KIND, EXTERNAL_NODE_KIND, MANUAL_LINK_PRODUCER,
-    MEMORY_NODE_KIND,
+    entity_node_id, CONFIG_EVENT_TYPE, ENTITY_EVENT_TYPE, ENTITY_NODE_KIND, EXTERNAL_NODE_KIND,
+    MANUAL_LINK_PRODUCER, MEMORY_EVENT_TYPE, MEMORY_NODE_KIND, UNRESOLVED_ENTITY_TYPE,
 };
 use crate::highwater::{HighWaterStore, Mark};
 use crate::index::{HnswIndex, VectorIndex};
@@ -90,6 +90,13 @@ const GENESIS: &str =
 /// the literal is single-sourced (like [`MANUAL_LINK_PRODUCER`]); M4/M7 will
 /// replace this with the user's real DID threaded through [`EventLog::signer_did`].
 const ENGINE_SIGNER_DID: &str = "did:wba:bossclaw-engine";
+
+/// The `content` key carrying the evolve on/off switch in a control `config`
+/// event (spec §8 / Rev 2 F2-sec). Single-sourced so the ONE writer
+/// ([`EventLog::set_evolve_enabled`]) and the reader ([`EventLog::evolve_enabled`])
+/// can never drift the key apart — a typo in one would silently disarm the
+/// fail-closed off-switch.
+const EVOLVE_ENABLED_KEY: &str = "evolve_enabled";
 
 /// `(event_id, arm_score)` pair returned by each retrieval arm. Used as the
 /// common type for both the vector arm (cosine distance, lower=better) and the
@@ -504,9 +511,9 @@ impl EventLog {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(
-            "SELECT payload FROM events WHERE event_type='config' ORDER BY seq DESC",
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
         for row in rows {
             let event: Event = serde_json::from_str(&row?)?;
             // Tolerant: a config lacking the model fields is a different control
@@ -1217,7 +1224,7 @@ impl EventLog {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
-            event_type: "config".to_string(),
+            event_type: CONFIG_EVENT_TYPE.to_string(),
             content: serde_json::json!({
                 "active_model_id": embedder.model_id(),
                 "dim": embedder.dim() as u32,
@@ -2090,9 +2097,9 @@ impl EventLog {
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
-    /// This is the ONLY writer of the `evolve_enabled` key — the off-switch is a
-    /// PRIVILEGE, not arbitrary data, so it has a typed setter (the precedent is
-    /// the active-model config written by [`EventLog::reembed_migration`]).
+    /// This is the ONLY writer of the [`EVOLVE_ENABLED_KEY`] key — the off-switch
+    /// is a PRIVILEGE, not arbitrary data, so it has a typed setter (the precedent
+    /// is the active-model config written by [`EventLog::reembed_migration`]).
     /// Control config must not be written through a generic `append` in v1.
     /// The change is Ed25519-signed + hash-chained like every event, so a forged
     /// or replayed flip is tamper-evident via `verify_chain`. (M7 additionally
@@ -2106,8 +2113,14 @@ impl EventLog {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
-            event_type: "config".to_string(),
-            content: serde_json::json!({ "evolve_enabled": enabled }),
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(EVOLVE_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
             model_meta: None,
             prev_hash: String::new(),
             hash: None,
@@ -2132,12 +2145,12 @@ impl EventLog {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(
-            "SELECT payload FROM events WHERE event_type = 'config' ORDER BY seq DESC",
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
         for row in rows {
             let ev: Event = serde_json::from_str(&row?)?;
-            if let Some(flag) = ev.content.get("evolve_enabled").and_then(|v| v.as_bool()) {
+            if let Some(flag) = ev.content.get(EVOLVE_ENABLED_KEY).and_then(|v| v.as_bool()) {
                 return Ok(flag); // newest explicit flag wins → sticky
             }
         }
@@ -2158,11 +2171,12 @@ impl EventLog {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT seq, id, payload FROM events
-             WHERE event_type = 'memory' AND seq > ?1 ORDER BY seq ASC LIMIT ?2",
+             WHERE event_type = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(rusqlite::params![cursor, limit as i64], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![MEMORY_EVENT_TYPE, cursor, limit as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        )?;
         let mut out = Vec::new();
         for row in rows {
             let (seq, id, payload) = row?;
@@ -2236,6 +2250,22 @@ impl EventLog {
         mention: &str,
     ) -> String {
         mention_to_id.get(mention).cloned().unwrap_or_else(|| mention.to_string())
+    }
+
+    /// Fold a [`EventLog::resolve_or_mint`] outcome `(entity_id, minted)` into the
+    /// tick counters, returning the id. Single-sourced so the resolve loop counts a
+    /// mint in exactly one place (no per-call-site duplication).
+    fn count_mint(
+        report: &mut EvolveReport,
+        minted_this_tick: &mut bool,
+        outcome: (String, bool),
+    ) -> String {
+        let (id, minted) = outcome;
+        if minted {
+            report.entities_minted += 1;
+            *minted_this_tick = true;
+        }
+        id
     }
 
     /// Run ONE evolve tick (spec §3, §8 / Rev 2 F1/F4/F5/F6): for each unprocessed
@@ -2332,56 +2362,45 @@ impl EventLog {
             //    relation/retraction endpoints the model named but did not list as
             //    entities are still resolved so they remap to graph-key ids. ──
             let mut mention_to_id: HashMap<String, String> = HashMap::new();
-            // Entity mentions first, capped (F6) — these may MINT.
-            for ent in proposals.entities.iter().take(MAX_ENTITIES_PER_MEMORY) {
-                if mention_to_id.contains_key(&ent.mention) {
-                    continue;
-                }
-                let id = match self.resolve_or_mint(
-                    embedder,
-                    reasoner,
-                    &ent.mention,
-                    &ent.entity_type,
-                    &read_set,
-                    &mut tick_mint_cache,
-                )? {
-                    (id, true) => {
-                        report.entities_minted += 1;
-                        minted_this_tick = true;
-                        id
-                    }
-                    (id, false) => id,
-                };
-                mention_to_id.insert(ent.mention.clone(), id);
-            }
-            // Then every relation/retraction endpoint not already resolved (F4):
-            // resolve (which may mint a bare endpoint the model referenced) so the
-            // remap below always lands on a real graph-key id.
-            let endpoint_mentions = proposals
-                .relations
+            // Resolve EVERY distinct mention to a stable entity id in ONE pass.
+            // The work list is, in order: entity proposals (capped at
+            // MAX_ENTITIES_PER_MEMORY, F6) with their declared type, then every
+            // relation/retraction endpoint with the neutral UNRESOLVED_ENTITY_TYPE
+            // (a bare endpoint the model named but did not list in entities[]).
+            // First-seen wins, so an endpoint that is also a declared entity keeps
+            // its real type. Folding both into one loop means the mint-count + the
+            // resolve call appear exactly once (no duplication).
+            let resolve_work = proposals
+                .entities
                 .iter()
-                .flat_map(|r| [r.src.clone(), r.dst.clone()])
-                .chain(proposals.retractions.iter().flat_map(|r| [r.src.clone(), r.dst.clone()]));
-            for mention in endpoint_mentions {
+                .take(MAX_ENTITIES_PER_MEMORY)
+                .map(|e| (e.mention.clone(), e.entity_type.clone()))
+                .chain(
+                    proposals
+                        .relations
+                        .iter()
+                        .flat_map(|r| [r.src.clone(), r.dst.clone()])
+                        .chain(
+                            proposals
+                                .retractions
+                                .iter()
+                                .flat_map(|r| [r.src.clone(), r.dst.clone()]),
+                        )
+                        .map(|m| (m, UNRESOLVED_ENTITY_TYPE.to_string())),
+                );
+            for (mention, entity_type) in resolve_work {
                 if mention_to_id.contains_key(&mention) {
-                    continue;
+                    continue; // first-seen wins (declared type beats the endpoint default)
                 }
-                // Unknown endpoints have no declared entity_type; use a neutral one.
-                let id = match self.resolve_or_mint(
+                let outcome = self.resolve_or_mint(
                     embedder,
                     reasoner,
                     &mention,
-                    "unknown",
+                    &entity_type,
                     &read_set,
                     &mut tick_mint_cache,
-                )? {
-                    (id, true) => {
-                        report.entities_minted += 1;
-                        minted_this_tick = true;
-                        id
-                    }
-                    (id, false) => id,
-                };
+                )?;
+                let id = Self::count_mint(&mut report, &mut minted_this_tick, outcome);
                 mention_to_id.insert(mention, id);
             }
 
@@ -2563,8 +2582,8 @@ impl EventLog {
             let store = self.inner.lock().expect(POISON);
             let conn = store.conn();
             conn.query_row(
-                "SELECT count(*) FROM events WHERE event_type = 'memory' AND seq > ?1",
-                rusqlite::params![cursor],
+                "SELECT count(*) FROM events WHERE event_type = ?1 AND seq > ?2",
+                rusqlite::params![MEMORY_EVENT_TYPE, cursor],
                 |r| r.get::<_, i64>(0),
             )? as usize
         };

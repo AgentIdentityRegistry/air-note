@@ -20,6 +20,7 @@ use bossclaw_core::extract::{
 use bossclaw_core::graph::ENTITY_NODE_PREFIX;
 use bossclaw_core::log::EventLog;
 use bossclaw_core::reason::ScriptedReasoner;
+use bossclaw_core::recall::RecallOptions;
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 
@@ -535,4 +536,108 @@ fn t_d_a_retraction_on_resolved_ids_fires_exactly_one_invalidate() {
         .count();
     assert_eq!(active_primary, 0, "the contradicted primary edge is retired");
     log.verify_chain().unwrap();
+}
+
+// ── T-A (recall-path proof): the obeyed-injection edge is not merely STORED below
+//    the trust gate — it is ACTUALLY IGNORED by recall ─────────────────────────
+
+/// `Hit` for a given event id, if present in the result set (local mirror of the
+/// helper in `tests/recall.rs` — integration test crates do not share helpers).
+fn find_hit<'a>(hits: &'a [bossclaw_core::Hit], id: &str) -> Option<&'a bossclaw_core::Hit> {
+    hits.iter().find(|h| h.event_id == id)
+}
+
+/// Seed a deterministic recall corpus: every event embeds the full query phrase
+/// (so the keyword arm surfaces ALL of them — the HNSW ANN arm is unseeded) and
+/// trailing distinct noise tokens set the rank (more noise → lower cosine → lower
+/// rank). Appends, derives vectors, builds the recall indexes (NOT the graph — the
+/// caller adds edges then rebuilds). Mirrors `tests/recall.rs::seeded_log`.
+fn seeded_corpus(texts: &[&str]) -> (EventLog, tempfile::TempDir, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    let mut ids = Vec::with_capacity(texts.len());
+    for t in texts {
+        ids.push(log.append(mk_memory(t)).unwrap());
+    }
+    log.rederive_pending(&embedder).unwrap();
+    log.rebuild_indexes(&embedder).unwrap();
+    (log, dir, ids)
+}
+
+/// T-A recall-path closure: a machine edge emitted on an OBEYED injection (origin
+/// machine, the exact `link_machine` mechanism `evolve_once` uses) with confidence
+/// BELOW `TRUST_MIN` contributes EXACTLY ZERO recall boost — the neighbour scores
+/// bit-identically (within 1 f32 ULP) to its no-edge baseline (retire the edge →
+/// compare EQUAL), proving the gate is consumed by recall, not merely that the
+/// edge is stored below threshold. A `>= TRUST_MIN` (trusted) edge DOES boost,
+/// proving the gate is selective, not a blanket "machine edges never boost".
+///
+/// Corpus sized 6 (Rev 2 F7): with top-`GRAPH_REINFORCE_TOPK` auto-seeding +
+/// seed-self-exclusion the boosted neighbour sits OUTSIDE the top-3, so any boost
+/// it gets comes ONLY from the edge to the top hit, never from being a seed itself.
+/// Same deterministic-corpus + 1-ULP tolerance pattern as the T-H trust-gate test.
+#[test]
+fn t_a_below_gate_injection_edge_is_ignored_by_recall_trusted_edge_boosts() {
+    let texts: &[&str] = &[
+        "rustacean memory engine ferris crab", // 0: phrase only → top seed
+        "rustacean memory engine ferris crab nz1", // 1
+        "rustacean memory engine ferris crab nz1 nz2", // 2
+        "rustacean memory engine ferris crab nz1 nz2 nz3", // 3
+        "rustacean memory engine ferris crab nz1 nz2 nz3 nz4", // 4
+        // 5: NEIGHBOUR — phrase + most noise → ranks LAST (outside the top-3) but
+        // present in every result set (contains the phrase verbatim).
+        "rustacean memory engine ferris crab nz1 nz2 nz3 nz4 nz5 nz6",
+    ];
+    let (log, _dir, ids) = seeded_corpus(texts);
+    let embedder = MockEmbedder::new(MID_DIM);
+    let query = "rustacean memory engine ferris crab";
+    let k = ids.len();
+    // The producer is a non-manual model id — exactly what evolve_once stamps for
+    // an obeyed-injection edge (origin = machine, never manual).
+    let attacker_producer = "scripted-evolve-v1";
+    let below_gate = TRUST_MIN - 0.2; // < TRUST_MIN → gated OUT of the recall boost
+
+    // ── (1) below-TRUST_MIN machine edge (the obeyed injection): gated OUT. ──
+    log.link_machine(&ids[0], "relates_to", &ids[5], below_gate, attacker_producer, &[ids[0].clone()])
+        .unwrap();
+    log.rebuild_graph().unwrap();
+    let low = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_low = find_hit(&low, &ids[5]).expect("neighbor present").score;
+
+    // It still EXISTS + is queryable (never-forget) — containment is "ignored by
+    // recall", not "deleted".
+    assert_eq!(log.all_edges().unwrap().len(), 1, "below-gate injection edge is still recorded");
+    let stored = log.all_edges().unwrap();
+    let injected = stored.iter().find(|e| e.relation == "relates_to").unwrap();
+    assert_eq!(injected.origin, "machine", "obeyed-injection edge is machine origin");
+
+    // …retire it to establish the true no-edge baseline.
+    log.invalidate(&ids[0], "relates_to", &ids[5], None, &[ids[0].clone()]).unwrap();
+    log.rebuild_graph().unwrap();
+    let base = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_base = find_hit(&base, &ids[5]).expect("neighbor present").score;
+
+    // ZERO contribution within 1 f32 ULP (the two recalls are at different
+    // Utc::now() instants, so the recency-jitter delta is ~one ULP; a real graph
+    // contribution would be ~+40%, far above one ULP — this still falsifies a leak).
+    let ulp = (s_base.abs() * f32::EPSILON).max(f32::MIN_POSITIVE);
+    assert!(
+        (s_low - s_base).abs() <= ulp,
+        "a below-TRUST_MIN injection edge must contribute ZERO recall boost (equal \
+         within 1 f32 ULP): low={s_low}, base={s_base}, ulp={ulp}"
+    );
+
+    // ── (2) a >= TRUST_MIN trusted machine edge DOES boost (gate is selective). ──
+    let above_gate = TRUST_MIN + 0.35;
+    log.link_machine(&ids[0], "relates_to", &ids[5], above_gate, attacker_producer, &[ids[0].clone()])
+        .unwrap();
+    log.rebuild_graph().unwrap();
+    let high = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
+    let s_high = find_hit(&high, &ids[5]).expect("neighbor present").score;
+    assert!(
+        s_high > s_base * 1.2,
+        "a >= TRUST_MIN machine edge must boost the neighbour over the no-edge \
+         baseline: high={s_high}, baseline={s_base}"
+    );
 }
