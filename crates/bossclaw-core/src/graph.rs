@@ -25,6 +25,12 @@ pub const MEMORY_EVENT_TYPE: &str = "memory";
 /// rotation + the evolve on/off switch). Single-sourced so the config reads and
 /// writes in the [`crate::log::EventLog`] config cluster cannot drift.
 pub const CONFIG_EVENT_TYPE: &str = "config";
+/// The `event_type` discriminator for a dossier (`page`) event — single-sourced
+/// so every stamp site, fold filter, and recall filter reference the same string.
+pub const PAGE_EVENT_TYPE: &str = "page";
+/// The `event_type` discriminator for a `supersede` event — single-sourced so
+/// the atomic-pair writer and the fold filter reference the same string.
+pub const SUPERSEDE_EVENT_TYPE: &str = "supersede";
 /// The neutral entity type stamped on an entity the model named ONLY as a bare
 /// relation/retraction endpoint (never listed in `entities[]`, so it carries no
 /// declared type). Single-sourced so the endpoint-mint site has no magic string.
@@ -314,7 +320,7 @@ pub fn fold_pages(events: &[Event]) -> Vec<Page> {
     use std::collections::HashSet;
     let mut superseded: HashSet<String> = HashSet::new();
     for ev in events {
-        if ev.event_type == "supersede" {
+        if ev.event_type == SUPERSEDE_EVENT_TYPE {
             if let Some(p) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
                 superseded.insert(p.to_string());
             }
@@ -324,7 +330,7 @@ pub fn fold_pages(events: &[Event]) -> Vec<Page> {
     // write wins deterministically.
     let mut by_topic: std::collections::BTreeMap<String, Page> = std::collections::BTreeMap::new();
     for ev in events {
-        if ev.event_type != "page" || superseded.contains(&ev.id) {
+        if ev.event_type != PAGE_EVENT_TYPE || superseded.contains(&ev.id) {
             continue;
         }
         if let Some((topic_id, title, text)) = parse_page_content(&ev.content) {

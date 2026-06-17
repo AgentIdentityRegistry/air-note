@@ -114,12 +114,10 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 
 /// Event types whose `content["text"]` is fed to the embedder. `page` does not
 /// exist until M4 but is listed here so the seam is forward-compatible.
-const EMBEDDABLE_EVENT_TYPES: &[&str] = &["memory", "page"];
-
-/// The `event_type` discriminator for a dossier (`page`) event — the single
-/// source of the page-kind string the recall page-filter matches against (spec
-/// §7 / F2). Same literal the `page`/`emit_page` helpers and `fold_pages` use.
-const PAGE_EVENT_TYPE: &str = "page";
+/// Composed from the canonical `*_EVENT_TYPE` consts in `graph` so this array
+/// and the stamp sites cannot drift.
+const EMBEDDABLE_EVENT_TYPES: &[&str] =
+    &[crate::graph::MEMORY_EVENT_TYPE, crate::graph::PAGE_EVENT_TYPE];
 
 /// The serialized, signed event log.
 pub struct EventLog {
@@ -978,10 +976,15 @@ impl EventLog {
         // Per-candidate event_type (F2): needed to set Hit.kind AND to filter
         // pages. Same single-lock id-IN pattern as candidate_timestamps.
         let kinds = self.candidate_event_types(&candidate_ids)?;
-        // Current page ids (for the superseded-page exclusion). Cheap: the pages
-        // projection is small.
+        // Current page ids (for the superseded-page exclusion). Gated behind a
+        // page-candidate check: the `pages` projection SELECT is skipped entirely
+        // on the common case where no page is in the fusion candidate set (Fix A).
         let current_page_ids: std::collections::HashSet<String> =
-            self.current_pages()?.into_iter().map(|p| p.page_event_id).collect();
+            if kinds.values().any(|k| k == crate::graph::PAGE_EVENT_TYPE) {
+                self.current_pages()?.into_iter().map(|p| p.page_event_id).collect()
+            } else {
+                std::collections::HashSet::new()
+            };
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
@@ -1089,11 +1092,9 @@ impl EventLog {
         });
         // F2: drop pages that must not surface — BEFORE truncate(k) so a
         // superseded page can never crowd out a valid lower-ranked candidate.
-        // "page" is the same discriminator the `page` event carries as its
-        // `event_type` (and the one in EMBEDDABLE_EVENT_TYPES) — the single source
-        // of the page-kind name.
+        // Uses the single-sourced `crate::graph::PAGE_EVENT_TYPE` discriminator.
         hits.retain(|h| {
-            if h.kind != PAGE_EVENT_TYPE {
+            if h.kind != crate::graph::PAGE_EVENT_TYPE {
                 return true; // non-page hits always survive
             }
             if opts.exclude_pages {
@@ -1612,7 +1613,7 @@ impl EventLog {
         }
         self.append(Event {
             id: String::new(), ts: String::new(), valid_time: None,
-            event_type: "page".to_string(),
+            event_type: crate::graph::PAGE_EVENT_TYPE.to_string(),
             content: serde_json::json!({
                 "topic_id": topic_id, "title": title, "text": text,
                 "claims": claims, "tags": tags,
@@ -1642,7 +1643,7 @@ impl EventLog {
         }
         self.append(Event {
             id: String::new(), ts: String::new(), valid_time: None,
-            event_type: "supersede".to_string(),
+            event_type: crate::graph::SUPERSEDE_EVENT_TYPE.to_string(),
             content: serde_json::json!({ "supersedes": supersedes }),
             model_meta: Some(ModelMeta {
                 model_id: producer.to_string(), prompt_hash: String::new(),
@@ -1677,7 +1678,7 @@ impl EventLog {
         }
         let page_ev = Event {
             id: String::new(), ts: String::new(), valid_time: None,
-            event_type: "page".to_string(),
+            event_type: crate::graph::PAGE_EVENT_TYPE.to_string(),
             content: serde_json::json!({
                 "topic_id": topic_id, "title": title, "text": text,
                 "claims": claims, "tags": tags,
@@ -1694,7 +1695,7 @@ impl EventLog {
             Some(prior) => {
                 let supersede_ev = Event {
                     id: String::new(), ts: String::new(), valid_time: None,
-                    event_type: "supersede".to_string(),
+                    event_type: crate::graph::SUPERSEDE_EVENT_TYPE.to_string(),
                     content: serde_json::json!({ "supersedes": prior }),
                     model_meta: Some(ModelMeta {
                         model_id: producer.to_string(), prompt_hash: String::new(),
@@ -2609,7 +2610,7 @@ impl EventLog {
         let mut by_id: HashMap<String, String> = HashMap::new();
         for row in rows {
             let (id, etype, payload) = row?;
-            if etype == "page" {
+            if etype == crate::graph::PAGE_EVENT_TYPE {
                 continue;
             }
             let ev: Event = serde_json::from_str(&payload)?;
