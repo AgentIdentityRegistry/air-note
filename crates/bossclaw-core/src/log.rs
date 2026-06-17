@@ -221,6 +221,26 @@ impl EventLog {
                 entity_type TEXT NOT NULL
             )",
         )?;
+        // Page projection (Tier-A; spec §4). At most one CURRENT page per topic;
+        // a deterministic fold over `page`/`supersede` events, rebuilt by
+        // `rebuild_graph`. `text` is the rendered body (also the embedded text).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS pages (
+                topic_id      TEXT PRIMARY KEY,
+                page_event_id TEXT NOT NULL,
+                title         TEXT NOT NULL,
+                text          TEXT NOT NULL
+            )",
+        )?;
+        // Summarize progress high-water-mark (spec §6 / F1) — sibling of
+        // evolve_cursor. NOT a fold: losing it only re-derives the dirty set
+        // (idempotent via the cited-set check). Single row.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS summarize_cursor (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                last_seq INTEGER NOT NULL
+            )",
+        )?;
         // Entity-resolution vectors (Tier-A derived; spec §6). Separate from
         // `vectors` so the resolution index NEVER mixes with the recall index —
         // recall must exclude entity-kind, resolution searches only entity-kind.
@@ -271,10 +291,40 @@ impl EventLog {
         })
     }
 
-    /// Append an event. `id`, `ts`, `prev_hash`, `hash`, `signature` are
-    /// assigned here; the caller supplies `event_type`, `content`, `model_meta`,
+    /// Append an event. `id`, `ts`, `prev_hash`, `hash`, `signature` are assigned
+    /// here; the caller supplies `event_type`, `content`, `model_meta`,
     /// `signed_by_did`, optional `valid_time`.
-    pub fn append(&self, mut event: Event) -> Result<String, BossclawError> {
+    pub fn append(&self, event: Event) -> Result<String, BossclawError> {
+        Self::reject_empty_tier_b(&event)?;
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        let id = self.append_event_in_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Atomically append `first` then `second` in ONE transaction (spec §3.7 /
+    /// F5). Used to emit `supersede`+`page` together so there is never a durable
+    /// orphan supersede (both commit or neither). `second` chains onto `first`
+    /// because the chain-tip read is SQL inside the shared tx, so it sees the
+    /// uncommitted `first`. Returns `(first_id, second_id)`.
+    pub fn append_pair(&self, first: Event, second: Event) -> Result<(String, String), BossclawError> {
+        Self::reject_empty_tier_b(&first)?;
+        Self::reject_empty_tier_b(&second)?;
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        let id1 = self.append_event_in_tx(&tx, first)?;
+        let id2 = self.append_event_in_tx(&tx, second)?;
+        tx.commit()?;
+        Ok((id1, id2))
+    }
+
+    /// The Tier-B non-empty-`source_event_ids` guard (a `model_meta: Some` event
+    /// must carry real lineage). Factored so both `append` and `append_pair`
+    /// enforce it before opening a transaction.
+    fn reject_empty_tier_b(event: &Event) -> Result<(), BossclawError> {
         if let Some(meta) = &event.model_meta {
             if meta.source_event_ids.is_empty() {
                 return Err(BossclawError::Chain(
@@ -282,34 +332,36 @@ impl EventLog {
                 ));
             }
         }
+        Ok(())
+    }
 
-        let store = self.inner.lock().expect(POISON);
-        let conn = store.conn();
-        let tx = conn.unchecked_transaction()?;
-
+    /// Assign id/ts/prev_hash, hash, sign, and INSERT `event` within `tx`. The
+    /// chain tip is read via SQL inside `tx`, so consecutive calls in one tx chain
+    /// correctly (the second sees the first's uncommitted insert). Returns the id.
+    fn append_event_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        mut event: Event,
+    ) -> Result<String, BossclawError> {
         let prev_hash: String = tx
             .query_row("SELECT hash FROM events ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
             .unwrap_or_else(|_| GENESIS.to_string());
-
         event.id = Ulid::new().to_string();
         event.ts = Utc::now().to_rfc3339();
         event.prev_hash = prev_hash;
         event.hash = None;
         event.signature = None;
-
         let hash = compute_hash(&event)?;
         let hash_hex = hex::encode(hash);
         let sig = sign_hash(&hash, &self.key);
         event.hash = Some(hash_hex.clone());
         event.signature = Some(sig);
-
         let payload = serde_json::to_string(&event)?;
         tx.execute(
             "INSERT INTO events (id, ts, event_type, payload, prev_hash, hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![event.id, event.ts, event.event_type, payload, event.prev_hash, hash_hex],
         )?;
-        tx.commit()?;
         Ok(event.id)
     }
 
@@ -1472,6 +1524,144 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Append a signed Tier-B `page` (summary) event for `topic_id` (spec §4).
+    /// `claims` are the structured `{text, cites:[event_id]}` items; `cites` MUST
+    /// be sorted+deduped and `claims` capped to `MAX_CLAIMS_PER_PAGE` by the
+    /// caller BEFORE this (F7 — canonicalization). NON-MANUAL producer: empty
+    /// `source_event_ids` rejected (F4). `text` is the rendered body (also the
+    /// embedded text). Returns the page event id.
+    // The explicit-args shape mirrors [`EventLog::entity`]; a params struct would
+    // add indirection without safety benefit (same rationale as `append_graph_event`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn page(
+        &self,
+        topic_id: &str,
+        title: &str,
+        text: &str,
+        claims: &[serde_json::Value],
+        tags: &[String],
+        producer: &str,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput(
+                "page event requires explicit non-empty source_event_ids (the cited memories)".into(),
+            ));
+        }
+        self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: "page".to_string(),
+            content: serde_json::json!({
+                "topic_id": topic_id, "title": title, "text": text,
+                "claims": claims, "tags": tags,
+            }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(), prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })
+    }
+
+    /// Append a signed Tier-B `supersede` retiring page id `supersedes` (spec §4).
+    /// Machine producer → empty `source_event_ids` rejected (F4). Prefer
+    /// [`EventLog::emit_page`] which pairs this with the replacement atomically.
+    pub fn supersede(
+        &self,
+        supersedes: &str,
+        producer: &str,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput(
+                "supersede event requires explicit non-empty source_event_ids".into(),
+            ));
+        }
+        self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: "supersede".to_string(),
+            content: serde_json::json!({ "supersedes": supersedes }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(), prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })
+    }
+
+    /// Emit a dossier for a topic, atomically superseding its prior page (F5).
+    /// When `prior_page_id` is `Some`, `supersede`+`page` go through `append_pair`
+    /// (no orphan supersede); when `None` (first page), just the `page`. Returns
+    /// `(page_event_id, superseded)`. The caller guarantees `claims` are already
+    /// floor-verified, cap-applied, and `cites`-sorted (F6/F7).
+    // Explicit-args shape mirrors [`EventLog::page`]; a params struct would add
+    // indirection without safety benefit (same rationale as `append_graph_event`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_page(
+        &self,
+        topic_id: &str,
+        title: &str,
+        text: &str,
+        claims: &[serde_json::Value],
+        tags: &[String],
+        producer: &str,
+        source_event_ids: &[String],
+        prior_page_id: Option<&str>,
+    ) -> Result<(String, bool), BossclawError> {
+        let page_ev = Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: "page".to_string(),
+            content: serde_json::json!({
+                "topic_id": topic_id, "title": title, "text": text,
+                "claims": claims, "tags": tags,
+            }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(), prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        };
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput("page requires non-empty source_event_ids".into()));
+        }
+        match prior_page_id {
+            None => Ok((self.append(page_ev)?, false)),
+            Some(prior) => {
+                let supersede_ev = Event {
+                    id: String::new(), ts: String::new(), valid_time: None,
+                    event_type: "supersede".to_string(),
+                    content: serde_json::json!({ "supersedes": prior }),
+                    model_meta: Some(ModelMeta {
+                        model_id: producer.to_string(), prompt_hash: String::new(),
+                        source_event_ids: source_event_ids.to_vec(),
+                    }),
+                    prev_hash: String::new(), hash: None,
+                    signed_by_did: self.signer_did(), signature: None,
+                };
+                let (_s, p) = self.append_pair(supersede_ev, page_ev)?;
+                Ok((p, true))
+            }
+        }
+    }
+
+    /// Every CURRENT page (one per topic), `ORDER BY topic_id ASC`. Tier-A read.
+    pub fn current_pages(&self) -> Result<Vec<crate::graph::Page>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT topic_id, page_event_id, title, text FROM pages ORDER BY topic_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::Page {
+            topic_id: r.get(0)?, page_event_id: r.get(1)?, title: r.get(2)?, text: r.get(3)?,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
     /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
     /// default for `source_event_ids` is gated to the manual producer only.
     ///
@@ -1578,6 +1768,10 @@ impl EventLog {
         let entity_ids: HashSet<String> =
             entities.iter().map(|e| e.entity_id.clone()).collect();
 
+        // Fold page/supersede events → current dossier per topic (F9).
+        let page_events = self.page_and_supersede_events_ordered()?;
+        let pages = crate::graph::fold_pages(&page_events);
+
         let memory_ids = self.memory_page_ids()?;
 
         // Distinct endpoints → nodes (BTreeMap = deterministic node order).
@@ -1605,6 +1799,7 @@ impl EventLog {
         tx.execute("DELETE FROM edges", [])?;
         tx.execute("DELETE FROM nodes", [])?;
         tx.execute("DELETE FROM entities", [])?;
+        tx.execute("DELETE FROM pages", [])?;
         for e in &edges {
             tx.execute(
                 "INSERT INTO edges
@@ -1636,6 +1831,12 @@ impl EventLog {
                     serde_json::to_string(&e.aliases)?,
                     e.entity_type
                 ],
+            )?;
+        }
+        for p in &pages {
+            tx.execute(
+                "INSERT INTO pages (topic_id, page_event_id, title, text) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![p.topic_id, p.page_event_id, p.title, p.text],
             )?;
         }
         tx.commit()?;
@@ -1678,6 +1879,20 @@ impl EventLog {
         for row in rows {
             out.push(serde_json::from_str(&row?)?);
         }
+        Ok(out)
+    }
+
+    /// All `page` + `supersede` events, payload-parsed, in chain (`seq ASC`)
+    /// order — the input to [`crate::graph::fold_pages`].
+    fn page_and_supersede_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('page','supersede') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(serde_json::from_str(&row?)?); }
         Ok(out)
     }
 

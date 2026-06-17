@@ -279,6 +279,61 @@ pub fn fold_edges(events: &[Event]) -> Vec<Edge> {
     edges
 }
 
+/// A folded summary page: the CURRENT (un-superseded) `page` event for a topic,
+/// projected into the `pages` table (spec §4). `page_event_id` is the signed
+/// event's id (what a `supersede` references); the prose lives in `text` (also
+/// the embedded text). At most one `Page` per `topic_id` (F9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// The topic this dossier is about — an `entity:<ulid>` node id.
+    pub topic_id: String,
+    /// The current page event's id.
+    pub page_event_id: String,
+    /// Human-readable dossier title.
+    pub title: String,
+    /// The rendered markdown body (also the embeddable/recall text).
+    pub text: String,
+}
+
+/// Extract `(topic_id, title, text)` from a `page` event's content, or `None` if
+/// any is missing/non-string (malformed — skipped by the fold, not fatal).
+pub fn parse_page_content(content: &serde_json::Value) -> Option<(String, String, String)> {
+    let topic_id = content.get("topic_id")?.as_str()?.to_string();
+    let title = content.get("title")?.as_str()?.to_string();
+    let text = content.get("text")?.as_str()?.to_string();
+    Some((topic_id, title, text))
+}
+
+/// Fold `page`/`supersede` events (MUST be in `seq` order) into the current
+/// dossier per topic (spec §4 / F9). A `supersede{supersedes: P}` retires page
+/// id `P`; the current page for a topic is the latest (`seq`-max) `page` for that
+/// `topic_id` not retired by any supersede. **At most one** per topic (zero is a
+/// benign, transient orphan-supersede state). Deterministic → byte-identical
+/// rebuild. Malformed events are skipped.
+pub fn fold_pages(events: &[Event]) -> Vec<Page> {
+    use std::collections::HashSet;
+    let mut superseded: HashSet<String> = HashSet::new();
+    for ev in events {
+        if ev.event_type == "supersede" {
+            if let Some(p) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
+                superseded.insert(p.to_string());
+            }
+        }
+    }
+    // Latest non-superseded page per topic, walking in seq order so the last
+    // write wins deterministically.
+    let mut by_topic: std::collections::BTreeMap<String, Page> = std::collections::BTreeMap::new();
+    for ev in events {
+        if ev.event_type != "page" || superseded.contains(&ev.id) {
+            continue;
+        }
+        if let Some((topic_id, title, text)) = parse_page_content(&ev.content) {
+            by_topic.insert(topic_id.clone(), Page { topic_id, page_event_id: ev.id.clone(), title, text });
+        }
+    }
+    by_topic.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

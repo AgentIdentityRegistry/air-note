@@ -557,3 +557,71 @@ fn malicious_machine_relation_label_is_inert_data_not_sql() {
     assert_eq!(edges[0].origin, "machine");
     assert_eq!(edges[0].confidence_milli, Some(950));
 }
+
+// ── M4b Task 1: page/supersede events + pages projection ──────────────────────
+// `current_pages()` returns `bossclaw_core::graph::Page`; tests reach its fields
+// off the returned values, so no bare `Page` import is needed here.
+
+#[test]
+fn page_and_supersede_append_with_explicit_sources_and_reject_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("kenny works at acme")).unwrap();
+    let topic = "entity:01TOPIC";
+
+    // page() is a NON-manual producer → explicit non-empty sources required.
+    let p1 = log.page(topic, "Kenny", "Kenny works at Acme.",
+        &[json!({"text":"Kenny works at Acme.","cites":[m.clone()]})], &["work".into()],
+        "m4-reasoner", std::slice::from_ref(&m)).unwrap();
+    let ev = log.stream_all().unwrap().into_iter().find(|e| e.id == p1).unwrap();
+    assert_eq!(ev.event_type, "page");
+    assert_eq!(ev.content["topic_id"], json!(topic));
+    assert_eq!(ev.content["text"], json!("Kenny works at Acme."));
+    assert_eq!(ev.model_meta.unwrap().source_event_ids, vec![m.clone()]);
+
+    // Empty sources rejected on both helpers (F4 taint guard).
+    assert!(matches!(log.page(topic,"t","b",&[],&[],"m4-reasoner",&[]),
+        Err(bossclaw_core::BossclawError::InvalidInput(_))));
+    assert!(matches!(log.supersede(&p1,"m4-reasoner",&[]),
+        Err(bossclaw_core::BossclawError::InvalidInput(_))));
+}
+
+#[test]
+fn fold_pages_resolves_current_per_topic_and_supersede_retires() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("kenny")).unwrap();
+    let topic = "entity:01TOPIC";
+    let p1 = log.page(topic,"Kenny v1","v1 body",
+        &[json!({"text":"v1 body","cites":[m.clone()]})],&[],"m4-reasoner",std::slice::from_ref(&m)).unwrap();
+    log.rebuild_graph().unwrap();
+    assert_eq!(log.current_pages().unwrap().len(), 1);
+
+    // Regenerate: supersede p1, then p2 — both in one append_pair.
+    let p2 = log.emit_page(topic,"Kenny v2","v2 body",
+        &[json!({"text":"v2 body","cites":[m.clone()]})],&[],"m4-reasoner",std::slice::from_ref(&m),Some(&p1)).unwrap();
+    log.rebuild_graph().unwrap();
+    let cur = log.current_pages().unwrap();
+    assert_eq!(cur.len(), 1, "at most one current page per topic (F9)");
+    assert_eq!(cur[0].page_event_id, p2.0, "the newest non-superseded page is current");
+    assert_eq!(cur[0].text, "v2 body");
+    // p1 still in the log (auditable), just not current.
+    assert!(log.stream_all().unwrap().iter().any(|e| e.id == p1));
+}
+
+#[test]
+fn orphan_supersede_yields_at_most_one_and_rebuild_is_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let m = log.append(mk_memory("x")).unwrap();
+    let topic = "entity:01T";
+    let p1 = log.page(topic,"t","b",&[json!({"text":"b","cites":[m.clone()]})],&[],"r",std::slice::from_ref(&m)).unwrap();
+    // A supersede with no replacement page (simulating the F5 failure window's
+    // log shape) → zero current pages for the topic (benign, F9).
+    log.supersede(&p1,"r",std::slice::from_ref(&m)).unwrap();
+    log.rebuild_graph().unwrap();
+    let c1 = log.current_pages().unwrap();
+    assert!(c1.len() <= 1, "at most one (here zero) current page");
+    log.rebuild_graph().unwrap();
+    assert_eq!(c1, log.current_pages().unwrap(), "pages fold byte-identical across rebuilds");
+}
