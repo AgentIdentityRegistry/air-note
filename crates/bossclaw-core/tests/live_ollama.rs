@@ -38,6 +38,7 @@ use bossclaw_core::event::Event;
 use bossclaw_core::graph::ENTITY_NODE_PREFIX;
 use bossclaw_core::log::EventLog;
 use bossclaw_core::ollama::OllamaReasoner;
+use bossclaw_core::recall::RecallOptions;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 
@@ -330,4 +331,263 @@ fn live_re_running_a_tick_is_idempotent() {
         "re-running adds no events (idempotent)"
     );
     log.verify_chain().unwrap();
+}
+
+// ── Property 5 (M4b headline): a grounded dossier, surfaced by recall, superseded
+//    on contradiction, idempotent with no new facts ─────────────────────────────
+
+/// THE M4b summarize loop, proven LIVE. The summarizer is the half of the evolve
+/// loop that turns the M4a graph into a per-entity **dossier** (`page`) kept
+/// current via `supersede`, with every claim leashed to a signed source by the
+/// deterministic citation floor. This gate asserts the five end-to-end properties
+/// against the REAL `qwen2.5:7b-instruct`:
+///   1. after extraction + summarize ticks, a `page` exists for the entity;
+///   2. EVERY claim in that page cites ONLY ids in the gathered fact-set (grounded
+///      — the floor's subtract-only contract holding over a real model's draft);
+///   3. `recall("Kenny …")` surfaces the page (`Hit.kind == "page"`);
+///   4. a CONTRADICTING memory + re-tick → the page is SUPERSEDED (a fresh current
+///      page whose event id differs, the prior dropped from the projection);
+///   5. a re-tick with NO new facts emits NO new page (F6 idempotency, LIVE).
+///
+/// ROBUSTNESS (honest note, mirroring Property 3): a 7b at temperature 0 is
+/// *near*-deterministic, but whether extraction mints enough facts to clear
+/// `PAGE_MIN_FACTS` and whether the model cites grounded ids is model-output
+/// variance. We therefore drive the GROUNDED-DOSSIER phase under bounded retries
+/// (fresh stores each attempt) and pass if ANY attempt produces a grounded,
+/// recall-surfaced page; the contradiction + idempotency phases then run once on
+/// that store. This is NOT weakening the property — the property (the live loop
+/// *must be capable of* producing a grounded dossier and superseding it on a
+/// contradiction) is unchanged; the retry only absorbs the model's run-to-run
+/// variance, exactly as Property 3 and M2's recall gate do. If every attempt
+/// fails, the test fails loudly.
+#[test]
+#[ignore = "requires a local Ollama running qwen2.5:7b-instruct"]
+fn live_dossier_is_grounded_surfaces_and_supersedes_on_contradiction() {
+    /// Bounded attempts to absorb 7b output variance in the grounding phase.
+    /// Worst-case runtime: ~3 × ~50s ≈ 2.5 minutes (extraction + compose per attempt).
+    const MAX_ATTEMPTS: usize = 3;
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let reasoner = OllamaReasoner::new(MODEL);
+
+    let mut last_failure = String::new();
+    'attempts: for attempt in 1..=MAX_ATTEMPTS {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+
+        // ── Seed a few facts about Kenny so extraction has an entity + edges to
+        //    summarize. Each call runs one full tick (extraction THEN summarize).
+        //    A second bare tick guarantees the summarize phase sees the fully
+        //    folded graph even if the first tick summarized before all edges
+        //    folded. ──
+        ingest_and_evolve(&log, &embedder, &reasoner, "Kenny Ferris is a software engineer at Acme.");
+        ingest_and_evolve(&log, &embedder, &reasoner, "Kenny Ferris leads the Acme search team.");
+        log.evolve_once(&embedder, &reasoner).unwrap();
+
+        // Embed any freshly-emitted page so recall can surface it (the summarize
+        // phase refreshes the pages projection but not the vector index).
+        log.rederive_pending(&embedder).unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+        log.rebuild_graph().unwrap();
+
+        // ── Property 1: a page exists for the Kenny entity. ──
+        let pages = log.current_pages().unwrap();
+        let kenny_entity = log
+            .all_entities()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.label.to_lowercase().contains("kenny"));
+        let kenny_entity = match kenny_entity {
+            Some(e) => e,
+            None => {
+                last_failure = format!("attempt {attempt}: no Kenny entity minted");
+                eprintln!("{last_failure}; retrying");
+                continue 'attempts;
+            }
+        };
+        let page = match pages.iter().find(|p| p.topic_id == kenny_entity.entity_id) {
+            Some(p) => p.clone(),
+            None => {
+                last_failure = format!(
+                    "attempt {attempt}: no page for entity {} (pages={})",
+                    kenny_entity.entity_id,
+                    pages.len()
+                );
+                eprintln!("{last_failure}; retrying");
+                continue 'attempts;
+            }
+        };
+
+        // ── Property 2: every claim's cites ⊆ the fact-set (grounded). Read the
+        //    page event's signed claims and check each cite is a real fact id (the
+        //    deterministic floor guarantees this; the live assertion proves the
+        //    real model's draft actually went THROUGH the floor). ──
+        let facts = log.gather_fact_set(&kenny_entity).unwrap();
+        let fact_ids = facts.fact_ids();
+        assert!(
+            !fact_ids.is_empty(),
+            "the fact-set is non-empty (the page was grounded in real memories)"
+        );
+        let page_ev = log
+            .stream_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == page.page_event_id)
+            .expect("the current page resolves to a real event");
+        let claims = page_ev.content["claims"].as_array().cloned().unwrap_or_default();
+        assert!(!claims.is_empty(), "the grounded page has ≥1 surviving claim");
+        for claim in &claims {
+            let cites = claim["cites"].as_array().cloned().unwrap_or_default();
+            assert!(!cites.is_empty(), "every surviving claim cites ≥1 source (floor: no empty cites)");
+            for cite in &cites {
+                let cid = cite.as_str().expect("a cite is a string event id");
+                assert!(
+                    fact_ids.contains(cid),
+                    "claim cite {cid} is in the fact-set (grounded; the floor dropped any that were not)"
+                );
+                assert!(
+                    !cid.starts_with(ENTITY_NODE_PREFIX),
+                    "a cite is an EVENT id, never an entity:<ulid> node id"
+                );
+            }
+        }
+        // The page's lineage: non-empty, all event ids (no entity: prefix), the
+        // inducing memories are present. We check this by asserting each surviving
+        // cite is an event id (done above in the claim loop) and that model_meta is
+        // machine-origin and non-empty.
+        let page_meta = page_ev.model_meta.clone().expect("page carries model_meta lineage");
+        assert!(!page_meta.source_event_ids.is_empty(), "page lineage is non-empty");
+        assert_ne!(page_meta.model_id, "manual", "the page is machine-origin");
+        for sid in &page_meta.source_event_ids {
+            assert!(
+                !sid.starts_with(ENTITY_NODE_PREFIX),
+                "page lineage id {sid} must be an EVENT id, never an entity:<ulid> node id"
+            );
+        }
+
+        // ── Property 3: recall surfaces the page with kind == "page". ──
+        let hits = log
+            .recall(&embedder, "Kenny Ferris Acme engineer", 10, &RecallOptions::default())
+            .unwrap();
+        let surfaced = hits.iter().any(|h| h.event_id == page.page_event_id && h.kind == "page");
+        assert!(
+            surfaced,
+            "recall surfaces the current dossier as a page hit (hits: {:?})",
+            hits.iter().map(|h| (&h.event_id, &h.kind)).collect::<Vec<_>>()
+        );
+
+        // ── Property 4: a contradicting memory → the page is SUPERSEDED. ──
+        let prior_page_id = page.page_event_id.clone();
+        // Snapshot the fact-set BEFORE ingesting the contradiction so we can tell
+        // whether the fact-set actually changed (needed to distinguish variance from
+        // a deterministic supersede-machinery break below).
+        let facts_before_contradiction = log.gather_fact_set(&kenny_entity).unwrap();
+        let fact_ids_before = facts_before_contradiction.fact_ids();
+
+        // A memory that changes Kenny's employer; re-tick (extraction updates the
+        // graph → the topic is re-dirtied → summarize regenerates the dossier).
+        ingest_and_evolve(
+            &log,
+            &embedder,
+            &reasoner,
+            "Update: Kenny Ferris has left Acme and now works at Globex.",
+        );
+        log.evolve_once(&embedder, &reasoner).unwrap();
+        log.rederive_pending(&embedder).unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+        log.rebuild_graph().unwrap();
+
+        let pages_after = log.current_pages().unwrap();
+        let current = pages_after.iter().find(|p| p.topic_id == kenny_entity.entity_id);
+        let current = match current {
+            Some(p) => p.clone(),
+            None => {
+                last_failure = format!("attempt {attempt}: topic lost its page after the contradiction");
+                eprintln!("{last_failure}; retrying");
+                continue 'attempts;
+            }
+        };
+        if current.page_event_id == prior_page_id {
+            // Check whether the fact-set actually changed. If it did, the supersede
+            // machinery had every reason to fire but didn't — that is a deterministic
+            // failure, not model variance.
+            let facts_after = log.gather_fact_set(&kenny_entity).unwrap();
+            let fact_ids_after = facts_after.fact_ids();
+            let fact_set_changed = fact_ids_after != fact_ids_before;
+            if fact_set_changed {
+                // The contradiction memory was ingested and the fact-set grew (the new
+                // memory id is now in fact_ids_after), but the summarize loop did NOT
+                // emit a new page. This is NOT model-output variance (the model already
+                // ran); it means the supersede path in the summarize loop is broken.
+                panic!(
+                    "attempt {attempt}: the fact-set changed after the contradiction \
+                     (new ids: {:?}) but the page was NOT superseded (still {prior_page_id}). \
+                     This is a deterministic supersede-machinery failure, not model variance.",
+                    fact_ids_after.difference(&fact_ids_before).collect::<Vec<_>>()
+                );
+            }
+            // The fact-set did not change: the model did not update the graph (it may
+            // have labelled the change with a multi-valued relation that carries no
+            // retraction, or extraction produced nothing). That IS model variance →
+            // retry so a different extraction attempt has a chance to fire.
+            last_failure = format!(
+                "attempt {attempt}: the contradiction did not supersede the page \
+                 (still {prior_page_id}); fact-set unchanged (model variance — retrying)"
+            );
+            eprintln!("{last_failure}");
+            continue 'attempts;
+        }
+        // A supersede event referencing the prior page exists, and the prior page is
+        // no longer current (dropped from the projection).
+        let superseded = log.stream_all().unwrap().into_iter().any(|e| {
+            e.event_type == "supersede"
+                && e.content.get("supersedes").and_then(|v| v.as_str()) == Some(prior_page_id.as_str())
+        });
+        assert!(superseded, "a supersede event retired the prior page id");
+        assert!(
+            pages_after.iter().all(|p| p.page_event_id != prior_page_id),
+            "the superseded page is no longer current (left the projection)"
+        );
+        // The new body is still grounded (cites ⊆ the new fact-set).
+        let new_facts = log.gather_fact_set(&kenny_entity).unwrap();
+        let new_fact_ids = new_facts.fact_ids();
+        let new_page_ev = log
+            .stream_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == current.page_event_id)
+            .unwrap();
+        for claim in new_page_ev.content["claims"].as_array().cloned().unwrap_or_default() {
+            for cite in claim["cites"].as_array().cloned().unwrap_or_default() {
+                let cid = cite.as_str().unwrap();
+                assert!(new_fact_ids.contains(cid), "the regenerated page is still grounded ({cid})");
+            }
+        }
+
+        // ── Property 5: a re-tick with NO new facts emits NO new page (F6). ──
+        let current_page_id = current.page_event_id.clone();
+        let report_idem = log.evolve_once(&embedder, &reasoner).unwrap();
+        assert_eq!(
+            report_idem.pages_emitted, 0,
+            "no new facts → the summarize phase emits no new page (F6 idempotency)"
+        );
+        assert_eq!(report_idem.pages_superseded, 0, "no supersede churn on an unchanged grounding set");
+        let pages_final = log.current_pages().unwrap();
+        let final_page = pages_final
+            .iter()
+            .find(|p| p.topic_id == kenny_entity.entity_id)
+            .expect("the topic still has exactly one current page");
+        assert_eq!(
+            final_page.page_event_id, current_page_id,
+            "the current page is unchanged after an idempotent re-tick"
+        );
+
+        log.verify_chain().unwrap();
+        eprintln!("live M4b dossier gate passed on attempt {attempt}/{MAX_ATTEMPTS}");
+        return;
+    }
+    panic!(
+        "the live model never produced a grounded, recall-surfaced, supersede-on-\
+         contradiction dossier across {MAX_ATTEMPTS} attempts — last: {last_failure}"
+    );
 }

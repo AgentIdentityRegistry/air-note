@@ -10,6 +10,122 @@ pre-1.0 and not yet published to crates.io).
 
 ## [Unreleased]
 
+### M4b — Summarizer (2026-06-17)
+
+The summarize half of the evolve loop: it turns the M4a entity graph into
+*understanding* — a per-entity, model-written **dossier** (`page`) that recall
+returns as synthesis, kept current via `supersede`, with every claim leashed to
+a signed source. It reuses M4a's `evolve_once` runtime + `Reasoner` seam: after
+extraction + `rebuild_graph`, a summarize phase gathers a bounded fact-set per
+dirty topic (entity + current edges + lineage memories — **never another
+page**), the model composes a draft of discrete cited claims, the deterministic
+**citation floor** subtracts every ungrounded claim, and the survivor is written
+atomically (`supersede` + `page` in one transaction). The model's prose is
+**data, never authority**: cited-but-fallible, machine-origin-lower-trust, never
+itself a summary-source (the one-way rule), supersede-not-delete.
+
+#### Added
+
+- **`page`/`supersede` Tier-B events + `pages` projection** (`src/graph.rs`,
+  `src/log.rs`) — `EventLog::page(topic_id, title, text, claims, tags, producer,
+  source_event_ids)` mints a signed dossier for an `entity:<ulid>` topic;
+  `supersede(prior)` retires one. Both are NON-MANUAL producers → empty
+  `source_event_ids` is rejected (the F4 taint guard, extended). `rebuild_graph`
+  folds them via `fold_pages` into a `pages` table (`topic_id` PRIMARY KEY) — the
+  **current** (un-superseded, `seq`-max) page per topic, **at most one** (zero is
+  a benign transient orphan-supersede state, F9). Byte-identical on rebuild. The
+  body lives in `content.text` so it embeds + recalls with zero embed-path change
+  (`EMBEDDABLE_EVENT_TYPES` already carried `"page"`); a `supersede` carries only
+  `{supersedes}` → non-embeddable by construction.
+- **Atomic `append_pair` + `emit_page`** (`src/log.rs`, F5) — `append` is
+  refactored around a private `append_event_in_tx` core so `append_pair(first,
+  second)` can chain two events in ONE transaction (the second reads the chain
+  tip inside the shared tx, seeing the uncommitted first). `emit_page(…,
+  prior_page_id)` uses it to emit `supersede`+`page` together when regenerating —
+  never a durable orphan supersede; a topic is never left page-less. The Tier-B
+  non-empty-lineage guard (`reject_empty_tier_b`) runs before either path opens a
+  transaction.
+- **Pure summarizer pipeline** (`src/summarize.rs`, PURE — mirrors `extract.rs`)
+  — `FactSet`/`DraftPage`/`DraftClaim`/`RenderedPage` types; `compose_schema()`
+  (`{title, claims:[{text, cites:[string]}]}`); `build_compose_prompt` (the
+  fenced fact-set, each memory tagged with its event id so the model can cite it,
+  edges as lines, via the shared M4a source-fence helper); `parse_draft`
+  (tolerant — a malformed draft degrades to fewer claims, never a panic); the
+  **`citation_floor`** (subtract-only: keep a claim ONLY if its `cites` is
+  non-empty AND every cite is in the fact-set — an anti-fabrication bar-raiser,
+  NOT a relevance/entailment boundary, F8); and `assemble` (renders the body +
+  the sorted+deduped union of surviving cites, returns `None` when nothing
+  survived so the empty-floor path never reaches `append`, F4). The cap
+  (`MAX_CLAIMS_PER_PAGE`) is applied **before** the signed content is built (F7).
+- **The `evolve_once` summarize phase** (`src/log.rs`, `src/evolve.rs`) — a
+  persistent `summarize_cursor` (sibling of `evolve_cursor`, NOT a fold, F1);
+  `dirty_entities_since` re-derives the dirty topic set each tick from
+  `entity:`-prefixed endpoints of `link`/`invalidate`/`entity` events past the
+  cursor (no per-tick accumulator). `summarize_topics` gathers each topic's
+  fact-set (`gather_fact_set`, ≤ `SUMMARY_BATCH` topics/tick), composes, runs the
+  floor, and emits via `emit_page` **only when the cited-source SET differs from
+  the current page's** — idempotency keyed on grounding, never prose (F6: a
+  temperature-0 model still rewords across runs; comparing wording would churn a
+  supersede every tick). A per-topic `continue` on any gather/compose/parse/emit
+  error (F4): extraction is already committed, so one topic's failure never
+  breaks the batch or blocks the cursor. `EvolveReport` gains `pages_emitted` +
+  `pages_superseded` (F10).
+- **The one-way rule, enforced at the reader** (`src/log.rs`, F3) — a fact-set is
+  raw memories + edges only, never another page. Enforced at BOTH arms:
+  `fact_texts_for_ids` drops `page`-typed ids by construction (a page id reaching
+  the fact-set is a contract violation, never silently summarized), AND the
+  evolve loop's internal extraction recall passes `exclude_pages: true`.
+- **Recall surfaces current dossiers** (`src/recall.rs`, `src/log.rs`, F2) — a
+  `Hit.kind` field (the event's type) lets callers distinguish synthesis (a
+  dossier) from ground truth (a raw memory); a `RecallOptions.exclude_pages`
+  (default `false`) implements the one-way rule for the internal recall.
+  `candidate_event_types` fetches per-candidate kinds, and recall drops
+  excluded/superseded pages **before** `truncate(k)` — so a superseded page can
+  never crowd out a valid lower-ranked candidate. Only the *current* page for a
+  topic surfaces; superseded pages stay in the log (auditable, `as_of`) but leave
+  the projection + recall.
+- **Recall-neutral in v1** (F11) — no `PAGE_RECALL_WEIGHT`, no model-critique
+  pass (`SUMMARY_REFLECT` dropped): the deterministic floor is the subtract
+  mechanism, and safety is structural (supersede-exclusion + the one-way rule +
+  machine-origin-lower-trust + the actuator never reading a page).
+- **Named constants** (`src/summarize.rs`, `src/extract.rs`) — `PAGE_REACH`
+  (`Tight`: entity + its edges + their lineage), `PAGE_MIN_FACTS` (`2` — no
+  dossier for a bare name), `MAX_CLAIMS_PER_PAGE` (`32`), `SUMMARY_BATCH` (`8`).
+  No magic numbers.
+
+#### Tests
+
+- **Hermetic suite (CI, `ScriptedReasoner` + `MockEmbedder`)** — page/supersede
+  append + empty-lineage rejection, `fold_pages` current-per-topic +
+  supersede-retire + at-most-one orphan-supersede + byte-identical rebuild
+  (`tests/graph.rs`); compose prompt shape + `parse_draft` + citation-floor
+  subtract-only + assemble empty→None + sorted/deduped cites + cap
+  (`tests/summarize.rs`); the summarize phase end-to-end — grounded page emit,
+  cursor-drain + cited-set idempotency, the one-way rule (a page body never
+  re-enters the fact-set), empty-floor→no-page-without-breaking-the-batch
+  (`tests/evolve.rs`); recall surfaces the current page + excludes superseded +
+  `exclude_pages` hides all + superseded-at-rank-1-does-not-crowd-out
+  (`tests/recall.rs`). **M4b security suite** (`tests/evolve.rs`): the page
+  lineage is event-ids-only (never an `entity:`/topic id), a SQL-injection
+  payload in a page title/text is inert literal data that survives a rebuild, a
+  `supersede` is never embeddable (no vector row, never in recall), and an
+  injection in a memory cannot plant an uncited claim or emit a `config` — the
+  floor surgically drops the fabricated claims while keeping the one faithful,
+  grounded claim (a per-claim subtract), and the machine-origin page carries full
+  lineage.
+- **Live-Ollama behavioral gate** (`tests/live_ollama.rs`, `#[ignore]`, feature
+  `ollama`) — asserts properties not bytes against the real
+  `qwen2.5:7b-instruct`: after extraction + summarize ticks a `page` exists for
+  the entity; EVERY surviving claim cites only ids in the gathered fact-set
+  (grounded — the floor's contract holding over a real draft); `recall` surfaces
+  the dossier as a `page` hit; a contradicting memory + re-tick SUPERSEDES the
+  page (a fresh current page, the prior dropped from the projection, still
+  grounded); a re-tick with no new facts emits no new page (F6 idempotency,
+  LIVE). Bounded retries absorb the 7b's run-to-run output variance (mirroring
+  the M4a contradiction gate); the property is unchanged. Run locally with
+  `cargo test -p bossclaw-core --features ollama --test live_ollama -- --ignored`;
+  never part of the hermetic CI suite.
+
 ### M4a — Clever Linker (2026-06-16)
 
 The LLM auto-linker that *populates* the M3 graph. A local model

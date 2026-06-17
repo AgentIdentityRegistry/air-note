@@ -114,7 +114,10 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 
 /// Event types whose `content["text"]` is fed to the embedder. `page` does not
 /// exist until M4 but is listed here so the seam is forward-compatible.
-const EMBEDDABLE_EVENT_TYPES: &[&str] = &["memory", "page"];
+/// Composed from the canonical `*_EVENT_TYPE` consts in `graph` so this array
+/// and the stamp sites cannot drift.
+const EMBEDDABLE_EVENT_TYPES: &[&str] =
+    &[crate::graph::MEMORY_EVENT_TYPE, crate::graph::PAGE_EVENT_TYPE];
 
 /// The serialized, signed event log.
 pub struct EventLog {
@@ -221,6 +224,26 @@ impl EventLog {
                 entity_type TEXT NOT NULL
             )",
         )?;
+        // Page projection (Tier-A; spec §4). At most one CURRENT page per topic;
+        // a deterministic fold over `page`/`supersede` events, rebuilt by
+        // `rebuild_graph`. `text` is the rendered body (also the embedded text).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS pages (
+                topic_id      TEXT PRIMARY KEY,
+                page_event_id TEXT NOT NULL,
+                title         TEXT NOT NULL,
+                text          TEXT NOT NULL
+            )",
+        )?;
+        // Summarize progress high-water-mark (spec §6 / F1) — sibling of
+        // evolve_cursor. NOT a fold: losing it only re-derives the dirty set
+        // (idempotent via the cited-set check). Single row.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS summarize_cursor (
+                id INTEGER PRIMARY KEY CHECK (id = 0),
+                last_seq INTEGER NOT NULL
+            )",
+        )?;
         // Entity-resolution vectors (Tier-A derived; spec §6). Separate from
         // `vectors` so the resolution index NEVER mixes with the recall index —
         // recall must exclude entity-kind, resolution searches only entity-kind.
@@ -271,10 +294,40 @@ impl EventLog {
         })
     }
 
-    /// Append an event. `id`, `ts`, `prev_hash`, `hash`, `signature` are
-    /// assigned here; the caller supplies `event_type`, `content`, `model_meta`,
+    /// Append an event. `id`, `ts`, `prev_hash`, `hash`, `signature` are assigned
+    /// here; the caller supplies `event_type`, `content`, `model_meta`,
     /// `signed_by_did`, optional `valid_time`.
-    pub fn append(&self, mut event: Event) -> Result<String, BossclawError> {
+    pub fn append(&self, event: Event) -> Result<String, BossclawError> {
+        Self::reject_empty_tier_b(&event)?;
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        let id = self.append_event_in_tx(&tx, event)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Atomically append `first` then `second` in ONE transaction (spec §3.7 /
+    /// F5). Used to emit `supersede`+`page` together so there is never a durable
+    /// orphan supersede (both commit or neither). `second` chains onto `first`
+    /// because the chain-tip read is SQL inside the shared tx, so it sees the
+    /// uncommitted `first`. Returns `(first_id, second_id)`.
+    pub fn append_pair(&self, first: Event, second: Event) -> Result<(String, String), BossclawError> {
+        Self::reject_empty_tier_b(&first)?;
+        Self::reject_empty_tier_b(&second)?;
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        let id1 = self.append_event_in_tx(&tx, first)?;
+        let id2 = self.append_event_in_tx(&tx, second)?;
+        tx.commit()?;
+        Ok((id1, id2))
+    }
+
+    /// The Tier-B non-empty-`source_event_ids` guard (a `model_meta: Some` event
+    /// must carry real lineage). Factored so both `append` and `append_pair`
+    /// enforce it before opening a transaction.
+    fn reject_empty_tier_b(event: &Event) -> Result<(), BossclawError> {
         if let Some(meta) = &event.model_meta {
             if meta.source_event_ids.is_empty() {
                 return Err(BossclawError::Chain(
@@ -282,34 +335,36 @@ impl EventLog {
                 ));
             }
         }
+        Ok(())
+    }
 
-        let store = self.inner.lock().expect(POISON);
-        let conn = store.conn();
-        let tx = conn.unchecked_transaction()?;
-
+    /// Assign id/ts/prev_hash, hash, sign, and INSERT `event` within `tx`. The
+    /// chain tip is read via SQL inside `tx`, so consecutive calls in one tx chain
+    /// correctly (the second sees the first's uncommitted insert). Returns the id.
+    fn append_event_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        mut event: Event,
+    ) -> Result<String, BossclawError> {
         let prev_hash: String = tx
             .query_row("SELECT hash FROM events ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
             .unwrap_or_else(|_| GENESIS.to_string());
-
         event.id = Ulid::new().to_string();
         event.ts = Utc::now().to_rfc3339();
         event.prev_hash = prev_hash;
         event.hash = None;
         event.signature = None;
-
         let hash = compute_hash(&event)?;
         let hash_hex = hex::encode(hash);
         let sig = sign_hash(&hash, &self.key);
         event.hash = Some(hash_hex.clone());
         event.signature = Some(sig);
-
         let payload = serde_json::to_string(&event)?;
         tx.execute(
             "INSERT INTO events (id, ts, event_type, payload, prev_hash, hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![event.id, event.ts, event.event_type, payload, event.prev_hash, hash_hex],
         )?;
-        tx.commit()?;
         Ok(event.id)
     }
 
@@ -918,6 +973,18 @@ impl EventLog {
         // ── Recency boost needs each candidate's ts; fetch them in one query. ──
         let candidate_ids: Vec<String> = fused.keys().cloned().collect();
         let timestamps = self.candidate_timestamps(&candidate_ids)?;
+        // Per-candidate event_type (F2): needed to set Hit.kind AND to filter
+        // pages. Same single-lock id-IN pattern as candidate_timestamps.
+        let kinds = self.candidate_event_types(&candidate_ids)?;
+        // Current page ids (for the superseded-page exclusion). Gated behind a
+        // page-candidate check: the `pages` projection SELECT is skipped entirely
+        // on the common case where no page is in the fusion candidate set (Fix A).
+        let current_page_ids: std::collections::HashSet<String> =
+            if kinds.values().any(|k| k == crate::graph::PAGE_EVENT_TYPE) {
+                self.current_pages()?.into_iter().map(|p| p.page_event_id).collect()
+            } else {
+                std::collections::HashSet::new()
+            };
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
@@ -984,7 +1051,11 @@ impl EventLog {
                 if keyword_set.contains(&id) {
                     sources.push(RecallSource::Keyword);
                 }
-                let hit = Hit { event_id: id, score: score_f64 as f32, sources };
+                // Per-hit event type (F2). Read before `id` is moved into the Hit;
+                // a candidate missing from the map (race with deletion) gets an
+                // empty kind, which the page-filter treats as a non-page (kept).
+                let kind = kinds.get(&id).cloned().unwrap_or_default();
+                let hit = Hit { event_id: id, score: score_f64 as f32, sources, kind };
                 (hit, score_f64)
             })
             .collect();
@@ -1018,6 +1089,18 @@ impl EventLog {
                     tb.cmp(&ta) // newer (larger DateTime) first
                 })
                 .then_with(|| b.event_id.cmp(&a.event_id)) // lexicographic DESC backstop
+        });
+        // F2: drop pages that must not surface — BEFORE truncate(k) so a
+        // superseded page can never crowd out a valid lower-ranked candidate.
+        // Uses the single-sourced `crate::graph::PAGE_EVENT_TYPE` discriminator.
+        hits.retain(|h| {
+            if h.kind != crate::graph::PAGE_EVENT_TYPE {
+                return true; // non-page hits always survive
+            }
+            if opts.exclude_pages {
+                return false; // one-way rule (F3)
+            }
+            current_page_ids.contains(&h.event_id) // else: only the CURRENT page
         });
         hits.truncate(k);
         Ok(hits)
@@ -1149,6 +1232,38 @@ impl EventLog {
                     log::warn!("recall: event {id} has unparseable ts {ts:?}: {e}");
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// `id → event_type` for the given ids, one parameterized query (F2). Ids not
+    /// present are simply absent from the map. Mirrors [`Self::candidate_timestamps`]'
+    /// single-lock IN-query so recall can tag each [`Hit`] with its kind and filter
+    /// pages.
+    fn candidate_event_types(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, BossclawError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, event_type FROM events WHERE id IN ({placeholders})");
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, t) = row?;
+            out.insert(id, t);
         }
         Ok(out)
     }
@@ -1472,6 +1587,144 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Append a signed Tier-B `page` (summary) event for `topic_id` (spec §4).
+    /// `claims` are the structured `{text, cites:[event_id]}` items; `cites` MUST
+    /// be sorted+deduped and `claims` capped to `MAX_CLAIMS_PER_PAGE` by the
+    /// caller BEFORE this (F7 — canonicalization). NON-MANUAL producer: empty
+    /// `source_event_ids` rejected (F4). `text` is the rendered body (also the
+    /// embedded text). Returns the page event id.
+    // The explicit-args shape mirrors [`EventLog::entity`]; a params struct would
+    // add indirection without safety benefit (same rationale as `append_graph_event`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn page(
+        &self,
+        topic_id: &str,
+        title: &str,
+        text: &str,
+        claims: &[serde_json::Value],
+        tags: &[String],
+        producer: &str,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput(
+                "page event requires explicit non-empty source_event_ids (the cited memories)".into(),
+            ));
+        }
+        self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::PAGE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "topic_id": topic_id, "title": title, "text": text,
+                "claims": claims, "tags": tags,
+            }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(), prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })
+    }
+
+    /// Append a signed Tier-B `supersede` retiring page id `supersedes` (spec §4).
+    /// Machine producer → empty `source_event_ids` rejected (F4). Prefer
+    /// [`EventLog::emit_page`] which pairs this with the replacement atomically.
+    pub fn supersede(
+        &self,
+        supersedes: &str,
+        producer: &str,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput(
+                "supersede event requires explicit non-empty source_event_ids".into(),
+            ));
+        }
+        self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::SUPERSEDE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "supersedes": supersedes }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(), prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })
+    }
+
+    /// Emit a dossier for a topic, atomically superseding its prior page (F5).
+    /// When `prior_page_id` is `Some`, `supersede`+`page` go through `append_pair`
+    /// (no orphan supersede); when `None` (first page), just the `page`. Returns
+    /// `(page_event_id, superseded)`. The caller guarantees `claims` are already
+    /// floor-verified, cap-applied, and `cites`-sorted (F6/F7).
+    // Explicit-args shape mirrors [`EventLog::page`]; a params struct would add
+    // indirection without safety benefit (same rationale as `append_graph_event`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_page(
+        &self,
+        topic_id: &str,
+        title: &str,
+        text: &str,
+        claims: &[serde_json::Value],
+        tags: &[String],
+        producer: &str,
+        source_event_ids: &[String],
+        prior_page_id: Option<&str>,
+    ) -> Result<(String, bool), BossclawError> {
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput("page requires non-empty source_event_ids".into()));
+        }
+        let page_ev = Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::PAGE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "topic_id": topic_id, "title": title, "text": text,
+                "claims": claims, "tags": tags,
+            }),
+            model_meta: Some(ModelMeta {
+                model_id: producer.to_string(), prompt_hash: String::new(),
+                source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        };
+        match prior_page_id {
+            None => Ok((self.append(page_ev)?, false)),
+            Some(prior) => {
+                let supersede_ev = Event {
+                    id: String::new(), ts: String::new(), valid_time: None,
+                    event_type: crate::graph::SUPERSEDE_EVENT_TYPE.to_string(),
+                    content: serde_json::json!({ "supersedes": prior }),
+                    model_meta: Some(ModelMeta {
+                        model_id: producer.to_string(), prompt_hash: String::new(),
+                        source_event_ids: source_event_ids.to_vec(),
+                    }),
+                    prev_hash: String::new(), hash: None,
+                    signed_by_did: self.signer_did(), signature: None,
+                };
+                let (_s, p) = self.append_pair(supersede_ev, page_ev)?;
+                Ok((p, true))
+            }
+        }
+    }
+
+    /// Every CURRENT page (one per topic), `ORDER BY topic_id ASC`. Tier-A read.
+    pub fn current_pages(&self) -> Result<Vec<crate::graph::Page>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT topic_id, page_event_id, title, text FROM pages ORDER BY topic_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::Page {
+            topic_id: r.get(0)?, page_event_id: r.get(1)?, title: r.get(2)?, text: r.get(3)?,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
     /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
     /// default for `source_event_ids` is gated to the manual producer only.
     ///
@@ -1578,6 +1831,10 @@ impl EventLog {
         let entity_ids: HashSet<String> =
             entities.iter().map(|e| e.entity_id.clone()).collect();
 
+        // Fold page/supersede events → current dossier per topic (F9).
+        let page_events = self.page_and_supersede_events_ordered()?;
+        let pages = crate::graph::fold_pages(&page_events);
+
         let memory_ids = self.memory_page_ids()?;
 
         // Distinct endpoints → nodes (BTreeMap = deterministic node order).
@@ -1605,6 +1862,7 @@ impl EventLog {
         tx.execute("DELETE FROM edges", [])?;
         tx.execute("DELETE FROM nodes", [])?;
         tx.execute("DELETE FROM entities", [])?;
+        tx.execute("DELETE FROM pages", [])?;
         for e in &edges {
             tx.execute(
                 "INSERT INTO edges
@@ -1636,6 +1894,12 @@ impl EventLog {
                     serde_json::to_string(&e.aliases)?,
                     e.entity_type
                 ],
+            )?;
+        }
+        for p in &pages {
+            tx.execute(
+                "INSERT INTO pages (topic_id, page_event_id, title, text) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![p.topic_id, p.page_event_id, p.title, p.text],
             )?;
         }
         tx.commit()?;
@@ -1678,6 +1942,20 @@ impl EventLog {
         for row in rows {
             out.push(serde_json::from_str(&row?)?);
         }
+        Ok(out)
+    }
+
+    /// All `page` + `supersede` events, payload-parsed, in chain (`seq ASC`)
+    /// order — the input to [`crate::graph::fold_pages`].
+    fn page_and_supersede_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('page','supersede') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(serde_json::from_str(&row?)?); }
         Ok(out)
     }
 
@@ -2241,6 +2519,345 @@ impl EventLog {
         Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
     }
 
+    /// Read the summarize cursor (0 if unset). Sibling of `evolve_cursor`, the
+    /// summarize-phase high-water-mark over `seq` (spec §6 / M4b F1). NOT a fold:
+    /// losing it only re-derives the dirty set, which idempotency (F6) makes a
+    /// safe no-op for already-current topics.
+    fn summarize_cursor(&self) -> Result<i64, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let v = conn
+            .query_row("SELECT last_seq FROM summarize_cursor WHERE id = 0", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        Ok(v)
+    }
+
+    /// Persist the summarize cursor (spec §6 / M4b F1). Single-row upsert.
+    fn set_summarize_cursor(&self, seq: i64) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO summarize_cursor (id, last_seq) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET last_seq = ?1",
+            rusqlite::params![seq],
+        )?;
+        Ok(())
+    }
+
+    /// The distinct `entity:`-prefixed endpoints of `link`/`invalidate`/`entity`
+    /// events with `seq > cursor` — the dirty topic set (spec §6 / M4b F1).
+    /// Non-entity endpoints (bare mentions passed through by `map_mention`) are
+    /// excluded. Returns `(max_seq_scanned, entity_ids)`; `max_seq_scanned`
+    /// stays at `cursor` when nothing matched. Parameterised query only.
+    fn dirty_entities_since(&self, cursor: i64) -> Result<(i64, Vec<String>), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, event_type, payload FROM events
+             WHERE seq > ?1 AND event_type IN ('link','invalidate','entity') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cursor], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut max_seq = cursor;
+        let mut seen = std::collections::BTreeSet::new();
+        for row in rows {
+            let (seq, etype, payload) = row?;
+            max_seq = seq;
+            let ev: Event = serde_json::from_str(&payload)?;
+            if etype == "entity" {
+                seen.insert(crate::graph::entity_node_id(&ev.id));
+            } else if let Some((src, _r, dst, _c)) = crate::graph::parse_link_content(&ev.content) {
+                for endpoint in [src, dst] {
+                    if endpoint.starts_with(crate::graph::ENTITY_NODE_PREFIX) {
+                        seen.insert(endpoint);
+                    }
+                }
+            }
+        }
+        Ok((max_seq, seen.into_iter().collect()))
+    }
+
+    /// Like [`EventLog::texts_for_ids`], but DROPS any `page`-typed id by
+    /// construction — the one-way rule enforced at fact-set materialization
+    /// (spec §7 / M4b F3). A page id reaching the fact-set is a contract
+    /// violation, never silently summarized back into a summary. One `IN (?,...)`
+    /// query (mirrors [`EventLog::texts_for_ids`]); caller id order is preserved
+    /// on the way out (the gather sorts lineage before calling, but preserving
+    /// order is a defensive courtesy and costs nothing).
+    fn fact_texts_for_ids(&self, ids: &[String]) -> Result<Vec<(String, String)>, BossclawError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String =
+            (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql =
+            format!("SELECT id, event_type, payload FROM events WHERE id IN ({placeholders})");
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        // Build a by-id map; skip page-typed rows (F3: a summary never feeds
+        // summary-generation).
+        let mut by_id: HashMap<String, String> = HashMap::new();
+        for row in rows {
+            let (id, etype, payload) = row?;
+            if etype == crate::graph::PAGE_EVENT_TYPE {
+                continue;
+            }
+            let ev: Event = serde_json::from_str(&payload)?;
+            if let Some(t) = ev.content.get("text").and_then(|t| t.as_str()) {
+                by_id.insert(id, t.to_string());
+            }
+        }
+        // Preserve the caller's id order, same as texts_for_ids.
+        Ok(ids.iter().filter_map(|id| by_id.get(id).map(|t| (id.clone(), t.clone()))).collect())
+    }
+
+    /// Read an event's `model_meta.source_event_ids` by its `entity:<ulid>` node
+    /// id (M4b lineage gather): strip the `entity:` prefix to recover the entity
+    /// event id, then read its lineage. `None` if the event is absent or carries
+    /// no `model_meta`. One parameterised query.
+    fn source_ids_of_entity(&self, entity_id: &str) -> Result<Option<Vec<String>>, BossclawError> {
+        let event_id = entity_id
+            .strip_prefix(crate::graph::ENTITY_NODE_PREFIX)
+            .unwrap_or(entity_id);
+        self.source_ids_of_event(event_id)
+    }
+
+    /// Read an event's `model_meta.source_event_ids` by event id (M4b lineage
+    /// gather). `None` if the event is absent or carries no `model_meta`. One
+    /// parameterised query.
+    fn source_ids_of_event(&self, event_id: &str) -> Result<Option<Vec<String>>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM events WHERE id = ?1",
+                rusqlite::params![event_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match payload {
+            None => Ok(None),
+            Some(p) => {
+                let ev: Event = serde_json::from_str(&p)?;
+                Ok(ev.model_meta.map(|m| m.source_event_ids))
+            }
+        }
+    }
+
+    /// The current page's `(page_event_id, sorted+deduped cited-source ids)` for a
+    /// topic, or `None` if the topic has no current page (M4b F6 idempotency key).
+    /// The cited set is the union of the page event's claim `cites` — the exact
+    /// value the summarize phase compares against to skip an unchanged dossier.
+    fn current_page_for_topic(
+        &self,
+        topic_id: &str,
+    ) -> Result<Option<(String, Vec<String>)>, BossclawError> {
+        // The current page id from the projection (small, parameterised read).
+        let page_event_id: Option<String> = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT page_event_id FROM pages WHERE topic_id = ?1",
+                rusqlite::params![topic_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        let page_event_id = match page_event_id {
+            None => return Ok(None),
+            Some(id) => id,
+        };
+        // Parse the page event's claims → the sorted+deduped union of cites.
+        let payload: Option<String> = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT payload FROM events WHERE id = ?1",
+                rusqlite::params![page_event_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        let mut cites: Vec<String> = Vec::new();
+        if let Some(p) = payload {
+            let ev: Event = serde_json::from_str(&p)?;
+            if let Some(claims) = ev.content.get("claims").and_then(|c| c.as_array()) {
+                for claim in claims {
+                    if let Some(arr) = claim.get("cites").and_then(|c| c.as_array()) {
+                        cites.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)));
+                    }
+                }
+            }
+        }
+        cites.sort();
+        cites.dedup();
+        Ok(Some((page_event_id, cites)))
+    }
+
+    /// Gather the bounded fact-set for one topic entity (spec §3.3, `Tight`
+    /// reach): its current edges (as `src -relation-> dst` lines) + the memory
+    /// texts in the lineage of the entity event and those edges. NEVER includes a
+    /// page (M4b F3, via [`EventLog::fact_texts_for_ids`]).
+    ///
+    /// `pub` (not `pub(crate)`) so the hermetic evolve tests can compute the
+    /// EXACT fact-set the summarize phase will gather and script the matching
+    /// compose turn (the `ScriptedReasoner` keys on the precise prompt). It is a
+    /// pure read over already-signed events — exposing it leaks no write path.
+    pub fn gather_fact_set(
+        &self,
+        entity: &crate::graph::Entity,
+    ) -> Result<crate::summarize::FactSet, BossclawError> {
+        let neighbors = self.neighbors(&entity.entity_id).unwrap_or_default(); // current edges
+        let edges: Vec<String> = neighbors
+            .iter()
+            .map(|e| format!("{} -{}-> {}", e.src, e.relation, e.dst))
+            .collect();
+        // Lineage memory ids = union of source_event_ids on the entity event + the
+        // edge (link) events, resolved through the page-dropping reader (F3).
+        let mut lineage: Vec<String> = Vec::new();
+        if let Some(ids) = self.source_ids_of_entity(&entity.entity_id)? {
+            lineage.extend(ids);
+        }
+        for e in &neighbors {
+            if let Some(ids) = self.source_ids_of_event(&e.edge_id)? {
+                lineage.extend(ids);
+            }
+        }
+        lineage.sort();
+        lineage.dedup();
+        let memories = self.fact_texts_for_ids(&lineage)?;
+        Ok(crate::summarize::FactSet { entity: entity.clone(), edges, memories })
+    }
+
+    /// The summarize phase of one tick (spec §3, §6 / M4b). For each dirty topic
+    /// (≤ [`crate::extract::SUMMARY_BATCH`], deterministic `entity_id` order):
+    /// gather the fact-set → compose → citation floor → assemble → (idempotency
+    /// F6) emit only when the cited-source SET differs from the current page's →
+    /// [`EventLog::emit_page`] (atomic supersede, F5). Per-topic `continue` on any
+    /// gather/compose/parse/emit error (F4) — extraction already committed, so a
+    /// topic-A failure must never block topic B or the cursor advance. Advances
+    /// `summarize_cursor` to the scanned tip ONLY when the dirty set fully drained
+    /// this tick (F1); otherwise the overflow re-scans next tick (idempotent).
+    fn summarize_topics(
+        &self,
+        reasoner: &dyn crate::reason::Reasoner,
+        report: &mut EvolveReport,
+    ) -> Result<(), BossclawError> {
+        let cursor = self.summarize_cursor()?;
+        let (max_seq, dirty) = self.dirty_entities_since(cursor)?;
+        let drained = dirty.len() <= crate::extract::SUMMARY_BATCH;
+        let entities = self.all_entities()?;
+        for topic_id in dirty.iter().take(crate::extract::SUMMARY_BATCH) {
+            let entity = match entities.iter().find(|e| &e.entity_id == topic_id) {
+                Some(e) => e.clone(),
+                None => continue, // a dirty endpoint with no folded entity (rare) → skip.
+                // Intentional F1 safe: the cursor may advance past this entity
+                // permanently — it has no entity record so it cannot be
+                // summarized. A future mint or repair event emits a NEW event
+                // with a seq PAST the advanced cursor, re-dirtying the topic
+                // for the next tick. Nothing is silently dropped forever.
+            };
+            let facts = match self.gather_fact_set(&entity) {
+                Ok(f) if f.fact_count() >= crate::summarize::PAGE_MIN_FACTS => f,
+                _ => continue, // too thin, or a gather error → skip this topic (F4)
+            };
+            let raw = match reasoner.complete_json(
+                crate::summarize::SUMMARIZE_SYSTEM,
+                &crate::summarize::build_compose_prompt(&facts),
+                &crate::summarize::compose_schema(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("summarize: compose failed for {topic_id}, skipping: {e}");
+                    continue;
+                }
+            };
+            let draft = match crate::summarize::parse_draft(&raw) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("summarize: malformed draft for {topic_id}, skipping: {e}");
+                    continue;
+                }
+            };
+            let floored = crate::summarize::citation_floor(&draft, &facts);
+            // F4: the empty-floor path NEVER reaches emit_page/append (an empty
+            // source set would hit the Tier-B reject and is not an emit anyway).
+            let rendered = match crate::summarize::assemble(&floored) {
+                Some(r) => r,
+                None => continue,
+            };
+            // Idempotency (F6): compare the cited-source SET against the current
+            // page; an unchanged grounding set emits nothing (no supersede churn).
+            let prior = self.current_page_for_topic(topic_id)?;
+            if let Some((_pid, prior_cites)) = &prior {
+                if prior_cites == &rendered.cites {
+                    continue;
+                }
+            }
+            // Canonicalize each claim's own `cites` for F7 signed content. This
+            // is NOT removable and NOT a duplicate of assemble(): assemble() sorts
+            // the cites UNION to produce `source_event_ids` (the page-level set),
+            // while this block sorts each INDIVIDUAL claim's `cites` array (the
+            // per-claim attribution stored in `content.claims[].cites`). Removing
+            // this leaves per-claim cites in raw model order → JCS-canonical
+            // signing becomes non-deterministic. The cap precedes signing.
+            let claims_json: Vec<serde_json::Value> = floored
+                .claims
+                .iter()
+                .map(|c| {
+                    let mut cites = c.cites.clone();
+                    cites.sort();
+                    cites.dedup();
+                    serde_json::json!({ "text": c.text, "cites": cites })
+                })
+                .collect();
+            let claims_capped =
+                &claims_json[..claims_json.len().min(crate::summarize::MAX_CLAIMS_PER_PAGE)];
+            let prior_id = prior.as_ref().map(|(id, _)| id.as_str());
+            match self.emit_page(
+                topic_id,
+                &rendered.title,
+                &rendered.text,
+                claims_capped,
+                &[],
+                reasoner.model_id(),
+                &rendered.cites,
+                prior_id,
+            ) {
+                Ok((_pid, superseded)) => {
+                    report.pages_emitted += 1;
+                    if superseded {
+                        report.pages_superseded += 1;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("summarize: emit_page failed for {topic_id}, skipping: {e}");
+                    continue;
+                }
+            }
+        }
+        // Refresh the projection only if the phase changed the page set.
+        if report.pages_emitted > 0 || report.pages_superseded > 0 {
+            self.rebuild_graph()?;
+        }
+        // F1: advance the cursor only when the dirty set fully drained this tick.
+        if drained && max_seq > cursor {
+            self.set_summarize_cursor(max_seq)?;
+        }
+        Ok(())
+    }
+
     /// Map a proposed mention to its resolved `entity:<ulid>` if known, else pass
     /// the raw string through (a relation endpoint the model named but resolution
     /// did not cover — kept as an opaque node id, never silently dropped). Pure
@@ -2327,10 +2944,17 @@ impl EventLog {
             let text = crate::extract::truncate_for_reasoner(&full_text).to_string();
 
             // ── 1. recall context (M2). entity-kind is excluded from recall by
-            //    construction (separate index), so neighbors are memories/pages.
-            //    The read-set is EVENT ids only (never entity:<ulid>), spec §16. ──
+            //    construction (separate index); `exclude_pages: true` drops pages
+            //    too, so extraction context is raw memories only — the one-way rule
+            //    (F3, defense-in-depth with `fact_texts_for_ids`). The read-set is
+            //    EVENT ids only (never entity:<ulid>), spec §16. ──
             let recalled: Vec<String> = self
-                .recall(embedder, &text, crate::extract::GRAPH_CONTEXT_K, &RecallOptions::default())
+                .recall(
+                    embedder,
+                    &text,
+                    crate::extract::GRAPH_CONTEXT_K,
+                    &RecallOptions { exclude_pages: true, ..Default::default() },
+                )
                 .map(|hits| {
                     hits.into_iter()
                         .filter(|h| h.event_id != mem_id) // never feed the source back as context
@@ -2501,6 +3125,14 @@ impl EventLog {
         if last_committed_seq > cursor {
             self.set_evolve_cursor(last_committed_seq)?;
         }
+
+        // ── 9. summarize phase (M4b): AFTER extraction committed + the graph is
+        //    folded, (re)summarize the dirty topics into dossier `page` events.
+        //    Best-effort and self-contained — its per-topic `continue` (F4) never
+        //    unwinds the already-committed extraction work; it manages its own
+        //    `summarize_cursor` (F1) independent of the extraction cursor above. ──
+        self.summarize_topics(reasoner, &mut report)?;
+
         Ok(report)
     }
 
