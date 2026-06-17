@@ -2550,10 +2550,38 @@ impl EventLog {
     /// deterministically ordered. Fed to Pass B so the model can confirm
     /// contradictions against KNOWN edges. Best-effort per id: a graph read error
     /// on one id is skipped (degrade, never break — spec §10).
+    ///
+    /// Endpoints are rendered by their human-readable NAME, not the opaque
+    /// `entity:<ulid>` node id: first the surface mention used in THIS memory
+    /// (the inverse of `mention_to_id`, so the line aligns with the identifiers in
+    /// the Pass-B PROPOSED lists), else the entity's stored `label`, else the raw
+    /// id as a last resort. A small local model (the live 7b) cannot reason about
+    /// opaque ULIDs — worse, it copies them into its echoed relation/retraction
+    /// endpoints, which then fail the `(src, relation, dst)` identity match in
+    /// [`crate::extract::intersect_keep_floor`] and silently drop the retraction,
+    /// so the F4 contradiction-retirement never fires. Naming the endpoints keeps
+    /// the neighborhood usable AND keeps the model's echo aligned with the floor.
     fn neighborhood_lines(
         &self,
         mention_to_id: &HashMap<String, String>,
     ) -> Result<Vec<String>, BossclawError> {
+        // id → display name. Prefer the surface mention from THIS memory (so the
+        // rendered line uses the exact identifiers the model sees in the PROPOSED
+        // lists); fall back to the stored entity label for endpoints this memory
+        // did not mention (the OTHER end of a 1-hop edge).
+        let mut name_of: HashMap<String, String> = HashMap::new();
+        for (mention, id) in mention_to_id {
+            // First-mention-wins is irrelevant here (a given id maps from one
+            // mention per tick via the resolve cache); insert is fine.
+            name_of.entry(id.clone()).or_insert_with(|| mention.clone());
+        }
+        for ent in self.all_entities()? {
+            name_of.entry(ent.entity_id).or_insert(ent.label);
+        }
+        // Render an endpoint id to its name, falling back to the raw id so an
+        // unknown endpoint is never silently blanked.
+        let render = |id: &str| name_of.get(id).cloned().unwrap_or_else(|| id.to_string());
+
         let mut seen: BTreeMap<String, ()> = BTreeMap::new();
         for id in mention_to_id.values() {
             let edges = match self.neighbors(id) {
@@ -2564,7 +2592,10 @@ impl EventLog {
                 }
             };
             for edge in edges {
-                seen.insert(format!("{} -{}-> {}", edge.src, edge.relation, edge.dst), ());
+                seen.insert(
+                    format!("{} -{}-> {}", render(&edge.src), edge.relation, render(&edge.dst)),
+                    (),
+                );
             }
         }
         Ok(seen.into_keys().collect())

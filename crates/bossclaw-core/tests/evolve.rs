@@ -497,7 +497,10 @@ fn t_d_a_retraction_on_resolved_ids_fires_exactly_one_invalidate() {
     }
     // Pass B over the floor (the retraction passes through the floor unchanged);
     // the model echoes the retraction so the intersect keeps it. The neighborhood
-    // the loop builds is the resolved edge `alice -works_at_primary-> initech`.
+    // the loop builds renders endpoints by their human-readable NAME (the surface
+    // mention used this tick), not the opaque entity:<ulid> — see
+    // `EventLog::neighborhood_lines`. Both "Alice" and "Initech" are mentioned in
+    // src2, so the resolved edge renders as `Alice -works_at_primary-> Initech`.
     let floor2 = verify_floor(&parse_proposals(&pa2).unwrap(), src2);
     let b_resp2 = json!({
         "entities": [],
@@ -507,7 +510,7 @@ fn t_d_a_retraction_on_resolved_ids_fires_exactly_one_invalidate() {
             "reason": r.reason, "confidence": r.confidence,
         })).collect::<Vec<_>>(),
     });
-    let nbh = vec![format!("{alice} -works_at_primary-> {initech}")];
+    let nbh = vec!["Alice -works_at_primary-> Initech".to_string()];
     let b_prompt2 = build_pass_b_prompt(src2, &floor2, &nbh);
     reasoner = reasoner.with_response(PASS_B_SYSTEM, &b_prompt2, b_resp2);
 
