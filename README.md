@@ -14,8 +14,8 @@ Every message is Ed25519-signed and verified against the sender's AIR-published 
 |------|------------|
 | [`agent-bridge-mcp/`](agent-bridge-mcp/) | Reference implementation in **Node (≥22)**: an MCP server that exposes messaging tools to AI clients, plus the `air-msg` CLI for humans. |
 | [`crates/air-rs/`](crates/air-rs/) | Reference implementation in **Rust**: envelope, JCS canonicalization, Ed25519 signing, sealed-box encryption, and relay transport — byte-compatible with the Node version, validated by shared conformance vectors. |
-| [`apps/desktop/`](apps/desktop/) | **BossClaw** — the reference desktop agent (Tauri + React): AIR identity onboarding, multi-provider LLM streaming, OS-keychain secrets. Consumes `crates/air-rs`. |
-| [`packages/shared/`](packages/shared/) | `@bossclaw/shared` — shared TypeScript used by the desktop app. |
+| [`apps/desktop/`](apps/desktop/) | **AIR Agent** — the reference desktop agent (Tauri + React): AIR identity onboarding, multi-provider LLM streaming, OS-keychain secrets. Consumes `crates/air-rs`. |
+| [`packages/shared/`](packages/shared/) | `@air-agent/shared` — shared TypeScript used by the desktop app. |
 | [`skills/verified/`](skills/verified/) | Bundled, manifest-described agent skills (daily briefing, document converter, research assistant). |
 
 ## Features
@@ -65,14 +65,14 @@ cargo test -p air-rs                         # unit + integration tests
 cargo test --features conformance -p air-rs  # protocol conformance vectors
 ```
 
-## BossClaw desktop app
+## AIR Agent desktop app
 
-`apps/desktop/` is **BossClaw** — the open-source reference desktop agent built on AIR identity, now living in this monorepo alongside the messaging stack it uses.
+`apps/desktop/` is **AIR Agent** — the open-source reference desktop agent built on AIR identity, now living in this monorepo alongside the messaging stack it uses.
 
 ```bash
 npm install                 # from repo root — installs the workspace
 npm run dev:desktop         # run the Tauri app in dev mode
-npm run typecheck --workspace @bossclaw/desktop
+npm run typecheck --workspace @air-agent/desktop
 ```
 
 The Rust backend (`apps/desktop/src-tauri/`) is a member of the same Cargo workspace as `crates/air-rs`, which it depends on directly.

@@ -11,11 +11,11 @@ A2A is an open protocol for authenticated AI-agent-to-agent messaging. Two agent
 
 ## Status
 
-This crate is **pre-v1**. The protocol spec is at `draft-1`. APIs are subject to change until the v1 promotion (target: Phase 3 Week 5 of BossClaw's roadmap).
+This crate is **pre-v1**. The protocol spec is at `draft-1`. APIs are subject to change until the v1 promotion (target: Phase 3 Week 5 of AIR Agent's roadmap).
 
 ## Why does this exist?
 
-BossClaw is the reference implementation of trust infrastructure for AI agents. `air-rs` is the protocol code extracted from BossClaw so any other Rust agent (OpenClaw, Mercury, Hermes, future agents) can drop it in via `cargo add air-rs`.
+AIR Agent is the reference implementation of trust infrastructure for AI agents. `air-rs` is the protocol code extracted from AIR Agent so any other Rust agent (OpenClaw, Mercury, Hermes, future agents) can drop it in via `cargo add air-rs`.
 
 ## License
 
@@ -24,5 +24,5 @@ Apache-2.0. Spec text at `/specs/air/draft-1` is CC-BY-4.0.
 ## Related
 
 - [Agent Identity Registry (AIR)](https://agentidentityregistry.org) — neutral trust scoring + DID document hosting
-- [BossClaw](https://github.com/AgentIdentityRegistry/air-note) — desktop forever-companion agent using `air-rs`
+- [AIR Agent](https://github.com/AgentIdentityRegistry/air-note) — desktop forever-companion agent using `air-rs`
 - [Spec at draft-1](https://agentidentityregistry.org/specs/air/draft-1) — wire format + conformance vectors
