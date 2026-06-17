@@ -39,6 +39,10 @@ pub struct Hit {
     pub score: f32,
     /// Every arm that surfaced this id (the hit's provenance / evidence).
     pub sources: Vec<RecallSource>,
+    /// The event's type (`"memory"` / `"page"` / …) — lets callers distinguish
+    /// synthesis (a dossier) from ground truth (a raw memory), and lets recall
+    /// filter superseded/excluded pages (spec §7 / F2).
+    pub kind: String,
 }
 
 /// Optional re-ranking stage. v1 default is a no-op (spec §5.7).
@@ -78,6 +82,9 @@ pub struct RecallOptions {
     /// candidates within [`GRAPH_MAX_HOPS`] of these (current edges only). When
     /// empty, recall auto-seeds from the top [`GRAPH_AUTO_SEED_TOPK`] fused hits.
     pub graph_seeds: Vec<String>,
+    /// When true, drop ALL `page`-kind hits — the one-way rule for the evolve
+    /// loop's internal recall (spec §7 / F3). User-facing recall leaves it false.
+    pub exclude_pages: bool,
 }
 
 /// Reciprocal-rank-fusion constant `k` (Cormack et al., "Reciprocal Rank Fusion

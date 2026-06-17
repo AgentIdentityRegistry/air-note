@@ -116,6 +116,11 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// exist until M4 but is listed here so the seam is forward-compatible.
 const EMBEDDABLE_EVENT_TYPES: &[&str] = &["memory", "page"];
 
+/// The `event_type` discriminator for a dossier (`page`) event — the single
+/// source of the page-kind string the recall page-filter matches against (spec
+/// §7 / F2). Same literal the `page`/`emit_page` helpers and `fold_pages` use.
+const PAGE_EVENT_TYPE: &str = "page";
+
 /// The serialized, signed event log.
 pub struct EventLog {
     inner: Mutex<Store>,
@@ -970,6 +975,13 @@ impl EventLog {
         // ── Recency boost needs each candidate's ts; fetch them in one query. ──
         let candidate_ids: Vec<String> = fused.keys().cloned().collect();
         let timestamps = self.candidate_timestamps(&candidate_ids)?;
+        // Per-candidate event_type (F2): needed to set Hit.kind AND to filter
+        // pages. Same single-lock id-IN pattern as candidate_timestamps.
+        let kinds = self.candidate_event_types(&candidate_ids)?;
+        // Current page ids (for the superseded-page exclusion). Cheap: the pages
+        // projection is small.
+        let current_page_ids: std::collections::HashSet<String> =
+            self.current_pages()?.into_iter().map(|p| p.page_event_id).collect();
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
@@ -1036,7 +1048,11 @@ impl EventLog {
                 if keyword_set.contains(&id) {
                     sources.push(RecallSource::Keyword);
                 }
-                let hit = Hit { event_id: id, score: score_f64 as f32, sources };
+                // Per-hit event type (F2). Read before `id` is moved into the Hit;
+                // a candidate missing from the map (race with deletion) gets an
+                // empty kind, which the page-filter treats as a non-page (kept).
+                let kind = kinds.get(&id).cloned().unwrap_or_default();
+                let hit = Hit { event_id: id, score: score_f64 as f32, sources, kind };
                 (hit, score_f64)
             })
             .collect();
@@ -1070,6 +1086,20 @@ impl EventLog {
                     tb.cmp(&ta) // newer (larger DateTime) first
                 })
                 .then_with(|| b.event_id.cmp(&a.event_id)) // lexicographic DESC backstop
+        });
+        // F2: drop pages that must not surface — BEFORE truncate(k) so a
+        // superseded page can never crowd out a valid lower-ranked candidate.
+        // "page" is the same discriminator the `page` event carries as its
+        // `event_type` (and the one in EMBEDDABLE_EVENT_TYPES) — the single source
+        // of the page-kind name.
+        hits.retain(|h| {
+            if h.kind != PAGE_EVENT_TYPE {
+                return true; // non-page hits always survive
+            }
+            if opts.exclude_pages {
+                return false; // one-way rule (F3)
+            }
+            current_page_ids.contains(&h.event_id) // else: only the CURRENT page
         });
         hits.truncate(k);
         Ok(hits)
@@ -1201,6 +1231,38 @@ impl EventLog {
                     log::warn!("recall: event {id} has unparseable ts {ts:?}: {e}");
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// `id → event_type` for the given ids, one parameterized query (F2). Ids not
+    /// present are simply absent from the map. Mirrors [`Self::candidate_timestamps`]'
+    /// single-lock IN-query so recall can tag each [`Hit`] with its kind and filter
+    /// pages.
+    fn candidate_event_types(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, BossclawError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, event_type FROM events WHERE id IN ({placeholders})");
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, t) = row?;
+            out.insert(id, t);
         }
         Ok(out)
     }
@@ -2881,10 +2943,17 @@ impl EventLog {
             let text = crate::extract::truncate_for_reasoner(&full_text).to_string();
 
             // ── 1. recall context (M2). entity-kind is excluded from recall by
-            //    construction (separate index), so neighbors are memories/pages.
-            //    The read-set is EVENT ids only (never entity:<ulid>), spec §16. ──
+            //    construction (separate index); `exclude_pages: true` drops pages
+            //    too, so extraction context is raw memories only — the one-way rule
+            //    (F3, defense-in-depth with `fact_texts_for_ids`). The read-set is
+            //    EVENT ids only (never entity:<ulid>), spec §16. ──
             let recalled: Vec<String> = self
-                .recall(embedder, &text, crate::extract::GRAPH_CONTEXT_K, &RecallOptions::default())
+                .recall(
+                    embedder,
+                    &text,
+                    crate::extract::GRAPH_CONTEXT_K,
+                    &RecallOptions { exclude_pages: true, ..Default::default() },
+                )
                 .map(|hits| {
                     hits.into_iter()
                         .filter(|h| h.event_id != mem_id) // never feed the source back as context

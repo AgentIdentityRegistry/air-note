@@ -1806,3 +1806,185 @@ fn recall_intra_result_reinforcement_boosts_neighbor_of_a_non_top_hit() {
         "neighbour of a non-top strong hit must be reinforced: boosted={s_nb}, base={s_nb_base}"
     );
 }
+
+// ── M4b Task 5: recall surfaces CURRENT pages, excludes superseded ones, and
+//    honours the one-way `exclude_pages` rule (spec §7 / F2 / F3). ──
+
+/// The discriminator recall uses to identify a dossier hit — the same string the
+/// `page` event carries as its `event_type`. Spelled once here so the tests never
+/// drift from the production discriminator (no magic string).
+const PAGE_KIND: &str = "page";
+
+/// Producer label for the synthetic pages these tests emit (any non-empty model
+/// id; the recall path never inspects it).
+const TEST_PRODUCER: &str = "m4-reasoner";
+
+/// Fold the event log into its projections so `current_pages()` (the recall
+/// page-filter's source of truth) reflects the `page`/`supersede` events appended
+/// so far, AND re-embed + re-index so a freshly-appended page is reachable by
+/// recall. Mirrors the seed path in `seeded_log` but for the post-hoc pages.
+fn reindex_and_refold(log: &EventLog, embedder: &MockEmbedder) {
+    log.rederive_pending(embedder).unwrap();
+    log.rebuild_indexes(embedder).unwrap();
+    log.rebuild_graph().unwrap();
+}
+
+/// (a) a CURRENT page surfaces in recall tagged `kind == "page"`; (b) after it is
+/// superseded by a replacement, recall returns the NEW page and NEVER the
+/// superseded id — even though the superseded page's vector is still in the index;
+/// (c) `RecallOptions{exclude_pages:true,..}` drops ALL page hits while leaving
+/// raw memories. Exercises the §7/F2 superseded-exclusion and the F3 one-way rule.
+#[test]
+fn current_page_surfaces_superseded_excluded_and_exclude_pages_hides_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+    let embedder = MockEmbedder::new(MID_DIM);
+
+    // The query phrase every asserted event embeds verbatim, so BOTH the keyword
+    // arm (FTS5 quotes the whole query into one phrase) and the vector arm surface
+    // it deterministically (see the graph-proximity test's note above).
+    let query = "acme corp dossier";
+    let topic = "entity:01TOPICKENNY";
+
+    // A raw memory the page can cite (contains the query phrase verbatim).
+    let mem = log
+        .append(mk_memory_event("acme corp dossier kenny works here"))
+        .unwrap();
+
+    // First dossier (current). Its body embeds the query phrase so recall finds it.
+    let p1 = log
+        .page(
+            topic,
+            "Kenny",
+            "acme corp dossier kenny summary v1",
+            &[json!({ "text": "Kenny works at Acme.", "cites": [mem.clone()] })],
+            &[],
+            TEST_PRODUCER,
+            std::slice::from_ref(&mem),
+        )
+        .unwrap();
+    reindex_and_refold(&log, &embedder);
+
+    // (a) the current page surfaces, tagged kind == "page".
+    let hits = log
+        .recall(&embedder, query, RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+    let page_hit = find_hit(&hits, &p1).expect("current page must surface in recall");
+    assert_eq!(page_hit.kind, PAGE_KIND, "a page hit must carry kind == \"page\"");
+
+    // (b) supersede p1 with p2 (atomic supersede+page); the superseded id must
+    //     never surface again, even though its vector is still indexed.
+    let (p2, superseded) = log
+        .emit_page(
+            topic,
+            "Kenny",
+            "acme corp dossier kenny summary v2",
+            &[json!({ "text": "Kenny now leads Acme.", "cites": [mem.clone()] })],
+            &[],
+            TEST_PRODUCER,
+            std::slice::from_ref(&mem),
+            Some(&p1),
+        )
+        .unwrap();
+    assert!(superseded, "emit_page with a prior id must report a supersede");
+    reindex_and_refold(&log, &embedder);
+
+    let hits = log
+        .recall(&embedder, query, RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+    assert!(
+        find_hit(&hits, &p2).is_some(),
+        "the new current page must surface; hits={hits:?}"
+    );
+    assert!(
+        find_hit(&hits, &p1).is_none(),
+        "the SUPERSEDED page id must never surface, even with its vector indexed; hits={hits:?}"
+    );
+
+    // (c) exclude_pages drops every page-kind hit, but raw memories remain.
+    let opts = RecallOptions { exclude_pages: true, ..Default::default() };
+    let hits = log.recall(&embedder, query, RECALL_TOP_K, &opts).unwrap();
+    assert!(
+        !hits.iter().any(|h| h.kind == PAGE_KIND),
+        "exclude_pages must hide ALL page hits; hits={hits:?}"
+    );
+    assert!(
+        find_hit(&hits, &mem).is_some(),
+        "exclude_pages must still surface raw memories; hits={hits:?}"
+    );
+}
+
+/// Ordering invariant (§7 / F2): the superseded-page filter runs BEFORE
+/// `truncate(k)`, so a superseded page that would rank #1 cannot crowd a valid
+/// memory out of a `k == 1` result. The page text is the bare query phrase (zero
+/// noise → top bag-of-words cosine → rank #1); the memory carries the phrase plus
+/// noise (lower cosine → rank #2). Once the page is superseded, recall at k=1 must
+/// still return the memory — proving the drop precedes the truncate, not follows.
+#[test]
+fn superseded_page_at_rank_one_does_not_crowd_out_a_valid_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+    let embedder = MockEmbedder::new(MID_DIM);
+
+    // A distinctive phrase so nothing else in the corpus collides on it.
+    let query = "zeta zeta zeta";
+    let topic = "entity:01TOPICZETA";
+
+    // Memory: query phrase + noise → present in both arms, ranks BELOW a zero-noise
+    // match.
+    let mem = log
+        .append(mk_memory_event("zeta zeta zeta noiseone noisetwo noisethree"))
+        .unwrap();
+
+    // Page: EXACTLY the query phrase → zero trailing noise → highest cosine → it
+    // would rank #1 if it were allowed to surface.
+    let p1 = log
+        .page(
+            topic,
+            "Zeta",
+            "zeta zeta zeta",
+            &[json!({ "text": "Zeta fact.", "cites": [mem.clone()] })],
+            &[],
+            TEST_PRODUCER,
+            std::slice::from_ref(&mem),
+        )
+        .unwrap();
+    log.rederive_pending(&embedder).unwrap();
+    log.rebuild_indexes(&embedder).unwrap();
+    log.rebuild_graph().unwrap();
+
+    // Sanity: while current, the page DOES rank #1 at k=2 (above the noisier
+    // memory) — establishing it would occupy the single slot at k=1.
+    let pre = log
+        .recall(&embedder, query, 2, &RecallOptions::default())
+        .unwrap();
+    assert_eq!(
+        rank_of(&pre, &p1),
+        Some(0),
+        "the zero-noise page must rank #1 while current; pre={pre:?}"
+    );
+
+    // Supersede the page (orphan supersede is benign here, F9) → it leaves the
+    // pages projection but its vector stays in the index.
+    log.supersede(&p1, TEST_PRODUCER, std::slice::from_ref(&mem)).unwrap();
+    log.rebuild_graph().unwrap();
+    assert!(
+        log.current_pages().unwrap().is_empty(),
+        "after supersede with no replacement, the topic has no current page"
+    );
+
+    // k == 1: the superseded #1 page must be filtered BEFORE truncate, so the
+    // rank-2 memory survives as the single returned hit.
+    let hits = log.recall(&embedder, query, 1, &RecallOptions::default()).unwrap();
+    assert_eq!(hits.len(), 1, "k=1 must yield exactly one hit; hits={hits:?}");
+    assert_eq!(
+        &hits[0].event_id, &mem,
+        "the superseded #1 page must not crowd out the valid memory at k=1; hits={hits:?}"
+    );
+    assert!(
+        find_hit(&hits, &p1).is_none(),
+        "the superseded page must never appear; hits={hits:?}"
+    );
+}
