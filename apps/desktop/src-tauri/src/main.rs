@@ -46,10 +46,10 @@ fn main() {
             let data_dir = app.path().app_data_dir().expect("app data dir");
             let identity_store = IdentityStore::new(vault, data_dir);
 
-            // Default to mock for dev; toggle to real AIR via BOSSCLAW_USE_REAL_AIR env var.
+            // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
             // Settings UI will offer a friendlier toggle in a later task.
             let air_client: Arc<dyn air::AirClient> =
-                if std::env::var("BOSSCLAW_USE_REAL_AIR").is_ok() {
+                if std::env::var("AIR_AGENT_USE_REAL_AIR").is_ok() {
                     Arc::new(HttpAirClient::production())
                 } else {
                     Arc::new(MockAirClient::new())
