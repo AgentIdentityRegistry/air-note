@@ -161,6 +161,44 @@ pub fn build_compose_prompt(facts: &FactSet) -> String {
     p
 }
 
+/// Pass B — the citation floor (spec §5/§8, subtract-only). Keep a claim ONLY if
+/// its `cites` is non-empty AND every cite is in `facts.fact_ids()`. Order is
+/// preserved (the result is the INTERSECTION of composed-and-cited claims — the
+/// model can never ADD a claim here). This is a citation-existence + in-set
+/// check: an anti-fabrication bar-raiser, NOT a relevance/entailment boundary (F8).
+pub fn citation_floor(draft: &DraftPage, facts: &FactSet) -> DraftPage {
+    let allowed = facts.fact_ids();
+    let claims = draft
+        .claims
+        .iter()
+        .filter(|c| !c.cites.is_empty() && c.cites.iter().all(|id| allowed.contains(id)))
+        .map(|c| DraftClaim { text: c.text.clone(), cites: c.cites.clone() })
+        .collect();
+    DraftPage { title: draft.title.clone(), claims }
+}
+
+/// Assemble surviving claims into a [`RenderedPage`] — the markdown body (one
+/// claim per line) + the sorted+deduped union of all cites (the page's
+/// `source_event_ids`, F7). Returns `None` if no claim survived (→ no page
+/// emitted; the empty-floor path never reaches `append`, spec §10/F4). Truncates
+/// to `MAX_CLAIMS_PER_PAGE` BEFORE building (F7 — the cap precedes the signed
+/// content).
+pub fn assemble(draft: &DraftPage) -> Option<RenderedPage> {
+    if draft.claims.is_empty() {
+        return None;
+    }
+    let claims = &draft.claims[..draft.claims.len().min(MAX_CLAIMS_PER_PAGE)];
+    let text = claims
+        .iter()
+        .map(|c| format!("- {}", c.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cites: Vec<String> = claims.iter().flat_map(|c| c.cites.iter().cloned()).collect();
+    cites.sort();
+    cites.dedup();
+    Some(RenderedPage { title: draft.title.clone(), text, cites })
+}
+
 /// Parse a reasoner draft value into a [`DraftPage`] (spec §5). Returns
 /// `Err(BossclawError::Reasoner(_))` when `raw` is not a JSON object — a
 /// structurally-broken reasoner response the caller should treat as a per-topic

@@ -1,8 +1,11 @@
-//! Pure tests for the M4b summarizer pipeline (compose prompt + parse). Citation
-//! floor + assemble tests are added in Task 3. The live model is proven by the
-//! `#[ignore]` gate in `tests/live_ollama.rs`.
+//! Pure tests for the M4b summarizer pipeline (compose prompt + parse + citation
+//! floor + assemble). The live model is proven by the `#[ignore]` gate in
+//! `tests/live_ollama.rs`.
 use bossclaw_core::graph::Entity;
-use bossclaw_core::summarize::{build_compose_prompt, compose_schema, parse_draft, FactSet};
+use bossclaw_core::summarize::{
+    assemble, build_compose_prompt, citation_floor, compose_schema, parse_draft, DraftClaim,
+    DraftPage, FactSet,
+};
 use serde_json::json;
 
 fn facts_with_label(label: &str) -> FactSet {
@@ -101,4 +104,41 @@ fn parse_draft_errors_on_non_object_input() {
     assert!(parse_draft(&json!("text")).is_err(), "string input should Err");
     // A valid object still succeeds.
     assert!(parse_draft(&json!({"title": "T", "claims": []})).is_ok());
+}
+
+fn draft() -> DraftPage {
+    DraftPage {
+        title: "Kenny".into(),
+        claims: vec![
+            DraftClaim { text: "Works at Acme.".into(), cites: vec!["01MEM".into()] }, // in-set → keep
+            DraftClaim { text: "Lives on Mars.".into(),  cites: vec![] },              // empty → drop
+            DraftClaim { text: "Is the CEO.".into(),     cites: vec!["01FAKE".into()] }, // out-of-set → drop
+        ],
+    }
+}
+
+#[test]
+fn citation_floor_keeps_only_in_set_cited_claims() {
+    let kept = citation_floor(&draft(), &facts()); // facts() has memory 01MEM
+    assert_eq!(kept.claims.len(), 1);
+    assert_eq!(kept.claims[0].text, "Works at Acme.");
+}
+
+#[test]
+fn assemble_renders_body_and_sorts_dedupes_cites_or_none_when_empty() {
+    // Two claims citing an overlapping set → cites union sorted + deduped (F7).
+    let d = DraftPage {
+        title: "K".into(),
+        claims: vec![
+            DraftClaim { text: "a".into(), cites: vec!["01B".into(), "01A".into()] },
+            DraftClaim { text: "b".into(), cites: vec!["01A".into()] },
+        ],
+    };
+    let r = assemble(&d).unwrap();
+    assert!(r.text.contains("a") && r.text.contains("b"), "body has both claims");
+    assert_eq!(r.cites, vec!["01A".to_string(), "01B".to_string()], "sorted + deduped");
+
+    // No surviving claims → None (→ no page emitted).
+    let empty = DraftPage { title: "K".into(), claims: vec![] };
+    assert!(assemble(&empty).is_none());
 }
