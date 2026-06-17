@@ -7,6 +7,7 @@
 //! Milestone 3 (Graph): bi-temporal link/invalidate fold + graph-proximity recall boost.
 //! Milestone 4a (Clever Linker): the Reasoner seam + LLM auto-linker (entity/link/invalidate
 //! from memories), the evolve-loop runtime, the edge-trust gate.
+//! Milestone 4b (Summarizer): per-entity dossier pages + supersede + the citation floor.
 //!
 //! The event log is the single source of truth; every other structure (M2+) is
 //! derived and rebuildable from it. See
@@ -33,6 +34,7 @@ pub mod ollama;
 pub mod reason;
 pub mod recall;
 pub mod sign;
+pub mod summarize;
 pub mod store;
 
 pub use embed::{Embedder, MockEmbedder};
@@ -49,3 +51,4 @@ pub use model2vec::Model2Vec;
 pub use ollama::OllamaReasoner;
 pub use reason::{Reasoner, ScriptedReasoner};
 pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};
+pub use summarize::{FactSet, RenderedPage};

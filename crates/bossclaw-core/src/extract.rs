@@ -165,7 +165,7 @@ use crate::reason::{extraction_schema, Reasoner};
 /// Single-sourced so Pass A and Pass B can never drift their fences apart — a
 /// future edit to one fence and not the other would be an injection-containment
 /// regression.
-fn push_fenced_source(s: &mut String, source: &str) {
+pub(crate) fn push_fenced_source(s: &mut String, source: &str) {
     s.push_str("<<<SOURCE_BEGIN>>>\n");
     s.push_str(source);
     s.push_str("\n<<<SOURCE_END>>>\n");
