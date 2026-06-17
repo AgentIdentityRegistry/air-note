@@ -364,6 +364,7 @@ fn live_re_running_a_tick_is_idempotent() {
 #[ignore = "requires a local Ollama running qwen2.5:7b-instruct"]
 fn live_dossier_is_grounded_surfaces_and_supersedes_on_contradiction() {
     /// Bounded attempts to absorb 7b output variance in the grounding phase.
+    /// Worst-case runtime: ~3 × ~50s ≈ 2.5 minutes (extraction + compose per attempt).
     const MAX_ATTEMPTS: usize = 3;
 
     let embedder = MockEmbedder::new(MID_DIM);
@@ -450,10 +451,19 @@ fn live_dossier_is_grounded_surfaces_and_supersedes_on_contradiction() {
                 );
             }
         }
-        // The page's lineage is the union of surviving cites (non-empty, event ids).
+        // The page's lineage: non-empty, all event ids (no entity: prefix), the
+        // inducing memories are present. We check this by asserting each surviving
+        // cite is an event id (done above in the claim loop) and that model_meta is
+        // machine-origin and non-empty.
         let page_meta = page_ev.model_meta.clone().expect("page carries model_meta lineage");
         assert!(!page_meta.source_event_ids.is_empty(), "page lineage is non-empty");
         assert_ne!(page_meta.model_id, "manual", "the page is machine-origin");
+        for sid in &page_meta.source_event_ids {
+            assert!(
+                !sid.starts_with(ENTITY_NODE_PREFIX),
+                "page lineage id {sid} must be an EVENT id, never an entity:<ulid> node id"
+            );
+        }
 
         // ── Property 3: recall surfaces the page with kind == "page". ──
         let hits = log
@@ -468,6 +478,12 @@ fn live_dossier_is_grounded_surfaces_and_supersedes_on_contradiction() {
 
         // ── Property 4: a contradicting memory → the page is SUPERSEDED. ──
         let prior_page_id = page.page_event_id.clone();
+        // Snapshot the fact-set BEFORE ingesting the contradiction so we can tell
+        // whether the fact-set actually changed (needed to distinguish variance from
+        // a deterministic supersede-machinery break below).
+        let facts_before_contradiction = log.gather_fact_set(&kenny_entity).unwrap();
+        let fact_ids_before = facts_before_contradiction.fact_ids();
+
         // A memory that changes Kenny's employer; re-tick (extraction updates the
         // graph → the topic is re-dirtied → summarize regenerates the dossier).
         ingest_and_evolve(
@@ -492,13 +508,33 @@ fn live_dossier_is_grounded_surfaces_and_supersedes_on_contradiction() {
             }
         };
         if current.page_event_id == prior_page_id {
-            // The model did not regenerate (it may not have updated the graph or the
-            // grounding set was unchanged). That is model variance — retry.
+            // Check whether the fact-set actually changed. If it did, the supersede
+            // machinery had every reason to fire but didn't — that is a deterministic
+            // failure, not model variance.
+            let facts_after = log.gather_fact_set(&kenny_entity).unwrap();
+            let fact_ids_after = facts_after.fact_ids();
+            let fact_set_changed = fact_ids_after != fact_ids_before;
+            if fact_set_changed {
+                // The contradiction memory was ingested and the fact-set grew (the new
+                // memory id is now in fact_ids_after), but the summarize loop did NOT
+                // emit a new page. This is NOT model-output variance (the model already
+                // ran); it means the supersede path in the summarize loop is broken.
+                panic!(
+                    "attempt {attempt}: the fact-set changed after the contradiction \
+                     (new ids: {:?}) but the page was NOT superseded (still {prior_page_id}). \
+                     This is a deterministic supersede-machinery failure, not model variance.",
+                    fact_ids_after.difference(&fact_ids_before).collect::<Vec<_>>()
+                );
+            }
+            // The fact-set did not change: the model did not update the graph (it may
+            // have labelled the change with a multi-valued relation that carries no
+            // retraction, or extraction produced nothing). That IS model variance →
+            // retry so a different extraction attempt has a chance to fire.
             last_failure = format!(
                 "attempt {attempt}: the contradiction did not supersede the page \
-                 (still {prior_page_id})"
+                 (still {prior_page_id}); fact-set unchanged (model variance — retrying)"
             );
-            eprintln!("{last_failure}; retrying");
+            eprintln!("{last_failure}");
             continue 'attempts;
         }
         // A supersede event referencing the prior page exists, and the prior page is
