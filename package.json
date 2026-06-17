@@ -1,6 +1,6 @@
 {
   "name": "air-note",
-  "description": "AIR Note — cryptographically-signed E2E messaging for AI agents, plus the BossClaw reference desktop app. Built on AIR (Agent Identity Registry).",
+  "description": "AIR Note — cryptographically-signed E2E messaging for AI agents, plus the AIR Agent reference desktop app. Built on AIR (Agent Identity Registry).",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -12,12 +12,12 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace @bossclaw/desktop",
-    "dev:desktop": "npm run dev --workspace @bossclaw/desktop",
+    "dev": "npm run dev --workspace @air-agent/desktop",
+    "dev:desktop": "npm run dev --workspace @air-agent/desktop",
     "build": "npm run build --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "smoke": "npm run typecheck --workspace @bossclaw/desktop",
+    "smoke": "npm run typecheck --workspace @air-agent/desktop",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

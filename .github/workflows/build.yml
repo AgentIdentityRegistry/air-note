@@ -52,7 +52,7 @@ jobs:
         run: npm install
 
       - name: TypeScript check
-        run: npm run typecheck --workspace @bossclaw/desktop
+        run: npm run typecheck --workspace @air-agent/desktop
 
       - name: Create frontend dist dir (required for tauri::generate_context!)
         run: mkdir -p apps/desktop/dist
@@ -70,4 +70,4 @@ jobs:
         run: cargo test
 
       - name: Build Tauri app
-        run: npm run build --workspace @bossclaw/desktop
+        run: npm run build --workspace @air-agent/desktop
