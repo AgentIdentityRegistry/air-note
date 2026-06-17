@@ -1,10 +1,10 @@
 {
-  "id": "bossclaw.skill.document_converter_markitdown",
+  "id": "air-agent.skill.document_converter_markitdown",
   "name": "Document Converter (MarkItDown)",
   "version": "1.0.0",
   "description": "Converts local documents into clean Markdown outputs.",
-  "author": "BossClaw",
-  "minBossClawVersion": "0.1.0",
+  "author": "AIR Agent",
+  "minAirAgentVersion": "0.1.0",
   "category": ["productivity", "files"],
   "tags": ["markdown", "converter", "documents"],
   "runtime": {

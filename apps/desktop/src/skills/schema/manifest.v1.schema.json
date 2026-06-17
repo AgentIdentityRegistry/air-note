@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bossclaw.ai/schemas/manifest.v1.schema.json",
-  "title": "BossClaw Skill Manifest v1",
+  "$id": "https://agentidentityregistry.org/schemas/manifest.v1.schema.json",
+  "title": "AIR Agent Skill Manifest v1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -10,7 +10,7 @@
     "version",
     "description",
     "author",
-    "minBossClawVersion",
+    "minAirAgentVersion",
     "runtime",
     "permissions",
     "trust"
@@ -20,7 +20,7 @@
       "type": "string",
       "anyOf": [
         {
-          "pattern": "^bossclaw\\.skill\\.[A-Za-z0-9._-]+$"
+          "pattern": "^air-agent\\.skill\\.[A-Za-z0-9._-]+$"
         },
         {
           "pattern": "^[A-Za-z0-9._-]+$"
@@ -43,7 +43,7 @@
       "type": "string",
       "minLength": 1
     },
-    "minBossClawVersion": {
+    "minAirAgentVersion": {
       "type": "string",
       "minLength": 1
     },

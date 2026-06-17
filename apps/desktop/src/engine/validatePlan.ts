@@ -41,8 +41,8 @@ export type PlanMissionProposal = {
   autonomy: PlannerMode;
 };
 
-export type BossClawPlanV1 = {
-  schema: "bossclaw.plan.v1";
+export type AirAgentPlanV1 = {
+  schema: "air-agent.plan.v1";
   goal: string;
   mode: PlannerMode;
   summary?: string;
@@ -92,13 +92,13 @@ function extractJsonObject(raw: string): string {
 
 export function validatePlan(
   payload: unknown
-): { ok: true; data: BossClawPlanV1 } | { ok: false; errors: string[] } {
+): { ok: true; data: AirAgentPlanV1 } | { ok: false; errors: string[] } {
   const isValid = validate(payload);
 
   if (isValid) {
     return {
       ok: true,
-      data: payload as BossClawPlanV1
+      data: payload as AirAgentPlanV1
     };
   }
 
@@ -111,7 +111,7 @@ export function validatePlan(
 
 export function parseAndValidatePlanText(
   raw: string
-): { ok: true; data: BossClawPlanV1; normalizedText: string } | { ok: false; errors: string[] } {
+): { ok: true; data: AirAgentPlanV1; normalizedText: string } | { ok: false; errors: string[] } {
   try {
     const jsonText = extractJsonObject(raw);
     const parsed = JSON.parse(jsonText) as unknown;
