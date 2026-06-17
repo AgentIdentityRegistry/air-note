@@ -60,6 +60,40 @@ pub const GRAPH_CONTEXT_K: usize = 8;
 /// booby-trapped memory cannot flood the entity index.
 pub const MAX_ENTITIES_PER_MEMORY: usize = 32;
 
+/// Maximum memories processed per evolve tick (spec §11 / Rev 2 F6): bounds
+/// tick latency so one tick can never starve the writer. Tunable in dogfooding.
+pub const EVOLVE_BATCH: usize = 16;
+
+/// Debounce after an append before an evolve tick fires, in milliseconds (spec
+/// §11): coalesces a burst of appends into one tick so a rapid import does not
+/// trigger one tick per memory. Tunable. Consumed by
+/// [`crate::evolve::debounce_due`]; the running scheduler is M7.
+pub const EVOLVE_DEBOUNCE_MS: u128 = 2000;
+
+/// Maximum source-memory length (in bytes) fed to the reasoner per memory (spec
+/// §11 / Rev 2 F6). A memory longer than this is TRUNCATED on a UTF-8 char
+/// boundary before extraction so a booby-trapped giant memory cannot blow up the
+/// prompt / model-call cost. The full memory text is untouched on disk — only
+/// the copy handed to the reasoner is bounded.
+pub const MAX_INPUT_TEXT_BYTES: usize = 16_384;
+
+/// Truncate `text` to at most [`MAX_INPUT_TEXT_BYTES`] bytes on a UTF-8 char
+/// boundary (Rev 2 F6). Returns the input unchanged when it already fits, else a
+/// borrowed prefix — never splits a multi-byte char (which would panic / corrupt
+/// the prompt). Pure; unit-tested.
+pub fn truncate_for_reasoner(text: &str) -> &str {
+    if text.len() <= MAX_INPUT_TEXT_BYTES {
+        return text;
+    }
+    // Walk back to the last char boundary at or below the cap so we never slice
+    // through a multi-byte UTF-8 sequence.
+    let mut end = MAX_INPUT_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// The outcome of resolving one entity mention against the existing entity nodes
 /// (spec §6). The embedding-first, model-adjudicated mid-band decision.
 #[derive(Debug, Clone, PartialEq, Eq)]

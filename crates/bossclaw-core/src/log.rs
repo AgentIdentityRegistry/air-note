@@ -20,6 +20,8 @@ use rusqlite::OptionalExtension;
 use crate::embed::Embedder;
 use crate::error::BossclawError;
 use crate::event::{compute_hash, Event, ModelMeta};
+use crate::evolve::{EvolveReport, EvolveStatus};
+use crate::extract::{ResolveDecision, EVOLVE_BATCH, MAX_ENTITIES_PER_MEMORY, MAX_REFLECT};
 use crate::graph::{
     entity_node_id, ENTITY_EVENT_TYPE, ENTITY_NODE_KIND, EXTERNAL_NODE_KIND, MANUAL_LINK_PRODUCER,
     MEMORY_NODE_KIND,
@@ -222,6 +224,16 @@ impl EventLog {
                 dim       INTEGER NOT NULL,
                 embedding BLOB NOT NULL,
                 PRIMARY KEY(entity_id, model_id)
+            )",
+        )?;
+        // Evolve-loop progress (re-derivable progress state — NOT a Tier-A fold,
+        // spec §4). Single row (id pinned to 0), advanced after each committed
+        // batch. Losing it only re-processes events (idempotent: an active
+        // edge-key is skipped and a resolved entity is reused), never corrupts.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS evolve_cursor (
+                id       INTEGER PRIMARY KEY CHECK (id = 0),
+                last_seq INTEGER NOT NULL
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -477,30 +489,33 @@ impl EventLog {
     }
 
     /// Return the active embedding model configuration, parsed from the latest
-    /// `config` event in the log.
+    /// `config` event that CARRIES the model fields.
     ///
-    /// A `config` event has `event_type = "config"` and a `content` object
-    /// with `active_model_id`, `dim`, and `schema_version`. Only the row with
-    /// the highest `seq` is used; earlier config events are superseded.
+    /// A model-config event has `event_type = "config"` and a `content` object
+    /// with `active_model_id`, `dim`, and `schema_version`. Config events are
+    /// scanned newest-first and the first one that successfully parses as an
+    /// [`ActiveModel`] wins; configs that carry only other control keys (e.g. a
+    /// control `config` setting just `evolve_enabled`, Rev 2 F2-sec(c)) are
+    /// SKIPPED rather than erroring — the on/off switch and the active model are
+    /// independent control keys that may be set in separate config events.
     ///
-    /// Returns `Ok(None)` if no `config` event has ever been appended.
+    /// Returns `Ok(None)` if no `config` event carries the model fields.
     pub fn active_model(&self) -> Result<Option<ActiveModel>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
-        let result = conn.query_row(
-            "SELECT payload FROM events WHERE event_type='config' ORDER BY seq DESC LIMIT 1",
-            [],
-            |r| r.get::<_, String>(0),
-        );
-        match result {
-            Ok(payload) => {
-                let event: Event = serde_json::from_str(&payload)?;
-                let model: ActiveModel = serde_json::from_value(event.content)?;
-                Ok(Some(model))
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type='config' ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let event: Event = serde_json::from_str(&row?)?;
+            // Tolerant: a config lacking the model fields is a different control
+            // config (e.g. evolve_enabled-only). Skip it, do not error.
+            if let Ok(model) = serde_json::from_value::<ActiveModel>(event.content) {
+                return Ok(Some(model));
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(BossclawError::Store(e.to_string())),
         }
+        Ok(None)
     }
 
     /// Return every event in chain order (M1: full scan; M2 adds `since`).
@@ -2042,6 +2057,524 @@ impl EventLog {
         }
         // Fail-closed: only accept an id the model was actually offered.
         Ok(candidate_ids.iter().find(|id| id.as_str() == chosen).cloned())
+    }
+
+    // ── Evolve loop (spec §8, Task 7) ────────────────────────────────────────
+
+    /// Read the evolve cursor (the last processed `seq`); `0` if never set (the
+    /// table is empty on a fresh store → no memory has been processed). The
+    /// cursor is persistent progress state, NOT a fold (spec §4).
+    pub fn evolve_cursor(&self) -> Result<i64, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let seq = conn
+            .query_row("SELECT last_seq FROM evolve_cursor WHERE id = 0", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        Ok(seq)
+    }
+
+    /// Set the evolve cursor to `last_seq` (idempotent upsert of the single row).
+    /// Persistent progress state — NOT rebuilt from events (spec §4). Losing it
+    /// only re-processes events idempotently; it never corrupts the log.
+    pub fn set_evolve_cursor(&self, last_seq: i64) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO evolve_cursor (id, last_seq) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET last_seq = ?1",
+            rusqlite::params![last_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Set the evolve on/off switch by appending a control `config` event whose
+    /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
+    ///
+    /// This is the ONLY writer of the `evolve_enabled` key — the off-switch is a
+    /// PRIVILEGE, not arbitrary data, so it has a typed setter (the precedent is
+    /// the active-model config written by [`EventLog::reembed_migration`]).
+    /// Control config must not be written through a generic `append` in v1.
+    /// The change is Ed25519-signed + hash-chained like every event, so a forged
+    /// or replayed flip is tamper-evident via `verify_chain`. (M7 additionally
+    /// verifies the signer DID == the resolved user owner before honoring it;
+    /// `signed_by_did` is unverified today — spec §16 / M3 §12.1.)
+    ///
+    /// Carries NO model fields, so it never disturbs [`EventLog::active_model`]
+    /// (which skips configs lacking `active_model_id`/`dim`/`schema_version`).
+    pub fn set_evolve_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: "config".to_string(),
+            content: serde_json::json!({ "evolve_enabled": enabled }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
+    /// Whether the evolve loop is enabled (spec §8 off-switch / Rev 2 F2-sec(a)).
+    ///
+    /// STICKY / fail-closed semantics: config events are scanned newest-first and
+    /// the FIRST one that carries an explicit `evolve_enabled` bool wins. Because
+    /// [`EventLog::set_evolve_enabled`] is the only writer of the key, this is
+    /// exactly "the latest EXPLICIT value": once an explicit `false` exists with
+    /// no LATER explicit `true`, the loop stays disabled — a flag-LESS newer
+    /// config (e.g. an active-model switch) does NOT silently re-arm the loop.
+    /// Default-open (`true`) ONLY when the flag was never set at all.
+    ///
+    /// Honored BEFORE any model call in [`EventLog::evolve_once`].
+    pub fn evolve_enabled(&self) -> Result<bool, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = 'config' ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let ev: Event = serde_json::from_str(&row?)?;
+            if let Some(flag) = ev.content.get("evolve_enabled").and_then(|v| v.as_bool()) {
+                return Ok(flag); // newest explicit flag wins → sticky
+            }
+        }
+        Ok(true) // flag never set → default open
+    }
+
+    /// The `(seq, id, text)` of each unprocessed `memory` event strictly after the
+    /// cursor, in `seq ASC` order, capped at `limit` (the per-tick batch). Only
+    /// `memory` events are processed (the evolve unit of work; `file_ingested`
+    /// extraction is deferred — M4a scope). Returns owned data so the store lock
+    /// is released before any model/embedder call (lock discipline).
+    fn unprocessed_memories_since(
+        &self,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String)>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, id, payload FROM events
+             WHERE event_type = 'memory' AND seq > ?1 ORDER BY seq ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cursor, limit as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, id, payload) = row?;
+            let ev: Event = serde_json::from_str(&payload)?;
+            if let Some(text) = ev.content.get("text").and_then(|t| t.as_str()) {
+                out.push((seq, id, text.to_string()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The CURRENT active edge-keys `(src, relation, dst)` from the folded `edges`
+    /// table (`invalidated_at IS NULL`). These endpoints are already RESOLVED
+    /// `entity:<ulid>` ids (the fold stores whatever a `link` carried, and the
+    /// evolve loop only ever emits links on resolved ids — Rev 2 F4), so a
+    /// retraction must be remapped to resolved ids BEFORE it is confirmed against
+    /// this set. Used both to confirm retractions and to seed within-tick dedup.
+    fn active_edge_keys(&self) -> Result<Vec<(String, String, String)>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT src, relation, dst FROM edges WHERE invalidated_at IS NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch the `content["text"]` of each id in `ids` (memory/page events), in
+    /// the caller's order (recall rank), skipping ids with no text. Turns recalled
+    /// EVENT ids into the Pass-A cheat-sheet text. Parameterized `IN (...)` — no
+    /// string interpolation of values.
+    fn texts_for_ids(&self, ids: &[String]) -> Result<Vec<String>, BossclawError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String =
+            (0..ids.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, payload FROM events WHERE id IN ({placeholders})");
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        // Preserve the caller's id order (recall rank), not SQL row order.
+        let mut by_id: HashMap<String, String> = HashMap::new();
+        for row in rows {
+            let (id, payload) = row?;
+            let ev: Event = serde_json::from_str(&payload)?;
+            if let Some(t) = ev.content.get("text").and_then(|t| t.as_str()) {
+                by_id.insert(id, t.to_string());
+            }
+        }
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
+    }
+
+    /// Map a proposed mention to its resolved `entity:<ulid>` if known, else pass
+    /// the raw string through (a relation endpoint the model named but resolution
+    /// did not cover — kept as an opaque node id, never silently dropped). Pure
+    /// helper over the per-memory `mention_to_id` map (Rev 2 F4).
+    fn map_mention(
+        mention_to_id: &HashMap<String, String>,
+        mention: &str,
+    ) -> String {
+        mention_to_id.get(mention).cloned().unwrap_or_else(|| mention.to_string())
+    }
+
+    /// Run ONE evolve tick (spec §3, §8 / Rev 2 F1/F4/F5/F6): for each unprocessed
+    /// `memory` (≤ [`EVOLVE_BATCH`]): recall context → Pass A propose → resolve
+    /// EVERY distinct mention (entities ∪ relations ∪ retractions) to a stable
+    /// `entity:<ulid>` → augment with the resolved-entity neighborhood → Pass B
+    /// (pure fail-closed span floor + ONE model critique that can only subtract,
+    /// then cardinality-gated retraction confirmation against the CURRENT graph
+    /// on RESOLVED ids) → emit `entity`/`invalidate`/`link` events through
+    /// [`EventLog::append`] (the single serialized writer — the loop is NOT
+    /// privileged) → advance the cursor after the batch commits.
+    ///
+    /// Idempotency: an active edge-key is skipped (seeded from the graph and
+    /// updated WITHIN the tick, Rev 2 F5, so two memories asserting the same edge
+    /// in one tick emit only once); a resolved/just-minted entity is reused.
+    ///
+    /// Resource fail-safes (Rev 2 F6): at most [`MAX_ENTITIES_PER_MEMORY`]
+    /// entities are accepted per memory, the source text is truncated to
+    /// [`crate::extract::MAX_INPUT_TEXT_BYTES`] before the model sees it, and the
+    /// entity index is rebuilt ONCE after the batch (not per memory).
+    ///
+    /// Degrade-never-break (spec §10): the off-switch short-circuits to a no-op
+    /// BEFORE any model call; a reasoner/graph error on a memory logs + STOPS the
+    /// batch (the cursor does not advance past an unprocessed memory) so the
+    /// memory retries next tick — recall + storage are untouched.
+    pub fn evolve_once(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+    ) -> Result<EvolveReport, BossclawError> {
+        let mut report = EvolveReport::default();
+        // Off-switch is checked BEFORE any model call (Rev 2 F2-sec).
+        if !self.evolve_enabled()? {
+            report.skipped_disabled = true;
+            return Ok(report);
+        }
+        let cursor = self.evolve_cursor()?;
+        let batch = self.unprocessed_memories_since(cursor, EVOLVE_BATCH)?;
+        // Within-tick active-key set (Rev 2 F5): seed from the current graph, then
+        // grow as this tick emits — so a duplicate edge across two memories in the
+        // SAME tick is skipped, not double-emitted.
+        let mut active_keys: HashSet<(String, String, String)> =
+            self.active_edge_keys()?.into_iter().collect();
+        let mut last_committed_seq = cursor;
+        // Whether any mint happened → rebuild the entity index ONCE after the
+        // batch (Rev 2 F6), instead of O(memories) rebuilds inside the loop.
+        let mut minted_this_tick = false;
+        // Tick-scoped mention→id cache (mention surface form → resolved id). Since
+        // the entity index is rebuilt only AFTER the batch (F6), a mention minted
+        // by an EARLIER memory in this tick is not yet in the index; this cache
+        // lets a LATER memory in the same tick reuse that mint instead of minting a
+        // duplicate — which is also what lets within-tick edge dedup (F5) land
+        // (two memories asserting the same edge resolve to the same key).
+        let mut tick_mint_cache: HashMap<String, String> = HashMap::new();
+
+        for (seq, mem_id, full_text) in batch {
+            // F6: bound the text handed to the reasoner (the on-disk memory is
+            // untouched; only the extraction copy is truncated).
+            let text = crate::extract::truncate_for_reasoner(&full_text).to_string();
+
+            // ── 1. recall context (M2). entity-kind is excluded from recall by
+            //    construction (separate index), so neighbors are memories/pages.
+            //    The read-set is EVENT ids only (never entity:<ulid>), spec §16. ──
+            let recalled: Vec<String> = self
+                .recall(embedder, &text, crate::extract::GRAPH_CONTEXT_K, &RecallOptions::default())
+                .map(|hits| {
+                    hits.into_iter()
+                        .filter(|h| h.event_id != mem_id) // never feed the source back as context
+                        .map(|h| h.event_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let recalled_texts = self.texts_for_ids(&recalled)?;
+            let read_set: Vec<String> = {
+                let mut v = vec![mem_id.clone()];
+                v.extend(recalled.iter().cloned());
+                v
+            };
+
+            // ── 2. Pass A — propose. A reasoner error makes THIS memory a no-op
+            //    (stop the batch; the cursor stays at last_committed_seq so the
+            //    memory retries next tick) — spec §10. ──
+            let proposals = match crate::extract::propose(reasoner, &text, &recalled_texts) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("evolve: Pass A failed for memory {mem_id}, stopping batch: {e}");
+                    break;
+                }
+            };
+
+            // ── 3. resolve EVERY distinct mention across entities ∪ relations ∪
+            //    retractions to a stable entity:<ulid> (Rev 2 F4). An entity
+            //    mention that resolves Mint becomes a signed `entity` event;
+            //    relation/retraction endpoints the model named but did not list as
+            //    entities are still resolved so they remap to graph-key ids. ──
+            let mut mention_to_id: HashMap<String, String> = HashMap::new();
+            // Entity mentions first, capped (F6) — these may MINT.
+            for ent in proposals.entities.iter().take(MAX_ENTITIES_PER_MEMORY) {
+                if mention_to_id.contains_key(&ent.mention) {
+                    continue;
+                }
+                let id = match self.resolve_or_mint(
+                    embedder,
+                    reasoner,
+                    &ent.mention,
+                    &ent.entity_type,
+                    &read_set,
+                    &mut tick_mint_cache,
+                )? {
+                    (id, true) => {
+                        report.entities_minted += 1;
+                        minted_this_tick = true;
+                        id
+                    }
+                    (id, false) => id,
+                };
+                mention_to_id.insert(ent.mention.clone(), id);
+            }
+            // Then every relation/retraction endpoint not already resolved (F4):
+            // resolve (which may mint a bare endpoint the model referenced) so the
+            // remap below always lands on a real graph-key id.
+            let endpoint_mentions = proposals
+                .relations
+                .iter()
+                .flat_map(|r| [r.src.clone(), r.dst.clone()])
+                .chain(proposals.retractions.iter().flat_map(|r| [r.src.clone(), r.dst.clone()]));
+            for mention in endpoint_mentions {
+                if mention_to_id.contains_key(&mention) {
+                    continue;
+                }
+                // Unknown endpoints have no declared entity_type; use a neutral one.
+                let id = match self.resolve_or_mint(
+                    embedder,
+                    reasoner,
+                    &mention,
+                    "unknown",
+                    &read_set,
+                    &mut tick_mint_cache,
+                )? {
+                    (id, true) => {
+                        report.entities_minted += 1;
+                        minted_this_tick = true;
+                        id
+                    }
+                    (id, false) => id,
+                };
+                mention_to_id.insert(mention, id);
+            }
+
+            // ── 4. augment: the neighborhood of the resolved entity ids (the
+            //    second half of the cheat sheet) as `src -relation-> dst` lines. ──
+            let neighborhood = self.neighborhood_lines(&mention_to_id)?;
+
+            // ── 5. Pass B — model-driven critique over a pure fail-closed floor
+            //    (Rev 2 F1): the floor keeps only span-verified relations; the
+            //    model may DROP or down-confidence but NEVER add an edge the floor
+            //    didn't support. Bounded by MAX_REFLECT total passes (Pass A +
+            //    this critique = 2). A reasoner error → no-op this memory. ──
+            // The MAX_REFLECT bound (Pass A propose + one Pass B critique = 2) is
+            // enforced at COMPILE time: this tick runs exactly those two model
+            // passes, so a future tightening of MAX_REFLECT below 2 must fail the
+            // build rather than silently under-run the reflexion contract.
+            const _: () = assert!(MAX_REFLECT >= 2, "evolve runs Pass A + one critique");
+            let refined = match crate::extract::critique_with_reasoner(
+                reasoner, &text, &proposals, &neighborhood,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("evolve: Pass B failed for memory {mem_id}, stopping batch: {e}");
+                    break;
+                }
+            };
+
+            // ── 6. remap refined relations'/retractions' endpoints to resolved
+            //    ids (Rev 2 F4) BEFORE confirming retractions / emitting links. ──
+            let remapped_retractions: Vec<crate::extract::ProposedRetraction> = refined
+                .retractions
+                .iter()
+                .map(|r| crate::extract::ProposedRetraction {
+                    src: Self::map_mention(&mention_to_id, &r.src),
+                    relation: r.relation.clone(),
+                    dst: Self::map_mention(&mention_to_id, &r.dst),
+                    reason: r.reason.clone(),
+                    confidence: r.confidence,
+                })
+                .collect();
+            // Confirm against the CURRENT active edges (resolved ids). active_keys
+            // already holds resolved-id keys; only materialize the slice when there
+            // is actually a retraction to confirm (retractions are rare — avoid the
+            // per-memory clone of the whole active set otherwise).
+            let confirmed = if remapped_retractions.is_empty() {
+                Vec::new()
+            } else {
+                let active_now: Vec<(String, String, String)> =
+                    active_keys.iter().cloned().collect();
+                crate::extract::confirm_retractions(&remapped_retractions, &active_now)
+            };
+
+            // ── 6a. invalidate confirmed contradictions FIRST (so the fold closes
+            //    the old interval before any replacement opens). Drop the retired
+            //    key from the within-tick active set. ──
+            for r in &confirmed {
+                self.invalidate(&r.src, &r.relation, &r.dst, None, &read_set)?;
+                active_keys.remove(&(r.src.clone(), r.relation.clone(), r.dst.clone()));
+                report.invalidates_emitted += 1;
+            }
+
+            // ── 6b. emit confirmed relations as machine links on RESOLVED ids,
+            //    skipping any (src, relation, dst) ALREADY active — including ones
+            //    emitted earlier in THIS tick (Rev 2 F5). ──
+            for rel in &refined.relations {
+                let s = Self::map_mention(&mention_to_id, &rel.src);
+                let d = Self::map_mention(&mention_to_id, &rel.dst);
+                let key = (s.clone(), rel.relation.clone(), d.clone());
+                if active_keys.contains(&key) {
+                    continue; // already asserted → emit nothing (idempotent)
+                }
+                self.link_machine(
+                    &s, &rel.relation, &d, rel.confidence, reasoner.model_id(), &read_set,
+                )?;
+                active_keys.insert(key);
+                report.links_emitted += 1;
+            }
+
+            report.memories_processed += 1;
+            last_committed_seq = seq;
+        }
+
+        // ── 7. rebuild the entity index ONCE after the batch (Rev 2 F6) so the
+        //    next tick can resolve this tick's mints, and refresh the graph so
+        //    the folded `edges`/`entities` reflect the just-emitted events. ──
+        if minted_this_tick {
+            self.rebuild_entity_index(embedder)?;
+        }
+        if report.links_emitted > 0
+            || report.invalidates_emitted > 0
+            || report.entities_minted > 0
+        {
+            self.rebuild_graph()?;
+        }
+
+        // ── 8. advance the cursor to the last fully-processed memory's seq, only
+        //    after the batch committed (a stopped batch leaves it where it was). ──
+        if last_committed_seq > cursor {
+            self.set_evolve_cursor(last_committed_seq)?;
+        }
+        Ok(report)
+    }
+
+    /// Resolve one `mention` to an entity id, minting a signed `entity` event +
+    /// its resolution vector when resolution says Mint. Returns `(entity_id,
+    /// minted)` where `minted` is `true` iff a fresh entity was created.
+    ///
+    /// `entity_type` labels a freshly minted entity; `read_set` is the provenance
+    /// (EVENT ids only) stamped as the mint's `source_event_ids`. The
+    /// `Adjudicate` arm is already collapsed to Merge/Mint inside
+    /// [`EventLog::resolve_mention`]; the match below is exhaustive defensively.
+    ///
+    /// `tick_cache` carries mints WITHIN the current tick: because the entity
+    /// index is rebuilt only after the batch (Rev 2 F6), a mention this tick
+    /// already minted is not yet searchable, so the cache is consulted FIRST to
+    /// reuse that id (returning `minted = false` — the mint was already counted).
+    /// This keeps one surface mention = one entity per tick and is what lets the
+    /// within-tick edge dedup (F5) compare equal keys.
+    fn resolve_or_mint(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+        mention: &str,
+        entity_type: &str,
+        read_set: &[String],
+        tick_cache: &mut HashMap<String, String>,
+    ) -> Result<(String, bool), BossclawError> {
+        if let Some(id) = tick_cache.get(mention) {
+            return Ok((id.clone(), false)); // already minted/resolved this tick
+        }
+        let resolved = match self.resolve_mention(embedder, reasoner, mention)? {
+            ResolveDecision::Merge(id) => (id, false),
+            // resolve_mention collapses Adjudicate→Merge/Mint; Mint (and the
+            // unreachable Adjudicate) mint a fresh signed entity.
+            ResolveDecision::Mint | ResolveDecision::Adjudicate(_) => {
+                let new_id = self.entity(mention, &[], entity_type, reasoner.model_id(), read_set)?;
+                self.derive_entity_vector(embedder, &new_id, mention)?;
+                (new_id, true)
+            }
+        };
+        tick_cache.insert(mention.to_string(), resolved.0.clone());
+        Ok(resolved)
+    }
+
+    /// The current 1-hop neighborhood of the resolved entity ids as human-readable
+    /// `src -relation-> dst` lines (spec §6 cheat-sheet, second half), de-duped and
+    /// deterministically ordered. Fed to Pass B so the model can confirm
+    /// contradictions against KNOWN edges. Best-effort per id: a graph read error
+    /// on one id is skipped (degrade, never break — spec §10).
+    fn neighborhood_lines(
+        &self,
+        mention_to_id: &HashMap<String, String>,
+    ) -> Result<Vec<String>, BossclawError> {
+        let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        for id in mention_to_id.values() {
+            let edges = match self.neighbors(id) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("evolve: neighborhood lookup failed for {id}: {e}");
+                    continue;
+                }
+            };
+            for edge in edges {
+                seen.insert(format!("{} -{}-> {}", edge.src, edge.relation, edge.dst), ());
+            }
+        }
+        Ok(seen.into_keys().collect())
+    }
+
+    /// A snapshot of evolve-loop health (spec §8). `queue_depth` = unprocessed
+    /// `memory` events behind the cursor (LIVE); `enabled` reflects the sticky
+    /// off-switch (LIVE). `last_tick_ms`/`error_count`/`last_error` are honest
+    /// M4a stubs (`None`/`0`/`None`) — the running tick/error counters are owned
+    /// by M7's long-lived loop driver, not persisted here, so this method stays a
+    /// pure read and is unit-testable.
+    pub fn evolve_status(&self) -> Result<EvolveStatus, BossclawError> {
+        let cursor = self.evolve_cursor()?;
+        let queue_depth = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE event_type = 'memory' AND seq > ?1",
+                rusqlite::params![cursor],
+                |r| r.get::<_, i64>(0),
+            )? as usize
+        };
+        Ok(EvolveStatus {
+            queue_depth,
+            last_tick_ms: None,
+            error_count: 0,
+            last_error: None,
+            enabled: self.evolve_enabled()?,
+        })
     }
 
     /// Persist the current tip as the signed high-water mark (debounced by the

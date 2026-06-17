@@ -18,6 +18,7 @@
 pub mod embed;
 pub mod error;
 pub mod event;
+pub mod evolve;
 pub mod extract;
 #[cfg(feature = "fastembed")]
 pub mod fastembed;
@@ -37,6 +38,7 @@ pub mod store;
 pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};
+pub use evolve::{EvolveReport, EvolveStatus};
 #[cfg(feature = "fastembed")]
 pub use fastembed::FastEmbed;
 pub use graph::{AsOf, Edge, Entity, Node};
