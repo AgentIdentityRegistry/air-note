@@ -1610,6 +1610,9 @@ impl EventLog {
         source_event_ids: &[String],
         prior_page_id: Option<&str>,
     ) -> Result<(String, bool), BossclawError> {
+        if source_event_ids.is_empty() {
+            return Err(BossclawError::InvalidInput("page requires non-empty source_event_ids".into()));
+        }
         let page_ev = Event {
             id: String::new(), ts: String::new(), valid_time: None,
             event_type: "page".to_string(),
@@ -1624,9 +1627,6 @@ impl EventLog {
             prev_hash: String::new(), hash: None,
             signed_by_did: self.signer_did(), signature: None,
         };
-        if source_event_ids.is_empty() {
-            return Err(BossclawError::InvalidInput("page requires non-empty source_event_ids".into()));
-        }
         match prior_page_id {
             None => Ok((self.append(page_ev)?, false)),
             Some(prior) => {

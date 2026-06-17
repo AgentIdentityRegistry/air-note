@@ -621,7 +621,7 @@ fn orphan_supersede_yields_at_most_one_and_rebuild_is_byte_identical() {
     log.supersede(&p1,"r",std::slice::from_ref(&m)).unwrap();
     log.rebuild_graph().unwrap();
     let c1 = log.current_pages().unwrap();
-    assert!(c1.len() <= 1, "at most one (here zero) current page");
+    assert_eq!(c1.len(), 0, "orphan supersede ⇒ zero current pages");
     log.rebuild_graph().unwrap();
     assert_eq!(c1, log.current_pages().unwrap(), "pages fold byte-identical across rebuilds");
 }
