@@ -64,6 +64,13 @@ pub const MAX_ENTITIES_PER_MEMORY: usize = 32;
 /// tick latency so one tick can never starve the writer. Tunable in dogfooding.
 pub const EVOLVE_BATCH: usize = 16;
 
+/// Maximum topics (re)summarized per evolve tick (spec §11 / M4b). Bounds tick
+/// latency for the summarize phase; overflow stays past `summarize_cursor` for a
+/// later tick (M4b F1). Single-sourced here alongside [`EVOLVE_BATCH`] so the
+/// "evolve consts" grouping reads from one place; the M4b phase reads it via
+/// `crate::extract::SUMMARY_BATCH`.
+pub const SUMMARY_BATCH: usize = 8;
+
 /// Debounce after an append before an evolve tick fires, in milliseconds (spec
 /// §11): coalesces a burst of appends into one tick so a rapid import does not
 /// trigger one tick per memory. Tunable. Consumed by

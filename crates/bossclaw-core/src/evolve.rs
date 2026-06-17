@@ -36,6 +36,12 @@ pub struct EvolveReport {
     pub links_emitted: usize,
     /// `invalidate` events emitted this tick (confirmed contradictions).
     pub invalidates_emitted: usize,
+    /// New `page` (dossier) events emitted this tick by the summarize phase
+    /// (spec §3 / F10).
+    pub pages_emitted: usize,
+    /// `supersede` events emitted this tick (one per regenerated dossier; a
+    /// surfaced per-topic supersede-churn signal, F10).
+    pub pages_superseded: usize,
     /// Memories processed this tick (≤ [`EVOLVE_BATCH`]).
     pub memories_processed: usize,
     /// True iff the tick short-circuited because the off-switch is engaged.

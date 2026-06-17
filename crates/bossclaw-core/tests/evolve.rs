@@ -21,6 +21,7 @@ use bossclaw_core::graph::ENTITY_NODE_PREFIX;
 use bossclaw_core::log::EventLog;
 use bossclaw_core::reason::ScriptedReasoner;
 use bossclaw_core::recall::RecallOptions;
+use bossclaw_core::summarize::{build_compose_prompt, SUMMARIZE_SYSTEM};
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 
@@ -774,5 +775,222 @@ fn reasoner_error_mid_tick_stops_batch_and_does_not_advance_cursor() {
     assert_eq!(log.evolve_status().unwrap().queue_depth, 0, "queue drained");
 
     let _ = (m1, m2);
+    log.verify_chain().unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// M4b Task 4 — the evolve_once SUMMARIZE phase.
+//
+// evolve_once now runs the reasoner in BOTH phases (extraction AND compose), so
+// every fixture below scripts the extraction passes as a NO-OP (empty Pass A →
+// empty floor → empty Pass B, via `scripted_both_passes`) and then chains the
+// compose turn onto the SAME reasoner. The dirty topic set comes from an entity
+// + machine link seeded DIRECTLY (`log.entity` / `log.link_machine`), so the
+// summarize phase acts WITHOUT relying on extraction to mint anything. The
+// compose turn is scripted against the EXACT `(SUMMARIZE_SYSTEM,
+// build_compose_prompt(&facts))` the loop will produce — computed by calling the
+// loop's own `gather_fact_set` so the prompt is byte-identical.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An extraction Pass-A payload that proposes nothing — makes the extraction
+/// phase a no-op for the seeded memory (empty floor → empty Pass B echo), so
+/// only the summarize phase emits anything this tick.
+fn empty_pass_a() -> Value {
+    json!({ "entities": [], "relations": [], "retractions": [] })
+}
+
+/// Seed a memory, then mint an entity + a machine link citing that memory
+/// DIRECTLY (not via extraction) so the link/entity events land past
+/// `summarize_cursor = 0` → the dirty topic set. Rebuilds the graph so
+/// `neighbors`/`all_entities` see them. Returns `(memory_id, topic_id)`.
+fn seed_topic_directly(log: &EventLog, embedder: &MockEmbedder, text: &str) -> (String, String) {
+    let mem = seed_memory(log, embedder, text);
+    let lineage = std::slice::from_ref(&mem);
+    let topic = log.entity("Kenny", &[], "person", "scripted-evolve-v1", lineage).unwrap();
+    // A second endpoint entity so the machine link is well-formed.
+    let acme = log.entity("Acme", &[], "org", "scripted-evolve-v1", lineage).unwrap();
+    log.link_machine(&topic, "works_at", &acme, 0.9, "scripted-evolve-v1", lineage)
+        .unwrap();
+    log.rebuild_graph().unwrap();
+    (mem, topic)
+}
+
+#[test]
+fn summarize_phase_emits_a_grounded_page_then_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    let source = "Kenny works at Acme.";
+    let (mem, topic) = seed_topic_directly(&log, &embedder, source);
+
+    // The exact fact-set the loop will gather (so the compose prompt matches).
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts = log.gather_fact_set(&entity).unwrap();
+    assert!(facts.fact_count() >= bossclaw_core::summarize::PAGE_MIN_FACTS, "topic is summary-worthy");
+    let compose_prompt = build_compose_prompt(&facts);
+
+    // Extraction is a no-op; the compose turn returns one claim citing the memory.
+    let reasoner = scripted_both_passes("scripted-evolve-v1", source, &[], &[], empty_pass_a())
+        .with_response(
+            SUMMARIZE_SYSTEM,
+            &compose_prompt,
+            json!({ "title": "Kenny",
+                "claims": [{ "text": "Kenny works at Acme.", "cites": [mem.clone()] }] }),
+        );
+
+    let report = log.evolve_once(&embedder, &reasoner).unwrap();
+    assert_eq!(report.pages_emitted, 1, "exactly one dossier emitted");
+    assert_eq!(report.pages_superseded, 0, "first page supersedes nothing");
+
+    let pages = log.current_pages().unwrap();
+    assert_eq!(pages.len(), 1, "one current page for the topic");
+    assert_eq!(pages[0].topic_id, topic);
+    assert_eq!(pages[0].title, "Kenny");
+
+    // Lineage invariant: the page's source_event_ids are EVENT ids (the memory),
+    // NONE of them an entity:<ulid> (incl. the topic id, which lives in content).
+    let page_ev = log.stream_all().unwrap().into_iter()
+        .find(|e| e.id == pages[0].page_event_id).unwrap();
+    let lineage = page_ev.model_meta.unwrap().source_event_ids;
+    assert!(lineage.contains(&mem), "the inducing memory is in the lineage");
+    assert!(
+        lineage.iter().all(|id| !id.starts_with(ENTITY_NODE_PREFIX)),
+        "no entity:<ulid> id leaks into the page lineage (spec §16)"
+    );
+
+    // Idempotency, cursor arm (F1): a second tick emits no new page because the
+    // first tick drained the dirty set and advanced `summarize_cursor` past the
+    // entity/link events → the dirty set is now empty, so no topic is re-visited.
+    // (The cited-set arm of F6 is proven by the next test, where the topic IS
+    // re-dirtied but its grounding is unchanged.)
+    let report2 = log.evolve_once(&embedder, &reasoner).unwrap();
+    assert_eq!(report2.pages_emitted, 0, "drained dirty set → no re-summary (F1)");
+    assert_eq!(report2.pages_superseded, 0, "no churn on an unchanged topic");
+    assert_eq!(log.current_pages().unwrap().len(), 1, "still exactly one page");
+    log.verify_chain().unwrap();
+}
+
+#[test]
+fn re_dirtied_topic_with_unchanged_grounding_emits_no_page() {
+    // The F6 cited-set idempotency arm: a topic is re-dirtied (a NEW machine link
+    // citing the SAME memory lands past `summarize_cursor`), but its gathered
+    // cited-source SET is unchanged → the summarize phase emits nothing despite
+    // the topic being in the dirty set. This exercises `current_page_for_topic`'s
+    // cited-set comparison, not the cursor-drain shortcut.
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    let source = "Kenny works at Acme.";
+    let (mem, topic) = seed_topic_directly(&log, &embedder, source);
+
+    // Tick 1: emit the first page.
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts1 = log.gather_fact_set(&entity).unwrap();
+    let reasoner1 = scripted_both_passes("scripted-evolve-v1", source, &[], &[], empty_pass_a())
+        .with_response(
+            SUMMARIZE_SYSTEM,
+            &build_compose_prompt(&facts1),
+            json!({ "title": "Kenny",
+                "claims": [{ "text": "Kenny works at Acme.", "cites": [mem.clone()] }] }),
+        );
+    assert_eq!(log.evolve_once(&embedder, &reasoner1).unwrap().pages_emitted, 1);
+
+    // Re-dirty the topic: a SECOND machine link on the same topic, citing the
+    // SAME memory, lands past the now-advanced summarize_cursor. A new endpoint
+    // entity keeps the link well-formed. The lineage memory set is unchanged.
+    let lineage = std::slice::from_ref(&mem);
+    let beta = log.entity("Beta", &[], "org", "scripted-evolve-v1", lineage).unwrap();
+    log.link_machine(&topic, "advises", &beta, 0.9, "scripted-evolve-v1", lineage).unwrap();
+    log.rebuild_graph().unwrap();
+
+    // The topic is dirty again; gather the NEW fact-set (it has an extra edge
+    // line) and script a compose turn whose claims still cite ONLY the same
+    // memory → identical cited set → F6 must skip the emit.
+    let entity2 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts2 = log.gather_fact_set(&entity2).unwrap();
+    assert!(
+        facts2.edges.len() > facts1.edges.len(),
+        "the re-dirty added an edge (topic genuinely re-entered the dirty set)"
+    );
+    let reasoner2 = scripted_both_passes("scripted-evolve-v1", source, &[], &[], empty_pass_a())
+        .with_response(
+            SUMMARIZE_SYSTEM,
+            &build_compose_prompt(&facts2),
+            json!({ "title": "Kenny",
+                "claims": [{ "text": "Kenny works at Acme.", "cites": [mem.clone()] }] }),
+        );
+    let report2 = log.evolve_once(&embedder, &reasoner2).unwrap();
+    assert_eq!(report2.pages_emitted, 0, "unchanged cited set → no new page (F6 cited-set arm)");
+    assert_eq!(report2.pages_superseded, 0, "no supersede churn (F6)");
+    assert_eq!(log.current_pages().unwrap().len(), 1, "still exactly one current page");
+    log.verify_chain().unwrap();
+}
+
+#[test]
+fn one_way_rule_pages_never_enter_the_fact_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    let source = "Kenny works at Acme.";
+    let (mem, topic) = seed_topic_directly(&log, &embedder, source);
+
+    // Emit a page for the topic with a DISTINCTIVE body, then re-embed/rebuild so
+    // it is in the recall index and the pages projection.
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts0 = log.gather_fact_set(&entity).unwrap();
+    let reasoner0 = scripted_both_passes("scripted-evolve-v1", source, &[], &[], empty_pass_a())
+        .with_response(
+            SUMMARIZE_SYSTEM,
+            &build_compose_prompt(&facts0),
+            json!({ "title": "Kenny",
+                "claims": [{ "text": "DISTINCTIVE_PAGE_BODY_MARKER", "cites": [mem.clone()] }] }),
+        );
+    assert_eq!(log.evolve_once(&embedder, &reasoner0).unwrap().pages_emitted, 1);
+    log.rederive_pending(&embedder).unwrap();
+    log.rebuild_indexes(&embedder).unwrap();
+
+    // Now gather the fact-set AGAIN with a page present: the page body must NOT
+    // appear (fact_texts_for_ids drops page ids by construction, F3). The compose
+    // prompt the loop would build contains no page body.
+    let facts1 = log.gather_fact_set(&entity).unwrap();
+    let prompt = build_compose_prompt(&facts1);
+    assert!(
+        !prompt.contains("DISTINCTIVE_PAGE_BODY_MARKER"),
+        "a page body never re-enters the fact-set / compose prompt (one-way rule, F3)"
+    );
+    // The memories that DO feed the set are the raw memory, never the page event.
+    assert!(
+        facts1.memories.iter().all(|(id, _)| id != &log.current_pages().unwrap()[0].page_event_id),
+        "the page event id is never a fact-set memory"
+    );
+    log.verify_chain().unwrap();
+}
+
+#[test]
+fn empty_floor_emits_no_page_and_does_not_break_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    let source = "Kenny works at Acme.";
+    let (_mem, topic) = seed_topic_directly(&log, &embedder, source);
+
+    // The compose turn cites an OUT-OF-SET id for every claim → the citation
+    // floor empties → assemble returns None → no page emitted. The tick must
+    // still complete (per-topic continue, F4) and advance.
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts = log.gather_fact_set(&entity).unwrap();
+    let reasoner = scripted_both_passes("scripted-evolve-v1", source, &[], &[], empty_pass_a())
+        .with_response(
+            SUMMARIZE_SYSTEM,
+            &build_compose_prompt(&facts),
+            json!({ "title": "Kenny",
+                "claims": [{ "text": "Out of scope.", "cites": ["01OUTOFSETxxxxxxxxxxxxxxxx"] }] }),
+        );
+
+    let report = log.evolve_once(&embedder, &reasoner).unwrap();
+    assert_eq!(report.pages_emitted, 0, "every claim was ungrounded → no page");
+    assert_eq!(report.pages_superseded, 0, "no supersede on an empty floor");
+    assert!(log.current_pages().unwrap().is_empty(), "no page exists for the topic");
+    // The tick completed cleanly (no error / no panic) — the batch did not break.
     log.verify_chain().unwrap();
 }
