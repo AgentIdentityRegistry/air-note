@@ -50,9 +50,10 @@ pub struct FactSet {
 impl FactSet {
     /// The set of every event id present (memory ids) — the citation floor's
     /// whitelist (spec §5/§8). Edge lines carry node ids, not citable event ids;
-    /// the model cites the MEMORY ids it drew from.
-    pub fn fact_ids(&self) -> HashSet<String> {
-        self.memories.iter().map(|(id, _)| id.clone()).collect()
+    /// the model cites the MEMORY ids it drew from. Returns borrowed `&str`
+    /// slices tied to `&self` — no String clones.
+    pub fn fact_ids(&self) -> HashSet<&str> {
+        self.memories.iter().map(|(id, _)| id.as_str()).collect()
     }
 
     /// Total facts (edges + memories) — gates `PAGE_MIN_FACTS` (spec §6).
@@ -171,7 +172,7 @@ pub fn citation_floor(draft: &DraftPage, facts: &FactSet) -> DraftPage {
     let claims = draft
         .claims
         .iter()
-        .filter(|c| !c.cites.is_empty() && c.cites.iter().all(|id| allowed.contains(id)))
+        .filter(|c| !c.cites.is_empty() && c.cites.iter().all(|id| allowed.contains(id.as_str())))
         .map(|c| DraftClaim { text: c.text.clone(), cites: c.cites.clone() })
         .collect();
     DraftPage { title: draft.title.clone(), claims }

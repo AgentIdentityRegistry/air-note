@@ -135,10 +135,25 @@ fn assemble_renders_body_and_sorts_dedupes_cites_or_none_when_empty() {
         ],
     };
     let r = assemble(&d).unwrap();
-    assert!(r.text.contains("a") && r.text.contains("b"), "body has both claims");
+    assert_eq!(r.text, "- a\n- b", "body is one dash-prefixed line per claim");
     assert_eq!(r.cites, vec!["01A".to_string(), "01B".to_string()], "sorted + deduped");
 
     // No surviving claims → None (→ no page emitted).
     let empty = DraftPage { title: "K".into(), claims: vec![] };
     assert!(assemble(&empty).is_none());
+}
+
+#[test]
+fn assemble_cites_exclude_truncated_claims() {
+    use bossclaw_core::summarize::MAX_CLAIMS_PER_PAGE;
+    let mut claims: Vec<DraftClaim> = (0..MAX_CLAIMS_PER_PAGE)
+        .map(|i| DraftClaim { text: format!("c{i}"), cites: vec![format!("MEM{i:02}")] })
+        .collect();
+    claims.push(DraftClaim { text: "overflow".into(), cites: vec!["OVERFLOW_CITE".into()] });
+    let r = assemble(&DraftPage { title: "T".into(), claims }).unwrap();
+    assert!(
+        !r.cites.contains(&"OVERFLOW_CITE".to_string()),
+        "cite from a truncated claim must not enter the page's source_event_ids"
+    );
+    assert_eq!(r.cites.len(), MAX_CLAIMS_PER_PAGE, "exactly the capped claims' cites");
 }
