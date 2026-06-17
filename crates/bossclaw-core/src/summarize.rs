@@ -28,6 +28,13 @@ pub const PAGE_MIN_FACTS: usize = 2;
 /// Cap on claims accepted from one draft (spec §11 / F7) — applied before signing.
 pub const MAX_CLAIMS_PER_PAGE: usize = 32;
 
+/// Maximum byte length of an entity label or type interpolated into the compose
+/// prompt's instruction tier. Entity labels are model-produced (M4a extraction)
+/// and could contain newlines or overlong text; truncating + stripping control
+/// chars prevents a crafted label from escaping the identity slot and injecting
+/// prompt instructions above the fenced sources.
+const MAX_PROMPT_IDENT_LEN: usize = 200;
+
 /// The bounded, already-signed inputs for ONE dossier (built by the evolve phase,
 /// spec §6): the anchor entity, its current edges as lines, and the cited memory
 /// texts. NEVER contains a `page` (the one-way rule, enforced upstream — F3).
@@ -102,17 +109,41 @@ pub fn compose_schema() -> serde_json::Value {
     })
 }
 
+/// Strip ASCII control characters (including CR/LF) from `s` and truncate to
+/// `MAX_PROMPT_IDENT_LEN` bytes on a UTF-8 char boundary. Used to sanitize
+/// model-produced entity labels and types before they are interpolated into the
+/// instruction tier of the compose prompt — prevents a multi-line label from
+/// escaping the identity slot and injecting instructions above the fenced
+/// sources.
+fn sanitize_ident(s: &str) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_ascii_control()).collect();
+    if cleaned.len() <= MAX_PROMPT_IDENT_LEN {
+        cleaned
+    } else {
+        let mut end = MAX_PROMPT_IDENT_LEN;
+        while end > 0 && !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned[..end].to_string()
+    }
+}
+
 /// Build the Pass-A compose prompt (spec §5): the fenced fact-set (each memory
 /// tagged with its event id so the model can cite it; edges as lines) + the
 /// instruction to write a concise dossier where EACH claim cites the source ids
 /// it draws from. Untrusted memory text is fenced via the M4a source-fence helper.
+/// Entity label and type are sanitized before interpolation (control-char strip +
+/// length cap) to prevent a model-produced label from injecting instructions into
+/// the instruction tier above the fenced sources.
 pub fn build_compose_prompt(facts: &FactSet) -> String {
+    let label = sanitize_ident(&facts.entity.label);
+    let entity_type = sanitize_ident(&facts.entity.entity_type);
     let mut p = String::new();
     p.push_str(&format!(
         "Write a concise factual dossier about {} ({}). Output ONLY claims you can \
          support from the sources below; for EACH claim list the source ids (the \
          [id] tags) it draws from in `cites`. Do not invent facts or citations.\n\n",
-        facts.entity.label, facts.entity.entity_type,
+        label, entity_type,
     ));
     if !facts.edges.is_empty() {
         p.push_str("Known relationships:\n");
@@ -130,11 +161,18 @@ pub fn build_compose_prompt(facts: &FactSet) -> String {
     p
 }
 
-/// Parse a reasoner draft value into a [`DraftPage`] (spec §5). Missing `title`
-/// defaults to empty; a claim missing `text` is dropped; missing/non-array
-/// `cites` becomes empty (the floor then drops it). Tolerant — a malformed draft
-/// degrades to fewer claims, never a panic.
+/// Parse a reasoner draft value into a [`DraftPage`] (spec §5). Returns
+/// `Err(BossclawError::Reasoner(_))` when `raw` is not a JSON object — a
+/// structurally-broken reasoner response the caller should treat as a per-topic
+/// `continue`. Within a valid object, degradation is tolerant: missing `title`
+/// defaults to `""`, a claim missing `text` is dropped, and missing/non-array
+/// `cites` becomes empty (the citation floor then drops such a claim).
 pub fn parse_draft(raw: &serde_json::Value) -> Result<DraftPage, BossclawError> {
+    if raw.as_object().is_none() {
+        return Err(BossclawError::Reasoner(
+            "compose draft was not a JSON object".into(),
+        ));
+    }
     let title = raw.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
     let mut claims = Vec::new();
     if let Some(arr) = raw.get("claims").and_then(|c| c.as_array()) {
