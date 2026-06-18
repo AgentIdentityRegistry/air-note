@@ -1010,6 +1010,15 @@ impl EventLog {
             } else {
                 std::collections::HashSet::new()
             };
+        // Current file ids whose grant is still active (for the file-version +
+        // revoked-grant exclusion). Gated: skipped entirely unless a file is in the
+        // fusion candidate set (mirrors the page gate).
+        let current_file_ids: std::collections::HashSet<String> =
+            if kinds.values().any(|k| k == crate::graph::FILE_INGESTED_EVENT_TYPE) {
+                self.current_files_active()?
+            } else {
+                std::collections::HashSet::new()
+            };
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
@@ -1115,17 +1124,25 @@ impl EventLog {
                 })
                 .then_with(|| b.event_id.cmp(&a.event_id)) // lexicographic DESC backstop
         });
-        // F2: drop pages that must not surface — BEFORE truncate(k) so a
-        // superseded page can never crowd out a valid lower-ranked candidate.
-        // Uses the single-sourced `crate::graph::PAGE_EVENT_TYPE` discriminator.
+        // F2/F4: drop pages/files that must not surface — BEFORE truncate(k) so a
+        // superseded or revoked entry can never crowd out a valid lower-ranked
+        // candidate. Uses single-sourced event-type discriminators.
         hits.retain(|h| {
-            if h.kind != crate::graph::PAGE_EVENT_TYPE {
-                return true; // non-page hits always survive
+            if h.kind == crate::graph::PAGE_EVENT_TYPE {
+                if opts.exclude_pages {
+                    return false; // one-way rule (F3)
+                }
+                return current_page_ids.contains(&h.event_id); // only the CURRENT page
             }
-            if opts.exclude_pages {
-                return false; // one-way rule (F3)
+            if h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE {
+                if opts.exclude_files {
+                    return false; // one-way rule for files — keeps external text out of evolve context (Task 9)
+                }
+                // Keep only the CURRENT version for its path AND only if the grant is
+                // still active (never-forget storage ≠ must-surface).
+                return current_file_ids.contains(&h.event_id);
             }
-            current_page_ids.contains(&h.event_id) // else: only the CURRENT page
+            true // every other kind always survives
         });
         hits.truncate(k);
         Ok(hits)
@@ -1835,8 +1852,6 @@ impl EventLog {
 
     /// Event ids of CURRENT files whose grant root is still ACTIVE (revoked = 0).
     /// Used by recall to drop stale-version AND revoked-grant file hits.
-    // Wired into the recall path in a later M5a task; defined here with the projection.
-    #[allow(dead_code)]
     pub(crate) fn current_files_active(&self) -> Result<std::collections::HashSet<String>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();

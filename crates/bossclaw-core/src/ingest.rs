@@ -942,4 +942,41 @@ mod orchestrator_tests {
         assert_eq!((r.ingested, r.superseded, r.deduped), (0, 0, 1),
             "mtime is provenance-only; identical bytes → dedup, NEVER supersede");
     }
+
+    #[test]
+    fn recall_returns_only_current_version_and_drops_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("topic.md"), b"alpha unique-token-v1").unwrap();
+
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open_with_recall(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical_folder = std::fs::canonicalize(&folder).unwrap();
+        run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+
+        // Change the file, re-ingest → v1 superseded by v2.
+        std::fs::write(folder.join("topic.md"), b"alpha unique-token-v2").unwrap();
+        run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        log.rebuild_indexes(&emb).unwrap();
+        log.rebuild_graph().unwrap();
+
+        // Recall: only the CURRENT (v2) file id survives the new arm.
+        let hits = log.recall(&emb, "alpha", 10, &Default::default()).unwrap();
+        let file_hits: Vec<_> = hits.iter().filter(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE).collect();
+        assert_eq!(file_hits.len(), 1, "only the current version surfaces, never both");
+        let canonical_file = canonical_folder.join("topic.md").to_string_lossy().to_string();
+        let cur = log.current_file_for_path(&canonical_file).unwrap().unwrap();
+        assert_eq!(file_hits[0].event_id, cur.file_event_id);
+        assert!(file_hits[0].sources.contains(&crate::recall::RecallSource::Keyword),
+            "the keyword (FTS) arm surfaces the file — proves ingest + rebuild_indexes populated FTS, not only vectors");
+
+        // Revoke the grant → the file is excluded from recall (still in the log).
+        log.revoke_grant(&canonical_folder).unwrap();
+        let hits2 = log.recall(&emb, "alpha", 10, &Default::default()).unwrap();
+        assert!(hits2.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
+            "a revoked grant's files do not surface in recall");
+    }
 }
