@@ -116,8 +116,11 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// exist until M4 but is listed here so the seam is forward-compatible.
 /// Composed from the canonical `*_EVENT_TYPE` consts in `graph` so this array
 /// and the stamp sites cannot drift.
-const EMBEDDABLE_EVENT_TYPES: &[&str] =
-    &[crate::graph::MEMORY_EVENT_TYPE, crate::graph::PAGE_EVENT_TYPE];
+const EMBEDDABLE_EVENT_TYPES: &[&str] = &[
+    crate::graph::MEMORY_EVENT_TYPE,
+    crate::graph::PAGE_EVENT_TYPE,
+    crate::graph::FILE_INGESTED_EVENT_TYPE,
+];
 
 /// The serialized, signed event log.
 pub struct EventLog {

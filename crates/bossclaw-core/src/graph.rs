@@ -42,6 +42,21 @@ pub const MEMORY_NODE_KIND: &str = "memory";
 /// `nodes.kind` for a node that resolves to no known event.
 pub const EXTERNAL_NODE_KIND: &str = "external";
 
+/// The `event_type` discriminator for an ingested-file event (M5a). Ground-truth
+/// (plain `append`, `model_meta: None`); added to `EMBEDDABLE_EVENT_TYPES` so its
+/// `content["text"]` is embedded + FTS-indexed + recallable. Single-sourced so the
+/// stamp site, the fold filter, and the recall arm reference the same string.
+pub const FILE_INGESTED_EVENT_TYPE: &str = "file_ingested";
+/// The `event_type` discriminator for a folder-grant event (M5a). Ground-truth.
+pub const GRANT_EVENT_TYPE: &str = "grant";
+/// The `event_type` discriminator for a folder-revoke event (M5a). Ground-truth.
+pub const REVOKE_EVENT_TYPE: &str = "revoke";
+/// The taint stamp written at `content["origin"]` of every `file_ingested` event
+/// (M5a, D4). Distinct from the `edges.origin` column (`"manual"`/`"machine"`):
+/// this marks external-origin content so the M6 lineage walk can fail closed.
+/// Single-sourced so the stamp site and the `is_external` classifier cannot drift.
+pub const EXTERNAL_ORIGIN: &str = "external";
+
 /// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
 /// links reference this exact form, so it is single-sourced.
 pub const ENTITY_NODE_PREFIX: &str = "entity:";
@@ -407,5 +422,20 @@ mod tests {
         assert_eq!(folded[0].entity_id, entity_node_id("01GOOD"));
         assert_eq!(folded[0].label, "Kenny");
         assert_eq!(folded[0].entity_type, "person");
+    }
+
+    #[test]
+    fn m5a_event_type_consts_are_distinct_and_stable() {
+        // Stable wire strings (these land in signed content + the byte-identical rebuild).
+        assert_eq!(FILE_INGESTED_EVENT_TYPE, "file_ingested");
+        assert_eq!(GRANT_EVENT_TYPE, "grant");
+        assert_eq!(REVOKE_EVENT_TYPE, "revoke");
+        assert_eq!(EXTERNAL_ORIGIN, "external");
+        // Must not collide with existing discriminators.
+        for other in [MEMORY_EVENT_TYPE, PAGE_EVENT_TYPE, SUPERSEDE_EVENT_TYPE, ENTITY_EVENT_TYPE, CONFIG_EVENT_TYPE] {
+            assert_ne!(FILE_INGESTED_EVENT_TYPE, other);
+            assert_ne!(GRANT_EVENT_TYPE, other);
+            assert_ne!(REVOKE_EVENT_TYPE, other);
+        }
     }
 }
