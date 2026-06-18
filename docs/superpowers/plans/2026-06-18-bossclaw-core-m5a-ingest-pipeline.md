@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust (edition 2021), `rustix` (safe syscall bindings — keeps `#![forbid(unsafe_code)]`), `rusqlite` + `bundled-sqlcipher`, `sha2`, `serde_json`, existing `EventLog`/`Embedder`/`graph` fold infrastructure. Tests are hermetic (temp homes + `MockEmbedder` + a mock parser), inline `#[cfg(test)] mod tests`.
 
+> **Plan revision — folds a second opinion (2026-06-18).** An independent **critic + security** review of *this plan* (both SHIP-WITH-FIXES, converged) verified all six load-bearing code claims TRUE (no Rev-1-style false reuse) but caught one genuine spec-level over-claim: **taint laundering via the evolve loop's recall _context_** — cursor-exclusion alone is NOT "no laundering" once files are recallable. Folded throughout: a new `RecallOptions.exclude_files` flag set in the evolve recall (Tasks 8–9); never-touch **case-insensitivity** for macOS/APFS + more secret patterns (Task 6); a Windows **re-fstat-after-open** + a **CI-both-OS** containment requirement + a macOS-strength reconciliation (Tasks 5/11); and added cross-fold, mtime-no-supersede, and context-laundering tests (Tasks 3/7/9). The matching spec correction is **Rev 3** (§4, §6, §10).
+
 ---
 
 ## Pre-flight (read before Task 1)
@@ -23,7 +25,7 @@
 - `rebuild_graph` — `log.rs:1807` folds edges/entities/pages and writes the projection tables inside one tx (`DELETE FROM …` then `INSERT`). M5a extends it to also fold+write `grants` and `files`.
 - `open_with_recall` — `log.rs:520` calls `rebuild_indexes` then `rebuild_graph`, so new projections rebuild on open for free.
 - Recall exclusion arm + gating — `log.rs:982` (gated `current_pages()` read) and `log.rs:1096` (the `hits.retain` page arm). M5a adds a parallel `file_ingested` arm.
-- Evolve cursor is `memory`-only — `log.rs:2443` `unprocessed_memories_since` filters `event_type = MEMORY_EVENT_TYPE`; its doc comment already says "`file_ingested` extraction is deferred". So file content is **excluded from extraction for free** (no laundering).
+- Evolve laundering has **TWO doors — both must be shut** (second-opinion finding; spec Rev 3 §4). (1) The evolve **cursor** (`unprocessed_memories_since`, `log.rs:2443`) filters `event_type = MEMORY_EVENT_TYPE`, so files are never extraction *subjects* (its doc comment already says "`file_ingested` extraction is deferred"). (2) The evolve loop's internal **recall context** (`evolve_once` → `recall(.., &RecallOptions { exclude_pages: true, .. })`, `log.rs:2951-2964`) — because Task 1 makes `file_ingested` recallable, an unfiltered context recall would feed external file text into `extract::propose` and the derived link/entity would **not** be marked external (laundering). **Task 8 adds `RecallOptions.exclude_files`; Task 9 sets it `true` in the evolve recall**, mirroring the existing `exclude_pages` (F3) one-way rule. Cursor exclusion alone is NOT "no laundering."
 - `#![forbid(unsafe_code)]` — `lib.rs:16`. Use `rustix` (safe wrappers), never hand-rolled `unsafe`.
 - Test harness (mirror exactly) — `log.rs:3378`: `const DEK: [u8;32] = [42u8;32];`, `const KEY_BYTES: [u8;32] = [7u8;32];`, `fn open_log(dir) { EventLog::open(&dir.join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap() }`, `fn mk_memory(text) -> Event {…}`, `tempfile::tempdir()`.
 
@@ -465,6 +467,35 @@ fn fold_files_cross_path_identical_bytes_both_current() {
     let mut b = mk_file_ingested("/b", "same", "/root"); b.id = "fb".to_string();
     let files = fold_files(&[a, b]);
     assert_eq!(files.len(), 2, "identical bytes at two paths → both kept (dedup is per-path)");
+}
+
+// Proves the ground-truth-supersede REUSE is safe: `SUPERSEDE_EVENT_TYPE` is
+// shared by pages and files, but a supersede targets exactly one id, and page
+// ids never collide with file ids — so neither fold cross-retires the other's.
+#[test]
+fn supersede_does_not_cross_retire_between_pages_and_files() {
+    let mut page = Event {
+        id: "P1".to_string(), ts: String::new(), valid_time: None,
+        event_type: PAGE_EVENT_TYPE.to_string(),
+        content: serde_json::json!({ "topic_id": "t", "title": "T", "text": "p" }),
+        model_meta: None, prev_hash: String::new(), hash: None,
+        signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+    };
+    let mut file = mk_file_ingested("/a", "h", "/root"); file.id = "F1".to_string();
+
+    // A supersede targeting the FILE id retires the file, NOT the page.
+    let sup_file = mk_file_supersede("F1");
+    assert_eq!(fold_pages(&[page.clone(), file.clone(), sup_file.clone()]).len(), 1,
+        "a file-supersede must not retire a page");
+    assert!(fold_files(&[page.clone(), file.clone(), sup_file]).is_empty(),
+        "the file-supersede retired its own file");
+
+    // A supersede targeting the PAGE id retires the page, NOT the file.
+    let sup_page = mk_file_supersede("P1");
+    assert_eq!(fold_files(&[page.clone(), file.clone(), sup_page.clone()]).len(), 1,
+        "a page-supersede must not retire a file");
+    assert!(fold_pages(&[page, file, sup_page]).is_empty(),
+        "the page-supersede retired its own page");
 }
 ```
 
@@ -979,15 +1010,21 @@ pub(crate) fn careful_open_windows(
     if !canonical.starts_with(&root_canonical) {
         return Err(IngestError::Containment("escapes grant root".into()));
     }
-    if !meta.file_type().is_file() {
+    // Open first, then re-check type on the OPENED handle (NOT the pre-open
+    // `symlink_metadata`) so a file→dir swap between canonicalize and open cannot
+    // slip a non-regular target through.
+    let file = std::fs::File::open(&canonical).map_err(|e| IngestError::Io(e.to_string()))?;
+    let opened = file.metadata().map_err(|e| IngestError::Io(e.to_string()))?;
+    if !opened.file_type().is_file() {
         return Err(IngestError::Containment("not a regular file".into()));
     }
-    let file = std::fs::File::open(&canonical).map_err(|e| IngestError::Io(e.to_string()))?;
-    Ok(ContainedFile { file, identity: FileIdentity::Path(canonical), size: meta.len() })
+    Ok(ContainedFile { file, identity: FileIdentity::Path(canonical), size: opened.len() })
 }
 ```
 
 > **`openat2`/`ResolveFlags`/`FileType::from_raw_mode` API check:** these are rustix 0.38 `fs` APIs. If a signature differs at compile time, fix to match `cargo doc -p rustix` — the TDD loop surfaces it immediately. The required behavior (kernel refuses symlink traversal + escape) is the contract; the exact call is mechanical.
+
+> **Containment strength + CI matrix (second-opinion reconciliation):** the Unix walk holds a *real directory fd* for each level, reached via per-descent `O_NOFOLLOW`; an already-open ancestor fd is immune to a later name swap, and the final careful open's `NOFOLLOW`/`openat2 RESOLVE_NO_SYMLINKS` refuses a swapped-in symlink. So **macOS is as symlink-swap-tight as Linux here** — the spec's earlier "macOS intermediate-dir residual" was over-conservative (Rev 3 §10 corrects it). The genuine residuals are **Windows** (non-atomic `canonicalize`→`open`) and **hardlink-into-grant** (Deferred/Risks). Because the two careful-open `cfg` branches are *different code*, the containment tests MUST run on **both macOS and Linux** in CI (Task 11), and the Linux swap test SHOULD assert the refusal is `ELOOP`-class so it's `RESOLVE_NO_SYMLINKS` that fired, not an accidental `ENOENT` (add `#[cfg(target_os = "linux")]` checking the `Containment(msg)` string contains the errno).
 
 - [ ] **Step 2: Write the failing containment tests (Unix; the TOCTOU swap is the key one)**
 
@@ -1094,36 +1131,45 @@ const MAX_WALK_DEPTH: usize = 64;
 
 /// Directory names never descended into (hazard reduction, NOT a containment
 /// boundary — the boundary is the grant + informed consent; spec §6.3). Matched
-/// case-sensitively against a single path component.
+/// **case-insensitively**: the primary platform (macOS/APFS) is case-insensitive,
+/// so a case-sensitive filter would let `.SSH` bypass it. Keep these LOWERCASE.
 const NEVER_TOUCH_DIRS: &[&str] =
     &[".ssh", ".aws", ".azure", ".gnupg", ".git", ".kube", ".docker", "gcloud"];
-/// Exact file names never ingested.
-const NEVER_TOUCH_FILES: &[&str] = &[".env", ".netrc", ".pgpass", ".git-credentials", "wallet.dat"];
-/// Glob patterns never ingested. Only two shapes are supported: `*.ext` (suffix)
-/// and `prefix*` (prefix). Single-sourced + tested.
-const NEVER_TOUCH_GLOBS: &[&str] =
-    &["*.key", "*.pem", "id_*", "*.keychain", "*.kdbx", "*.jks", "*.ppk", "*.mobileconfig", "*.ovpn"];
+/// Exact file names never ingested (LOWERCASE; matched case-insensitively).
+const NEVER_TOUCH_FILES: &[&str] = &[
+    ".env", ".netrc", ".pgpass", ".git-credentials", "wallet.dat",
+    ".npmrc", ".pypirc", ".dockercfg", "known_hosts",
+];
+/// Glob patterns never ingested. Only two shapes: `*.ext` (suffix) and `prefix*`
+/// (prefix). LOWERCASE; matched case-insensitively. Single-sourced + tested.
+const NEVER_TOUCH_GLOBS: &[&str] = &[
+    "*.key", "*.pem", "*.p12", "*.pfx", "*.gpg", "*.asc", "id_*",
+    "*.keychain", "*.kdbx", "*.jks", "*.ppk", "*.mobileconfig", "*.ovpn",
+];
 
-/// True if `name` matches a `*.ext` (suffix) or `prefix*` (prefix) glob.
-fn matches_glob(name: &str, pattern: &str) -> bool {
+/// True if `name_lc` (already lowercased by the caller) matches a `*.ext` (suffix)
+/// or `prefix*` (prefix) glob. Patterns are already lowercase.
+fn matches_glob(name_lc: &str, pattern: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix('*') {
-        name.ends_with(suffix)
+        name_lc.ends_with(suffix)
     } else if let Some(prefix) = pattern.strip_suffix('*') {
-        name.starts_with(prefix)
+        name_lc.starts_with(prefix)
     } else {
-        name == pattern
+        name_lc == pattern
     }
 }
 
 /// Whether a directory component must never be descended (hazard reduction).
-/// Also catches the `.config/gh` pair via `rel_dir` (the relative dir path).
+/// Case-insensitive. Also catches the `.config/gh` pair via `rel_dir`.
 fn is_never_touch_dir(name: &str, rel_dir: &str) -> bool {
-    NEVER_TOUCH_DIRS.contains(&name) || rel_dir.ends_with(".config/gh")
+    let name_lc = name.to_lowercase();
+    NEVER_TOUCH_DIRS.contains(&name_lc.as_str()) || rel_dir.to_lowercase().ends_with(".config/gh")
 }
 
-/// Whether a file component must never be ingested.
+/// Whether a file component must never be ingested. Case-insensitive.
 fn is_never_touch_file(name: &str) -> bool {
-    NEVER_TOUCH_FILES.contains(&name) || NEVER_TOUCH_GLOBS.iter().any(|g| matches_glob(name, g))
+    let name_lc = name.to_lowercase();
+    NEVER_TOUCH_FILES.contains(&name_lc.as_str()) || NEVER_TOUCH_GLOBS.iter().any(|g| matches_glob(&name_lc, g))
 }
 ```
 
@@ -1140,6 +1186,12 @@ mod filter_tests {
         assert!(is_never_touch_file("server.key"));
         assert!(is_never_touch_file("id_rsa"));
         assert!(is_never_touch_file("vault.kdbx"));
+        assert!(is_never_touch_file("cert.p12"));
+        assert!(is_never_touch_file("known_hosts"));
+        // Case-insensitive (macOS/APFS): uppercase variants must also match.
+        assert!(is_never_touch_file(".ENV"));
+        assert!(is_never_touch_file("Server.PEM"));
+        assert!(is_never_touch_file("ID_RSA"));
         assert!(!is_never_touch_file("notes.md"));
         assert!(!is_never_touch_file("readme.txt"));
     }
@@ -1147,6 +1199,7 @@ mod filter_tests {
     #[test]
     fn never_touch_dirs_including_config_gh() {
         assert!(is_never_touch_dir(".ssh", "project/.ssh"));
+        assert!(is_never_touch_dir(".SSH", "project/.SSH")); // case-insensitive (macOS)
         assert!(is_never_touch_dir(".git", "project/.git"));
         assert!(is_never_touch_dir("gh", "home/.config/gh"));
         assert!(!is_never_touch_dir("src", "project/src"));
@@ -1171,8 +1224,10 @@ Expected: PASS.
 The walk yields `(ContainedFile, PathBuf canonical_path, PathHint)` for each ingestable regular file, while updating an `inode-seen` set and the report's `skipped` list. It does NOT touch the log.
 
 ```rust
-/// A file the walk surfaced for ingest: the contained handle + its canonical
-/// absolute path + a sanitized hint.
+/// A file the walk surfaced for ingest: the contained handle + its path + a
+/// sanitized hint. `canonical_path` is `grant_root` (already canonicalized) joined
+/// with the walk-relative components — safe to treat as canonical because the walk
+/// admitted no symlink and no `..`, so it equals `realpath` WITHOUT re-resolving.
 pub(crate) struct WalkedFile {
     pub(crate) file: ContainedFile,
     pub(crate) canonical_path: PathBuf,
@@ -1547,7 +1602,12 @@ impl ContainedFile {
 }
 ```
 
-- [ ] **Step 4: Write the failing orchestrator test (fresh / dedup / supersede)**
+> **Contract notes (second-opinion clarifications):**
+> - `ingest_grant_inner` populates the `vectors` table per file (`derive_vector_for`) but does **NOT** rebuild the in-memory ANN index or the FTS index — so it alone leaves files keyword-unsearchable. Callers MUST run `rebuild_indexes(embedder)` + `rebuild_graph()` before recall; `ingest_all` (Task 11) does this, and any test that recalls must do it explicitly.
+> - The byte cap is checked twice on purpose: the walk's `cf.size() > MAX_FILE_BYTES` (fstat — a cheap early-out) and `read_all_capped`'s `cap + 1` read (**authoritative** — catches a file that grows after fstat). Treat `read_all_capped` as the source of truth.
+> - Capture `modified_at` BEFORE `read_all_capped` (it consumes the `ContainedFile`); the plan's ordering already does this — keep a comment so a refactor can't reorder it.
+
+- [ ] **Step 4: Write the failing orchestrator test (fresh / dedup / supersede + mtime-only no-op)**
 
 ```rust
 #[cfg(all(test, unix))]
@@ -1599,6 +1659,27 @@ mod orchestrator_tests {
         assert_eq!(ev.content["text"], "# v2 changed");
         assert!(is_external(&ev), "file_ingested is externally tainted");
     }
+
+    #[test]
+    fn mtime_change_without_byte_change_does_not_supersede() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        let f = folder.join("a.md");
+        std::fs::write(&f, b"identical bytes").unwrap();
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical = std::fs::canonicalize(&folder).unwrap();
+        assert_eq!(run_ingest(&log, &canonical, &NativeTextParser, &emb).ingested, 1);
+
+        // Rewrite IDENTICAL bytes (bumps mtime, content_hash unchanged).
+        std::fs::write(&f, b"identical bytes").unwrap();
+        let r = run_ingest(&log, &canonical, &NativeTextParser, &emb);
+        assert_eq!((r.ingested, r.superseded, r.deduped), (0, 0, 1),
+            "mtime is provenance-only; identical bytes → dedup, NEVER supersede");
+    }
 }
 ```
 
@@ -1624,9 +1705,18 @@ git commit -m "feat(bossclaw-core): M5a Task 7 — ingest orchestrator (dedup/su
 - Modify: `crates/bossclaw-core/src/log.rs` (the `recall` method)
 - Test: inline in `log.rs` (or `ingest.rs`)
 
-- [ ] **Step 1: Add the gated current-file set + the retain arm in `recall`**
+- [ ] **Step 1: Add `exclude_files` to `RecallOptions`, then the gated current-file set + retain arm in `recall`**
 
-In `recall` (log.rs:944), alongside the `current_page_ids` block (982–987), add:
+First, in `crates/bossclaw-core/src/recall.rs`, add a field to `RecallOptions` (right after `exclude_pages`, ~line 87) — the file analogue of the F3 one-way rule:
+
+```rust
+    /// When true, drop ALL `file_ingested`-kind hits — the one-way rule for the
+    /// evolve loop's internal recall (Task 9), so external file text never enters
+    /// the reasoner's extraction context. User-facing recall leaves it false.
+    pub exclude_files: bool,
+```
+
+Then in `recall` (log.rs:944), alongside the `current_page_ids` block (982–987), add:
 
 ```rust
 // Current file ids whose grant is still active (for the file-version +
@@ -1651,6 +1741,9 @@ hits.retain(|h| {
         return current_page_ids.contains(&h.event_id); // only the CURRENT page
     }
     if h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE {
+        if opts.exclude_files {
+            return false; // one-way rule for files — keeps external text out of evolve context (Task 9)
+        }
         // Keep only the CURRENT version for its path AND only if the grant is
         // still active (never-forget storage ≠ must-surface).
         return current_file_ids.contains(&h.event_id);
@@ -1693,6 +1786,8 @@ fn recall_returns_only_current_version_and_drops_revoked() {
     let canonical_file = canonical_folder.join("topic.md").to_string_lossy().to_string();
     let cur = log.current_file_for_path(&canonical_file).unwrap().unwrap();
     assert_eq!(file_hits[0].event_id, cur.file_event_id);
+    assert!(file_hits[0].sources.contains(&crate::recall::RecallSource::Keyword),
+        "the keyword (FTS) arm surfaces the file — proves ingest + rebuild_indexes populated FTS, not only vectors");
 
     // Revoke the grant → the file is excluded from recall (still in the log).
     log.revoke_grant(&canonical_folder).unwrap();
@@ -1716,9 +1811,10 @@ git commit -m "feat(bossclaw-core): M5a Task 8 — recall file_ingested exclusio
 
 ---
 
-### Task 9: Taint classifier + extraction-exclusion + ground-truth invariants
+### Task 9: Taint root — classifier, evolve cursor + CONTEXT exclusion, ground-truth invariants
 
 **Files:**
+- Modify: `crates/bossclaw-core/src/log.rs` (set `exclude_files: true` in `evolve_once`'s internal recall — closes evolve door (2))
 - Modify: `crates/bossclaw-core/src/ingest.rs` (re-export `is_external`)
 - Modify: `crates/bossclaw-core/src/lib.rs` (`pub use ingest::is_external;`)
 - Test: inline in `ingest.rs`
@@ -1731,7 +1827,23 @@ In `lib.rs`, extend the ingest re-export:
 pub use ingest::{is_external, IngestReport, NativeTextParser, Parser, PathHint};
 ```
 
-- [ ] **Step 2: Write the taint + extraction-exclusion tests**
+- [ ] **Step 2: Close evolve door (2) — exclude files from the reasoner's recall context**
+
+In `evolve_once` (`log.rs:2951-2957`) the internal context recall passes `exclude_pages: true` only. Add `exclude_files: true`:
+
+```rust
+            let recalled: Vec<String> = self
+                .recall(
+                    embedder,
+                    &text,
+                    crate::extract::GRAPH_CONTEXT_K,
+                    &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() },
+                )
+```
+
+This is the ONLY behavioral change to the evolve loop. Then grep every other internal `recall(` call site in the evolve/summarize paths that feeds a model and add `exclude_files: true` there too; verify `gather_fact_set`/`fact_texts_for_ids` cannot pull a `file_ingested` id into reasoner context (they already drop pages — extend the same way if any path can).
+
+- [ ] **Step 3: Write the taint + cursor-exclusion + CONTEXT-laundering + ground-truth tests**
 
 ```rust
 #[test]
@@ -1778,23 +1890,70 @@ fn ingested_files_are_excluded_from_the_evolve_cursor() {
 
     // The evolve queue depth counts ONLY memory events; the file_ingested must
     // not appear (verified against the memory-only cursor at log.rs:2443).
+    // NOTE: this proves files are not extraction SUBJECTS (door 1); the
+    // context-laundering test below proves they are not extraction CONTEXT (door 2).
     let depth = log.evolve_status().unwrap();
-    assert_eq!(depth.queue_depth, 0, "file_ingested events are not evolve work (no extraction laundering)");
+    assert_eq!(depth.queue_depth, 0, "file_ingested events are never an evolve work-unit (cursor door)");
+}
+
+// Door (2): the evolve loop's internal recall must NOT surface file text as
+// context. Assert the EXACT RecallOptions the loop uses (exclude_pages +
+// exclude_files) returns ZERO file hits, while user-facing recall (defaults)
+// DOES return the file — proving the knob, not an empty corpus, is what hides it.
+#[cfg(unix)]
+#[test]
+fn evolve_context_recall_excludes_file_text() {
+    use crate::embed::MockEmbedder;
+    use crate::recall::RecallOptions;
+    use ed25519_dalek::SigningKey;
+    const DEK: [u8; 32] = [42u8; 32];
+    const KEY_BYTES: [u8; 32] = [7u8; 32];
+
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("notes");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("a.md"), b"zztoken external poison").unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = EventLog::open_with_recall(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+    log.add_grant(&folder).unwrap();
+    log.ingest_all(&NativeTextParser, &emb).unwrap();
+
+    // User-facing recall surfaces the file…
+    let user = log.recall(&emb, "zztoken", 10, &Default::default()).unwrap();
+    assert!(user.iter().any(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE), "default recall returns the file");
+    // …the evolve-context recall (the loop's exact options) does NOT.
+    let ctx = log.recall(&emb, "zztoken", 10, &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() }).unwrap();
+    assert!(ctx.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
+        "exclude_files drops file text from the reasoner's extraction context (no laundering)");
+}
+
+// A ground-truth supersede the orchestrator emits is NOT externally tainted —
+// `origin` is the single source of truth for `is_external`, and supersedes carry none.
+#[test]
+fn ground_truth_supersede_is_not_external() {
+    let sup = Event {
+        id: "s".into(), ts: String::new(), valid_time: None,
+        event_type: crate::graph::SUPERSEDE_EVENT_TYPE.into(),
+        content: serde_json::json!({ "supersedes": "f1" }),
+        model_meta: None, prev_hash: String::new(), hash: None,
+        signed_by_did: "did:wba:AIR-TEST".into(), signature: None,
+    };
+    assert!(!is_external(&sup), "a file supersede is ground-truth control, not external content");
 }
 ```
 
-> `evolve_status()` returns `EvolveStatus`; confirm the queue-depth field name (`queue_depth`) against `evolve.rs`/`log.rs:3242`. If it differs, assert via `unprocessed`-equivalent. The invariant: ingesting files adds **zero** evolve work.
+> `evolve_status()` returns `EvolveStatus`; confirm the queue-depth field name (`queue_depth`) against `evolve.rs`/`log.rs:3242`. If it differs, assert via the `unprocessed`-equivalent. The invariant: ingesting files adds **zero** evolve work AND contributes **zero** extraction context.
 
-- [ ] **Step 3: Run → expect PASS**
+- [ ] **Step 4: Run → expect PASS**
 
-Run: `cargo test -p bossclaw-core taint_classifier ingested_files_are_excluded -- --nocolor`
-Expected: PASS.
+Run: `cargo test -p bossclaw-core taint_classifier ingested_files_are_excluded evolve_context_recall_excludes ground_truth_supersede_is_not_external -- --nocolor`
+Expected: PASS (4 tests — both evolve doors proven shut).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bossclaw-core/src/ingest.rs crates/bossclaw-core/src/lib.rs
-git commit -m "feat(bossclaw-core): M5a Task 9 — taint classifier + evolve-exclusion proof"
+git add crates/bossclaw-core/src/log.rs crates/bossclaw-core/src/ingest.rs crates/bossclaw-core/src/lib.rs
+git commit -m "feat(bossclaw-core): M5a Task 9 — taint root: classifier + BOTH evolve doors (cursor + context exclude_files)"
 ```
 
 ---
@@ -1991,6 +2150,8 @@ grep -rn 'unsafe' crates/bossclaw-core/src/ingest.rs            # expect: NONE
 
 Expected: all tests pass; clippy clean (default + ollama); `forbid(unsafe_code)` present; zero `unsafe` in `ingest.rs`.
 
+> **CI matrix (second-opinion):** the careful open has distinct Linux (`openat2`) vs macOS (`openat`+`NOFOLLOW`) `cfg` branches, and the containment/walk tests are `#[cfg(unix)]`. Ensure CI runs `cargo test -p bossclaw-core` on **both macOS and Linux** (the M1–M4 matrix already does) so neither branch is exercised only on a dev laptop; if Windows is in the matrix, confirm `careful_open_windows` + its tests are gated and run there too.
+
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -2006,6 +2167,7 @@ git commit -m "feat(bossclaw-core): M5a Task 11 — ingest_all + grant lifecycle
 - **Extraction** of entities/links from `file_ingested` content (evolve over files) — a later milestone; the M5a taint root makes it safe.
 - **Actuator / writes (M6):** the fail-closed lineage WALK that *consumes* `is_external`, plus the confused-deputy write defenses. M5a plants the root and ships the classifier but claims **no** end-to-end write gate.
 - **Content high-entropy-line skip** (secret-in-granted-folder mitigation) — documented fast-follow.
+- **Hardlink-into-grant escape (residual, not defended in M5a).** A hardlink inside a granted folder pointing at an inode whose other name is *outside* the grant is caught by neither `NOFOLLOW`/`openat2 RESOLVE_BENEATH` (a hardlink has no parent pointer — the name genuinely is beneath the root) nor the name-based never-touch filter. The inode-seen set is **dedup, NOT containment** (never sell it as containment). The boundary is the grant + informed consent (an attacker who can plant hardlinks in your folder can equally copy the bytes in). Optional hardening (own decision, with a real tradeoff): skip-or-flag `st_nlink > 1` files loudly in the report — but that also skips *legitimate* within-grant hardlinks the inode-seen set would otherwise ingest once. Documented in spec Rev 3 §10.
 - **Linux `openat2` as the sole final-open path on every Unix** — M5a uses the `openat`+`NOFOLLOW` fd-chain uniformly (with `openat2` layered on Linux); broadening is optional hardening.
 
 ## Self-review (completed by the plan author)
