@@ -530,7 +530,6 @@ fn file_ingested_content(
 /// True iff `event` is externally-tainted (M5a, D5). The classifier the M6
 /// actuator's fail-closed lineage walk will consume; here it is the taint root +
 /// a tested predicate. Reads the single-sourced `EXTERNAL_ORIGIN` stamp.
-#[allow(dead_code)] // re-exported + tested in Task 9
 pub fn is_external(event: &Event) -> bool {
     event.content.get("origin").and_then(|v| v.as_str()) == Some(crate::graph::EXTERNAL_ORIGIN)
 }
@@ -763,6 +762,41 @@ mod tests {
         let h = PathHint { ext: Some("txt".into()) };
         assert_eq!(h.ext.as_deref(), Some("txt"));
     }
+
+    #[test]
+    fn taint_classifier_marks_external_origin() {
+        // A file_ingested event is classified external; a memory is not.
+        let file_ev = Event {
+            id: "f".into(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::FILE_INGESTED_EVENT_TYPE.into(),
+            content: serde_json::json!({ "text": "x", "origin": crate::graph::EXTERNAL_ORIGIN }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".into(), signature: None,
+        };
+        assert!(is_external(&file_ev));
+        let mem = Event {
+            id: "m".into(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::MEMORY_EVENT_TYPE.into(),
+            content: serde_json::json!({ "text": "x" }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".into(), signature: None,
+        };
+        assert!(!is_external(&mem), "a memory carries no external taint");
+    }
+
+    #[test]
+    fn ground_truth_supersede_is_not_external() {
+        // The ground-truth supersede the orchestrator emits is NOT externally
+        // tainted — `origin` is the single source of truth for is_external.
+        let sup = Event {
+            id: "s".into(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::SUPERSEDE_EVENT_TYPE.into(),
+            content: serde_json::json!({ "supersedes": "f1" }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".into(), signature: None,
+        };
+        assert!(!is_external(&sup), "a file supersede is ground-truth control, not external content");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -880,6 +914,7 @@ mod containment_tests {
 mod orchestrator_tests {
     use super::*;
     use crate::embed::MockEmbedder;
+    use crate::recall::RecallOptions;
     use ed25519_dalek::SigningKey;
 
     const DEK: [u8; 32] = [42u8; 32];
@@ -978,5 +1013,49 @@ mod orchestrator_tests {
         let hits2 = log.recall(&emb, "alpha", 10, &Default::default()).unwrap();
         assert!(hits2.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
             "a revoked grant's files do not surface in recall");
+    }
+
+    // Door (1): files are never an evolve extraction SUBJECT (the cursor is memory-only).
+    #[test]
+    fn ingested_files_are_excluded_from_the_evolve_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.md"), b"some note").unwrap();
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical = std::fs::canonicalize(&folder).unwrap();
+        assert_eq!(run_ingest(&log, &canonical, &NativeTextParser, &emb).ingested, 1);
+
+        // The evolve queue depth counts ONLY memory events; file_ingested must not appear.
+        let depth = log.evolve_status().unwrap();
+        assert_eq!(depth.queue_depth, 0, "file_ingested events are never an evolve work-unit (cursor door)");
+    }
+
+    // Door (2): the evolve loop's internal recall must NOT surface file text as context.
+    // Assert the EXACT RecallOptions the loop uses returns ZERO file hits, while
+    // user-facing recall (defaults) DOES — proving the knob, not an empty corpus, hides it.
+    #[test]
+    fn evolve_context_recall_excludes_file_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.md"), b"zztoken external poison").unwrap();
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open_with_recall(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical = std::fs::canonicalize(&folder).unwrap();
+        run_ingest(&log, &canonical, &NativeTextParser, &emb);
+        log.rebuild_indexes(&emb).unwrap();
+        log.rebuild_graph().unwrap();
+
+        // User-facing recall surfaces the file…
+        let user = log.recall(&emb, "zztoken", 10, &Default::default()).unwrap();
+        assert!(user.iter().any(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE), "default recall returns the file");
+        // …the evolve-context recall (the loop's exact options) does NOT.
+        let ctx = log.recall(&emb, "zztoken", 10, &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() }).unwrap();
+        assert!(ctx.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
+            "exclude_files drops file text from the reasoner's extraction context (no laundering)");
     }
 }

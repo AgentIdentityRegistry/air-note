@@ -2821,11 +2821,16 @@ impl EventLog {
             ))
         })?;
         // Build a by-id map; skip page-typed rows (F3: a summary never feeds
-        // summary-generation).
+        // summary-generation) and file-typed rows (M5a Task 9: external file
+        // text is never laundered into a summary — defense-in-depth, the root
+        // fix is closing the evolve context recall door so a file id never
+        // reaches a lineage in the first place).
         let mut by_id: HashMap<String, String> = HashMap::new();
         for row in rows {
             let (id, etype, payload) = row?;
-            if etype == crate::graph::PAGE_EVENT_TYPE {
+            if etype == crate::graph::PAGE_EVENT_TYPE
+                || etype == crate::graph::FILE_INGESTED_EVENT_TYPE
+            {
                 continue;
             }
             let ev: Event = serde_json::from_str(&payload)?;
@@ -3160,15 +3165,18 @@ impl EventLog {
 
             // ── 1. recall context (M2). entity-kind is excluded from recall by
             //    construction (separate index); `exclude_pages: true` drops pages
-            //    too, so extraction context is raw memories only — the one-way rule
-            //    (F3, defense-in-depth with `fact_texts_for_ids`). The read-set is
-            //    EVENT ids only (never entity:<ulid>), spec §16. ──
+            //    and `exclude_files: true` drops external file text (M5a Task 9,
+            //    evolve door 2) — so extraction context is raw memories only, the
+            //    one-way rule (F3, defense-in-depth with `fact_texts_for_ids`).
+            //    External file text must never be laundered into auto-derived
+            //    links/entities. The read-set is EVENT ids only (never
+            //    entity:<ulid>), spec §16. ──
             let recalled: Vec<String> = self
                 .recall(
                     embedder,
                     &text,
                     crate::extract::GRAPH_CONTEXT_K,
-                    &RecallOptions { exclude_pages: true, ..Default::default() },
+                    &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() },
                 )
                 .map(|hits| {
                     hits.into_iter()
