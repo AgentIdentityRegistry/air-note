@@ -11,7 +11,7 @@ use crate::vault::{secret_delete_cached, secret_get_cached, secret_set_cached};
 
 const HELPER_DIR_NAME: &str = "playwright-helper";
 const PW_FETCH_SCRIPT_NAME: &str = "fetch_rendered.mjs";
-const WEB_USER_AGENT: &str = "BossClawDesktop/1.0 (+web.extract)";
+const WEB_USER_AGENT: &str = "AIRAgentDesktop/1.0 (+web.extract)";
 const MAX_WEB_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
@@ -282,7 +282,7 @@ if (!url) {
 (async () => {
   try {
     const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ userAgent: 'BossClawDesktop/1.0 (+web.extract interactive)' });
+    const page = await browser.newPage({ userAgent: 'AIRAgentDesktop/1.0 (+web.extract interactive)' });
     await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
     const html = await page.content();
     await browser.close();

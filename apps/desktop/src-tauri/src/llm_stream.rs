@@ -464,7 +464,7 @@ fn is_model_access_error(status: u16, message: &str) -> bool {
 }
 
 fn system_prompt_for_agent(app: &AppHandle, agent_id: &str) -> String {
-    let default_prompt = "You are BossClaw assistant. Be concise and practical.".to_string();
+    let default_prompt = "You are AIR Agent assistant. Be concise and practical.".to_string();
     let agent = match read_agent(app, agent_id) {
         Some(value) => value,
         None => return default_prompt,
@@ -482,7 +482,7 @@ fn system_prompt_for_agent(app: &AppHandle, agent_id: &str) -> String {
     }
 
     format!(
-        "You are the BossClaw desktop assistant for this agent. Agent purpose: {}",
+        "You are the AIR Agent desktop assistant for this agent. Agent purpose: {}",
         purpose
     )
 }
@@ -963,12 +963,12 @@ pub async fn llm_plan(
         || lowered_message.contains("weekly")
         || lowered_message.contains("each minute");
 
-    let planner_system_prompt = r#"You are the BossClaw planning engine running inside BossClaw Desktop.
-BossClaw Desktop has a built-in mission scheduler and can create recurring missions directly.
-Output exactly one JSON object that validates against schema id "bossclaw.plan.v1".
+    let planner_system_prompt = r#"You are the AIR Agent planning engine running inside AIR Agent Desktop.
+AIR Agent Desktop has a built-in mission scheduler and can create recurring missions directly.
+Output exactly one JSON object that validates against schema id "air-agent.plan.v1".
 Rules:
 - Do not include markdown, code fences, or extra commentary.
-- Use "schema": "bossclaw.plan.v1".
+- Use "schema": "air-agent.plan.v1".
 - Use "mode": "autopilot" or "fsd".
 - Include "steps" with concise titles and tool ids.
 - Prefer tool "llm.generate" for text-generation steps.

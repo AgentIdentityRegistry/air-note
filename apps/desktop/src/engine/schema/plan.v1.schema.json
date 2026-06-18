@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "bossclaw.plan.v1",
+  "$id": "air-agent.plan.v1",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema", "goal", "mode", "steps"],
   "properties": {
     "schema": {
-      "const": "bossclaw.plan.v1"
+      "const": "air-agent.plan.v1"
     },
     "goal": {
       "type": "string",

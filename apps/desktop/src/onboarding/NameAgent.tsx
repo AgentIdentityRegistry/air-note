@@ -19,7 +19,7 @@ export function NameAgent() {
         </label>
         <Input
           autoFocus
-          placeholder="e.g. Peter's BossClaw"
+          placeholder="e.g. Peter's AIR Agent"
           value={state.name}
           onChange={(e) => dispatch({ type: "set_name", name: e.target.value })}
         />

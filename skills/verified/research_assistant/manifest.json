@@ -1,10 +1,10 @@
 {
-  "id": "bossclaw.skill.research_assistant",
+  "id": "air-agent.skill.research_assistant",
   "name": "Research Assistant",
   "version": "1.0.0",
   "description": "Guides structured web research with clear citations and notes.",
-  "author": "BossClaw",
-  "minBossClawVersion": "0.1.0",
+  "author": "AIR Agent",
+  "minAirAgentVersion": "0.1.0",
   "category": ["research", "analysis"],
   "tags": ["web", "research", "citations"],
   "runtime": {

@@ -1,10 +1,10 @@
 {
-  "id": "bossclaw.skill.daily_briefing_framework",
+  "id": "air-agent.skill.daily_briefing_framework",
   "name": "Daily Briefing Framework",
   "version": "1.0.0",
   "description": "Builds a recurring briefing workflow with topic priorities.",
-  "author": "BossClaw",
-  "minBossClawVersion": "0.1.0",
+  "author": "AIR Agent",
+  "minAirAgentVersion": "0.1.0",
   "category": ["automation", "operations"],
   "tags": ["briefing", "schedule", "workflow"],
   "runtime": {

@@ -1,5 +1,5 @@
 {
-  "name": "@bossclaw/desktop",
+  "name": "@air-agent/desktop",
   "license": "Apache-2.0",
   "version": "0.1.0",
   "private": true,
@@ -15,7 +15,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@bossclaw/shared": "file:../../packages/shared",
+    "@air-agent/shared": "file:../../packages/shared",
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-opener": "^2.2.6",
     "ajv": "^8.17.1",

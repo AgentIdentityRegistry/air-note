@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "BossClaw",
+  "productName": "AIR Agent",
   "version": "0.0.1",
-  "identifier": "ai.bossclaw.desktop",
+  "identifier": "ai.air-agent.desktop",
   "build": {
     "beforeDevCommand": "npm run dev:web",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "BossClaw",
+        "title": "AIR Agent",
         "label": "main",
         "width": 1200,
         "height": 800,

@@ -17,7 +17,7 @@ pub use client_trait::{AirClient, AirError};
 pub use mock_client::MockAirClient;
 pub use http_client::HttpAirClient;
 pub use did_wba::{generate_keypair, build_did, build_did_document, AgentKeypair};
-pub use identity::{IdentityStore, IdentityMetadata};
+pub use identity::{IdentityStore, IdentityMetadata, migrate_identity_keys, migrate_identity_metadata};
 pub use types::*;
 
 #[cfg(test)]

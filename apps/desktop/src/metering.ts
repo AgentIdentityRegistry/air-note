@@ -20,7 +20,7 @@ const PRICE_TABLE: Record<string, PricePoint> = {
   "anthropic_claude:default": { promptPer1k: 0, completionPer1k: 0 },
   "brave:search": { promptPer1k: 0, completionPer1k: 0 },
   "tavily:search": { promptPer1k: 0, completionPer1k: 0 },
-  "bossclaw:default": { promptPer1k: 0, completionPer1k: 0 }
+  "air-agent:default": { promptPer1k: 0, completionPer1k: 0 }
 };
 
 function normalizeModel(model: string | null): string {

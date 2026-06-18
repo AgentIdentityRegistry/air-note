@@ -34,7 +34,7 @@ pub async fn a2a_demo_round_trip() -> Result<serde_json::Value, String> {
         thread_id: uuid_v4(),
         nonce: uuid_v4(),
         body: MessageBody::Offer(Offer {
-            item_id: "bossclaw-demo-item-001".to_string(),
+            item_id: "air-agent-demo-item-001".to_string(),
             offered_value: Value::Cash {
                 amount_cents: 1000,
                 currency: "USD".to_string(),

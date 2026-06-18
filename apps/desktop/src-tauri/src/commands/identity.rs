@@ -53,7 +53,7 @@ pub async fn create_identity(
     // 3. Build manifest
     let manifest = AgentManifest {
         name: name.clone(),
-        description: "BossClaw agent owned by user (v1)".to_string(),
+        description: "AIR Agent owned by user (v1)".to_string(),
         capabilities: vec![
             "a2a-negotiate-marketplace".to_string(),
             "sign-attestation".to_string(),

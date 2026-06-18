@@ -43,7 +43,7 @@ export function Done({ onFinish }: { onFinish: () => void }) {
       </div>
 
       <div style={{ marginTop: 24 }}>
-        <Button onClick={onFinish}>Open BossClaw</Button>
+        <Button onClick={onFinish}>Open AIR Agent</Button>
       </div>
     </Card>
   );

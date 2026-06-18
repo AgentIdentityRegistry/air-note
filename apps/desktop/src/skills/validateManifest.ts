@@ -10,7 +10,7 @@ export type Manifest = {
   version: string;
   description: string;
   author: string;
-  minBossClawVersion: string;
+  minAirAgentVersion: string;
   category?: string[];
   tags?: string[];
   runtime:

@@ -41,7 +41,7 @@ fn round_trip_works() {
 #[test]
 fn macos_keychain_round_trip() {
     use super::macos::MacosVault;
-    let v = MacosVault::new("ai.bossclaw.test");
+    let v = MacosVault::new("ai.air-agent.test");
     v.set("test_key", "test_value").unwrap();
     let got = v.get("test_key").unwrap();
     assert_eq!(got, Some("test_value".to_string()));

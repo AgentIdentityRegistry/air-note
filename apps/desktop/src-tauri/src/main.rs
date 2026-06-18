@@ -42,14 +42,22 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // One-time rename migration (BossClaw -> AIR Agent). Idempotent + best-effort;
+            // safe on every launch. MUST run before the vault/identity store are used below.
             let vault = vault::default_vault();
+            let legacy_vault = vault::vault_for_service(vault::LEGACY_IDENTITY_SERVICE);
+            let _ = air::migrate_identity_keys(legacy_vault.as_ref(), vault.as_ref());
+            vault::migrate_legacy_blob_once();
+
             let data_dir = app.path().app_data_dir().expect("app data dir");
+            let _ = air::migrate_identity_metadata(&data_dir, vault::LEGACY_IDENTITY_SERVICE);
+
             let identity_store = IdentityStore::new(vault, data_dir);
 
-            // Default to mock for dev; toggle to real AIR via BOSSCLAW_USE_REAL_AIR env var.
+            // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
             // Settings UI will offer a friendlier toggle in a later task.
             let air_client: Arc<dyn air::AirClient> =
-                if std::env::var("BOSSCLAW_USE_REAL_AIR").is_ok() {
+                if std::env::var("AIR_AGENT_USE_REAL_AIR").is_ok() {
                     Arc::new(HttpAirClient::production())
                 } else {
                     Arc::new(MockAirClient::new())

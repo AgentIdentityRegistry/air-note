@@ -6,12 +6,12 @@ export function Welcome() {
   const { dispatch } = useOnboarding();
   return (
     <Card>
-      <h1 style={{ margin: 0 }}>Welcome to BossClaw</h1>
+      <h1 style={{ margin: 0 }}>Welcome to AIR Agent</h1>
       <p style={{ color: "#666", marginTop: 4 }}>
         Your AI agent, with verifiable identity.
       </p>
       <p style={{ marginTop: "1.5rem", lineHeight: 1.5 }}>
-        BossClaw is an open-source AI agent that acts on your behalf. To start,
+        AIR Agent is an open-source AI agent that acts on your behalf. To start,
         we&apos;ll create a cryptographic identity for your agent and register it with{" "}
         <a href="https://agentidentityregistry.org" target="_blank" rel="noreferrer">AIR</a> (the
         Agent Identity Registry).
