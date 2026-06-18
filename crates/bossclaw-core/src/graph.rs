@@ -355,6 +355,47 @@ pub fn fold_pages(events: &[Event]) -> Vec<Page> {
     by_topic.into_values().collect()
 }
 
+/// A folded folder grant (M5a): the CURRENT state of one granted root. A
+/// deterministic fold over `grant`/`revoke` events; rebuilt by `rebuild_graph`.
+/// `revoked` files are kept in the log forever but excluded from recall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    /// The canonicalized absolute folder path (the grant's identity key).
+    pub canonical_root: String,
+    /// RFC 3339 ts of the latest `grant` event for this root (provenance).
+    pub granted_at: String,
+    /// True iff the latest event for this root is a `revoke`.
+    pub revoked: bool,
+}
+
+/// Extract `canonical_root` from a `grant`/`revoke` event's content, or `None`.
+fn parse_grant_content(content: &serde_json::Value) -> Option<String> {
+    Some(content.get("canonical_root")?.as_str()?.to_string())
+}
+
+/// Fold `grant`/`revoke` events (MUST be in `seq` order) into the current grant
+/// per root (last-writer-wins). A `grant` (re)activates and stamps `granted_at`;
+/// a `revoke` marks an EXISTING root revoked. A `revoke` with no prior grant is
+/// ignored. Deterministic → byte-identical rebuild.
+pub fn fold_grants(events: &[Event]) -> Vec<Grant> {
+    use std::collections::BTreeMap;
+    let mut by_root: BTreeMap<String, Grant> = BTreeMap::new();
+    for ev in events {
+        let root = match parse_grant_content(&ev.content) {
+            Some(r) => r,
+            None => continue,
+        };
+        if ev.event_type == GRANT_EVENT_TYPE {
+            by_root.insert(root.clone(), Grant { canonical_root: root, granted_at: ev.ts.clone(), revoked: false });
+        } else if ev.event_type == REVOKE_EVENT_TYPE {
+            if let Some(g) = by_root.get_mut(&root) {
+                g.revoked = true;
+            }
+        }
+    }
+    by_root.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +478,42 @@ mod tests {
             assert_ne!(GRANT_EVENT_TYPE, other);
             assert_ne!(REVOKE_EVENT_TYPE, other);
         }
+    }
+
+    #[test]
+    fn fold_grants_is_last_writer_wins_per_root() {
+        // grant A, grant B, revoke A, grant A again → A active (re-granted), B active.
+        let mk = |etype: &str, root: &str, ts: &str| Event {
+            id: String::new(), ts: ts.to_string(), valid_time: None,
+            event_type: etype.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        let events = vec![
+            mk(GRANT_EVENT_TYPE, "/a", "2026-06-18T00:00:00Z"),
+            mk(GRANT_EVENT_TYPE, "/b", "2026-06-18T00:00:01Z"),
+            mk(REVOKE_EVENT_TYPE, "/a", "2026-06-18T00:00:02Z"),
+            mk(GRANT_EVENT_TYPE, "/a", "2026-06-18T00:00:03Z"),
+        ];
+        let mut grants = fold_grants(&events);
+        grants.sort_by(|x, y| x.canonical_root.cmp(&y.canonical_root));
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].canonical_root, "/a");
+        assert!(!grants[0].revoked, "/a was re-granted after revoke → active");
+        assert_eq!(grants[0].granted_at, "2026-06-18T00:00:03Z", "granted_at = latest grant ts");
+        assert!(!grants[1].revoked, "/b never revoked");
+    }
+
+    #[test]
+    fn fold_grants_revoke_without_grant_is_ignored() {
+        let ev = Event {
+            id: String::new(), ts: "2026-06-18T00:00:00Z".to_string(), valid_time: None,
+            event_type: REVOKE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": "/never-granted" }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        assert!(fold_grants(&[ev]).is_empty(), "a revoke with no prior grant yields no row");
     }
 }

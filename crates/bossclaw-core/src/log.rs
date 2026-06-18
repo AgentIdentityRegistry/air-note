@@ -238,6 +238,16 @@ impl EventLog {
                 text          TEXT NOT NULL
             )",
         )?;
+        // Folder-grant projection (Tier-A; M5a). One row per granted root; a
+        // deterministic fold over `grant`/`revoke` events, rebuilt by `rebuild_graph`.
+        // `ingest_all` iterates active (revoked = 0) grants only.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS grants (
+                canonical_root TEXT PRIMARY KEY,
+                granted_at     TEXT NOT NULL,
+                revoked        INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
         // Summarize progress high-water-mark (spec §6 / F1) — sibling of
         // evolve_cursor. NOT a fold: losing it only re-derives the dirty set
         // (idempotent via the cited-set check). Single row.
@@ -1728,6 +1738,57 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Grant read-access to a folder (M5a). Canonicalizes `path`, appends a
+    /// ground-truth `grant` event, and refreshes the grants projection. Returns the
+    /// event id. Canonicalization fails closed if the path does not exist.
+    pub fn add_grant(&self, path: &std::path::Path) -> Result<String, BossclawError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| BossclawError::InvalidInput(format!("grant path not resolvable: {e}")))?;
+        let root = canonical.to_string_lossy().to_string();
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::GRANT_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Revoke a previously-granted folder (M5a). Canonicalizes `path`, appends a
+    /// ground-truth `revoke` event, and refreshes the grants projection. Ingested
+    /// files under a revoked root stay in the log but are excluded from recall.
+    pub fn revoke_grant(&self, path: &std::path::Path) -> Result<String, BossclawError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| BossclawError::InvalidInput(format!("revoke path not resolvable: {e}")))?;
+        let root = canonical.to_string_lossy().to_string();
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::REVOKE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Every grant (active and revoked), `ORDER BY canonical_root ASC`. Tier-A read.
+    pub fn grants(&self) -> Result<Vec<crate::graph::Grant>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_root, granted_at, revoked FROM grants ORDER BY canonical_root ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::Grant {
+            canonical_root: r.get(0)?, granted_at: r.get(1)?, revoked: r.get::<_, i64>(2)? != 0,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
     /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
     /// default for `source_event_ids` is gated to the manual producer only.
     ///
@@ -1838,6 +1899,10 @@ impl EventLog {
         let page_events = self.page_and_supersede_events_ordered()?;
         let pages = crate::graph::fold_pages(&page_events);
 
+        // Fold grant/revoke events → current grants projection (M5a).
+        let grant_events = self.grant_events_ordered()?;
+        let grants = crate::graph::fold_grants(&grant_events);
+
         let memory_ids = self.memory_page_ids()?;
 
         // Distinct endpoints → nodes (BTreeMap = deterministic node order).
@@ -1866,6 +1931,7 @@ impl EventLog {
         tx.execute("DELETE FROM nodes", [])?;
         tx.execute("DELETE FROM entities", [])?;
         tx.execute("DELETE FROM pages", [])?;
+        tx.execute("DELETE FROM grants", [])?;
         for e in &edges {
             tx.execute(
                 "INSERT INTO edges
@@ -1903,6 +1969,12 @@ impl EventLog {
             tx.execute(
                 "INSERT INTO pages (topic_id, page_event_id, title, text) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![p.topic_id, p.page_event_id, p.title, p.text],
+            )?;
+        }
+        for g in &grants {
+            tx.execute(
+                "INSERT INTO grants (canonical_root, granted_at, revoked) VALUES (?1, ?2, ?3)",
+                rusqlite::params![g.canonical_root, g.granted_at, g.revoked as i64],
             )?;
         }
         tx.commit()?;
@@ -1959,6 +2031,21 @@ impl EventLog {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows { out.push(serde_json::from_str(&row?)?); }
+        Ok(out)
+    }
+
+    /// All `grant`/`revoke` events, payload-parsed, in chain (`seq ASC`) order.
+    fn grant_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('grant', 'revoke') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
         Ok(out)
     }
 
@@ -3421,6 +3508,29 @@ mod tests {
             vec!["a".to_string(), "b".to_string()],
             "manual empty-source link defaults to [src, dst]"
         );
+    }
+
+    #[test]
+    fn grants_persist_revoke_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real folder to canonicalize.
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        {
+            let log = open_log(dir.path());
+            log.add_grant(&folder).unwrap();
+            let g = log.grants().unwrap();
+            assert_eq!(g.len(), 1);
+            assert!(!g[0].revoked);
+            log.revoke_grant(&folder).unwrap();
+            assert!(log.grants().unwrap()[0].revoked, "revoke marks the row");
+        }
+        // Reopen: grants are a fold over events, so they rebuild from the log.
+        let log2 = open_log(dir.path());
+        log2.rebuild_graph().unwrap();
+        let g = log2.grants().unwrap();
+        assert_eq!(g.len(), 1, "grant survives reopen via replay");
+        assert!(g[0].revoked, "revoked state survives reopen");
     }
 
     /// Minimal `memory` event for the graph-BFS unit test (mirrors the helper in
