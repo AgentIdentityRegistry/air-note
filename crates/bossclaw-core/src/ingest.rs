@@ -9,6 +9,61 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// Max bytes read per file. Files larger than this are skipped (recorded), not
+/// truncated — a partial body would corrupt content_hash + recall. 10 MiB covers
+/// notes/markdown/code; rich/large formats wait for M5b.
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+/// Whole-run wall-clock budget (spec §6.2). The walk stops cleanly past this and
+/// records a budget skip, so a pathological tree never hangs the engine.
+const INGEST_WALL_CLOCK: Duration = Duration::from_secs(300);
+/// Max directory nesting depth (defense against pathological/looping trees; the
+/// inode-seen set also breaks hardlink loops).
+const MAX_WALK_DEPTH: usize = 64;
+
+/// Directory names never descended into (hazard reduction, NOT a containment
+/// boundary — the boundary is the grant + informed consent; spec §6.3). Matched
+/// **case-insensitively**: the primary platform (macOS/APFS) is case-insensitive,
+/// so a case-sensitive filter would let `.SSH` bypass it. Keep these LOWERCASE.
+const NEVER_TOUCH_DIRS: &[&str] =
+    &[".ssh", ".aws", ".azure", ".gnupg", ".git", ".kube", ".docker", "gcloud"];
+/// Exact file names never ingested (LOWERCASE; matched case-insensitively).
+const NEVER_TOUCH_FILES: &[&str] = &[
+    ".env", ".netrc", ".pgpass", ".git-credentials", "wallet.dat",
+    ".npmrc", ".pypirc", ".dockercfg", "known_hosts",
+];
+/// Glob patterns never ingested. Only two shapes: `*.ext` (suffix) and `prefix*`
+/// (prefix). LOWERCASE; matched case-insensitively. Single-sourced + tested.
+const NEVER_TOUCH_GLOBS: &[&str] = &[
+    "*.key", "*.pem", "*.p12", "*.pfx", "*.gpg", "*.asc", "id_*",
+    "*.keychain", "*.kdbx", "*.jks", "*.ppk", "*.mobileconfig", "*.ovpn",
+];
+
+/// True if `name_lc` (already lowercased by the caller) matches a `*.ext` (suffix)
+/// or `prefix*` (prefix) glob. Patterns are already lowercase.
+fn matches_glob(name_lc: &str, pattern: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        name_lc.ends_with(suffix)
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name_lc.starts_with(prefix)
+    } else {
+        name_lc == pattern
+    }
+}
+
+/// Whether a directory component must never be descended (hazard reduction).
+/// Case-insensitive. Also catches the `.config/gh` pair via `rel_dir`.
+fn is_never_touch_dir(name: &str, rel_dir: &str) -> bool {
+    let name_lc = name.to_lowercase();
+    NEVER_TOUCH_DIRS.contains(&name_lc.as_str()) || rel_dir.to_lowercase().ends_with(".config/gh")
+}
+
+/// Whether a file component must never be ingested. Case-insensitive.
+fn is_never_touch_file(name: &str) -> bool {
+    let name_lc = name.to_lowercase();
+    NEVER_TOUCH_FILES.contains(&name_lc.as_str()) || NEVER_TOUCH_GLOBS.iter().any(|g| matches_glob(&name_lc, g))
+}
 
 /// A sanitized type hint for parser dispatch (spec §4). Carries the lowercased
 /// file extension ONLY — never a resolvable path — so a `Parser` can never
@@ -107,8 +162,9 @@ pub struct IngestReport {
 /// A per-run identity for hardlink/inode dedup. On Unix this is `(dev, ino)`; on
 /// Windows (where rustix has no `openat`) it falls back to the canonical path —
 /// a documented weaker guarantee (hardlinks are not deduped on Windows).
-// `Path` variant + the type itself are only constructed on their matching OS;
-// wired into the walk's dedup map in Task 6/7.
+// The walk's dedup `HashSet` now uses this type, but each variant is constructed
+// only on its matching OS (`DevIno` on unix, `Path` on Windows), so the off-target
+// variant is dead per build — the allow silences that per-variant case.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum FileIdentity {
@@ -132,12 +188,14 @@ pub(crate) struct ContainedFile {
 }
 
 impl ContainedFile {
-    // `identity`/`size` are consumed by the walk's dedup + budget logic in Task 6/7.
-    #[allow(dead_code)]
+    // Consumed by the unix walk's dedup + oversize check. On Windows the walk is
+    // cfg'd out (no `openat`), so these accessors have no caller there yet — keep
+    // the allow only on non-unix until the Windows ingest path lands.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn identity(&self) -> &FileIdentity {
         &self.identity
     }
-    #[allow(dead_code)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn size(&self) -> u64 {
         self.size
     }
@@ -166,8 +224,7 @@ impl ContainedFile {
 //    here refuses a final-component symlink AND a dir swapped to a symlink after
 //    readdir named it (TOCTOU). On Linux we additionally use openat2 with
 //    RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS (spec D3) when the kernel supports it. ──
-// Wired into the walk in Task 6 (it produces the `dir_fd` chain that calls this).
-#[allow(dead_code)]
+// Called by the walk (Task 6) for every regular-file leaf it surfaces.
 #[cfg(unix)]
 pub(crate) fn careful_open_file(
     dir_fd: &std::os::fd::OwnedFd,
@@ -268,6 +325,211 @@ pub(crate) fn careful_open_windows(
         identity: FileIdentity::Path(canonical),
         size: opened.len(),
     })
+}
+
+/// A file the walk surfaced for ingest: the contained handle + its path + a
+/// sanitized hint. `canonical_path` is `grant_root` (already canonicalized) joined
+/// with the walk-relative components — safe to treat as canonical because the walk
+/// admitted no symlink and no `..`, so it equals `realpath` WITHOUT re-resolving.
+// The ingest orchestrator (Task 7) reads `file` (the contained read), `canonical_path`
+// (provenance), and `hint` (parser dispatch). The walk + its tests construct
+// `WalkedFile` and hand it to the sink; the lib build (no tests) sees no reader yet.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub(crate) struct WalkedFile {
+    pub(crate) file: ContainedFile,
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) hint: PathHint,
+}
+
+/// Recursively walk `grant_root` (already canonicalized), invoking `sink` for each
+/// ingestable regular file. No-symlink-follow, never-touch-filtered, depth- and
+/// wall-clock-bounded, inode-deduped within the run. `report.skipped` accumulates
+/// never-touch / oversize / budget skips. Returns early (Ok) when the wall-clock
+/// budget is hit (a `<budget>` skip is recorded).
+// Driven by the ingest orchestrator in Task 7; exercised by `walk_tests` now.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub(crate) fn walk_grant(
+    grant_root: &std::path::Path,
+    started: Instant,
+    seen: &mut std::collections::HashSet<FileIdentity>,
+    report: &mut IngestReport,
+    mut sink: impl FnMut(WalkedFile) -> Result<(), crate::error::BossclawError>,
+) -> Result<(), crate::error::BossclawError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::ffi::OsStrExt;
+
+    let root_fd = rustix::fs::openat(
+        rustix::fs::CWD, grant_root.as_os_str().as_bytes(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty(),
+    ).map_err(|e| crate::error::BossclawError::Io(std::io::Error::other(e.to_string())))?;
+
+    // Explicit stack of (dir_fd, rel_dir, depth) so recursion can't blow the
+    // native stack; each dir_fd was opened from its parent with O_NOFOLLOW.
+    let mut stack: Vec<(std::os::fd::OwnedFd, String, usize)> = vec![(root_fd, String::new(), 0)];
+
+    while let Some((dir_fd, rel_dir, depth)) = stack.pop() {
+        if started.elapsed() > INGEST_WALL_CLOCK {
+            report.skipped.push((grant_root.join(&rel_dir), "wall-clock budget exceeded".into()));
+            return Ok(());
+        }
+        // Read entries from the dir fd. `Dir` borrows the fd; collect names first.
+        let dir = rustix::fs::Dir::read_from(&dir_fd)
+            .map_err(|e| crate::error::BossclawError::Io(std::io::Error::other(e.to_string())))?;
+        let mut entries: Vec<std::ffi::OsString> = Vec::new();
+        for entry in dir {
+            let entry = entry.map_err(|e| crate::error::BossclawError::Io(std::io::Error::other(e.to_string())))?;
+            let name_bytes = entry.file_name().to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            entries.push(std::ffi::OsStr::from_bytes(name_bytes).to_os_string());
+        }
+
+        for name_os in entries {
+            let name = name_os.to_string_lossy().to_string();
+            let rel_child = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
+
+            // statat with SYMLINK_NOFOLLOW: classify WITHOUT following symlinks.
+            let st = match rustix::fs::statat(&dir_fd, name_os.as_bytes(), rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => st,
+                Err(e) => { report.skipped.push((grant_root.join(&rel_child), format!("stat failed: {e}"))); continue; }
+            };
+            let ftype = rustix::fs::FileType::from_raw_mode(st.st_mode);
+
+            if ftype == rustix::fs::FileType::Symlink {
+                // No-symlink-follow: silently skip (not an error; expected).
+                continue;
+            }
+            if ftype == rustix::fs::FileType::Directory {
+                if is_never_touch_dir(&name, &rel_child) {
+                    report.skipped.push((grant_root.join(&rel_child), "never-touch dir".into()));
+                    continue;
+                }
+                if depth + 1 > MAX_WALK_DEPTH {
+                    report.skipped.push((grant_root.join(&rel_child), "max depth exceeded".into()));
+                    continue;
+                }
+                let child_fd = match rustix::fs::openat(
+                    &dir_fd, name_os.as_bytes(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty(),
+                ) {
+                    Ok(fd) => fd,
+                    Err(e) => { report.skipped.push((grant_root.join(&rel_child), format!("dir open refused: {e}"))); continue; }
+                };
+                stack.push((child_fd, rel_child, depth + 1));
+                continue;
+            }
+            if ftype != rustix::fs::FileType::RegularFile {
+                continue; // fifo, socket, device — skip silently
+            }
+
+            // Regular file.
+            if is_never_touch_file(&name) {
+                report.skipped.push((grant_root.join(&rel_child), "never-touch file".into()));
+                continue;
+            }
+            let cf = match careful_open_file(&dir_fd, &name_os) {
+                Ok(cf) => cf,
+                Err(IngestError::TooLarge) => { report.skipped.push((grant_root.join(&rel_child), "oversize".into())); continue; }
+                Err(e) => { report.failed.push((grant_root.join(&rel_child), e.to_string())); continue; }
+            };
+            if cf.size() > MAX_FILE_BYTES as u64 {
+                report.skipped.push((grant_root.join(&rel_child), "oversize".into()));
+                continue;
+            }
+            if !seen.insert(cf.identity().clone()) {
+                continue; // same inode already ingested this run (hardlink / overlap)
+            }
+            let hint = PathHint {
+                ext: std::path::Path::new(&name).extension().map(|e| e.to_string_lossy().to_lowercase()),
+            };
+            sink(WalkedFile { file: cf, canonical_path: grant_root.join(&rel_child), hint })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    #[test]
+    fn never_touch_files_and_globs() {
+        assert!(is_never_touch_file(".env"));
+        assert!(is_never_touch_file("server.key"));
+        assert!(is_never_touch_file("id_rsa"));
+        assert!(is_never_touch_file("vault.kdbx"));
+        assert!(is_never_touch_file("cert.p12"));
+        assert!(is_never_touch_file("known_hosts"));
+        // Case-insensitive (macOS/APFS): uppercase variants must also match.
+        assert!(is_never_touch_file(".ENV"));
+        assert!(is_never_touch_file("Server.PEM"));
+        assert!(is_never_touch_file("ID_RSA"));
+        assert!(!is_never_touch_file("notes.md"));
+        assert!(!is_never_touch_file("readme.txt"));
+    }
+
+    #[test]
+    fn never_touch_dirs_including_config_gh() {
+        assert!(is_never_touch_dir(".ssh", "project/.ssh"));
+        assert!(is_never_touch_dir(".SSH", "project/.SSH")); // case-insensitive (macOS)
+        assert!(is_never_touch_dir(".git", "project/.git"));
+        assert!(is_never_touch_dir("gh", "home/.config/gh"));
+        assert!(!is_never_touch_dir("src", "project/src"));
+    }
+
+    #[test]
+    fn glob_shapes() {
+        assert!(matches_glob("a.pem", "*.pem"));
+        assert!(matches_glob("id_ed25519", "id_*"));
+        assert!(!matches_glob("pem.txt", "*.pem"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod walk_tests {
+    use super::*;
+
+    fn collect(root: &std::path::Path) -> (Vec<String>, IngestReport) {
+        let mut report = IngestReport::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        walk_grant(root, Instant::now(), &mut seen, &mut report, |wf| {
+            names.push(wf.canonical_path.file_name().unwrap().to_string_lossy().to_string());
+            Ok(())
+        }).unwrap();
+        names.sort();
+        (names, report)
+    }
+
+    #[test]
+    fn walk_skips_never_touch_and_symlinks_finds_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.md"), b"a").unwrap();
+        std::fs::write(root.join(".env"), b"SECRET=1").unwrap();
+        std::fs::write(root.join("k.pem"), b"key").unwrap();
+        std::fs::create_dir(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh").join("id_rsa"), b"key").unwrap();
+        std::os::unix::fs::symlink(root.join("a.md"), root.join("link.md")).unwrap();
+
+        let (names, report) = collect(root);
+        assert_eq!(names, vec!["a.md".to_string()], "only the plain file is surfaced");
+        assert!(report.skipped.iter().any(|(_, r)| r == "never-touch file"));
+        assert!(report.skipped.iter().any(|(_, r)| r == "never-touch dir"));
+    }
+
+    #[test]
+    fn walk_dedups_hardlinks_within_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("orig.txt"), b"data").unwrap();
+        std::fs::hard_link(root.join("orig.txt"), root.join("dup.txt")).unwrap();
+        let (names, _r) = collect(root);
+        assert_eq!(names.len(), 1, "a hardlinked inode is surfaced once per run");
+    }
 }
 
 #[cfg(test)]
