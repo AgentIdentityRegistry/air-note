@@ -26,6 +26,7 @@ pub mod fastembed;
 pub mod graph;
 pub mod highwater;
 pub mod index;
+pub mod ingest;
 pub mod keyword;
 pub mod log;
 pub mod model2vec;
@@ -50,5 +51,6 @@ pub use model2vec::Model2Vec;
 #[cfg(feature = "ollama")]
 pub use ollama::OllamaReasoner;
 pub use reason::{Reasoner, ScriptedReasoner};
+pub use ingest::{IngestReport, NativeTextParser, Parser, PathHint};
 pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};
 pub use summarize::{FactSet, RenderedPage};
