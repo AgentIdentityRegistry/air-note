@@ -1915,8 +1915,29 @@ impl EventLog {
     ///
     /// Returns an owned `String` (not the `&'static str` const) because M4/M7 will
     /// make this dynamic — the user's real DID, looked up per call.
-    fn signer_did(&self) -> String {
+    pub(crate) fn signer_did(&self) -> String {
         ENGINE_SIGNER_DID.to_string()
+    }
+
+    /// Derive + persist the vector for a just-appended event id (M5a ingest convenience).
+    /// Best-effort: a non-embeddable or text-less event is a no-op.
+    // Called by the unix ingest orchestrator (`ingest_grant_inner`), whose own
+    // production caller is Task 11's `ingest_all`; until then the non-test lib
+    // build sees no live caller — keep the allow until Task 11.
+    #[allow(dead_code)]
+    pub(crate) fn derive_vector_for(&self, embedder: &dyn Embedder, event_id: &str) -> Result<(), BossclawError> {
+        let payload: Option<String> = {
+            let store = self.inner.lock().expect(POISON);
+            store.conn().query_row(
+                "SELECT payload FROM events WHERE id = ?1", rusqlite::params![event_id],
+                |r| r.get::<_, String>(0),
+            ).optional()?
+        };
+        if let Some(p) = payload {
+            let ev: Event = serde_json::from_str(&p)?;
+            self.derive_vector(embedder, &ev)?;
+        }
+        Ok(())
     }
 
     /// Rebuild the persisted `edges`/`nodes` tables as a deterministic fold over

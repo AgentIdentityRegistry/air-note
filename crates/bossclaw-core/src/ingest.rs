@@ -11,6 +11,16 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+// `Event` is used by the cross-platform `is_external` classifier, so it stays
+// un-gated. `sha2` (content hashing) and `EventLog` (the orchestrator impl) are
+// consumed ONLY by the `#[cfg(unix)]` ingest path — gate them so the Windows
+// build has no unused imports (the walk, hence the orchestrator, is unix-only).
+use crate::event::Event;
+#[cfg(unix)]
+use crate::log::EventLog;
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+
 /// Max bytes read per file. Files larger than this are skipped (recorded), not
 /// truncated — a partial body would corrupt content_hash + recall. 10 MiB covers
 /// notes/markdown/code; rich/large formats wait for M5b.
@@ -208,7 +218,9 @@ impl ContainedFile {
 
     /// Read up to `cap` bytes. Returns [`IngestError::TooLarge`] if the file has
     /// more than `cap` bytes (read `cap + 1` and check) — never a truncated body.
-    // Called by the walk orchestrator in Task 6/7 (the single contained read).
+    // The unix ingest orchestrator (the single contained read) + `containment_tests`
+    // consume it, but the orchestrator's own production caller is Task 11; until
+    // then the non-test lib build sees no live caller — keep the allow until Task 11.
     #[allow(dead_code)]
     pub(crate) fn read_all_capped(mut self, cap: usize) -> Result<Vec<u8>, IngestError> {
         let mut buf = Vec::with_capacity(self.size.min(cap as u64) as usize);
@@ -222,6 +234,18 @@ impl ContainedFile {
             return Err(IngestError::TooLarge);
         }
         Ok(buf)
+    }
+
+    /// File mtime as RFC 3339 UTC (provenance only).
+    // Reached only via the unix orchestrator's `file_mtime_rfc3339` (dead in the
+    // non-test lib build until Task 11's `ingest_all`).
+    #[allow(dead_code)]
+    pub(crate) fn modified_at_rfc3339(&self) -> String {
+        use chrono::{DateTime, Utc};
+        self.file.metadata().ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| DateTime::<Utc>::from(t).to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string())
     }
 }
 
@@ -471,6 +495,167 @@ pub(crate) fn walk_grant(
     Ok(())
 }
 
+/// Build the signed content of a `file_ingested` event (D4). `text` is top-level
+/// so `embeddable_text` finds it; `origin` is the taint stamp; everything is
+/// inside the signed bytes (JCS canonical + byte-identical rebuild).
+// Called only by `ingest_grant_inner` (dead in the non-test lib build until the
+// Task 11 `ingest_all` production caller lands).
+#[cfg(unix)]
+#[allow(dead_code)]
+fn file_ingested_content(
+    text: &str,
+    canonical_path: &str,
+    raw: &[u8],
+    grant_root: &str,
+    parser_id: &str,
+    modified_at: &str,
+) -> serde_json::Value {
+    let content_hash = hex::encode(Sha256::digest(raw));
+    let text_hash = hex::encode(Sha256::digest(text.as_bytes()));
+    serde_json::json!({
+        "text": text,
+        "origin": crate::graph::EXTERNAL_ORIGIN,
+        "provenance": {
+            "canonical_path": canonical_path,
+            "content_hash": content_hash,
+            "text_hash": text_hash,
+            "size_bytes": raw.len(),
+            "modified_at": modified_at,
+            "parser_id": parser_id,
+            "grant_root": grant_root,
+        }
+    })
+}
+
+/// True iff `event` is externally-tainted (M5a, D5). The classifier the M6
+/// actuator's fail-closed lineage walk will consume; here it is the taint root +
+/// a tested predicate. Reads the single-sourced `EXTERNAL_ORIGIN` stamp.
+#[allow(dead_code)] // re-exported + tested in Task 9
+pub fn is_external(event: &Event) -> bool {
+    event.content.get("origin").and_then(|v| v.as_str()) == Some(crate::graph::EXTERNAL_ORIGIN)
+}
+
+#[cfg(unix)]
+impl EventLog {
+    /// Ingest one already-granted, canonicalized folder `grant_root`. Walks it
+    /// safely, parses each file, applies the per-path dedup/supersede decision,
+    /// appending ground-truth `file_ingested` events (D4). Best-effort: per-file
+    /// problems land in the returned [`IngestReport`], not as errors. `seen` is
+    /// the run-wide inode-dedup set (shared across grants by `ingest_all`).
+    /// Re-checks the grant is still active before EVERY append so a concurrent
+    /// `revoke_grant` stops further writes (spec §7).
+    // The production caller is `ingest_all` (Task 11); until then only the
+    // `#[cfg(all(test, unix))]` orchestrator test exercises it, so the non-test
+    // lib build sees no caller — keep the allow until Task 11 wires `ingest_all`.
+    #[allow(dead_code)]
+    pub(crate) fn ingest_grant_inner(
+        &self,
+        grant_root: &std::path::Path,
+        parser: &dyn Parser,
+        embedder: &dyn crate::embed::Embedder,
+        started: Instant,
+        seen: &mut std::collections::HashSet<FileIdentity>,
+        report: &mut IngestReport,
+    ) -> Result<(), crate::error::BossclawError> {
+        let grant_root_str = grant_root.to_string_lossy().to_string();
+        // Collect walked files first (the walk borrows dir fds; appends happen after).
+        let mut walked: Vec<WalkedFile> = Vec::new();
+        walk_grant(grant_root, started, seen, report, |wf| { walked.push(wf); Ok(()) })?;
+
+        for wf in walked {
+            if started.elapsed() > INGEST_WALL_CLOCK {
+                report.skipped.push((wf.canonical_path, "wall-clock budget exceeded".into()));
+                continue;
+            }
+            // Re-check the grant is active before doing work (revoke mid-ingest).
+            let still_active = self.grants()?.iter().any(|g| g.canonical_root == grant_root_str && !g.revoked);
+            if !still_active {
+                report.skipped.push((wf.canonical_path, "grant revoked mid-ingest".into()));
+                continue;
+            }
+
+            let canonical_path = wf.canonical_path.to_string_lossy().to_string();
+            let modified_at = file_mtime_rfc3339(&wf.file);
+            let raw = match wf.file.read_all_capped(MAX_FILE_BYTES) {
+                Ok(b) => b,
+                Err(IngestError::TooLarge) => { report.skipped.push((wf.canonical_path, "oversize".into())); continue; }
+                Err(e) => { report.failed.push((wf.canonical_path, e.to_string())); continue; }
+            };
+            let text = match parser.convert(&raw, &wf.hint) {
+                Ok(t) => t,
+                Err(e @ IngestError::NonUtf8) => { report.skipped.push((wf.canonical_path, e.to_string())); continue; }
+                Err(e) => { report.failed.push((wf.canonical_path, e.to_string())); continue; }
+            };
+            let content = file_ingested_content(&text, &canonical_path, &raw, &grant_root_str, parser.parser_id(), &modified_at);
+            let new_hash = content["provenance"]["content_hash"].as_str().unwrap().to_string();
+
+            // ── Dedup / supersede decision (spec §4 table), keyed on canonical_path ──
+            match self.current_file_for_path(&canonical_path)? {
+                Some(prev) if prev.content_hash == new_hash => {
+                    report.deduped += 1; // same path + same bytes → no-op
+                }
+                Some(prev) => {
+                    // Changed bytes → atomic ground-truth supersede + new file_ingested.
+                    let supersede_ev = ground_truth_supersede(&prev.file_event_id, self.signer_did());
+                    let file_ev = ground_truth_file_ingested(content, self.signer_did());
+                    let (_s, new_id) = self.append_pair(supersede_ev, file_ev)?;
+                    self.derive_vector_for(embedder, &new_id)?;
+                    report.superseded += 1;
+                }
+                None => {
+                    let file_ev = ground_truth_file_ingested(content, self.signer_did());
+                    let new_id = self.append(file_ev)?;
+                    self.derive_vector_for(embedder, &new_id)?;
+                    report.ingested += 1;
+                }
+            }
+        }
+        // Refresh the `files`/`grants` projection so the per-path dedup/supersede
+        // decision (`current_file_for_path`) is correct on the NEXT run — the same
+        // append→rebuild lifecycle `add_grant`/`revoke_grant` use. NB: this does NOT
+        // rebuild the in-memory ANN/FTS recall indexes; callers (`ingest_all`, tests)
+        // still run `rebuild_indexes` before recall (contract note).
+        self.rebuild_graph()?;
+        Ok(())
+    }
+}
+
+/// A ground-truth `file_ingested` Event (model_meta: None → plain append/append_pair).
+// Called only by `ingest_grant_inner` (dead until Task 11's `ingest_all`).
+#[cfg(unix)]
+#[allow(dead_code)]
+fn ground_truth_file_ingested(content: serde_json::Value, signer_did: String) -> Event {
+    Event {
+        id: String::new(), ts: String::new(), valid_time: None,
+        event_type: crate::graph::FILE_INGESTED_EVENT_TYPE.to_string(),
+        content, model_meta: None, prev_hash: String::new(), hash: None,
+        signed_by_did: signer_did, signature: None,
+    }
+}
+
+/// A ground-truth `supersede` Event retiring `prior_id` (reuses SUPERSEDE_EVENT_TYPE
+/// but with model_meta: None — cross-fold safety holds via disjoint event ids).
+// Called only by `ingest_grant_inner` (dead until Task 11's `ingest_all`).
+#[cfg(unix)]
+#[allow(dead_code)]
+fn ground_truth_supersede(prior_id: &str, signer_did: String) -> Event {
+    Event {
+        id: String::new(), ts: String::new(), valid_time: None,
+        event_type: crate::graph::SUPERSEDE_EVENT_TYPE.to_string(),
+        content: serde_json::json!({ "supersedes": prior_id }),
+        model_meta: None, prev_hash: String::new(), hash: None,
+        signed_by_did: signer_did, signature: None,
+    }
+}
+
+/// File mtime as RFC 3339 (provenance only; NEVER a dedup/identity key).
+// Called only by `ingest_grant_inner` (dead until Task 11's `ingest_all`).
+#[cfg(unix)]
+#[allow(dead_code)]
+fn file_mtime_rfc3339(cf: &ContainedFile) -> String {
+    cf.modified_at_rfc3339()
+}
+
 #[cfg(test)]
 mod filter_tests {
     use super::*;
@@ -688,5 +873,73 @@ mod containment_tests {
         let dfd = open_dir(dir.path());
         let cf = careful_open_file(&dfd, std::ffi::OsStr::new("big.txt")).unwrap();
         assert!(matches!(cf.read_all_capped(10), Err(IngestError::TooLarge)));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod orchestrator_tests {
+    use super::*;
+    use crate::embed::MockEmbedder;
+    use ed25519_dalek::SigningKey;
+
+    const DEK: [u8; 32] = [42u8; 32];
+    const KEY_BYTES: [u8; 32] = [7u8; 32];
+
+    fn run_ingest(log: &EventLog, root: &std::path::Path, parser: &dyn Parser, emb: &MockEmbedder) -> IngestReport {
+        let mut report = IngestReport::default();
+        let mut seen = std::collections::HashSet::new();
+        log.ingest_grant_inner(root, parser, emb, Instant::now(), &mut seen, &mut report).unwrap();
+        report
+    }
+
+    #[test]
+    fn fresh_then_dedup_then_supersede() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.md"), b"# v1").unwrap();
+
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical_folder = std::fs::canonicalize(&folder).unwrap();
+
+        let r1 = run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        assert_eq!((r1.ingested, r1.deduped, r1.superseded), (1, 0, 0));
+
+        let r2 = run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        assert_eq!((r2.ingested, r2.deduped, r2.superseded), (0, 1, 0));
+
+        std::fs::write(folder.join("a.md"), b"# v2 changed").unwrap();
+        let r3 = run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        assert_eq!((r3.ingested, r3.deduped, r3.superseded), (0, 0, 1));
+
+        let canonical_file = canonical_folder.join("a.md").to_string_lossy().to_string();
+        let rec = log.current_file_for_path(&canonical_file).unwrap().unwrap();
+        let ev = log.stream_all().unwrap().into_iter().find(|e| e.id == rec.file_event_id).unwrap();
+        assert_eq!(ev.content["text"], "# v2 changed");
+        assert!(is_external(&ev), "file_ingested is externally tainted");
+    }
+
+    #[test]
+    fn mtime_change_without_byte_change_does_not_supersede() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        let f = folder.join("a.md");
+        std::fs::write(&f, b"identical bytes").unwrap();
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical = std::fs::canonicalize(&folder).unwrap();
+        assert_eq!(run_ingest(&log, &canonical, &NativeTextParser, &emb).ingested, 1);
+
+        // Rewrite IDENTICAL bytes (bumps mtime, content_hash unchanged).
+        std::fs::write(&f, b"identical bytes").unwrap();
+        let r = run_ingest(&log, &canonical, &NativeTextParser, &emb);
+        assert_eq!((r.ingested, r.superseded, r.deduped), (0, 0, 1),
+            "mtime is provenance-only; identical bytes → dedup, NEVER supersede");
     }
 }
