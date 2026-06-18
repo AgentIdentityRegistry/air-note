@@ -195,9 +195,6 @@ pub(crate) enum FileIdentity {
 /// hashing); the `Parser` never sees this handle or any path.
 #[derive(Debug)]
 pub(crate) struct ContainedFile {
-    // Read once by `read_all_capped`, which the walk calls in Task 6/7; until then
-    // the lib build (no tests) sees the field as unread.
-    #[allow(dead_code)]
     file: std::fs::File,
     identity: FileIdentity,
     size: u64,
@@ -218,10 +215,6 @@ impl ContainedFile {
 
     /// Read up to `cap` bytes. Returns [`IngestError::TooLarge`] if the file has
     /// more than `cap` bytes (read `cap + 1` and check) — never a truncated body.
-    // The unix ingest orchestrator (the single contained read) + `containment_tests`
-    // consume it, but the orchestrator's own production caller is Task 11; until
-    // then the non-test lib build sees no live caller — keep the allow until Task 11.
-    #[allow(dead_code)]
     pub(crate) fn read_all_capped(mut self, cap: usize) -> Result<Vec<u8>, IngestError> {
         let mut buf = Vec::with_capacity(self.size.min(cap as u64) as usize);
         // saturating_add: `cap + 1` would wrap if cap == usize::MAX (theoretical —
@@ -237,9 +230,6 @@ impl ContainedFile {
     }
 
     /// File mtime as RFC 3339 UTC (provenance only).
-    // Reached only via the unix orchestrator's `file_mtime_rfc3339` (dead in the
-    // non-test lib build until Task 11's `ingest_all`).
-    #[allow(dead_code)]
     pub(crate) fn modified_at_rfc3339(&self) -> String {
         use chrono::{DateTime, Utc};
         self.file.metadata().ok()
@@ -361,10 +351,6 @@ pub(crate) fn careful_open_windows(
 /// sanitized hint. `canonical_path` is `grant_root` (already canonicalized) joined
 /// with the walk-relative components — safe to treat as canonical because the walk
 /// admitted no symlink and no `..`, so it equals `realpath` WITHOUT re-resolving.
-// The ingest orchestrator (Task 7) reads `file` (the contained read), `canonical_path`
-// (provenance), and `hint` (parser dispatch). The walk + its tests construct
-// `WalkedFile` and hand it to the sink; the lib build (no tests) sees no reader yet.
-#[allow(dead_code)]
 #[cfg(unix)]
 pub(crate) struct WalkedFile {
     pub(crate) file: ContainedFile,
@@ -377,8 +363,6 @@ pub(crate) struct WalkedFile {
 /// wall-clock-bounded, inode-deduped within the run. `report.skipped` accumulates
 /// never-touch / oversize / budget skips. Returns early (Ok) when the wall-clock
 /// budget is hit (a `<budget>` skip is recorded).
-// Driven by the ingest orchestrator in Task 7; exercised by `walk_tests` now.
-#[allow(dead_code)]
 #[cfg(unix)]
 pub(crate) fn walk_grant(
     grant_root: &std::path::Path,
@@ -495,13 +479,41 @@ pub(crate) fn walk_grant(
     Ok(())
 }
 
+#[cfg(unix)]
+impl EventLog {
+    /// Ingest every ACTIVE granted folder (spec §4). Runs the safe pipeline per
+    /// grant, sharing ONE inode-seen set + ONE wall-clock budget across the whole
+    /// run, then refreshes the in-memory recall index so new files are immediately
+    /// recallable. Each `ingest_grant_inner` already refreshes the graph projection
+    /// (files/grants), so only the ANN/FTS index needs a final rebuild here.
+    /// Returns the aggregate [`IngestReport`].
+    ///
+    /// Perf note (future): `ingest_grant_inner` rebuilds the graph per grant; for
+    /// many grants on a large log a `defer_rebuild` flag could collapse those into
+    /// one post-loop rebuild. Out of scope for M5a (grant counts are small).
+    pub fn ingest_all(
+        &self,
+        parser: &dyn Parser,
+        embedder: &dyn crate::embed::Embedder,
+    ) -> Result<IngestReport, crate::error::BossclawError> {
+        let started = Instant::now();
+        let mut report = IngestReport::default();
+        let mut seen = std::collections::HashSet::new();
+        let active: Vec<String> = self.grants()?.into_iter().filter(|g| !g.revoked).map(|g| g.canonical_root).collect();
+        for root in active {
+            self.ingest_grant_inner(std::path::Path::new(&root), parser, embedder, started, &mut seen, &mut report)?;
+        }
+        // Make the newly-appended files recallable (graph projection already current
+        // from each ingest_grant_inner's internal rebuild).
+        self.rebuild_indexes(embedder)?;
+        Ok(report)
+    }
+}
+
 /// Build the signed content of a `file_ingested` event (D4). `text` is top-level
 /// so `embeddable_text` finds it; `origin` is the taint stamp; everything is
 /// inside the signed bytes (JCS canonical + byte-identical rebuild).
-// Called only by `ingest_grant_inner` (dead in the non-test lib build until the
-// Task 11 `ingest_all` production caller lands).
 #[cfg(unix)]
-#[allow(dead_code)]
 fn file_ingested_content(
     text: &str,
     canonical_path: &str,
@@ -543,10 +555,6 @@ impl EventLog {
     /// the run-wide inode-dedup set (shared across grants by `ingest_all`).
     /// Re-checks the grant is still active before EVERY append so a concurrent
     /// `revoke_grant` stops further writes (spec §7).
-    // The production caller is `ingest_all` (Task 11); until then only the
-    // `#[cfg(all(test, unix))]` orchestrator test exercises it, so the non-test
-    // lib build sees no caller — keep the allow until Task 11 wires `ingest_all`.
-    #[allow(dead_code)]
     pub(crate) fn ingest_grant_inner(
         &self,
         grant_root: &std::path::Path,
@@ -620,9 +628,7 @@ impl EventLog {
 }
 
 /// A ground-truth `file_ingested` Event (model_meta: None → plain append/append_pair).
-// Called only by `ingest_grant_inner` (dead until Task 11's `ingest_all`).
 #[cfg(unix)]
-#[allow(dead_code)]
 fn ground_truth_file_ingested(content: serde_json::Value, signer_did: String) -> Event {
     Event {
         id: String::new(), ts: String::new(), valid_time: None,
@@ -634,9 +640,7 @@ fn ground_truth_file_ingested(content: serde_json::Value, signer_did: String) ->
 
 /// A ground-truth `supersede` Event retiring `prior_id` (reuses SUPERSEDE_EVENT_TYPE
 /// but with model_meta: None — cross-fold safety holds via disjoint event ids).
-// Called only by `ingest_grant_inner` (dead until Task 11's `ingest_all`).
 #[cfg(unix)]
-#[allow(dead_code)]
 fn ground_truth_supersede(prior_id: &str, signer_did: String) -> Event {
     Event {
         id: String::new(), ts: String::new(), valid_time: None,
@@ -648,9 +652,7 @@ fn ground_truth_supersede(prior_id: &str, signer_did: String) -> Event {
 }
 
 /// File mtime as RFC 3339 (provenance only; NEVER a dedup/identity key).
-// Called only by `ingest_grant_inner` (dead until Task 11's `ingest_all`).
 #[cfg(unix)]
-#[allow(dead_code)]
 fn file_mtime_rfc3339(cf: &ContainedFile) -> String {
     cf.modified_at_rfc3339()
 }
@@ -1057,6 +1059,43 @@ mod orchestrator_tests {
         let ctx = log.recall(&emb, "zztoken", 10, &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() }).unwrap();
         assert!(ctx.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
             "exclude_files drops file text from the reasoner's extraction context (no laundering)");
+    }
+
+    #[test]
+    fn ingest_all_iterates_active_grants_and_is_recallable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let g1 = dir.path().join("notes1");
+        let g2 = dir.path().join("notes2");
+        std::fs::create_dir(&g1).unwrap();
+        std::fs::create_dir(&g2).unwrap();
+        std::fs::write(g1.join("x.md"), b"gamma unique-x").unwrap();
+        std::fs::write(g2.join("y.md"), b"gamma unique-y").unwrap();
+
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open_with_recall(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+        log.add_grant(&g1).unwrap();
+        log.add_grant(&g2).unwrap();
+
+        let report = log.ingest_all(&NativeTextParser, &emb).unwrap();
+        assert_eq!(report.ingested, 2, "both granted folders' files ingested");
+        let hits = log.recall(&emb, "gamma", 10, &Default::default()).unwrap();
+        assert_eq!(hits.iter().filter(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE).count(), 2);
+    }
+
+    #[test]
+    fn revoked_grant_is_not_ingested_by_ingest_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.md"), b"delta").unwrap();
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open_with_recall(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+        log.add_grant(&folder).unwrap();
+        log.revoke_grant(&std::fs::canonicalize(&folder).unwrap()).unwrap();
+        let report = log.ingest_all(&NativeTextParser, &emb).unwrap();
+        assert_eq!(report.ingested, 0, "ingest_all skips revoked grants");
     }
 
     #[test]

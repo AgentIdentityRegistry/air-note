@@ -1835,8 +1835,6 @@ impl EventLog {
 
     /// The CURRENT file record for `canonical_path`, or `None`. The dedup-decision
     /// lookup used by ingest.
-    // Wired into the ingest path in a later M5a task; defined here with the projection.
-    #[allow(dead_code)]
     pub(crate) fn current_file_for_path(&self, canonical_path: &str) -> Result<Option<crate::graph::FileRecord>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
@@ -1936,10 +1934,6 @@ impl EventLog {
 
     /// Derive + persist the vector for a just-appended event id (M5a ingest convenience).
     /// Best-effort: a non-embeddable or text-less event is a no-op.
-    // Called by the unix ingest orchestrator (`ingest_grant_inner`), whose own
-    // production caller is Task 11's `ingest_all`; until then the non-test lib
-    // build sees no live caller — keep the allow until Task 11.
-    #[allow(dead_code)]
     pub(crate) fn derive_vector_for(&self, embedder: &dyn Embedder, event_id: &str) -> Result<(), BossclawError> {
         let payload: Option<String> = {
             let store = self.inner.lock().expect(POISON);
