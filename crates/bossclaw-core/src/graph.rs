@@ -396,6 +396,62 @@ pub fn fold_grants(events: &[Event]) -> Vec<Grant> {
     by_root.into_values().collect()
 }
 
+/// A folded ingested-file record (M5a): the CURRENT (un-superseded) `file_ingested`
+/// event for one `canonical_path`. A deterministic fold over `file_ingested` +
+/// `supersede` events; rebuilt by `rebuild_graph`. Keyed on path, NOT on bytes:
+/// identical bytes at two paths yield two records (dedup is per-path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRecord {
+    /// The canonicalized absolute file path (the record's identity key).
+    pub canonical_path: String,
+    /// The current `file_ingested` event's ULID.
+    pub file_event_id: String,
+    /// sha256 (hex) of the file BYTES — the dedup identity key.
+    pub content_hash: String,
+    /// The grant root this file was ingested under (for revoke-aware recall).
+    pub grant_root: String,
+}
+
+/// Extract `(canonical_path, content_hash, grant_root)` from a `file_ingested`
+/// event's content, or `None` if malformed.
+fn parse_file_ingested_content(content: &serde_json::Value) -> Option<(String, String, String)> {
+    let p = content.get("provenance")?;
+    Some((
+        p.get("canonical_path")?.as_str()?.to_string(),
+        p.get("content_hash")?.as_str()?.to_string(),
+        p.get("grant_root")?.as_str()?.to_string(),
+    ))
+}
+
+/// Fold `file_ingested` + `supersede` events (MUST be in `seq` order) into the
+/// current file per path. A `supersede{supersedes: F}` retires `file_ingested` F;
+/// walking in seq order, the last non-superseded `file_ingested` per
+/// `canonical_path` wins. Mirrors [`fold_pages`] but keyed on path. A `supersede`
+/// whose target is a page id is harmless here (no `file_ingested` has that id).
+pub fn fold_files(events: &[Event]) -> Vec<FileRecord> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut superseded: HashSet<String> = HashSet::new();
+    for ev in events {
+        if ev.event_type == SUPERSEDE_EVENT_TYPE {
+            if let Some(s) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
+                superseded.insert(s.to_string());
+            }
+        }
+    }
+    let mut by_path: BTreeMap<String, FileRecord> = BTreeMap::new();
+    for ev in events {
+        if ev.event_type != FILE_INGESTED_EVENT_TYPE || superseded.contains(&ev.id) {
+            continue;
+        }
+        if let Some((canonical_path, content_hash, grant_root)) = parse_file_ingested_content(&ev.content) {
+            by_path.insert(canonical_path.clone(), FileRecord {
+                canonical_path, file_event_id: ev.id.clone(), content_hash, grant_root,
+            });
+        }
+    }
+    by_path.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,5 +571,80 @@ mod tests {
             signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
         };
         assert!(fold_grants(&[ev]).is_empty(), "a revoke with no prior grant yields no row");
+    }
+
+    fn mk_file_ingested(path: &str, content_hash: &str, grant_root: &str) -> Event {
+        Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: FILE_INGESTED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "text": "body", "origin": EXTERNAL_ORIGIN,
+                "provenance": { "canonical_path": path, "content_hash": content_hash, "grant_root": grant_root }
+            }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        }
+    }
+    fn mk_file_supersede(prior_id: &str) -> Event {
+        Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: SUPERSEDE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "supersedes": prior_id }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        }
+    }
+
+    #[test]
+    fn fold_files_keeps_latest_unsuperseded_per_path() {
+        // /a v1 (id "f1"), then supersede f1 + /a v2 ("f2"); /b once ("f3").
+        let mut v1 = mk_file_ingested("/a", "hashA1", "/root"); v1.id = "f1".to_string();
+        let sup = mk_file_supersede("f1");
+        let mut v2 = mk_file_ingested("/a", "hashA2", "/root"); v2.id = "f2".to_string();
+        let mut b = mk_file_ingested("/b", "hashB", "/root"); b.id = "f3".to_string();
+        let mut files = fold_files(&[v1, sup, v2, b]);
+        files.sort_by(|x, y| x.canonical_path.cmp(&y.canonical_path));
+        assert_eq!(files.len(), 2, "two distinct paths");
+        assert_eq!(files[0].canonical_path, "/a");
+        assert_eq!(files[0].file_event_id, "f2", "v2 is current; v1 superseded");
+        assert_eq!(files[0].content_hash, "hashA2");
+        assert_eq!(files[1].file_event_id, "f3");
+    }
+
+    #[test]
+    fn fold_files_cross_path_identical_bytes_both_current() {
+        let mut a = mk_file_ingested("/a", "same", "/root"); a.id = "fa".to_string();
+        let mut b = mk_file_ingested("/b", "same", "/root"); b.id = "fb".to_string();
+        let files = fold_files(&[a, b]);
+        assert_eq!(files.len(), 2, "identical bytes at two paths → both kept (dedup is per-path)");
+    }
+
+    // Proves the ground-truth-supersede REUSE is safe: SUPERSEDE_EVENT_TYPE is shared
+    // by pages and files, but a supersede targets exactly one id, and page ids never
+    // collide with file ids — so neither fold cross-retires the other's.
+    #[test]
+    fn supersede_does_not_cross_retire_between_pages_and_files() {
+        let page = Event {
+            id: "P1".to_string(), ts: String::new(), valid_time: None,
+            event_type: PAGE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "topic_id": "t", "title": "T", "text": "p" }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        let mut file = mk_file_ingested("/a", "h", "/root"); file.id = "F1".to_string();
+
+        // A supersede targeting the FILE id retires the file, NOT the page.
+        let sup_file = mk_file_supersede("F1");
+        assert_eq!(fold_pages(&[page.clone(), file.clone(), sup_file.clone()]).len(), 1,
+            "a file-supersede must not retire a page");
+        assert!(fold_files(&[page.clone(), file.clone(), sup_file]).is_empty(),
+            "the file-supersede retired its own file");
+
+        // A supersede targeting the PAGE id retires the page, NOT the file.
+        let sup_page = mk_file_supersede("P1");
+        assert_eq!(fold_files(&[page.clone(), file.clone(), sup_page.clone()]).len(), 1,
+            "a page-supersede must not retire a file");
+        assert!(fold_pages(&[page, file, sup_page]).is_empty(),
+            "the page-supersede retired its own page");
     }
 }

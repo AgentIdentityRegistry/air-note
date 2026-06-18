@@ -248,6 +248,18 @@ impl EventLog {
                 revoked        INTEGER NOT NULL DEFAULT 0
             )",
         )?;
+        // Ingested-file projection (Tier-A; M5a). At most one CURRENT file_ingested per
+        // canonical_path; a deterministic fold over file_ingested/supersede events,
+        // rebuilt by `rebuild_graph`. `content_hash` is the dedup key; `grant_root` lets
+        // recall exclude files under a now-revoked grant.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS files (
+                canonical_path TEXT PRIMARY KEY,
+                file_event_id  TEXT NOT NULL,
+                content_hash   TEXT NOT NULL,
+                grant_root     TEXT NOT NULL
+            )",
+        )?;
         // Summarize progress high-water-mark (spec §6 / F1) — sibling of
         // evolve_cursor. NOT a fold: losing it only re-derives the dirty set
         // (idempotent via the cited-set check). Single row.
@@ -1789,6 +1801,56 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Every CURRENT file (one per path), `ORDER BY canonical_path ASC`. Tier-A read.
+    pub fn current_files(&self) -> Result<Vec<crate::graph::FileRecord>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_path, file_event_id, content_hash, grant_root FROM files ORDER BY canonical_path ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::FileRecord {
+            canonical_path: r.get(0)?, file_event_id: r.get(1)?, content_hash: r.get(2)?, grant_root: r.get(3)?,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    /// The CURRENT file record for `canonical_path`, or `None`. The dedup-decision
+    /// lookup used by ingest.
+    // Wired into the ingest path in a later M5a task; defined here with the projection.
+    #[allow(dead_code)]
+    pub(crate) fn current_file_for_path(&self, canonical_path: &str) -> Result<Option<crate::graph::FileRecord>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let row = conn.query_row(
+            "SELECT canonical_path, file_event_id, content_hash, grant_root FROM files WHERE canonical_path = ?1",
+            rusqlite::params![canonical_path],
+            |r| Ok(crate::graph::FileRecord {
+                canonical_path: r.get(0)?, file_event_id: r.get(1)?, content_hash: r.get(2)?, grant_root: r.get(3)?,
+            }),
+        ).optional()?;
+        Ok(row)
+    }
+
+    /// Event ids of CURRENT files whose grant root is still ACTIVE (revoked = 0).
+    /// Used by recall to drop stale-version AND revoked-grant file hits.
+    // Wired into the recall path in a later M5a task; defined here with the projection.
+    #[allow(dead_code)]
+    pub(crate) fn current_files_active(&self) -> Result<std::collections::HashSet<String>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT f.file_event_id FROM files f \
+             JOIN grants g ON g.canonical_root = f.grant_root \
+             WHERE g.revoked = 0",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows { out.insert(row?); }
+        Ok(out)
+    }
+
     /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
     /// default for `source_event_ids` is gated to the manual producer only.
     ///
@@ -1903,6 +1965,10 @@ impl EventLog {
         let grant_events = self.grant_events_ordered()?;
         let grants = crate::graph::fold_grants(&grant_events);
 
+        // Fold file_ingested/supersede events → current file per path (M5a).
+        let file_events = self.file_and_supersede_events_ordered()?;
+        let files = crate::graph::fold_files(&file_events);
+
         let memory_ids = self.memory_page_ids()?;
 
         // Distinct endpoints → nodes (BTreeMap = deterministic node order).
@@ -1932,6 +1998,7 @@ impl EventLog {
         tx.execute("DELETE FROM entities", [])?;
         tx.execute("DELETE FROM pages", [])?;
         tx.execute("DELETE FROM grants", [])?;
+        tx.execute("DELETE FROM files", [])?;
         for e in &edges {
             tx.execute(
                 "INSERT INTO edges
@@ -1975,6 +2042,13 @@ impl EventLog {
             tx.execute(
                 "INSERT INTO grants (canonical_root, granted_at, revoked) VALUES (?1, ?2, ?3)",
                 rusqlite::params![g.canonical_root, g.granted_at, g.revoked as i64],
+            )?;
+        }
+        for f in &files {
+            tx.execute(
+                "INSERT INTO files (canonical_path, file_event_id, content_hash, grant_root)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![f.canonical_path, f.file_event_id, f.content_hash, f.grant_root],
             )?;
         }
         tx.commit()?;
@@ -2046,6 +2120,21 @@ impl EventLog {
         for row in rows {
             out.push(serde_json::from_str(&row?)?);
         }
+        Ok(out)
+    }
+
+    /// All `file_ingested`/`supersede` events, payload-parsed, in chain (`seq ASC`)
+    /// order. (Page supersedes are included but harmless — `fold_files` only retires
+    /// `file_ingested` ids.)
+    fn file_and_supersede_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('file_ingested', 'supersede') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(serde_json::from_str(&row?)?); }
         Ok(out)
     }
 
@@ -3531,6 +3620,29 @@ mod tests {
         let g = log2.grants().unwrap();
         assert_eq!(g.len(), 1, "grant survives reopen via replay");
         assert!(g[0].revoked, "revoked state survives reopen");
+    }
+
+    #[test]
+    fn files_projection_rebuilds_and_path_lookup_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // Append a file_ingested event by hand (ingest_grant lands in a later task).
+        let v1 = Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::FILE_INGESTED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "text": "hello", "origin": crate::graph::EXTERNAL_ORIGIN,
+                "provenance": { "canonical_path": "/x/a.md", "content_hash": "h1", "grant_root": "/x" }
+            }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: ENGINE_SIGNER_DID.to_string(), signature: None,
+        };
+        let id1 = log.append(v1).unwrap();
+        log.rebuild_graph().unwrap();
+        let rec = log.current_file_for_path("/x/a.md").unwrap().expect("present");
+        assert_eq!(rec.file_event_id, id1);
+        assert_eq!(rec.content_hash, "h1");
+        assert!(log.current_file_for_path("/x/missing.md").unwrap().is_none());
     }
 
     /// Minimal `memory` event for the graph-BFS unit test (mirrors the helper in
