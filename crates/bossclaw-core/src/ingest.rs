@@ -347,6 +347,29 @@ pub(crate) fn careful_open_windows(
     })
 }
 
+/// Tunable safety budgets for the walk. `Default` uses the production consts;
+/// tests construct tiny limits to exercise the cap/budget skip paths cheaply.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct WalkLimits {
+    pub(crate) max_file_bytes: usize,
+    pub(crate) wall_clock: Duration,
+    pub(crate) max_walk_depth: usize,
+    pub(crate) max_dir_entries: usize,
+}
+
+#[cfg(unix)]
+impl Default for WalkLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: MAX_FILE_BYTES,
+            wall_clock: INGEST_WALL_CLOCK,
+            max_walk_depth: MAX_WALK_DEPTH,
+            max_dir_entries: MAX_DIR_ENTRIES,
+        }
+    }
+}
+
 /// A file the walk surfaced for ingest: the contained handle + its path + a
 /// sanitized hint. `canonical_path` is `grant_root` (already canonicalized) joined
 /// with the walk-relative components — safe to treat as canonical because the walk
@@ -366,6 +389,7 @@ pub(crate) struct WalkedFile {
 #[cfg(unix)]
 pub(crate) fn walk_grant(
     grant_root: &std::path::Path,
+    limits: &WalkLimits,
     started: Instant,
     seen: &mut std::collections::HashSet<FileIdentity>,
     report: &mut IngestReport,
@@ -384,7 +408,7 @@ pub(crate) fn walk_grant(
     let mut stack: Vec<(std::os::fd::OwnedFd, String, usize)> = vec![(root_fd, String::new(), 0)];
 
     while let Some((dir_fd, rel_dir, depth)) = stack.pop() {
-        if started.elapsed() > INGEST_WALL_CLOCK {
+        if started.elapsed() > limits.wall_clock {
             report.skipped.push((grant_root.join(&rel_dir), "wall-clock budget exceeded".into()));
             return Ok(());
         }
@@ -400,7 +424,7 @@ pub(crate) fn walk_grant(
             }
             // Bound an adversarial million-entry fan-out: stop buffering past the cap
             // (the already-collected entries are still processed) and record a loud skip.
-            if entries.len() >= MAX_DIR_ENTRIES {
+            if entries.len() >= limits.max_dir_entries {
                 report.skipped.push((grant_root.join(&rel_dir), "directory entry cap exceeded".into()));
                 break;
             }
@@ -412,7 +436,7 @@ pub(crate) fn walk_grant(
             // syscall-storms (statat + careful_open per entry), so the per-dir check
             // at the top of the loop is not enough. The mask amortizes the clock read
             // to every 16384 entries (cheap given the per-dir entry cap above).
-            if i & 0x3FFF == 0 && started.elapsed() > INGEST_WALL_CLOCK {
+            if i & 0x3FFF == 0 && started.elapsed() > limits.wall_clock {
                 report.skipped.push((grant_root.join(&rel_dir), "wall-clock budget exceeded".into()));
                 return Ok(());
             }
@@ -435,7 +459,7 @@ pub(crate) fn walk_grant(
                     report.skipped.push((grant_root.join(&rel_child), "never-touch dir".into()));
                     continue;
                 }
-                if depth + 1 > MAX_WALK_DEPTH {
+                if depth + 1 > limits.max_walk_depth {
                     report.skipped.push((grant_root.join(&rel_child), "max depth exceeded".into()));
                     continue;
                 }
@@ -463,7 +487,7 @@ pub(crate) fn walk_grant(
                 Err(IngestError::TooLarge) => { report.skipped.push((grant_root.join(&rel_child), "oversize".into())); continue; }
                 Err(e) => { report.failed.push((grant_root.join(&rel_child), e.to_string())); continue; }
             };
-            if cf.size() > MAX_FILE_BYTES as u64 {
+            if cf.size() > limits.max_file_bytes as u64 {
                 report.skipped.push((grant_root.join(&rel_child), "oversize".into()));
                 continue;
             }
@@ -565,12 +589,13 @@ impl EventLog {
         report: &mut IngestReport,
     ) -> Result<(), crate::error::BossclawError> {
         let grant_root_str = grant_root.to_string_lossy().to_string();
+        let limits = WalkLimits::default();
         // Collect walked files first (the walk borrows dir fds; appends happen after).
         let mut walked: Vec<WalkedFile> = Vec::new();
-        walk_grant(grant_root, started, seen, report, |wf| { walked.push(wf); Ok(()) })?;
+        walk_grant(grant_root, &limits, started, seen, report, |wf| { walked.push(wf); Ok(()) })?;
 
         for wf in walked {
-            if started.elapsed() > INGEST_WALL_CLOCK {
+            if started.elapsed() > limits.wall_clock {
                 report.skipped.push((wf.canonical_path, "wall-clock budget exceeded".into()));
                 continue;
             }
@@ -583,7 +608,7 @@ impl EventLog {
 
             let canonical_path = wf.canonical_path.to_string_lossy().to_string();
             let modified_at = file_mtime_rfc3339(&wf.file);
-            let raw = match wf.file.read_all_capped(MAX_FILE_BYTES) {
+            let raw = match wf.file.read_all_capped(limits.max_file_bytes) {
                 Ok(b) => b,
                 Err(IngestError::TooLarge) => { report.skipped.push((wf.canonical_path, "oversize".into())); continue; }
                 Err(e) => { report.failed.push((wf.canonical_path, e.to_string())); continue; }
@@ -702,7 +727,19 @@ mod walk_tests {
         let mut report = IngestReport::default();
         let mut seen = std::collections::HashSet::new();
         let mut names = Vec::new();
-        walk_grant(root, Instant::now(), &mut seen, &mut report, |wf| {
+        walk_grant(root, &WalkLimits::default(), Instant::now(), &mut seen, &mut report, |wf| {
+            names.push(wf.canonical_path.file_name().unwrap().to_string_lossy().to_string());
+            Ok(())
+        }).unwrap();
+        names.sort();
+        (names, report)
+    }
+
+    fn collect_with(root: &std::path::Path, started: Instant, limits: &WalkLimits) -> (Vec<String>, IngestReport) {
+        let mut report = IngestReport::default();
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        walk_grant(root, limits, started, &mut seen, &mut report, |wf| {
             names.push(wf.canonical_path.file_name().unwrap().to_string_lossy().to_string());
             Ok(())
         }).unwrap();
@@ -735,6 +772,72 @@ mod walk_tests {
         std::fs::hard_link(root.join("orig.txt"), root.join("dup.txt")).unwrap();
         let (names, _r) = collect(root);
         assert_eq!(names.len(), 1, "a hardlinked inode is surfaced once per run");
+    }
+
+    // ── DoS-budget regression tests ──────────────────────────────────────────
+
+    /// Depth cap: root=0, a=1, b=2 (descended, files inside surface),
+    /// c=3 would require depth+1=3 > max_walk_depth=2 → skipped.
+    /// Verifies that `max_walk_depth` cuts the walk at the right boundary.
+    #[test]
+    fn dos_depth_cap_skips_dirs_beyond_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // root/a/b/mid.md  → depth of directory b is 2; file surfaces.
+        // root/a/b/c/deep.md → opening c requires depth+1=3 > 2 → c is skipped.
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        std::fs::write(root.join("a/b/mid.md"), b"mid").unwrap();
+        std::fs::write(root.join("a/b/c/deep.md"), b"deep").unwrap();
+
+        let limits = WalkLimits { max_walk_depth: 2, ..WalkLimits::default() };
+        let (names, report) = collect_with(root, Instant::now(), &limits);
+
+        assert!(names.contains(&"mid.md".to_string()), "mid.md (depth 2) must surface");
+        assert!(!names.contains(&"deep.md".to_string()), "deep.md (depth 3) must NOT surface");
+        assert!(
+            report.skipped.iter().any(|(_, r)| r == "max depth exceeded"),
+            "skipped must record 'max depth exceeded'; got: {:?}", report.skipped
+        );
+    }
+
+    /// Entry cap: with `max_dir_entries: 3` and 5 files in root, exactly 3 are
+    /// surfaced and the report records `"directory entry cap exceeded"`.
+    #[test]
+    fn dos_entry_cap_limits_files_per_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..5u8 {
+            std::fs::write(root.join(format!("f{i}.txt")), [i]).unwrap();
+        }
+
+        let limits = WalkLimits { max_dir_entries: 3, ..WalkLimits::default() };
+        let (names, report) = collect_with(root, Instant::now(), &limits);
+
+        assert_eq!(names.len(), 3, "entry cap of 3 must surface exactly 3 files; got {:?}", names);
+        assert!(
+            report.skipped.iter().any(|(_, r)| r == "directory entry cap exceeded"),
+            "skipped must record 'directory entry cap exceeded'; got: {:?}", report.skipped
+        );
+    }
+
+    /// Wall-clock budget: `Duration::ZERO` expires before the first entry is
+    /// processed (the per-dir check fires on every directory pop), so no files
+    /// surface and the skip reason is `"wall-clock budget exceeded"`.
+    #[test]
+    fn dos_wall_clock_budget_stops_walk_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("one.txt"), b"x").unwrap();
+
+        let limits = WalkLimits { wall_clock: Duration::ZERO, ..WalkLimits::default() };
+        // started = Instant::now() ensures elapsed() > ZERO immediately.
+        let (names, report) = collect_with(root, Instant::now(), &limits);
+
+        assert!(names.is_empty(), "zero budget must surface no files; got {:?}", names);
+        assert!(
+            report.skipped.iter().any(|(_, r)| r == "wall-clock budget exceeded"),
+            "skipped must record 'wall-clock budget exceeded'; got: {:?}", report.skipped
+        );
     }
 }
 
