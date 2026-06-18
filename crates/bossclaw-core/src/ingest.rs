@@ -18,9 +18,15 @@ const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 /// Whole-run wall-clock budget (spec §6.2). The walk stops cleanly past this and
 /// records a budget skip, so a pathological tree never hangs the engine.
 const INGEST_WALL_CLOCK: Duration = Duration::from_secs(300);
-/// Max directory nesting depth (defense against pathological/looping trees; the
-/// inode-seen set also breaks hardlink loops).
+/// Max directory nesting depth (defense against pathological/looping trees).
+/// The inode-seen set dedups **file** hardlinks; **directory** cycles are bounded
+/// here (directories are NOT inserted into the seen set), so this depth cap is the
+/// loop guard for directories.
 const MAX_WALK_DEPTH: usize = 64;
+/// Max entries buffered per directory (bounds an adversarial million-entry fan-out;
+/// generous for real note folders). Exceeding it records a loud skip and stops
+/// collecting further entries in that directory.
+const MAX_DIR_ENTRIES: usize = 100_000;
 
 /// Directory names never descended into (hazard reduction, NOT a containment
 /// boundary — the boundary is the grant + informed consent; spec §6.3). Matched
@@ -384,10 +390,24 @@ pub(crate) fn walk_grant(
             if name_bytes == b"." || name_bytes == b".." {
                 continue;
             }
+            // Bound an adversarial million-entry fan-out: stop buffering past the cap
+            // (the already-collected entries are still processed) and record a loud skip.
+            if entries.len() >= MAX_DIR_ENTRIES {
+                report.skipped.push((grant_root.join(&rel_dir), "directory entry cap exceeded".into()));
+                break;
+            }
             entries.push(std::ffi::OsStr::from_bytes(name_bytes).to_os_string());
         }
 
-        for name_os in entries {
+        for (i, name_os) in entries.into_iter().enumerate() {
+            // Re-check the wall-clock budget WITHIN the dir: a single huge directory
+            // syscall-storms (statat + careful_open per entry), so the per-dir check
+            // at the top of the loop is not enough. The mask amortizes the clock read
+            // to every 16384 entries (cheap given the per-dir entry cap above).
+            if i & 0x3FFF == 0 && started.elapsed() > INGEST_WALL_CLOCK {
+                report.skipped.push((grant_root.join(&rel_dir), "wall-clock budget exceeded".into()));
+                return Ok(());
+            }
             let name = name_os.to_string_lossy().to_string();
             let rel_child = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
 
