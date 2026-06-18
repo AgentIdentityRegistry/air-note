@@ -116,8 +116,11 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// exist until M4 but is listed here so the seam is forward-compatible.
 /// Composed from the canonical `*_EVENT_TYPE` consts in `graph` so this array
 /// and the stamp sites cannot drift.
-const EMBEDDABLE_EVENT_TYPES: &[&str] =
-    &[crate::graph::MEMORY_EVENT_TYPE, crate::graph::PAGE_EVENT_TYPE];
+const EMBEDDABLE_EVENT_TYPES: &[&str] = &[
+    crate::graph::MEMORY_EVENT_TYPE,
+    crate::graph::PAGE_EVENT_TYPE,
+    crate::graph::FILE_INGESTED_EVENT_TYPE,
+];
 
 /// The serialized, signed event log.
 pub struct EventLog {
@@ -233,6 +236,28 @@ impl EventLog {
                 page_event_id TEXT NOT NULL,
                 title         TEXT NOT NULL,
                 text          TEXT NOT NULL
+            )",
+        )?;
+        // Folder-grant projection (Tier-A; M5a). One row per granted root; a
+        // deterministic fold over `grant`/`revoke` events, rebuilt by `rebuild_graph`.
+        // `ingest_all` iterates active (revoked = 0) grants only.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS grants (
+                canonical_root TEXT PRIMARY KEY,
+                granted_at     TEXT NOT NULL,
+                revoked        INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
+        // Ingested-file projection (Tier-A; M5a). At most one CURRENT file_ingested per
+        // canonical_path; a deterministic fold over file_ingested/supersede events,
+        // rebuilt by `rebuild_graph`. `content_hash` is the dedup key; `grant_root` lets
+        // recall exclude files under a now-revoked grant.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS files (
+                canonical_path TEXT PRIMARY KEY,
+                file_event_id  TEXT NOT NULL,
+                content_hash   TEXT NOT NULL,
+                grant_root     TEXT NOT NULL
             )",
         )?;
         // Summarize progress high-water-mark (spec §6 / F1) — sibling of
@@ -985,6 +1010,15 @@ impl EventLog {
             } else {
                 std::collections::HashSet::new()
             };
+        // Current file ids whose grant is still active (for the file-version +
+        // revoked-grant exclusion). Gated: skipped entirely unless a file is in the
+        // fusion candidate set (mirrors the page gate).
+        let current_file_ids: std::collections::HashSet<String> =
+            if kinds.values().any(|k| k == crate::graph::FILE_INGESTED_EVENT_TYPE) {
+                self.current_files_active()?
+            } else {
+                std::collections::HashSet::new()
+            };
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
@@ -1090,17 +1124,25 @@ impl EventLog {
                 })
                 .then_with(|| b.event_id.cmp(&a.event_id)) // lexicographic DESC backstop
         });
-        // F2: drop pages that must not surface — BEFORE truncate(k) so a
-        // superseded page can never crowd out a valid lower-ranked candidate.
-        // Uses the single-sourced `crate::graph::PAGE_EVENT_TYPE` discriminator.
+        // F2/F4: drop pages/files that must not surface — BEFORE truncate(k) so a
+        // superseded or revoked entry can never crowd out a valid lower-ranked
+        // candidate. Uses single-sourced event-type discriminators.
         hits.retain(|h| {
-            if h.kind != crate::graph::PAGE_EVENT_TYPE {
-                return true; // non-page hits always survive
+            if h.kind == crate::graph::PAGE_EVENT_TYPE {
+                if opts.exclude_pages {
+                    return false; // one-way rule (F3)
+                }
+                return current_page_ids.contains(&h.event_id); // only the CURRENT page
             }
-            if opts.exclude_pages {
-                return false; // one-way rule (F3)
+            if h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE {
+                if opts.exclude_files {
+                    return false; // one-way rule for files — keeps external text out of evolve context (Task 9)
+                }
+                // Keep only the CURRENT version for its path AND only if the grant is
+                // still active (never-forget storage ≠ must-surface).
+                return current_file_ids.contains(&h.event_id);
             }
-            current_page_ids.contains(&h.event_id) // else: only the CURRENT page
+            true // every other kind always survives
         });
         hits.truncate(k);
         Ok(hits)
@@ -1725,6 +1767,103 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Grant read-access to a folder (M5a). Canonicalizes `path`, appends a
+    /// ground-truth `grant` event, and refreshes the grants projection. Returns the
+    /// event id. Canonicalization fails closed if the path does not exist.
+    pub fn add_grant(&self, path: &std::path::Path) -> Result<String, BossclawError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| BossclawError::InvalidInput(format!("grant path not resolvable: {e}")))?;
+        let root = canonical.to_string_lossy().to_string();
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::GRANT_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Revoke a previously-granted folder (M5a). Canonicalizes `path`, appends a
+    /// ground-truth `revoke` event, and refreshes the grants projection. Ingested
+    /// files under a revoked root stay in the log but are excluded from recall.
+    pub fn revoke_grant(&self, path: &std::path::Path) -> Result<String, BossclawError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| BossclawError::InvalidInput(format!("revoke path not resolvable: {e}")))?;
+        let root = canonical.to_string_lossy().to_string();
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::REVOKE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Every grant (active and revoked), `ORDER BY canonical_root ASC`. Tier-A read.
+    pub fn grants(&self) -> Result<Vec<crate::graph::Grant>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_root, granted_at, revoked FROM grants ORDER BY canonical_root ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::Grant {
+            canonical_root: r.get(0)?, granted_at: r.get(1)?, revoked: r.get::<_, i64>(2)? != 0,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    /// Every CURRENT file (one per path), `ORDER BY canonical_path ASC`. Tier-A read.
+    pub fn current_files(&self) -> Result<Vec<crate::graph::FileRecord>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_path, file_event_id, content_hash, grant_root FROM files ORDER BY canonical_path ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::FileRecord {
+            canonical_path: r.get(0)?, file_event_id: r.get(1)?, content_hash: r.get(2)?, grant_root: r.get(3)?,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    /// The CURRENT file record for `canonical_path`, or `None`. The dedup-decision
+    /// lookup used by ingest.
+    pub(crate) fn current_file_for_path(&self, canonical_path: &str) -> Result<Option<crate::graph::FileRecord>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let row = conn.query_row(
+            "SELECT canonical_path, file_event_id, content_hash, grant_root FROM files WHERE canonical_path = ?1",
+            rusqlite::params![canonical_path],
+            |r| Ok(crate::graph::FileRecord {
+                canonical_path: r.get(0)?, file_event_id: r.get(1)?, content_hash: r.get(2)?, grant_root: r.get(3)?,
+            }),
+        ).optional()?;
+        Ok(row)
+    }
+
+    /// Event ids of CURRENT files whose grant root is still ACTIVE (revoked = 0).
+    /// Used by recall to drop stale-version AND revoked-grant file hits.
+    pub(crate) fn current_files_active(&self) -> Result<std::collections::HashSet<String>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT f.file_event_id FROM files f \
+             JOIN grants g ON g.canonical_root = f.grant_root \
+             WHERE g.revoked = 0",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows { out.insert(row?); }
+        Ok(out)
+    }
+
     /// Shared builder for `link`/`invalidate`. The `[src, dst]` convenience
     /// default for `source_event_ids` is gated to the manual producer only.
     ///
@@ -1789,8 +1928,25 @@ impl EventLog {
     ///
     /// Returns an owned `String` (not the `&'static str` const) because M4/M7 will
     /// make this dynamic — the user's real DID, looked up per call.
-    fn signer_did(&self) -> String {
+    pub(crate) fn signer_did(&self) -> String {
         ENGINE_SIGNER_DID.to_string()
+    }
+
+    /// Derive + persist the vector for a just-appended event id (M5a ingest convenience).
+    /// Best-effort: a non-embeddable or text-less event is a no-op.
+    pub(crate) fn derive_vector_for(&self, embedder: &dyn Embedder, event_id: &str) -> Result<(), BossclawError> {
+        let payload: Option<String> = {
+            let store = self.inner.lock().expect(POISON);
+            store.conn().query_row(
+                "SELECT payload FROM events WHERE id = ?1", rusqlite::params![event_id],
+                |r| r.get::<_, String>(0),
+            ).optional()?
+        };
+        if let Some(p) = payload {
+            let ev: Event = serde_json::from_str(&p)?;
+            self.derive_vector(embedder, &ev)?;
+        }
+        Ok(())
     }
 
     /// Rebuild the persisted `edges`/`nodes` tables as a deterministic fold over
@@ -1835,6 +1991,14 @@ impl EventLog {
         let page_events = self.page_and_supersede_events_ordered()?;
         let pages = crate::graph::fold_pages(&page_events);
 
+        // Fold grant/revoke events → current grants projection (M5a).
+        let grant_events = self.grant_events_ordered()?;
+        let grants = crate::graph::fold_grants(&grant_events);
+
+        // Fold file_ingested/supersede events → current file per path (M5a).
+        let file_events = self.file_and_supersede_events_ordered()?;
+        let files = crate::graph::fold_files(&file_events);
+
         let memory_ids = self.memory_page_ids()?;
 
         // Distinct endpoints → nodes (BTreeMap = deterministic node order).
@@ -1863,6 +2027,8 @@ impl EventLog {
         tx.execute("DELETE FROM nodes", [])?;
         tx.execute("DELETE FROM entities", [])?;
         tx.execute("DELETE FROM pages", [])?;
+        tx.execute("DELETE FROM grants", [])?;
+        tx.execute("DELETE FROM files", [])?;
         for e in &edges {
             tx.execute(
                 "INSERT INTO edges
@@ -1900,6 +2066,19 @@ impl EventLog {
             tx.execute(
                 "INSERT INTO pages (topic_id, page_event_id, title, text) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![p.topic_id, p.page_event_id, p.title, p.text],
+            )?;
+        }
+        for g in &grants {
+            tx.execute(
+                "INSERT INTO grants (canonical_root, granted_at, revoked) VALUES (?1, ?2, ?3)",
+                rusqlite::params![g.canonical_root, g.granted_at, g.revoked as i64],
+            )?;
+        }
+        for f in &files {
+            tx.execute(
+                "INSERT INTO files (canonical_path, file_event_id, content_hash, grant_root)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![f.canonical_path, f.file_event_id, f.content_hash, f.grant_root],
             )?;
         }
         tx.commit()?;
@@ -1952,6 +2131,36 @@ impl EventLog {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events WHERE event_type IN ('page','supersede') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(serde_json::from_str(&row?)?); }
+        Ok(out)
+    }
+
+    /// All `grant`/`revoke` events, payload-parsed, in chain (`seq ASC`) order.
+    fn grant_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('grant', 'revoke') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// All `file_ingested`/`supersede` events, payload-parsed, in chain (`seq ASC`)
+    /// order. (Page supersedes are included but harmless — `fold_files` only retires
+    /// `file_ingested` ids.)
+    fn file_and_supersede_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('file_ingested', 'supersede') ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
@@ -2606,11 +2815,16 @@ impl EventLog {
             ))
         })?;
         // Build a by-id map; skip page-typed rows (F3: a summary never feeds
-        // summary-generation).
+        // summary-generation) and file-typed rows (M5a Task 9: external file
+        // text is never laundered into a summary — defense-in-depth, the root
+        // fix is closing the evolve context recall door so a file id never
+        // reaches a lineage in the first place).
         let mut by_id: HashMap<String, String> = HashMap::new();
         for row in rows {
             let (id, etype, payload) = row?;
-            if etype == crate::graph::PAGE_EVENT_TYPE {
+            if etype == crate::graph::PAGE_EVENT_TYPE
+                || etype == crate::graph::FILE_INGESTED_EVENT_TYPE
+            {
                 continue;
             }
             let ev: Event = serde_json::from_str(&payload)?;
@@ -2945,15 +3159,18 @@ impl EventLog {
 
             // ── 1. recall context (M2). entity-kind is excluded from recall by
             //    construction (separate index); `exclude_pages: true` drops pages
-            //    too, so extraction context is raw memories only — the one-way rule
-            //    (F3, defense-in-depth with `fact_texts_for_ids`). The read-set is
-            //    EVENT ids only (never entity:<ulid>), spec §16. ──
+            //    and `exclude_files: true` drops external file text (M5a Task 9,
+            //    evolve door 2) — so extraction context is raw memories only, the
+            //    one-way rule (F3, defense-in-depth with `fact_texts_for_ids`).
+            //    External file text must never be laundered into auto-derived
+            //    links/entities. The read-set is EVENT ids only (never
+            //    entity:<ulid>), spec §16. ──
             let recalled: Vec<String> = self
                 .recall(
                     embedder,
                     &text,
                     crate::extract::GRAPH_CONTEXT_K,
-                    &RecallOptions { exclude_pages: true, ..Default::default() },
+                    &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() },
                 )
                 .map(|hits| {
                     hits.into_iter()
@@ -3418,6 +3635,52 @@ mod tests {
             vec!["a".to_string(), "b".to_string()],
             "manual empty-source link defaults to [src, dst]"
         );
+    }
+
+    #[test]
+    fn grants_persist_revoke_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real folder to canonicalize.
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        {
+            let log = open_log(dir.path());
+            log.add_grant(&folder).unwrap();
+            let g = log.grants().unwrap();
+            assert_eq!(g.len(), 1);
+            assert!(!g[0].revoked);
+            log.revoke_grant(&folder).unwrap();
+            assert!(log.grants().unwrap()[0].revoked, "revoke marks the row");
+        }
+        // Reopen: grants are a fold over events, so they rebuild from the log.
+        let log2 = open_log(dir.path());
+        log2.rebuild_graph().unwrap();
+        let g = log2.grants().unwrap();
+        assert_eq!(g.len(), 1, "grant survives reopen via replay");
+        assert!(g[0].revoked, "revoked state survives reopen");
+    }
+
+    #[test]
+    fn files_projection_rebuilds_and_path_lookup_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // Append a file_ingested event by hand (ingest_grant lands in a later task).
+        let v1 = Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::FILE_INGESTED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "text": "hello", "origin": crate::graph::EXTERNAL_ORIGIN,
+                "provenance": { "canonical_path": "/x/a.md", "content_hash": "h1", "grant_root": "/x" }
+            }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: ENGINE_SIGNER_DID.to_string(), signature: None,
+        };
+        let id1 = log.append(v1).unwrap();
+        log.rebuild_graph().unwrap();
+        let rec = log.current_file_for_path("/x/a.md").unwrap().expect("present");
+        assert_eq!(rec.file_event_id, id1);
+        assert_eq!(rec.content_hash, "h1");
+        assert!(log.current_file_for_path("/x/missing.md").unwrap().is_none());
     }
 
     /// Minimal `memory` event for the graph-BFS unit test (mirrors the helper in

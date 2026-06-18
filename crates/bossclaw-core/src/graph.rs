@@ -42,6 +42,21 @@ pub const MEMORY_NODE_KIND: &str = "memory";
 /// `nodes.kind` for a node that resolves to no known event.
 pub const EXTERNAL_NODE_KIND: &str = "external";
 
+/// The `event_type` discriminator for an ingested-file event (M5a). Ground-truth
+/// (plain `append`, `model_meta: None`); added to `EMBEDDABLE_EVENT_TYPES` so its
+/// `content["text"]` is embedded + FTS-indexed + recallable. Single-sourced so the
+/// stamp site, the fold filter, and the recall arm reference the same string.
+pub const FILE_INGESTED_EVENT_TYPE: &str = "file_ingested";
+/// The `event_type` discriminator for a folder-grant event (M5a). Ground-truth.
+pub const GRANT_EVENT_TYPE: &str = "grant";
+/// The `event_type` discriminator for a folder-revoke event (M5a). Ground-truth.
+pub const REVOKE_EVENT_TYPE: &str = "revoke";
+/// The taint stamp written at `content["origin"]` of every `file_ingested` event
+/// (M5a, D4). Distinct from the `edges.origin` column (`"manual"`/`"machine"`):
+/// this marks external-origin content so the M6 lineage walk can fail closed.
+/// Single-sourced so the stamp site and the `is_external` classifier cannot drift.
+pub const EXTERNAL_ORIGIN: &str = "external";
+
 /// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
 /// links reference this exact form, so it is single-sourced.
 pub const ENTITY_NODE_PREFIX: &str = "entity:";
@@ -340,6 +355,103 @@ pub fn fold_pages(events: &[Event]) -> Vec<Page> {
     by_topic.into_values().collect()
 }
 
+/// A folded folder grant (M5a): the CURRENT state of one granted root. A
+/// deterministic fold over `grant`/`revoke` events; rebuilt by `rebuild_graph`.
+/// `revoked` files are kept in the log forever but excluded from recall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    /// The canonicalized absolute folder path (the grant's identity key).
+    pub canonical_root: String,
+    /// RFC 3339 ts of the latest `grant` event for this root (provenance).
+    pub granted_at: String,
+    /// True iff the latest event for this root is a `revoke`.
+    pub revoked: bool,
+}
+
+/// Extract `canonical_root` from a `grant`/`revoke` event's content, or `None`.
+fn parse_grant_content(content: &serde_json::Value) -> Option<String> {
+    Some(content.get("canonical_root")?.as_str()?.to_string())
+}
+
+/// Fold `grant`/`revoke` events (MUST be in `seq` order) into the current grant
+/// per root (last-writer-wins). A `grant` (re)activates and stamps `granted_at`;
+/// a `revoke` marks an EXISTING root revoked. A `revoke` with no prior grant is
+/// ignored. Deterministic → byte-identical rebuild.
+pub fn fold_grants(events: &[Event]) -> Vec<Grant> {
+    use std::collections::BTreeMap;
+    let mut by_root: BTreeMap<String, Grant> = BTreeMap::new();
+    for ev in events {
+        let root = match parse_grant_content(&ev.content) {
+            Some(r) => r,
+            None => continue,
+        };
+        if ev.event_type == GRANT_EVENT_TYPE {
+            by_root.insert(root.clone(), Grant { canonical_root: root, granted_at: ev.ts.clone(), revoked: false });
+        } else if ev.event_type == REVOKE_EVENT_TYPE {
+            if let Some(g) = by_root.get_mut(&root) {
+                g.revoked = true;
+            }
+        }
+    }
+    by_root.into_values().collect()
+}
+
+/// A folded ingested-file record (M5a): the CURRENT (un-superseded) `file_ingested`
+/// event for one `canonical_path`. A deterministic fold over `file_ingested` +
+/// `supersede` events; rebuilt by `rebuild_graph`. Keyed on path, NOT on bytes:
+/// identical bytes at two paths yield two records (dedup is per-path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRecord {
+    /// The canonicalized absolute file path (the record's identity key).
+    pub canonical_path: String,
+    /// The current `file_ingested` event's ULID.
+    pub file_event_id: String,
+    /// sha256 (hex) of the file BYTES — the dedup identity key.
+    pub content_hash: String,
+    /// The grant root this file was ingested under (for revoke-aware recall).
+    pub grant_root: String,
+}
+
+/// Extract `(canonical_path, content_hash, grant_root)` from a `file_ingested`
+/// event's content, or `None` if malformed.
+fn parse_file_ingested_content(content: &serde_json::Value) -> Option<(String, String, String)> {
+    let p = content.get("provenance")?;
+    Some((
+        p.get("canonical_path")?.as_str()?.to_string(),
+        p.get("content_hash")?.as_str()?.to_string(),
+        p.get("grant_root")?.as_str()?.to_string(),
+    ))
+}
+
+/// Fold `file_ingested` + `supersede` events (MUST be in `seq` order) into the
+/// current file per path. A `supersede{supersedes: F}` retires `file_ingested` F;
+/// walking in seq order, the last non-superseded `file_ingested` per
+/// `canonical_path` wins. Mirrors [`fold_pages`] but keyed on path. A `supersede`
+/// whose target is a page id is harmless here (no `file_ingested` has that id).
+pub fn fold_files(events: &[Event]) -> Vec<FileRecord> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut superseded: HashSet<String> = HashSet::new();
+    for ev in events {
+        if ev.event_type == SUPERSEDE_EVENT_TYPE {
+            if let Some(s) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
+                superseded.insert(s.to_string());
+            }
+        }
+    }
+    let mut by_path: BTreeMap<String, FileRecord> = BTreeMap::new();
+    for ev in events {
+        if ev.event_type != FILE_INGESTED_EVENT_TYPE || superseded.contains(&ev.id) {
+            continue;
+        }
+        if let Some((canonical_path, content_hash, grant_root)) = parse_file_ingested_content(&ev.content) {
+            by_path.insert(canonical_path.clone(), FileRecord {
+                canonical_path, file_event_id: ev.id.clone(), content_hash, grant_root,
+            });
+        }
+    }
+    by_path.into_values().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +519,132 @@ mod tests {
         assert_eq!(folded[0].entity_id, entity_node_id("01GOOD"));
         assert_eq!(folded[0].label, "Kenny");
         assert_eq!(folded[0].entity_type, "person");
+    }
+
+    #[test]
+    fn m5a_event_type_consts_are_distinct_and_stable() {
+        // Stable wire strings (these land in signed content + the byte-identical rebuild).
+        assert_eq!(FILE_INGESTED_EVENT_TYPE, "file_ingested");
+        assert_eq!(GRANT_EVENT_TYPE, "grant");
+        assert_eq!(REVOKE_EVENT_TYPE, "revoke");
+        assert_eq!(EXTERNAL_ORIGIN, "external");
+        // Must not collide with existing discriminators.
+        for other in [MEMORY_EVENT_TYPE, PAGE_EVENT_TYPE, SUPERSEDE_EVENT_TYPE, ENTITY_EVENT_TYPE, CONFIG_EVENT_TYPE] {
+            assert_ne!(FILE_INGESTED_EVENT_TYPE, other);
+            assert_ne!(GRANT_EVENT_TYPE, other);
+            assert_ne!(REVOKE_EVENT_TYPE, other);
+        }
+    }
+
+    #[test]
+    fn fold_grants_is_last_writer_wins_per_root() {
+        // grant A, grant B, revoke A, grant A again → A active (re-granted), B active.
+        let mk = |etype: &str, root: &str, ts: &str| Event {
+            id: String::new(), ts: ts.to_string(), valid_time: None,
+            event_type: etype.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        let events = vec![
+            mk(GRANT_EVENT_TYPE, "/a", "2026-06-18T00:00:00Z"),
+            mk(GRANT_EVENT_TYPE, "/b", "2026-06-18T00:00:01Z"),
+            mk(REVOKE_EVENT_TYPE, "/a", "2026-06-18T00:00:02Z"),
+            mk(GRANT_EVENT_TYPE, "/a", "2026-06-18T00:00:03Z"),
+        ];
+        let mut grants = fold_grants(&events);
+        grants.sort_by(|x, y| x.canonical_root.cmp(&y.canonical_root));
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].canonical_root, "/a");
+        assert!(!grants[0].revoked, "/a was re-granted after revoke → active");
+        assert_eq!(grants[0].granted_at, "2026-06-18T00:00:03Z", "granted_at = latest grant ts");
+        assert!(!grants[1].revoked, "/b never revoked");
+    }
+
+    #[test]
+    fn fold_grants_revoke_without_grant_is_ignored() {
+        let ev = Event {
+            id: String::new(), ts: "2026-06-18T00:00:00Z".to_string(), valid_time: None,
+            event_type: REVOKE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": "/never-granted" }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        assert!(fold_grants(&[ev]).is_empty(), "a revoke with no prior grant yields no row");
+    }
+
+    fn mk_file_ingested(path: &str, content_hash: &str, grant_root: &str) -> Event {
+        Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: FILE_INGESTED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "text": "body", "origin": EXTERNAL_ORIGIN,
+                "provenance": { "canonical_path": path, "content_hash": content_hash, "grant_root": grant_root }
+            }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        }
+    }
+    fn mk_file_supersede(prior_id: &str) -> Event {
+        Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: SUPERSEDE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "supersedes": prior_id }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        }
+    }
+
+    #[test]
+    fn fold_files_keeps_latest_unsuperseded_per_path() {
+        // /a v1 (id "f1"), then supersede f1 + /a v2 ("f2"); /b once ("f3").
+        let mut v1 = mk_file_ingested("/a", "hashA1", "/root"); v1.id = "f1".to_string();
+        let sup = mk_file_supersede("f1");
+        let mut v2 = mk_file_ingested("/a", "hashA2", "/root"); v2.id = "f2".to_string();
+        let mut b = mk_file_ingested("/b", "hashB", "/root"); b.id = "f3".to_string();
+        let mut files = fold_files(&[v1, sup, v2, b]);
+        files.sort_by(|x, y| x.canonical_path.cmp(&y.canonical_path));
+        assert_eq!(files.len(), 2, "two distinct paths");
+        assert_eq!(files[0].canonical_path, "/a");
+        assert_eq!(files[0].file_event_id, "f2", "v2 is current; v1 superseded");
+        assert_eq!(files[0].content_hash, "hashA2");
+        assert_eq!(files[1].file_event_id, "f3");
+    }
+
+    #[test]
+    fn fold_files_cross_path_identical_bytes_both_current() {
+        let mut a = mk_file_ingested("/a", "same", "/root"); a.id = "fa".to_string();
+        let mut b = mk_file_ingested("/b", "same", "/root"); b.id = "fb".to_string();
+        let files = fold_files(&[a, b]);
+        assert_eq!(files.len(), 2, "identical bytes at two paths → both kept (dedup is per-path)");
+    }
+
+    // Proves the ground-truth-supersede REUSE is safe: SUPERSEDE_EVENT_TYPE is shared
+    // by pages and files, but a supersede targets exactly one id, and page ids never
+    // collide with file ids — so neither fold cross-retires the other's.
+    #[test]
+    fn supersede_does_not_cross_retire_between_pages_and_files() {
+        let page = Event {
+            id: "P1".to_string(), ts: String::new(), valid_time: None,
+            event_type: PAGE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "topic_id": "t", "title": "T", "text": "p" }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        let mut file = mk_file_ingested("/a", "h", "/root"); file.id = "F1".to_string();
+
+        // A supersede targeting the FILE id retires the file, NOT the page.
+        let sup_file = mk_file_supersede("F1");
+        assert_eq!(fold_pages(&[page.clone(), file.clone(), sup_file.clone()]).len(), 1,
+            "a file-supersede must not retire a page");
+        assert!(fold_files(&[page.clone(), file.clone(), sup_file]).is_empty(),
+            "the file-supersede retired its own file");
+
+        // A supersede targeting the PAGE id retires the page, NOT the file.
+        let sup_page = mk_file_supersede("P1");
+        assert_eq!(fold_files(&[page.clone(), file.clone(), sup_page.clone()]).len(), 1,
+            "a page-supersede must not retire a file");
+        assert!(fold_pages(&[page, file, sup_page]).is_empty(),
+            "the page-supersede retired its own page");
     }
 }

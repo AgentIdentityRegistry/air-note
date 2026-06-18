@@ -85,6 +85,10 @@ pub struct RecallOptions {
     /// When true, drop ALL `page`-kind hits — the one-way rule for the evolve
     /// loop's internal recall (spec §7 / F3). User-facing recall leaves it false.
     pub exclude_pages: bool,
+    /// When true, drop ALL `file_ingested`-kind hits — the one-way rule for the
+    /// evolve loop's internal recall (Task 9), so external file text never enters
+    /// the reasoner's extraction context. User-facing recall leaves it false.
+    pub exclude_files: bool,
 }
 
 /// Reciprocal-rank-fusion constant `k` (Cormack et al., "Reciprocal Rank Fusion

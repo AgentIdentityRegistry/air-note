@@ -1,6 +1,7 @@
 use bossclaw_core::event::{canonical_bytes, compute_hash, Event};
 use bossclaw_core::sign::{sign_hash, verify_hash};
 use ed25519_dalek::SigningKey;
+use sha2::{Digest, Sha256};
 
 fn fixture_event() -> Event {
     Event {
@@ -72,4 +73,37 @@ fn tampered_hash_fails_verification() {
     let mut bad = hash;
     bad[0] ^= 0xFF;
     assert!(verify_hash(&bad, &sig, &key.verifying_key()).is_err());
+}
+
+#[test]
+fn file_ingested_canonicalization_is_frozen() {
+    let ev = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+        ts: "2026-06-18T00:00:00+00:00".to_string(),
+        valid_time: None,
+        event_type: "file_ingested".to_string(),
+        content: serde_json::json!({
+            "text": "hello",
+            "origin": "external",
+            "provenance": {
+                "canonical_path": "/x/a.md",
+                "content_hash": "aaa",
+                "text_hash": "bbb",
+                "size_bytes": 5,
+                "modified_at": "2026-06-18T00:00:00+00:00",
+                "parser_id": "native-text-v1",
+                "grant_root": "/x"
+            }
+        }),
+        model_meta: None,
+        prev_hash: "0".repeat(64),
+        hash: None,
+        signed_by_did: "did:wba:bossclaw-engine".to_string(),
+        signature: None,
+    };
+    let canon = canonical_bytes(&ev).unwrap();
+    let got = hex::encode(Sha256::digest(&canon));
+    // FREEZE: run once; copy the printed hex into `expected`; re-run → PASS.
+    let expected = "3754a3d258b562b999f4e4df214c89db39d5027b4c6c902096193a617b0b83e0";
+    assert_eq!(got, expected, "file_ingested canonicalization changed (got {got}); update only if intentional");
 }

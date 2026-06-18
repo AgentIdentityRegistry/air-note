@@ -24,6 +24,10 @@ hex = "0.4"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 log = "0.4"
 hnsw_rs = "0.3.4"
+# Safe, I/O-safe syscall bindings — used by the ingest careful-open + walk so the
+# crate keeps `#![forbid(unsafe_code)]` (no hand-rolled libc/unsafe). `fs` enables
+# openat/openat2/statat/readdir; `process` is not needed in M5a.
+rustix = { version = "0.38", features = ["fs"] }
 
 [features]
 fastembed = ["dep:fastembed"]
