@@ -1058,4 +1058,30 @@ mod orchestrator_tests {
         assert!(ctx.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
             "exclude_files drops file text from the reasoner's extraction context (no laundering)");
     }
+
+    #[test]
+    fn file_ingested_survives_byte_identical_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("a.md"), b"stable bytes").unwrap();
+        let emb = MockEmbedder::new(16);
+
+        let recorded_hash = {
+            let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+            log.add_grant(&folder).unwrap();
+            let canonical = std::fs::canonicalize(&folder).unwrap();
+            run_ingest(&log, &canonical, &NativeTextParser, &emb);
+            let ev = log.stream_all().unwrap().into_iter()
+                .find(|e| e.event_type == crate::graph::FILE_INGESTED_EVENT_TYPE).unwrap();
+            ev.hash.clone().unwrap()
+        };
+        // Reopen: the chain re-verifies and the file_ingested hash is unchanged.
+        let log2 = EventLog::open_with_recall(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+        log2.verify_chain().unwrap();
+        let ev2 = log2.stream_all().unwrap().into_iter()
+            .find(|e| e.event_type == crate::graph::FILE_INGESTED_EVENT_TYPE).unwrap();
+        assert_eq!(ev2.hash.unwrap(), recorded_hash, "file_ingested is byte-identical across reopen");
+    }
 }
