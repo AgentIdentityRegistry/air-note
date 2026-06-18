@@ -148,8 +148,10 @@ impl ContainedFile {
     #[allow(dead_code)]
     pub(crate) fn read_all_capped(mut self, cap: usize) -> Result<Vec<u8>, IngestError> {
         let mut buf = Vec::with_capacity(self.size.min(cap as u64) as usize);
+        // saturating_add: `cap + 1` would wrap if cap == usize::MAX (theoretical —
+        // cap is a small constant — but free to guard).
         let read = (&mut self.file)
-            .take(cap as u64 + 1)
+            .take((cap as u64).saturating_add(1))
             .read_to_end(&mut buf)
             .map_err(|e| IngestError::Io(e.to_string()))?;
         if read > cap {
@@ -177,10 +179,14 @@ pub(crate) fn careful_open_file(
     #[cfg(target_os = "linux")]
     let owned = {
         use rustix::fs::{openat2, ResolveFlags};
+        // O_NONBLOCK so a FIFO swapped in during the post-readdir TOCTOU window
+        // returns immediately (a writer-less FIFO read-only open would otherwise
+        // block forever); the fstat type-reject below then drops it. Cleared on
+        // the accepted regular-file path before any read.
         match openat2(
             dir_fd,
             name.as_bytes(),
-            OFlags::RDONLY | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
         ) {
@@ -190,18 +196,20 @@ pub(crate) fn careful_open_file(
             Err(rustix::io::Errno::NOSYS) => rustix::fs::openat(
                 dir_fd,
                 name.as_bytes(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(|e| IngestError::Containment(e.to_string()))?,
             Err(e) => return Err(IngestError::Containment(e.to_string())),
         }
     };
+    // O_NONBLOCK so a FIFO swapped in during the post-readdir TOCTOU window returns
+    // immediately instead of blocking on a writer; the fstat type-reject drops it.
     #[cfg(not(target_os = "linux"))]
     let owned = rustix::fs::openat(
         dir_fd,
         name.as_bytes(),
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| IngestError::Containment(e.to_string()))?;
@@ -211,8 +219,17 @@ pub(crate) fn careful_open_file(
     if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
         return Err(IngestError::Containment("not a regular file".into()));
     }
+    // Accepted as a regular file: clear O_NONBLOCK (set above only to dodge the
+    // FIFO-open hang) so `read_all_capped` is an ordinary blocking read. Regular
+    // files ignore O_NONBLOCK for I/O, but clearing keeps the handle conventional.
+    let fl = rustix::fs::fcntl_getfl(&owned).map_err(|e| IngestError::Io(e.to_string()))?;
+    rustix::fs::fcntl_setfl(&owned, fl.difference(OFlags::NONBLOCK))
+        .map_err(|e| IngestError::Io(e.to_string()))?;
     Ok(ContainedFile {
         file: std::fs::File::from(owned),
+        // dev_t/ino_t widths differ per-OS (apple dev_t=i32); the cast can
+        // sign-extend, but the value feeds dedup identity only (intra-run
+        // consistency), not containment — so it is acceptable.
         identity: FileIdentity::DevIno(st.st_dev as u64, st.st_ino as u64),
         size: st.st_size as u64,
     })
@@ -350,6 +367,36 @@ mod containment_tests {
                 "swap must fail ELOOP-class (symlink refused), got: {msg}"
             );
         }
+    }
+
+    // FIFO-swap DoS: a name resolves to a real file at readdir, then is swapped
+    // for a FIFO before the open. O_NOFOLLOW does NOT help (a FIFO is not a
+    // symlink), so without O_NONBLOCK the read-only open would block forever
+    // waiting for a writer. The open MUST return and be rejected as non-regular.
+    // If this hangs, the O_NONBLOCK guard is missing on the exercised arm.
+    //
+    // The FIFO is created via the POSIX `mkfifo(1)` tool (uniform across the
+    // macOS + Linux CI targets): rustix 0.38's `mknodat` is `cfg(not(apple))`
+    // and it ships no `mkfifoat`, and `#![forbid(unsafe_code)]` rules out a raw
+    // `libc::mkfifo`. A test fixture may shell out; the "no subprocess" rule is
+    // a constraint on the ingest core, not on test setup.
+    #[test]
+    fn careful_open_refuses_a_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, b"ok").unwrap();
+        let dfd = open_dir(dir.path());
+        // Swap the regular file for a FIFO AFTER the dir fd is open (the TOCTOU window).
+        std::fs::remove_file(&target).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&target)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed to create the test FIFO");
+        // Must RETURN (rejected as non-regular), not block forever.
+        let err = careful_open_file(&dfd, std::ffi::OsStr::new("real.txt")).unwrap_err();
+        assert!(matches!(err, IngestError::Containment(_)),
+            "a fifo must be refused as non-regular (no hang), got {err:?}");
     }
 
     #[test]
