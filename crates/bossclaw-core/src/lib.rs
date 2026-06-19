@@ -51,10 +51,12 @@ pub use model2vec::Model2Vec;
 #[cfg(feature = "ollama")]
 pub use ollama::OllamaReasoner;
 pub use reason::{Reasoner, ScriptedReasoner};
-#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), any(feature = "markitdown", feature = "sandbox-test-hooks")))]
 mod sandbox;
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
-pub use sandbox::{SandboxedMarkitdownParser, sandbox_test_hooks};
+pub use sandbox::SandboxedMarkitdownParser;
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "sandbox-test-hooks"))]
+pub use sandbox::sandbox_test_hooks;
 
 pub use ingest::{is_external, IngestReport, NativeTextParser, Parser, PathHint};
 pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};

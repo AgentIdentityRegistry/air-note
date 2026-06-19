@@ -38,6 +38,9 @@ ollama = ["dep:ureq"]
 # M5b: sandboxed markitdown subprocess parser. Enables rustix `process`
 # (kill_process_group for the timeout group-kill). Default build stays pure.
 markitdown = ["rustix/process", "dep:tempfile"]
+# Test-only jail probes (un-jailed control, egress watcher). CI enables this;
+# release binaries enable only `markitdown` and must NOT ship these hooks.
+sandbox-test-hooks = ["markitdown"]
 
 [dependencies.fastembed]
 version = "5.16"

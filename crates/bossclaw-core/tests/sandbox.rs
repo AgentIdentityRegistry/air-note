@@ -1,7 +1,7 @@
-//! Real-subprocess jail proofs. Gated: require --features markitdown AND a built
+//! Real-subprocess jail proofs. Gated: require --features sandbox-test-hooks AND a built
 //! venv at $BOSSCLAW_MARKITDOWN_VENV AND the OS jail tool present.
-//! Run: BOSSCLAW_MARKITDOWN_VENV=/tmp/m5b-venv cargo test -p bossclaw-core --features markitdown --test sandbox -- --ignored
-#![cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
+//! Run: BOSSCLAW_MARKITDOWN_VENV=/tmp/m5b-venv cargo test -p bossclaw-core --features sandbox-test-hooks --test sandbox -- --ignored
+#![cfg(all(any(target_os = "macos", target_os = "linux"), feature = "sandbox-test-hooks"))]
 
 use bossclaw_core::Parser;
 

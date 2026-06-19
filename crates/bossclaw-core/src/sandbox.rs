@@ -368,7 +368,7 @@ pub(crate) fn spawn_jailed_fd_scan() -> Vec<i32> {
 /// loopback listener's port), and report whether ANY outbound connection was made.
 /// MUST be false — the stripped registry has no URL-fetching converter and the jail
 /// denies network. Returns true (= FAIL) if anything connected.
-#[cfg(any(test, feature = "markitdown"))]
+#[cfg(feature = "sandbox-test-hooks")]
 pub(crate) fn convert_makes_outbound_connection(bytes_template: &str, ext: &str) -> bool {
     let listener = match std::net::TcpListener::bind("127.0.0.1:0") { Ok(l) => l, Err(_) => return false };
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -385,6 +385,7 @@ pub(crate) fn convert_makes_outbound_connection(bytes_template: &str, ext: &str)
 }
 
 /// Public test hooks — called from `tests/sandbox.rs` integration tests.
+#[cfg(feature = "sandbox-test-hooks")]
 pub mod sandbox_test_hooks {
     /// True iff the jail proves network denial (jailed connect refused at jail layer).
     pub fn probe_egress_blocks() -> bool {
@@ -401,7 +402,6 @@ pub mod sandbox_test_hooks {
     }
     /// True iff converting `bytes_template` (a hostile document) caused an outbound
     /// TCP connection to a loopback listener. MUST be false — the jail must block it.
-    #[cfg(feature = "markitdown")]
     pub fn hostile_doc_connects(bytes_template: &str, ext: &str) -> bool {
         super::convert_makes_outbound_connection(bytes_template, ext)
     }

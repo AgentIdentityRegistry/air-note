@@ -135,9 +135,15 @@ jobs:
             crates/bossclaw-core/python/requirements.in
       - name: Build the markitdown venv (pip-audit + version drift guard inside)
         run: PYBIN=python crates/bossclaw-core/scripts/build-venv.sh "${{ runner.temp }}/m5b-venv"
-      - name: Clippy bossclaw-core (markitdown feature)
-        run: cargo clippy -p bossclaw-core --features markitdown --all-targets -- -D warnings
+      - name: Clippy bossclaw-core (sandbox-test-hooks feature)
+        run: cargo clippy -p bossclaw-core --features sandbox-test-hooks --all-targets -- -D warnings
+      - name: Markitdown version-pin drift guard (Rust const vs requirements.in)
+        run: |
+          rust_pin=$(grep -oE 'MARKITDOWN_VERSION: &str = "[^"]+"' crates/bossclaw-core/src/sandbox.rs | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          lock_pin=$(grep -oE 'markitdown\[[^]]*\]==[0-9.]+' crates/bossclaw-core/python/requirements.in | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "rust=$rust_pin lock=$lock_pin"
+          [ "$rust_pin" = "$lock_pin" ] || { echo "markitdown pin drift"; exit 1; }
       - name: Gated jail proofs
-        run: cargo test -p bossclaw-core --features markitdown -- --ignored
+        run: cargo test -p bossclaw-core --features sandbox-test-hooks -- --ignored
         env:
           BOSSCLAW_MARKITDOWN_VENV: ${{ runner.temp }}/m5b-venv
