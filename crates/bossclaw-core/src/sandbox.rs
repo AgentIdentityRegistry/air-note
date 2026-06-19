@@ -309,6 +309,11 @@ fn run_probe(venv: &Venv, jailed: bool) -> bool {
     // The end-to-end no-egress guarantee is independently backstopped by the hostile-doc
     // proof (tests/sandbox.rs), which asserts a real conversion accepts no connection.
     eprintln!("[egress-probe] jailed={jailed} outcome={outcome:?} accepted={accepted}");
+    // SOUNDNESS INVARIANT: ECONNREFUSED (RefusedConn) on the child's sentinel ALONE cannot
+    // distinguish "isolated empty-netns loopback" from "host loopback with no listener on
+    // this port". The proof that the child is NOT in the host netns is `!accepted` — the
+    // host listener is live for the whole probe, so a host-netns child would CONNECT and set
+    // accepted=true. NEVER accept RefusedConn without the `&& !accepted` conjunct below.
     let refused = matches!(outcome, ProbeOutcome::RefusedPerm)
         || (cfg!(target_os = "linux") && matches!(outcome, ProbeOutcome::RefusedConn));
     refused && !accepted
