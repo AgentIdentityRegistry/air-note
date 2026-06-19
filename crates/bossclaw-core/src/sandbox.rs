@@ -347,6 +347,23 @@ impl Parser for SandboxedMarkitdownParser {
     }
 }
 
+/// TEST ONLY. Spawn a jailed child that fstat-scans fds 3..64 and reports any
+/// that are open regular files — the parent's SQLCipher DB handle would appear
+/// here if it were NOT O_CLOEXEC. Returns the leaked fd numbers (MUST be empty).
+#[cfg(test)]
+pub(crate) fn spawn_jailed_fd_scan() -> Vec<i32> {
+    let venv = match discover_venv() { Ok(v) => v, Err(_) => return vec![-1] };
+    let scratch = match tempfile::tempdir() { Ok(d) => d, Err(_) => return vec![-2] };
+    let py = match venv.python.to_str() { Some(s) => s, None => return vec![-3] };
+    let script = "import os,stat\nleaked=[]\nfor fd in range(3,64):\n    try:\n        st=os.fstat(fd)\n        if stat.S_ISREG(st.st_mode): leaked.append(fd)\n    except OSError:\n        pass\nprint('LEAKED:'+','.join(map(str,leaked)))";
+    let cmd = wrap_jail(scratch.path(), py, &["-c".into(), script.into()]);
+    let out = run_pump(cmd, b"", 1 << 16, 64 << 10, std::time::Duration::from_secs(8)).unwrap_or_default();
+    out.lines()
+        .find_map(|l| l.strip_prefix("LEAKED:"))
+        .map(|s| s.split(',').filter(|x| !x.is_empty()).filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
 /// Public test hooks — called from `tests/sandbox.rs` integration tests.
 pub mod sandbox_test_hooks {
     /// True iff the jail proves network denial (jailed connect refused at jail layer).

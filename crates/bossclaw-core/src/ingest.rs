@@ -1380,6 +1380,68 @@ mod orchestrator_tests {
         );
     }
 
+    // ── T9: fd-leak proof ──────────────────────────────────────────────────────
+    /// Proves that the parent's SQLCipher DB handle (opened in the same process)
+    /// does NOT leak into the jailed child as an open regular-file fd. Requires the
+    /// venv + jail to be available; gated + ignored so CI skips it without the env.
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
+    #[test]
+    #[ignore]
+    fn db_handle_does_not_leak_into_the_jailed_child() {
+        let dir = tempfile::tempdir().unwrap();
+        // A live EventLog → its SQLCipher DB handle + signing key are open in THIS process.
+        let _log = EventLog::open(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        let leaked = crate::sandbox::spawn_jailed_fd_scan();
+        assert!(leaked.is_empty(), "a regular-file fd leaked into the jailed child (the DB handle?): {leaked:?}");
+    }
+
+    // ── T9: end-to-end ingest through the jail ─────────────────────────────────
+    /// A granted folder containing a real PDF is ingested through the sandboxed
+    /// markitdown parser; the resulting event must be externally tainted (is_external).
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
+    #[test]
+    #[ignore]
+    fn ingest_grant_with_real_pdf_creates_external_taint_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("docs");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::copy("tests/fixtures/hello.pdf", folder.join("hello.pdf")).unwrap();
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let router = ParserRouter::new(
+            Box::new(NativeTextParser),
+            Box::new(crate::sandbox::SandboxedMarkitdownParser::discover().expect("venv + jail")),
+        );
+        let report = log.ingest_all(&router, &emb).unwrap();
+        assert_eq!(report.ingested, 1, "the PDF should ingest; got {report:?}");
+        // The ingested event must be externally tainted (the taint root M6 consumes).
+        let canonical = std::fs::canonicalize(&folder).unwrap().join("hello.pdf").to_string_lossy().to_string();
+        let rec = log.current_file_for_path(&canonical).unwrap().expect("pdf recorded");
+        let ev = log.stream_all().unwrap().into_iter().find(|e| e.id == rec.file_event_id).unwrap();
+        assert!(is_external(&ev), "file_ingested from a real PDF must carry external taint; content={:?}", ev.content);
+    }
+
+    // ── T9: feature-off degradation (hermetic — no venv, not ignored) ──────────
+    /// With `ParserRouter::native_only()`, a PDF in a granted folder must be recorded
+    /// as skipped with reason "sandbox unavailable" — no panic, no ingest, no event.
+    #[test]
+    fn feature_off_router_skips_pdf_with_sandbox_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("docs");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("x.pdf"), b"%PDF-1.4 not really").unwrap();
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let report = log.ingest_all(&ParserRouter::native_only(), &emb).unwrap();
+        assert_eq!(report.ingested, 0);
+        assert!(
+            report.skipped.iter().any(|(p, r)| p.ends_with("x.pdf") && r.contains("sandbox unavailable")),
+            "got {:?}", report.skipped
+        );
+    }
+
     #[test]
     fn empty_extraction_is_skipped_not_an_empty_event() {
         let dir = tempfile::tempdir().unwrap();
