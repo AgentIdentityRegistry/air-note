@@ -1,0 +1,4 @@
+# PLACEHOLDER — generated on Linux x86_64 only (different wheels than macOS).
+# Generate via: pip-compile --generate-hashes --output-file <this> requirements.in
+# CI (Task 11) regenerates + uses this on the Ubuntu leg. build-venv.sh on Linux
+# requires this to be filled before it will install.
