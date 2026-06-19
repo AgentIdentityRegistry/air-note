@@ -3,6 +3,7 @@
 //! Rust side; the OS jail (T6) and egress probe (T7) build on `run_pump`.
 
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::process::CommandExt; // process_group — safe, stable
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +17,6 @@ use crate::ingest::IngestError;
 /// under `out_cap` (killing the group the instant the cap is exceeded), reading
 /// stderr into a bounded buffer, and enforcing `timeout` with a group-kill.
 /// EVERY return path reaps the child. Returns stdout as UTF-8.
-#[allow(dead_code)] // used by pump_tests and by future T8 parser
 pub(crate) fn run_pump(
     mut cmd: Command,
     input: &[u8],
@@ -118,17 +118,16 @@ fn kill_group(pid: i32) {
 use std::path::{Path, PathBuf};
 
 /// A located, validated venv: the interpreter + the first-party wrapper.
-#[allow(dead_code)] // wired in T7/T8
 #[derive(Debug)]
 pub(crate) struct Venv {
     pub(crate) python: PathBuf,
+    #[allow(dead_code)] // used by T8's parser
     pub(crate) wrapper: PathBuf,
 }
 
 /// Locate the bundled markitdown venv via an explicit path. Env override for
 /// tests/headless (`BOSSCLAW_MARKITDOWN_VENV`); the desktop wires the
 /// app-resources path in M7. Missing/invalid → `SandboxUnavailable` (→ skip).
-#[allow(dead_code)] // wired in T7/T8
 pub(crate) fn discover_venv() -> Result<Venv, IngestError> {
     let root = std::env::var_os("BOSSCLAW_MARKITDOWN_VENV")
         .map(PathBuf::from)
@@ -174,7 +173,6 @@ fn build_jailed_command_for_test(scratch: &Path, program: &str, args: &[String])
 /// Linux: `bwrap` (unshare net+pid+ipc, ro-bind system + the venv, tmpfs/bind scratch).
 /// EFFICACY is proven by the T7 egress probe. `program` is the venv python (so its
 /// parent's parent is the venv root, which Linux must bind).
-#[allow(dead_code)] // wired in T7/T8
 #[cfg(target_os = "macos")]
 fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
     let mut c = Command::new("/usr/bin/sandbox-exec");
@@ -184,7 +182,6 @@ fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
     apply_scrub(&mut c, scratch);
     c
 }
-#[allow(dead_code)] // wired in T7/T8
 #[cfg(target_os = "linux")]
 fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
     let venv_root = Path::new(program).parent().and_then(|p| p.parent());
@@ -203,6 +200,113 @@ fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
     c.arg(program).args(args);
     apply_scrub(&mut c, scratch);
     c
+}
+
+// ── Egress probe ────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+#[allow(dead_code)] // diagnostic payload, read via Debug
+enum ProbeOutcome {
+    Connected,
+    RefusedPerm,
+    RefusedConn,
+    Other(String),
+    ChildError(String),
+}
+
+/// True iff the jail genuinely denies network: the jailed child's connect to our
+/// loopback listener is refused at the jail layer AND nothing is accepted.
+/// Fail-closed: any other outcome → false (not proven → caller skips).
+pub(crate) fn probe_egress(venv: &Venv) -> bool {
+    run_probe(venv, true)
+}
+
+fn run_probe(venv: &Venv, jailed: bool) -> bool {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(_) => return false,
+    };
+    // Dedicated accept thread, bounded — ANY accepted socket means the jail FAILED.
+    let acc = std::thread::spawn(move || accept_within(&listener, Duration::from_secs(4)));
+
+    let scratch = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let py = match venv.python.to_str() {
+        Some(s) => s,
+        None => return false,
+    };
+    // The child tries to connect and prints exactly one sentinel.
+    let script = format!(
+        "import socket,sys,errno\n\
+         try:\n\
+        \x20   socket.create_connection(('127.0.0.1',{port}),timeout=2); print('CONNECTED')\n\
+         except OSError as e:\n\
+        \x20   pm=(errno.EPERM,errno.EACCES,errno.ENETUNREACH,errno.EAFNOSUPPORT)\n\
+        \x20   print('REFUSED_PERM' if e.errno in pm else ('REFUSED_CONN' if e.errno==errno.ECONNREFUSED else 'OTHER:%d'%(e.errno or -1)))"
+    );
+    let cmd = if jailed {
+        wrap_jail(scratch.path(), py, &["-c".into(), script])
+    } else {
+        let mut c = Command::new(py);
+        c.args(["-c", &script]);
+        apply_scrub(&mut c, scratch.path());
+        c
+    };
+    let outcome = match run_pump(cmd, b"", 1 << 16, 64 << 10, Duration::from_secs(8)) {
+        Ok(s) => match s.trim() {
+            "CONNECTED" => ProbeOutcome::Connected,
+            "REFUSED_PERM" => ProbeOutcome::RefusedPerm,
+            "REFUSED_CONN" => ProbeOutcome::RefusedConn,
+            o => ProbeOutcome::Other(o.to_string()),
+        },
+        Err(e) => ProbeOutcome::ChildError(format!("{e:?}")),
+    };
+    let accepted = acc.join().unwrap_or(false);
+    // PROVEN only on a jail-layer refusal with nothing accepted. Everything else
+    // is fail-closed (not proven). Logged so the controller can audit honesty.
+    eprintln!("[egress-probe] jailed={jailed} outcome={outcome:?} accepted={accepted}");
+    matches!(outcome, ProbeOutcome::RefusedPerm) && !accepted
+}
+
+/// Block up to `timeout` for a single inbound connection; true iff one arrives.
+fn accept_within(listener: &TcpListener, timeout: Duration) -> bool {
+    listener.set_nonblocking(true).ok();
+    let start = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok(_) => return true,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() >= timeout {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Public test hooks — called from `tests/sandbox.rs` integration tests.
+pub mod sandbox_test_hooks {
+    /// True iff the jail proves network denial (jailed connect refused at jail layer).
+    pub fn probe_egress_blocks() -> bool {
+        super::discover_venv()
+            .map(|v| super::probe_egress(&v))
+            .unwrap_or(false)
+    }
+    /// True iff even the UN-jailed child fails to connect (should be FALSE — it
+    /// proves the probe has teeth: without the jail, the connect succeeds).
+    pub fn unjailed_probe_blocks() -> bool {
+        super::discover_venv()
+            .map(|v| super::run_probe(&v, false))
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

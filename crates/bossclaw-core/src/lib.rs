@@ -53,6 +53,8 @@ pub use ollama::OllamaReasoner;
 pub use reason::{Reasoner, ScriptedReasoner};
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
 mod sandbox;
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
+pub use sandbox::sandbox_test_hooks;
 
 pub use ingest::{is_external, IngestReport, NativeTextParser, Parser, PathHint};
 pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};
