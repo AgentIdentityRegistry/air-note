@@ -120,6 +120,12 @@ pub enum IngestError {
     Parse(String),
     /// An OS error while reading the contained handle.
     Io(String),
+    /// The sandbox could not be established (feature off, venv missing/invalid,
+    /// or the egress probe did not prove network denial). Skipped, not failed —
+    /// native ingest continues (fail-closed).
+    SandboxUnavailable(String),
+    /// The jailed parser exceeded the wall-clock budget and was killed. Failed.
+    Timeout,
 }
 
 impl std::fmt::Display for IngestError {
@@ -130,7 +136,20 @@ impl std::fmt::Display for IngestError {
             IngestError::TooLarge => write!(f, "exceeds byte cap"),
             IngestError::Parse(m) => write!(f, "parse error: {m}"),
             IngestError::Io(m) => write!(f, "io error: {m}"),
+            IngestError::SandboxUnavailable(m) => write!(f, "sandbox unavailable: {m}"),
+            IngestError::Timeout => write!(f, "parser timed out"),
         }
+    }
+}
+
+impl IngestError {
+    /// True if this error should be recorded as a `skipped` (benign: file not
+    /// ingestable here) rather than a `failed` (a safety/IO problem). Single
+    /// source of truth for the `ingest_grant_inner` routing. `TooLarge` is here
+    /// for completeness — the read path intercepts it before `convert`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn is_skip(&self) -> bool {
+        matches!(self, IngestError::NonUtf8 | IngestError::TooLarge | IngestError::SandboxUnavailable(_))
     }
 }
 
@@ -632,7 +651,7 @@ impl EventLog {
             };
             let text = match parser.convert(&raw, &wf.hint) {
                 Ok(t) => t,
-                Err(e @ IngestError::NonUtf8) => { report.skipped.push((wf.canonical_path, e.to_string())); continue; }
+                Err(e) if e.is_skip() => { report.skipped.push((wf.canonical_path, e.to_string())); continue; }
                 Err(e) => { report.failed.push((wf.canonical_path, e.to_string())); continue; }
             };
             let content = file_ingested_content(&text, &canonical_path, &raw, &grant_root_str, parser.parser_id(), &modified_at);
@@ -887,6 +906,16 @@ mod tests {
         // 0xFF 0xFE is not valid UTF-8.
         let err = p.convert(&[0xFF, 0xFE, 0x00], &PathHint::default()).unwrap_err();
         assert!(matches!(err, IngestError::NonUtf8));
+    }
+
+    #[test]
+    fn error_skip_classification_is_correct() {
+        assert_eq!(IngestError::SandboxUnavailable("x".into()).to_string(), "sandbox unavailable: x");
+        assert_eq!(IngestError::Timeout.to_string(), "parser timed out");
+        assert!(IngestError::SandboxUnavailable("x".into()).is_skip());
+        assert!(IngestError::NonUtf8.is_skip());
+        assert!(!IngestError::Timeout.is_skip());
+        assert!(!IngestError::Parse("y".into()).is_skip());
     }
 
     #[test]
