@@ -25,6 +25,20 @@ use sha2::{Digest, Sha256};
 /// truncated — a partial body would corrupt content_hash + recall. 10 MiB covers
 /// notes/markdown/code; rich/large formats wait for M5b.
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+/// Larger byte cap for rich formats routed to the sandboxed parser (M5b). M5a's
+/// `MAX_FILE_BYTES` (10 MiB) is sized for text/notes; PDFs/Office docs are
+/// routinely larger, so the walk applies this cap to rich extensions instead.
+const MAX_RICH_FILE_BYTES: usize = 100 * 1024 * 1024;
+
+/// Extensions routed to the sandboxed `markitdown` parser (lowercase, no dot).
+/// Single source of truth for BOTH the parser-aware byte budget AND dispatch.
+const RICH_EXTS: &[&str] = &["pdf", "docx", "pptx", "xlsx", "xls", "msg"];
+
+/// True if `ext` (lowercased, no dot) is a rich format handled by the sandboxed parser.
+pub(crate) fn is_rich_ext(ext: Option<&str>) -> bool {
+    ext.is_some_and(|e| RICH_EXTS.contains(&e))
+}
+
 /// Whole-run wall-clock budget (spec §6.2). The walk stops cleanly past this and
 /// records a budget skip, so a pathological tree never hangs the engine.
 const INGEST_WALL_CLOCK: Duration = Duration::from_secs(300);
@@ -353,6 +367,7 @@ pub(crate) fn careful_open_windows(
 #[derive(Debug, Clone)]
 pub(crate) struct WalkLimits {
     pub(crate) max_file_bytes: usize,
+    pub(crate) max_rich_file_bytes: usize,
     pub(crate) wall_clock: Duration,
     pub(crate) max_walk_depth: usize,
     pub(crate) max_dir_entries: usize,
@@ -363,6 +378,7 @@ impl Default for WalkLimits {
     fn default() -> Self {
         Self {
             max_file_bytes: MAX_FILE_BYTES,
+            max_rich_file_bytes: MAX_RICH_FILE_BYTES,
             wall_clock: INGEST_WALL_CLOCK,
             max_walk_depth: MAX_WALK_DEPTH,
             max_dir_entries: MAX_DIR_ENTRIES,
@@ -487,16 +503,16 @@ pub(crate) fn walk_grant(
                 Err(IngestError::TooLarge) => { report.skipped.push((grant_root.join(&rel_child), "oversize".into())); continue; }
                 Err(e) => { report.failed.push((grant_root.join(&rel_child), e.to_string())); continue; }
             };
-            if cf.size() > limits.max_file_bytes as u64 {
+            let ext = std::path::Path::new(&name).extension().map(|e| e.to_string_lossy().to_lowercase());
+            let cap = if is_rich_ext(ext.as_deref()) { limits.max_rich_file_bytes } else { limits.max_file_bytes };
+            if cf.size() > cap as u64 {
                 report.skipped.push((grant_root.join(&rel_child), "oversize".into()));
                 continue;
             }
             if !seen.insert(cf.identity().clone()) {
                 continue; // same inode already ingested this run (hardlink / overlap)
             }
-            let hint = PathHint {
-                ext: std::path::Path::new(&name).extension().map(|e| e.to_string_lossy().to_lowercase()),
-            };
+            let hint = PathHint { ext };
             sink(WalkedFile { file: cf, canonical_path: grant_root.join(&rel_child), hint })?;
         }
     }
@@ -608,7 +624,8 @@ impl EventLog {
 
             let canonical_path = wf.canonical_path.to_string_lossy().to_string();
             let modified_at = file_mtime_rfc3339(&wf.file);
-            let raw = match wf.file.read_all_capped(limits.max_file_bytes) {
+            let read_cap = if is_rich_ext(wf.hint.ext.as_deref()) { limits.max_rich_file_bytes } else { limits.max_file_bytes };
+            let raw = match wf.file.read_all_capped(read_cap) {
                 Ok(b) => b,
                 Err(IngestError::TooLarge) => { report.skipped.push((wf.canonical_path, "oversize".into())); continue; }
                 Err(e) => { report.failed.push((wf.canonical_path, e.to_string())); continue; }
@@ -844,6 +861,17 @@ mod walk_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_rich_ext_matches_only_the_sandboxed_set() {
+        for e in ["pdf", "docx", "pptx", "xlsx", "xls", "msg"] {
+            assert!(is_rich_ext(Some(e)), "{e}");
+        }
+        for e in ["txt", "md", "csv", "json", "html", "rs"] {
+            assert!(!is_rich_ext(Some(e)), "{e}");
+        }
+        assert!(!is_rich_ext(None));
+    }
 
     #[test]
     fn native_parser_reads_utf8_text() {
@@ -1225,5 +1253,60 @@ mod orchestrator_tests {
         let ev2 = log2.stream_all().unwrap().into_iter()
             .find(|e| e.event_type == crate::graph::FILE_INGESTED_EVENT_TYPE).unwrap();
         assert_eq!(ev2.hash.unwrap(), recorded_hash, "file_ingested is byte-identical across reopen");
+    }
+
+    /// Read-cap proof (PR16): the READ cap in `ingest_grant_inner` — not just the
+    /// walk gate — is parser-aware. `ingest_grant_inner` uses `WalkLimits::default()`
+    /// internally (not injectable), so this drives the REAL production caps with real
+    /// sizes: an ~11 MiB `.pdf` is over the 10 MiB native cap but under the 100 MiB
+    /// rich cap (ingested), while an ~11 MiB `.txt` is over the native cap (skipped
+    /// "oversize"). Both filler bodies are `b'a'` (valid UTF-8) so `NativeTextParser`
+    /// converts them without a non-UTF-8 skip masking the size decision.
+    #[test]
+    fn read_cap_is_rich_aware_for_oversize_native_but_undersize_rich() {
+        const ELEVEN_MIB: usize = 11 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("big.pdf"), vec![b'a'; ELEVEN_MIB]).unwrap();
+        std::fs::write(folder.join("big.txt"), vec![b'a'; ELEVEN_MIB]).unwrap();
+
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical_folder = std::fs::canonicalize(&folder).unwrap();
+
+        let report = log.ingest_all(&NativeTextParser, &emb).unwrap();
+
+        // The 11 MiB .pdf clears the 100 MiB rich cap and is ingested…
+        assert_eq!(report.ingested, 1, "only the rich .pdf ingests; got {report:?}");
+        let pdf_path = canonical_folder.join("big.pdf").to_string_lossy().to_string();
+        assert!(log.current_file_for_path(&pdf_path).unwrap().is_some(), "the .pdf must be recorded");
+        // …while the 11 MiB .txt is over the 10 MiB native cap → skipped "oversize".
+        let txt_path = canonical_folder.join("big.txt");
+        assert!(
+            report.skipped.iter().any(|(p, r)| *p == txt_path && r == "oversize"),
+            "the native .txt over the native cap must skip 'oversize'; got: {:?}", report.skipped
+        );
+    }
+}
+
+/// Read/walk budget is parser-aware (M5b T1): rich extensions get the larger
+/// `max_rich_file_bytes` cap; everything else stays on `max_file_bytes`.
+#[cfg(all(test, unix))]
+mod rich_budget_tests {
+    use super::*;
+
+    #[test]
+    fn walk_applies_rich_budget_to_rich_ext_and_native_budget_to_others() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.pdf"), vec![b'a'; 500]).unwrap();
+        std::fs::write(dir.path().join("big.txt"), vec![b'a'; 500]).unwrap();
+        let limits = WalkLimits { max_file_bytes: 100, max_rich_file_bytes: 10_000, ..Default::default() };
+        let (mut seen, mut report, mut walked) = (std::collections::HashSet::new(), IngestReport::default(), Vec::new());
+        walk_grant(dir.path(), &limits, Instant::now(), &mut seen, &mut report, |wf| { walked.push(wf.canonical_path); Ok(()) }).unwrap();
+        assert!(walked.iter().any(|p| p.ends_with("big.pdf")), "rich file should pass its larger budget");
+        assert!(report.skipped.iter().any(|(p, r)| p.ends_with("big.txt") && r == "oversize"), "native file over native cap should skip");
     }
 }

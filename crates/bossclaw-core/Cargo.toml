@@ -35,6 +35,9 @@ fastembed = ["dep:fastembed"]
 # Ollama server). The default build is pure (no network dep). Enable this
 # feature in production binaries that ship the real LLM backend.
 ollama = ["dep:ureq"]
+# M5b: sandboxed markitdown subprocess parser. Enables rustix `process`
+# (kill_process_group for the timeout group-kill). Default build stays pure.
+markitdown = ["rustix/process", "dep:tempfile"]
 
 [dependencies.fastembed]
 version = "5.16"
@@ -45,6 +48,10 @@ version = "2"
 optional = true
 default-features = false
 features = ["json", "tls"]
+
+[dependencies.tempfile]
+version = "3"
+optional = true
 
 [dev-dependencies]
 tempfile = "3"
