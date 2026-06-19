@@ -298,10 +298,20 @@ fn run_probe(venv: &Venv, jailed: bool) -> bool {
         Err(e) => ProbeOutcome::ChildError(format!("{e:?}")),
     };
     let accepted = acc.join().unwrap_or(false);
-    // PROVEN only on a jail-layer refusal with nothing accepted. Everything else
-    // is fail-closed (not proven). Logged so the controller can audit honesty.
+    // PROVEN only on a definite connection refusal with nothing accepted; ambiguous
+    // outcomes (Other/ChildError/Connected) stay fail-closed. macOS Seatbelt denies the
+    // connect syscall outright (EPERM → RefusedPerm). Linux `bwrap --unshare-net` puts the
+    // child in a private network namespace: its connect to the host's LIVE loopback
+    // listener cannot reach it and is refused — ENETUNREACH if the netns loopback is down
+    // (RefusedPerm) or ECONNREFUSED if it is up (RefusedConn, accepted on Linux only). A
+    // NON-isolated child would instead CONNECT (accepted=true) since the listener is live,
+    // so a refusal together with nothing-accepted proves isolation regardless of the errno.
+    // The end-to-end no-egress guarantee is independently backstopped by the hostile-doc
+    // proof (tests/sandbox.rs), which asserts a real conversion accepts no connection.
     eprintln!("[egress-probe] jailed={jailed} outcome={outcome:?} accepted={accepted}");
-    matches!(outcome, ProbeOutcome::RefusedPerm) && !accepted
+    let refused = matches!(outcome, ProbeOutcome::RefusedPerm)
+        || (cfg!(target_os = "linux") && matches!(outcome, ProbeOutcome::RefusedConn));
+    refused && !accepted
 }
 
 /// Block up to `timeout` for a single inbound connection; true iff one arrives.
