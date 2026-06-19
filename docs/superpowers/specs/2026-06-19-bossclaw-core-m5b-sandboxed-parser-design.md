@@ -2,7 +2,7 @@
 
 - **Milestone:** M5b (brick 1 of the Vault-Brain architecture — GBrain `air/vault-brain-architecture` — the universal safe door for untrusted bytes)
 - **Date:** 2026-06-19
-- **Status:** **Rev 2** — independent critic + security second opinion folded (both returned SHIP-WITH-FIXES). See §0 changelog. Pending Peter review → implementation + dedicated security review of the built jail.
+- **Status:** **IMPLEMENTED** (T1–T12 on branch `bossclaw-core-m5b-sandboxed-parser`). All jail proofs green on macOS (network-denied with teeth, real-PDF e2e, no DB-handle/secret fd leak, hostile-doc → zero egress, fail-closed degradation). The **mandated security review of the built jail = SHIP-WITH-FIXES, 0 Critical** — all 8 §11 invariants verified to hold *in the code*. Review #2 (CI version-drift guard) + #3 (test hooks moved behind a `sandbox-test-hooks` feature so they don't ship in the `markitdown` build) folded. **Pre-merge follow-up: review #1** — commit a real hash-pinned `requirements-linux-x86_64.lock` (needs a Linux x86_64 env; the dev box is macOS-only — CI currently regenerates it fresh). The Linux jail (bwrap/PID-ns) is validated by the CI Ubuntu leg, not locally. Spec Rev 2 design below is unchanged. See §0 changelog for the plan-review history.
 - **Builds on:** M5a (Ingest Pipeline, `main 6fa2b51`) — read-only folder ingest + the taint root
 - **Crate:** `crates/bossclaw-core` (engine; `#![forbid(unsafe_code)]`)
 
