@@ -183,7 +183,6 @@ fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
 }
 #[cfg(target_os = "linux")]
 fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
-    let venv_root = Path::new(program).parent().and_then(|p| p.parent());
     let mut c = Command::new("bwrap");
     c.args([
         "--unshare-net", "--unshare-pid", "--unshare-ipc", "--die-with-parent",
@@ -191,14 +190,46 @@ fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
         "--ro-bind-try", "/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64",
         "--proc", "/proc", "--dev", "/dev",
     ]);
-    if let Some(root) = venv_root {
-        let r = root.to_string_lossy().into_owned();
-        c.arg("--ro-bind-try").arg(&r).arg(&r);
+    // Bind the venv root AND — when the interpreter is a symlink to a base Python
+    // whose prefix (the real binary + libpython + stdlib) lives outside the system
+    // dirs (setup-python's /opt/hostedtoolcache on CI, an M7 bundled prefix later)
+    // — that prefix too. Without it `bwrap`'s execvp of the interpreter dies ENOENT
+    // (the symlink dangles in the mount namespace). EFFICACY is still the T7 probe's job.
+    for bind in jail_extra_ro_binds(Path::new(program)) {
+        let b = bind.to_string_lossy().into_owned();
+        c.arg("--ro-bind-try").arg(&b).arg(&b);
     }
     c.arg("--bind").arg(scratch).arg(scratch).arg("--chdir").arg(scratch);
     c.arg(program).args(args);
     apply_scrub(&mut c, scratch);
     c
+}
+
+/// The read-only paths a Linux `bwrap` jail must bind (besides the system dirs) so
+/// the venv interpreter can exec inside the mount namespace: the venv root, plus
+/// the resolved interpreter's prefix when that prefix is NOT already covered by the
+/// system mounts (`/usr`, `/bin`, `/lib`, `/lib64`). A venv's `bin/python` is usually
+/// a symlink to a base Python whose binary, `libpython`, and stdlib live in that
+/// prefix (on GitHub Actions, `/opt/hostedtoolcache/...`); leaving it unbound makes
+/// `execvp` fail ENOENT inside the jail. Pure + platform-independent so it is
+/// unit-tested on macOS even though it only feeds the Linux jail.
+#[allow(dead_code)] // wired into the Linux wrap_jail; exercised by unit tests on all unix
+fn jail_extra_ro_binds(program: &Path) -> Vec<PathBuf> {
+    let mut binds = Vec::new();
+    if let Some(venv_root) = program.parent().and_then(|p| p.parent()) {
+        binds.push(venv_root.to_path_buf());
+    }
+    if let Ok(real) = std::fs::canonicalize(program) {
+        if let Some(prefix) = real.parent().and_then(|p| p.parent()) {
+            let covered_by_system =
+                ["/usr", "/bin", "/lib", "/lib64"].iter().any(|m| prefix.starts_with(m));
+            let already_bound = binds.iter().any(|b| b.as_path() == prefix);
+            if !covered_by_system && !already_bound {
+                binds.push(prefix.to_path_buf());
+            }
+        }
+    }
+    binds
 }
 
 // ── Egress probe ────────────────────────────────────────────────────────────
@@ -479,6 +510,53 @@ mod jail_tests {
         assert!(
             out.contains(&*scratch.path().to_string_lossy()),
             "cwd must be the scratch dir; got: {out}"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod jail_bind_tests {
+    use super::jail_extra_ro_binds;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    /// The CI failure: a venv whose `bin/python` symlinks to a base Python in a
+    /// separate prefix (mirrors setup-python's /opt/hostedtoolcache layout). The
+    /// jail MUST bind that resolved prefix, or execvp dies ENOENT inside bwrap.
+    #[test]
+    fn binds_resolved_interpreter_prefix_when_symlinked_outside_venv() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonicalize up front so lexical (venv-root) and resolved (prefix) paths
+        // compare equal (macOS canonicalizes /var → /private/var).
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let venv = root.join("venv");
+        let base = root.join("toolcache").join("x64");
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        std::fs::write(base.join("bin").join("python3"), b"#!/bin/true\n").unwrap();
+        symlink(base.join("bin").join("python3"), venv.join("bin").join("python")).unwrap();
+
+        let binds = jail_extra_ro_binds(&venv.join("bin").join("python"));
+        assert!(binds.contains(&venv), "venv root must be bound: {binds:?}");
+        assert!(binds.contains(&base), "resolved interpreter prefix must be bound: {binds:?}");
+    }
+
+    /// An interpreter that resolves under /usr (already ro-bound) must NOT add a
+    /// duplicate /usr bind — only the venv root.
+    #[test]
+    fn skips_prefix_already_covered_by_system_mounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let venv = root.join("venv");
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        // /usr/bin/env exists + resolves under /usr on macOS and Linux.
+        symlink("/usr/bin/env", venv.join("bin").join("python")).unwrap();
+
+        let binds = jail_extra_ro_binds(&venv.join("bin").join("python"));
+        assert!(binds.contains(&venv), "venv root must be bound: {binds:?}");
+        assert!(
+            !binds.iter().any(|b| b == Path::new("/usr")),
+            "must not double-bind a system-covered prefix: {binds:?}"
         );
     }
 }

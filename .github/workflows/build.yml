@@ -143,6 +143,11 @@ jobs:
           lock_pin=$(grep -oE 'markitdown\[[^]]*\]==[0-9.]+' crates/bossclaw-core/python/requirements.in | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           echo "rust=$rust_pin lock=$lock_pin"
           [ "$rust_pin" = "$lock_pin" ] || { echo "markitdown pin drift"; exit 1; }
+      # Hermetic sandbox unit tests (no venv/jail) — these are NOT #[ignore], so the
+      # gated step below (`-- --ignored`) skips them; run them explicitly so the jail
+      # arg-construction logic (jail_extra_ro_binds) is exercised on every PR.
+      - name: Sandbox hermetic unit tests
+        run: cargo test -p bossclaw-core --features sandbox-test-hooks --lib sandbox::
       - name: Gated jail proofs
         run: cargo test -p bossclaw-core --features sandbox-test-hooks -- --ignored
         env:
