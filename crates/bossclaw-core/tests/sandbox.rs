@@ -22,3 +22,23 @@ fn converts_real_pdf_and_reports_parser_id() {
     assert!(md.to_lowercase().contains("hello"), "expected 'hello' in: {md}");
     assert!(p.parser_id().starts_with("markitdown-sandboxed-v"));
 }
+
+#[test]
+#[ignore]
+fn hostile_document_makes_no_outbound_connection() {
+    // HTML referencing our listener + an RSS-ish body — neither should fetch.
+    let html = "<html><body><img src=\"http://127.0.0.1:{PORT}/x\"><a href=\"http://127.0.0.1:{PORT}/y\">z</a></body></html>";
+    assert!(!bossclaw_core::sandbox_test_hooks::hostile_doc_connects(html, "html"), "jailed parser must make NO outbound connection");
+}
+
+#[test]
+#[ignore]
+fn malformed_pdf_fails_without_hang() {
+    let p = bossclaw_core::SandboxedMarkitdownParser::discover().expect("venv + jail");
+    let hint = bossclaw_core::ingest::PathHint { ext: Some("pdf".into()) };
+    // Garbage claiming to be a PDF. The point: the call RETURNS (no hang, no host
+    // crash) — markitdown either errors or yields trivial/empty text.
+    let r = p.convert(b"%PDF-1.4\nnot a real pdf \x00\xff\xfe garbage", &hint);
+    let acceptable = r.is_err() || r.as_ref().map(|s| s.trim().len() < 50).unwrap_or(true);
+    assert!(acceptable, "malformed input should fail or yield trivial text, got: {r:?}");
+}

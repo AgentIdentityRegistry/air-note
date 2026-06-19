@@ -364,6 +364,26 @@ pub(crate) fn spawn_jailed_fd_scan() -> Vec<i32> {
         .unwrap_or_default()
 }
 
+/// TEST ONLY. Build the parser, convert `bytes` (with `{PORT}` replaced by a live
+/// loopback listener's port), and report whether ANY outbound connection was made.
+/// MUST be false — the stripped registry has no URL-fetching converter and the jail
+/// denies network. Returns true (= FAIL) if anything connected.
+#[cfg(any(test, feature = "markitdown"))]
+pub(crate) fn convert_makes_outbound_connection(bytes_template: &str, ext: &str) -> bool {
+    let listener = match std::net::TcpListener::bind("127.0.0.1:0") { Ok(l) => l, Err(_) => return false };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let acc = std::thread::spawn(move || accept_within(&listener, std::time::Duration::from_secs(4)));
+    let connected = (|| {
+        let p = SandboxedMarkitdownParser::discover().ok()?;
+        let bytes = bytes_template.replace("{PORT}", &port.to_string());
+        let _ = p.convert(bytes.as_bytes(), &crate::ingest::PathHint { ext: Some(ext.to_string()) });
+        Some(())
+    })().is_some();
+    let accepted = acc.join().unwrap_or(false);
+    let _ = connected;
+    accepted
+}
+
 /// Public test hooks — called from `tests/sandbox.rs` integration tests.
 pub mod sandbox_test_hooks {
     /// True iff the jail proves network denial (jailed connect refused at jail layer).
@@ -378,6 +398,12 @@ pub mod sandbox_test_hooks {
         super::discover_venv()
             .map(|v| super::run_probe(&v, false))
             .unwrap_or(false)
+    }
+    /// True iff converting `bytes_template` (a hostile document) caused an outbound
+    /// TCP connection to a loopback listener. MUST be false — the jail must block it.
+    #[cfg(feature = "markitdown")]
+    pub fn hostile_doc_connects(bytes_template: &str, ext: &str) -> bool {
+        super::convert_makes_outbound_connection(bytes_template, ext)
     }
 }
 
@@ -409,6 +435,12 @@ mod pump_tests {
     fn pump_does_not_deadlock_on_large_interleaved_io() {
         let out = run_pump(sh("cat"), &vec![b'x'; 1 << 20], 4 << 20, 64 << 10, Duration::from_secs(10)).unwrap();
         assert_eq!(out.len(), 1 << 20);
+    }
+
+    #[test]
+    fn run_pump_fails_closed_when_program_missing() {
+        let err = run_pump(Command::new("/nonexistent/jail-tool-xyz"), b"", 1 << 16, 64 << 10, Duration::from_secs(2)).unwrap_err();
+        assert!(matches!(err, crate::ingest::IngestError::SandboxUnavailable(_)), "missing tool must fail closed, got {err:?}");
     }
 }
 
