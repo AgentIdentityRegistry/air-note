@@ -51,6 +51,9 @@ pub use model2vec::Model2Vec;
 #[cfg(feature = "ollama")]
 pub use ollama::OllamaReasoner;
 pub use reason::{Reasoner, ScriptedReasoner};
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "markitdown"))]
+mod sandbox;
+
 pub use ingest::{is_external, IngestReport, NativeTextParser, Parser, PathHint};
 pub use recall::{Hit, NoopReranker, RecallOptions, RecallSource, Reranker};
 pub use summarize::{FactSet, RenderedPage};
