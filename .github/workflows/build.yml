@@ -71,3 +71,82 @@ jobs:
 
       - name: Build Tauri app
         run: npm run build --workspace @air-agent/desktop
+
+  # bossclaw-core engine — its own job (the desktop crate does NOT depend on it,
+  # so the job above never compiled or tested it). Default features = pure build
+  # (no subprocess, no network). Unix-only this milestone: M5a/M5b ingest is
+  # Unix-only, and SQLCipher (bundled-sqlcipher) needs a system OpenSSL on Windows.
+  # Windows engine support + its crypto-backend choice lands at M7 (desktop wiring).
+  bossclaw-core:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-core-${{ hashFiles('Cargo.lock') }}
+      - name: Test bossclaw-core (default features)
+        run: cargo test -p bossclaw-core
+      - name: Clippy bossclaw-core (default features)
+        run: cargo clippy -p bossclaw-core --all-targets -- -D warnings
+
+  # M5b sandboxed-parser jail proofs. Builds the pinned markitdown venv (pip-audit
+  # + 0.1.6 drift guard run inside build-venv.sh), then runs the gated jail tests.
+  # macOS validates the Seatbelt path; Ubuntu validates the bwrap/PID-ns path.
+  bossclaw-core-jail:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-jail-${{ hashFiles('Cargo.lock') }}
+      - name: Install bubblewrap (Linux jail tool)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # The committed per-platform lockfiles (requirements-{macos-arm64,linux-x86_64}.lock)
+      # are the source of truth; build-venv.sh installs from them with --require-hashes and
+      # pip-audits them. No CI regeneration — this leg now audits + installs the COMMITTED
+      # Linux lock, so a drifted/incomplete lock fails here instead of being silently rebuilt.
+      - name: Build the markitdown venv (pip-audit + version drift guard inside)
+        run: PYBIN=python crates/bossclaw-core/scripts/build-venv.sh "${{ runner.temp }}/m5b-venv"
+      - name: Clippy bossclaw-core (sandbox-test-hooks feature)
+        run: cargo clippy -p bossclaw-core --features sandbox-test-hooks --all-targets -- -D warnings
+      - name: Markitdown version-pin drift guard (Rust const vs requirements.in)
+        run: |
+          rust_pin=$(grep -oE 'MARKITDOWN_VERSION: &str = "[^"]+"' crates/bossclaw-core/src/sandbox.rs | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          lock_pin=$(grep -oE 'markitdown\[[^]]*\]==[0-9.]+' crates/bossclaw-core/python/requirements.in | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "rust=$rust_pin lock=$lock_pin"
+          [ "$rust_pin" = "$lock_pin" ] || { echo "markitdown pin drift"; exit 1; }
+      # Hermetic sandbox unit tests (no venv/jail) — these are NOT #[ignore], so the
+      # gated step below (`-- --ignored`) skips them; run them explicitly so the jail
+      # arg-construction logic (jail_extra_ro_binds) is exercised on every PR.
+      - name: Sandbox hermetic unit tests
+        run: "cargo test -p bossclaw-core --features sandbox-test-hooks --lib sandbox::"
+      - name: Gated jail proofs
+        run: cargo test -p bossclaw-core --features sandbox-test-hooks -- --ignored
+        env:
+          BOSSCLAW_MARKITDOWN_VENV: ${{ runner.temp }}/m5b-venv
