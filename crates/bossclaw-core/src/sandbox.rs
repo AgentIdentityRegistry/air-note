@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::ingest::IngestError;
+use crate::ingest::{IngestError, Parser, PathHint};
 
 /// Run `cmd` in its own process group, streaming `input` to stdin on a writer
 /// thread (no deadlock against a full stdout pipe), reading stdout incrementally
@@ -121,7 +121,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub(crate) struct Venv {
     pub(crate) python: PathBuf,
-    #[allow(dead_code)] // used by T8's parser
     pub(crate) wrapper: PathBuf,
 }
 
@@ -289,6 +288,62 @@ fn accept_within(listener: &TcpListener, timeout: Duration) -> bool {
             }
             Err(_) => return false,
         }
+    }
+}
+
+// ── SandboxedMarkitdownParser ────────────────────────────────────────────────
+
+/// Pinned markitdown version — MUST equal the venv lockfile pin (drift-guarded in CI).
+const MARKITDOWN_VERSION: &str = "0.1.6";
+const RICH_OUTPUT_CAP: usize = 32 * 1024 * 1024;
+const RICH_STDERR_CAP: usize = 64 * 1024;
+const RICH_WALL_CLOCK: Duration = Duration::from_secs(30);
+
+/// The sandboxed rich-document parser (M5b brick 1). Proves the network jail
+/// once at construction (fail-closed — `discover` returns `SandboxUnavailable` if
+/// the jail can't be proven, so a constructed parser is always jailed). Rebuilds
+/// a fresh jailed child per `convert`; `run_pump`'s spawn-error path fails closed
+/// if the jail tool is missing at spawn time.
+pub struct SandboxedMarkitdownParser {
+    venv: Venv,
+    id: String,
+}
+
+impl SandboxedMarkitdownParser {
+    /// Locate the venv and prove the jail. Returns `SandboxUnavailable` (→ skip)
+    /// if either fails — never constructs an un-jailed parser.
+    pub fn discover() -> Result<Self, IngestError> {
+        let venv = discover_venv()?;
+        if !probe_egress(&venv) {
+            return Err(IngestError::SandboxUnavailable(
+                "network jail could not be proven".into(),
+            ));
+        }
+        Ok(Self {
+            venv,
+            id: format!("markitdown-sandboxed-v{MARKITDOWN_VERSION}"),
+        })
+    }
+}
+
+impl Parser for SandboxedMarkitdownParser {
+    fn convert(&self, raw: &[u8], hint: &PathHint) -> Result<String, IngestError> {
+        let scratch =
+            tempfile::tempdir().map_err(|e| IngestError::Io(e.to_string()))?;
+        let ext = hint.ext.clone().unwrap_or_default();
+        let py = self
+            .venv
+            .python
+            .to_str()
+            .ok_or_else(|| IngestError::SandboxUnavailable("non-utf8 venv python path".into()))?;
+        let wrapper = self.venv.wrapper.to_string_lossy().into_owned();
+        let cmd = wrap_jail(scratch.path(), py, &[wrapper, ext]);
+        run_pump(cmd, raw, RICH_OUTPUT_CAP, RICH_STDERR_CAP, RICH_WALL_CLOCK)
+        // `scratch` drops here on every path (success/timeout/cap) → removed.
+    }
+
+    fn parser_id(&self) -> &str {
+        &self.id
     }
 }
 
