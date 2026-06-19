@@ -175,6 +175,35 @@ impl Parser for NativeTextParser {
     fn parser_id(&self) -> &str { "native-text-v1" }
 }
 
+/// The feature-off / no-jail stand-in for the rich parser: every rich file is
+/// reported `SandboxUnavailable` (→ skipped), so the engine degrades to exactly
+/// M5a behavior when `markitdown` is disabled or no venv is present.
+pub struct NullRichParser;
+impl Parser for NullRichParser {
+    fn convert(&self, _raw: &[u8], _hint: &PathHint) -> Result<String, IngestError> {
+        Err(IngestError::SandboxUnavailable("markitdown parser not available".into()))
+    }
+    fn parser_id(&self) -> &str { "null-rich" }
+}
+
+/// Selects the parser for a file by its extension hint. Holds the native + rich
+/// parsers; the orchestrator calls `pick` then uses the SAME returned parser for
+/// both `convert` and `parser_id` (correct provenance).
+pub struct ParserRouter {
+    native: Box<dyn Parser>,
+    rich: Box<dyn Parser>,
+}
+impl ParserRouter {
+    /// Construct a router with explicit native and rich parser implementations.
+    pub fn new(native: Box<dyn Parser>, rich: Box<dyn Parser>) -> Self { Self { native, rich } }
+    /// M5a-equivalent default: native text + a null rich parser (rich → skip).
+    pub fn native_only() -> Self { Self { native: Box::new(NativeTextParser), rich: Box::new(NullRichParser) } }
+    /// The chosen parser for `hint`.
+    pub fn pick(&self, hint: &PathHint) -> &dyn Parser {
+        if is_rich_ext(hint.ext.as_deref()) { self.rich.as_ref() } else { self.native.as_ref() }
+    }
+}
+
 /// A test double that returns a fixed string regardless of input.
 #[cfg(test)]
 pub struct MockParser {
@@ -552,7 +581,7 @@ impl EventLog {
     /// one post-loop rebuild. Out of scope for M5a (grant counts are small).
     pub fn ingest_all(
         &self,
-        parser: &dyn Parser,
+        router: &ParserRouter,
         embedder: &dyn crate::embed::Embedder,
     ) -> Result<IngestReport, crate::error::BossclawError> {
         let started = Instant::now();
@@ -560,7 +589,7 @@ impl EventLog {
         let mut seen = std::collections::HashSet::new();
         let active: Vec<String> = self.grants()?.into_iter().filter(|g| !g.revoked).map(|g| g.canonical_root).collect();
         for root in active {
-            self.ingest_grant_inner(std::path::Path::new(&root), parser, embedder, started, &mut seen, &mut report)?;
+            self.ingest_grant_inner(std::path::Path::new(&root), router, embedder, started, &mut seen, &mut report)?;
         }
         // Make the newly-appended files recallable (graph projection already current
         // from each ingest_grant_inner's internal rebuild).
@@ -617,7 +646,7 @@ impl EventLog {
     pub(crate) fn ingest_grant_inner(
         &self,
         grant_root: &std::path::Path,
-        parser: &dyn Parser,
+        router: &ParserRouter,
         embedder: &dyn crate::embed::Embedder,
         started: Instant,
         seen: &mut std::collections::HashSet<FileIdentity>,
@@ -649,11 +678,18 @@ impl EventLog {
                 Err(IngestError::TooLarge) => { report.skipped.push((wf.canonical_path, "oversize".into())); continue; }
                 Err(e) => { report.failed.push((wf.canonical_path, e.to_string())); continue; }
             };
+            let parser = router.pick(&wf.hint);
             let text = match parser.convert(&raw, &wf.hint) {
                 Ok(t) => t,
                 Err(e) if e.is_skip() => { report.skipped.push((wf.canonical_path, e.to_string())); continue; }
                 Err(e) => { report.failed.push((wf.canonical_path, e.to_string())); continue; }
             };
+            // Empty / whitespace-only extraction (e.g. a scanned image-only PDF)
+            // is NOT a signed empty event — record a skip instead.
+            if text.trim().is_empty() {
+                report.skipped.push((wf.canonical_path, "no extractable text".into()));
+                continue;
+            }
             let content = file_ingested_content(&text, &canonical_path, &raw, &grant_root_str, parser.parser_id(), &modified_at);
             let new_hash = content["provenance"]["content_hash"].as_str().unwrap().to_string();
 
@@ -959,6 +995,20 @@ mod tests {
         };
         assert!(!is_external(&sup), "a file supersede is ground-truth control, not external content");
     }
+
+    #[test]
+    fn router_dispatches_by_extension() {
+        let r = ParserRouter::new(Box::new(MockParser{output:"N".into()}), Box::new(MockParser{output:"R".into()}));
+        let pdf = PathHint{ext:Some("pdf".into())}; let txt = PathHint{ext:Some("txt".into())};
+        assert_eq!(r.pick(&pdf).convert(b"",&pdf).unwrap(), "R");
+        assert_eq!(r.pick(&txt).convert(b"",&txt).unwrap(), "N");
+    }
+
+    #[test]
+    fn native_only_router_skips_rich_with_sandbox_unavailable() {
+        let r = ParserRouter::native_only(); let pdf = PathHint{ext:Some("pdf".into())};
+        assert!(matches!(r.pick(&pdf).convert(b"%PDF",&pdf).unwrap_err(), IngestError::SandboxUnavailable(_)));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1082,10 +1132,10 @@ mod orchestrator_tests {
     const DEK: [u8; 32] = [42u8; 32];
     const KEY_BYTES: [u8; 32] = [7u8; 32];
 
-    fn run_ingest(log: &EventLog, root: &std::path::Path, parser: &dyn Parser, emb: &MockEmbedder) -> IngestReport {
+    fn run_ingest(log: &EventLog, root: &std::path::Path, router: &ParserRouter, emb: &MockEmbedder) -> IngestReport {
         let mut report = IngestReport::default();
         let mut seen = std::collections::HashSet::new();
-        log.ingest_grant_inner(root, parser, emb, Instant::now(), &mut seen, &mut report).unwrap();
+        log.ingest_grant_inner(root, router, emb, Instant::now(), &mut seen, &mut report).unwrap();
         report
     }
 
@@ -1102,14 +1152,14 @@ mod orchestrator_tests {
         log.add_grant(&folder).unwrap();
         let canonical_folder = std::fs::canonicalize(&folder).unwrap();
 
-        let r1 = run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        let r1 = run_ingest(&log, &canonical_folder, &ParserRouter::native_only(), &emb);
         assert_eq!((r1.ingested, r1.deduped, r1.superseded), (1, 0, 0));
 
-        let r2 = run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        let r2 = run_ingest(&log, &canonical_folder, &ParserRouter::native_only(), &emb);
         assert_eq!((r2.ingested, r2.deduped, r2.superseded), (0, 1, 0));
 
         std::fs::write(folder.join("a.md"), b"# v2 changed").unwrap();
-        let r3 = run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        let r3 = run_ingest(&log, &canonical_folder, &ParserRouter::native_only(), &emb);
         assert_eq!((r3.ingested, r3.deduped, r3.superseded), (0, 0, 1));
 
         let canonical_file = canonical_folder.join("a.md").to_string_lossy().to_string();
@@ -1131,11 +1181,11 @@ mod orchestrator_tests {
         let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
         log.add_grant(&folder).unwrap();
         let canonical = std::fs::canonicalize(&folder).unwrap();
-        assert_eq!(run_ingest(&log, &canonical, &NativeTextParser, &emb).ingested, 1);
+        assert_eq!(run_ingest(&log, &canonical, &ParserRouter::native_only(), &emb).ingested, 1);
 
         // Rewrite IDENTICAL bytes (bumps mtime, content_hash unchanged).
         std::fs::write(&f, b"identical bytes").unwrap();
-        let r = run_ingest(&log, &canonical, &NativeTextParser, &emb);
+        let r = run_ingest(&log, &canonical, &ParserRouter::native_only(), &emb);
         assert_eq!((r.ingested, r.superseded, r.deduped), (0, 0, 1),
             "mtime is provenance-only; identical bytes → dedup, NEVER supersede");
     }
@@ -1152,11 +1202,11 @@ mod orchestrator_tests {
         let log = EventLog::open_with_recall(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
         log.add_grant(&folder).unwrap();
         let canonical_folder = std::fs::canonicalize(&folder).unwrap();
-        run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        run_ingest(&log, &canonical_folder, &ParserRouter::native_only(), &emb);
 
         // Change the file, re-ingest → v1 superseded by v2.
         std::fs::write(folder.join("topic.md"), b"alpha unique-token-v2").unwrap();
-        run_ingest(&log, &canonical_folder, &NativeTextParser, &emb);
+        run_ingest(&log, &canonical_folder, &ParserRouter::native_only(), &emb);
         log.rebuild_indexes(&emb).unwrap();
         log.rebuild_graph().unwrap();
 
@@ -1188,7 +1238,7 @@ mod orchestrator_tests {
         let log = EventLog::open(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
         log.add_grant(&folder).unwrap();
         let canonical = std::fs::canonicalize(&folder).unwrap();
-        assert_eq!(run_ingest(&log, &canonical, &NativeTextParser, &emb).ingested, 1);
+        assert_eq!(run_ingest(&log, &canonical, &ParserRouter::native_only(), &emb).ingested, 1);
 
         // The evolve queue depth counts ONLY memory events; file_ingested must not appear.
         let depth = log.evolve_status().unwrap();
@@ -1208,7 +1258,7 @@ mod orchestrator_tests {
         let log = EventLog::open_with_recall(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
         log.add_grant(&folder).unwrap();
         let canonical = std::fs::canonicalize(&folder).unwrap();
-        run_ingest(&log, &canonical, &NativeTextParser, &emb);
+        run_ingest(&log, &canonical, &ParserRouter::native_only(), &emb);
         log.rebuild_indexes(&emb).unwrap();
         log.rebuild_graph().unwrap();
 
@@ -1237,7 +1287,7 @@ mod orchestrator_tests {
         log.add_grant(&g1).unwrap();
         log.add_grant(&g2).unwrap();
 
-        let report = log.ingest_all(&NativeTextParser, &emb).unwrap();
+        let report = log.ingest_all(&ParserRouter::native_only(), &emb).unwrap();
         assert_eq!(report.ingested, 2, "both granted folders' files ingested");
         let hits = log.recall(&emb, "gamma", 10, &Default::default()).unwrap();
         assert_eq!(hits.iter().filter(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE).count(), 2);
@@ -1254,7 +1304,7 @@ mod orchestrator_tests {
         let log = EventLog::open_with_recall(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
         log.add_grant(&folder).unwrap();
         log.revoke_grant(&std::fs::canonicalize(&folder).unwrap()).unwrap();
-        let report = log.ingest_all(&NativeTextParser, &emb).unwrap();
+        let report = log.ingest_all(&ParserRouter::native_only(), &emb).unwrap();
         assert_eq!(report.ingested, 0, "ingest_all skips revoked grants");
     }
 
@@ -1271,7 +1321,7 @@ mod orchestrator_tests {
             let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
             log.add_grant(&folder).unwrap();
             let canonical = std::fs::canonicalize(&folder).unwrap();
-            run_ingest(&log, &canonical, &NativeTextParser, &emb);
+            run_ingest(&log, &canonical, &ParserRouter::native_only(), &emb);
             let ev = log.stream_all().unwrap().into_iter()
                 .find(|e| e.event_type == crate::graph::FILE_INGESTED_EVENT_TYPE).unwrap();
             ev.hash.clone().unwrap()
@@ -1289,8 +1339,11 @@ mod orchestrator_tests {
     /// internally (not injectable), so this drives the REAL production caps with real
     /// sizes: an ~11 MiB `.pdf` is over the 10 MiB native cap but under the 100 MiB
     /// rich cap (ingested), while an ~11 MiB `.txt` is over the native cap (skipped
-    /// "oversize"). Both filler bodies are `b'a'` (valid UTF-8) so `NativeTextParser`
-    /// converts them without a non-UTF-8 skip masking the size decision.
+    /// "oversize"). Both filler bodies are `b'a'` (valid UTF-8). We use
+    /// `NativeTextParser` for both slots so the cap logic — not parser dispatch —
+    /// is what is under test. Production would use `NullRichParser` (→ skip), but
+    /// that would mask the size decision; `native_only()` is the correct choice for
+    /// a dispatch test, not a cap test.
     #[test]
     fn read_cap_is_rich_aware_for_oversize_native_but_undersize_rich() {
         const ELEVEN_MIB: usize = 11 * 1024 * 1024;
@@ -1306,7 +1359,14 @@ mod orchestrator_tests {
         log.add_grant(&folder).unwrap();
         let canonical_folder = std::fs::canonicalize(&folder).unwrap();
 
-        let report = log.ingest_all(&NativeTextParser, &emb).unwrap();
+        // NativeTextParser for BOTH slots: we are testing the cap routing, not
+        // the parser dispatch. The real rich slot (NullRichParser) would return
+        // SandboxUnavailable and mask the size decision.
+        let router = ParserRouter::new(
+            Box::new(NativeTextParser),
+            Box::new(NativeTextParser),
+        );
+        let report = log.ingest_all(&router, &emb).unwrap();
 
         // The 11 MiB .pdf clears the 100 MiB rich cap and is ingested…
         assert_eq!(report.ingested, 1, "only the rich .pdf ingests; got {report:?}");
@@ -1317,6 +1377,33 @@ mod orchestrator_tests {
         assert!(
             report.skipped.iter().any(|(p, r)| *p == txt_path && r == "oversize"),
             "the native .txt over the native cap must skip 'oversize'; got: {:?}", report.skipped
+        );
+    }
+
+    #[test]
+    fn empty_extraction_is_skipped_not_an_empty_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+        // A .md file whose parser returns whitespace-only text.
+        std::fs::write(folder.join("blank.md"), b"   ").unwrap();
+
+        let emb = MockEmbedder::new(16);
+        let log = EventLog::open(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES)).unwrap();
+        log.add_grant(&folder).unwrap();
+        let canonical_folder = std::fs::canonicalize(&folder).unwrap();
+
+        // Router with a MockParser that returns whitespace for every file.
+        let router = ParserRouter::new(
+            Box::new(MockParser { output: "   ".into() }),
+            Box::new(NullRichParser),
+        );
+        let report = run_ingest(&log, &canonical_folder, &router, &emb);
+        assert_eq!(report.ingested, 0, "whitespace-only extraction must not produce an event");
+        assert!(
+            report.skipped.iter().any(|(_, r)| r == "no extractable text"),
+            "must record 'no extractable text' skip; got: {:?}", report.skipped
         );
     }
 }
