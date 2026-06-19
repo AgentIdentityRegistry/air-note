@@ -115,6 +115,96 @@ fn kill_group(pid: i32) {
     }
 }
 
+use std::path::{Path, PathBuf};
+
+/// A located, validated venv: the interpreter + the first-party wrapper.
+#[allow(dead_code)] // wired in T7/T8
+#[derive(Debug)]
+pub(crate) struct Venv {
+    pub(crate) python: PathBuf,
+    pub(crate) wrapper: PathBuf,
+}
+
+/// Locate the bundled markitdown venv via an explicit path. Env override for
+/// tests/headless (`BOSSCLAW_MARKITDOWN_VENV`); the desktop wires the
+/// app-resources path in M7. Missing/invalid → `SandboxUnavailable` (→ skip).
+#[allow(dead_code)] // wired in T7/T8
+pub(crate) fn discover_venv() -> Result<Venv, IngestError> {
+    let root = std::env::var_os("BOSSCLAW_MARKITDOWN_VENV")
+        .map(PathBuf::from)
+        .ok_or_else(|| IngestError::SandboxUnavailable("no venv path configured".into()))?;
+    let python = root.join("bin").join("python");
+    let wrapper = root.join("convert_stdin.py");
+    if !python.exists() || !wrapper.exists() {
+        return Err(IngestError::SandboxUnavailable(format!("venv incomplete at {}", root.display())));
+    }
+    Ok(Venv { python, wrapper })
+}
+
+/// Scrub the child's environment + pin its cwd to the scratch dir. SHARED by the
+/// jailed builder AND the test builder so there is exactly ONE scrub path (no
+/// drift between what tests check and what production runs). No secret (DEK,
+/// signing key, API keys) can reach the child via env — `env_clear` then a
+/// minimal allowlist.
+fn apply_scrub(c: &mut Command, scratch: &Path) {
+    c.env_clear();
+    c.env("PATH", "/usr/bin:/bin");
+    c.env("LC_ALL", "C.UTF-8");
+    c.env("HOME", scratch);
+    c.env("PYTHONNOUSERSITE", "1");
+    c.env("PYTHONDONTWRITEBYTECODE", "1");
+    c.env("PYTHONHASHSEED", "0");
+    c.current_dir(scratch);
+}
+
+/// Test-only builder: env-scrubbed + scratch cwd, NO OS jail. Exercises the same
+/// `apply_scrub` production uses, so the scrub test covers the real scrub path.
+#[cfg(test)]
+fn build_jailed_command_for_test(scratch: &Path, program: &str, args: &[String]) -> Command {
+    let mut c = Command::new(program);
+    c.args(args);
+    apply_scrub(&mut c, scratch);
+    c
+}
+
+/// Wrap `program`+`args` with the per-OS network+fs jail.
+///
+/// macOS: `sandbox-exec` + a Seatbelt profile that denies network + denies writes outside
+/// the scratch (file-read is broad — spec posture is network-hard, fs-read best-effort).
+/// Linux: `bwrap` (unshare net+pid+ipc, ro-bind system + the venv, tmpfs/bind scratch).
+/// EFFICACY is proven by the T7 egress probe. `program` is the venv python (so its
+/// parent's parent is the venv root, which Linux must bind).
+#[allow(dead_code)] // wired in T7/T8
+#[cfg(target_os = "macos")]
+fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
+    let mut c = Command::new("/usr/bin/sandbox-exec");
+    c.arg("-D").arg(format!("SCRATCH={}", scratch.display()));
+    c.arg("-p").arg(include_str!("sandbox_profiles/seatbelt.sb"));
+    c.arg(program).args(args);
+    apply_scrub(&mut c, scratch);
+    c
+}
+#[allow(dead_code)] // wired in T7/T8
+#[cfg(target_os = "linux")]
+fn wrap_jail(scratch: &Path, program: &str, args: &[String]) -> Command {
+    let venv_root = Path::new(program).parent().and_then(|p| p.parent());
+    let mut c = Command::new("bwrap");
+    c.args([
+        "--unshare-net", "--unshare-pid", "--unshare-ipc", "--die-with-parent",
+        "--ro-bind-try", "/usr", "/usr", "--ro-bind-try", "/bin", "/bin",
+        "--ro-bind-try", "/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64",
+        "--proc", "/proc", "--dev", "/dev",
+    ]);
+    if let Some(root) = venv_root {
+        let r = root.to_string_lossy().into_owned();
+        c.arg("--ro-bind-try").arg(&r).arg(&r);
+    }
+    c.arg("--bind").arg(scratch).arg(scratch).arg("--chdir").arg(scratch);
+    c.arg(program).args(args);
+    apply_scrub(&mut c, scratch);
+    c
+}
+
 #[cfg(test)]
 mod pump_tests {
     use super::*;
@@ -143,5 +233,44 @@ mod pump_tests {
     fn pump_does_not_deadlock_on_large_interleaved_io() {
         let out = run_pump(sh("cat"), &vec![b'x'; 1 << 20], 4 << 20, 64 << 10, Duration::from_secs(10)).unwrap();
         assert_eq!(out.len(), 1 << 20);
+    }
+}
+
+#[cfg(test)]
+mod jail_tests {
+    use super::*;
+
+    #[test]
+    fn discover_venv_missing_env_is_sandbox_unavailable() {
+        // Ensure the var is unset for this test (it may be set in the env).
+        std::env::remove_var("BOSSCLAW_MARKITDOWN_VENV");
+        assert!(matches!(discover_venv().unwrap_err(), crate::ingest::IngestError::SandboxUnavailable(_)));
+    }
+
+    #[test]
+    fn discover_venv_incomplete_dir_is_sandbox_unavailable() {
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("BOSSCLAW_MARKITDOWN_VENV", d.path()); // empty dir → no python/wrapper
+        let r = discover_venv();
+        std::env::remove_var("BOSSCLAW_MARKITDOWN_VENV");
+        assert!(matches!(r.unwrap_err(), crate::ingest::IngestError::SandboxUnavailable(_)));
+    }
+
+    #[test]
+    fn apply_scrub_clears_env_and_sets_scratch_cwd() {
+        std::env::set_var("FAKE_SECRET", "leak-me");
+        let scratch = tempfile::tempdir().unwrap();
+        let cmd = build_jailed_command_for_test(
+            scratch.path(),
+            "/bin/sh",
+            &["-c".into(), "echo \"${FAKE_SECRET:-CLEAN}\"; pwd".into()],
+        );
+        let out = run_pump(cmd, b"", 1 << 20, 64 << 10, std::time::Duration::from_secs(5)).unwrap();
+        std::env::remove_var("FAKE_SECRET");
+        assert!(out.contains("CLEAN"), "env must be scrubbed; got: {out}");
+        assert!(
+            out.contains(&*scratch.path().to_string_lossy()),
+            "cwd must be the scratch dir; got: {out}"
+        );
     }
 }
