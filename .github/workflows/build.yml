@@ -127,14 +127,10 @@ jobs:
       - name: Install bubblewrap (Linux jail tool)
         if: matrix.platform == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
-      - name: Generate the Linux lockfile (committed lock is macOS-arm64; Linux wheels differ)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          python -m venv "${{ runner.temp }}/lc"
-          "${{ runner.temp }}/lc/bin/pip" install --upgrade pip pip-tools
-          "${{ runner.temp }}/lc/bin/pip-compile" --generate-hashes \
-            --output-file crates/bossclaw-core/python/requirements-linux-x86_64.lock \
-            crates/bossclaw-core/python/requirements.in
+      # The committed per-platform lockfiles (requirements-{macos-arm64,linux-x86_64}.lock)
+      # are the source of truth; build-venv.sh installs from them with --require-hashes and
+      # pip-audits them. No CI regeneration — this leg now audits + installs the COMMITTED
+      # Linux lock, so a drifted/incomplete lock fails here instead of being silently rebuilt.
       - name: Build the markitdown venv (pip-audit + version drift guard inside)
         run: PYBIN=python crates/bossclaw-core/scripts/build-venv.sh "${{ runner.temp }}/m5b-venv"
       - name: Clippy bossclaw-core (sandbox-test-hooks feature)
