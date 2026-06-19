@@ -74,12 +74,14 @@ jobs:
 
   # bossclaw-core engine — its own job (the desktop crate does NOT depend on it,
   # so the job above never compiled or tested it). Default features = pure build
-  # (no subprocess, no network). Windows is included to catch the unix cfg-gating.
+  # (no subprocess, no network). Unix-only this milestone: M5a/M5b ingest is
+  # Unix-only, and SQLCipher (bundled-sqlcipher) needs a system OpenSSL on Windows.
+  # Windows engine support + its crypto-backend choice lands at M7 (desktop wiring).
   bossclaw-core:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, ubuntu-22.04, windows-latest]
+        platform: [macos-latest, ubuntu-22.04]
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v5
