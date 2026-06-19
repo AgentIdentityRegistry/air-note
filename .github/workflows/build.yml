@@ -147,7 +147,7 @@ jobs:
       # gated step below (`-- --ignored`) skips them; run them explicitly so the jail
       # arg-construction logic (jail_extra_ro_binds) is exercised on every PR.
       - name: Sandbox hermetic unit tests
-        run: cargo test -p bossclaw-core --features sandbox-test-hooks --lib sandbox::
+        run: "cargo test -p bossclaw-core --features sandbox-test-hooks --lib sandbox::"
       - name: Gated jail proofs
         run: cargo test -p bossclaw-core --features sandbox-test-hooks -- --ignored
         env:
