@@ -71,3 +71,73 @@ jobs:
 
       - name: Build Tauri app
         run: npm run build --workspace @air-agent/desktop
+
+  # bossclaw-core engine — its own job (the desktop crate does NOT depend on it,
+  # so the job above never compiled or tested it). Default features = pure build
+  # (no subprocess, no network). Windows is included to catch the unix cfg-gating.
+  bossclaw-core:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-core-${{ hashFiles('Cargo.lock') }}
+      - name: Test bossclaw-core (default features)
+        run: cargo test -p bossclaw-core
+      - name: Clippy bossclaw-core (default features)
+        run: cargo clippy -p bossclaw-core --all-targets -- -D warnings
+
+  # M5b sandboxed-parser jail proofs. Builds the pinned markitdown venv (pip-audit
+  # + 0.1.6 drift guard run inside build-venv.sh), then runs the gated jail tests.
+  # macOS validates the Seatbelt path; Ubuntu validates the bwrap/PID-ns path.
+  bossclaw-core-jail:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-jail-${{ hashFiles('Cargo.lock') }}
+      - name: Install bubblewrap (Linux jail tool)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Generate the Linux lockfile (committed lock is macOS-arm64; Linux wheels differ)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          python -m venv "${{ runner.temp }}/lc"
+          "${{ runner.temp }}/lc/bin/pip" install --upgrade pip pip-tools
+          "${{ runner.temp }}/lc/bin/pip-compile" --generate-hashes \
+            --output-file crates/bossclaw-core/python/requirements-linux-x86_64.lock \
+            crates/bossclaw-core/python/requirements.in
+      - name: Build the markitdown venv (pip-audit + version drift guard inside)
+        run: PYBIN=python crates/bossclaw-core/scripts/build-venv.sh "${{ runner.temp }}/m5b-venv"
+      - name: Clippy bossclaw-core (markitdown feature)
+        run: cargo clippy -p bossclaw-core --features markitdown --all-targets -- -D warnings
+      - name: Gated jail proofs
+        run: cargo test -p bossclaw-core --features markitdown -- --ignored
+        env:
+          BOSSCLAW_MARKITDOWN_VENV: ${{ runner.temp }}/m5b-venv
