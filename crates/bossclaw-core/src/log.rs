@@ -104,6 +104,24 @@ const ENGINE_SIGNER_DID: &str = "did:wba:bossclaw-engine";
 /// fail-closed off-switch.
 const EVOLVE_ENABLED_KEY: &str = "evolve_enabled";
 
+/// The `content` key carrying the M6b reconciliation-proposer on/off switch in a
+/// control `config` event (M6b §5.3). Single-sourced so the ONE writer
+/// ([`EventLog::set_proposals_enabled`]) and the reader
+/// ([`EventLog::proposals_enabled`]) can never drift the key apart. INDEPENDENT of
+/// [`EVOLVE_ENABLED_KEY`]: turning proposals off leaves evolve curation (entity /
+/// link / invalidate emission) fully running — it suppresses ONLY the autonomous
+/// `write_proposal` synthesis layered on top of a confirmed contradiction.
+const PROPOSALS_ENABLED_KEY: &str = "proposals_enabled";
+
+/// The instruction channel (`system`) for the M6b whole-file rewrite reasoner call
+/// (spec §5.5). The data channel is [`crate::reconcile::build_rewrite_prompt`]'s
+/// fenced frame; this system line states the engine's intent so the prompt itself
+/// stays purely about the (untrusted, fenced) file body.
+#[cfg(unix)]
+const RECONCILE_SYSTEM: &str =
+    "You correct a file so it is consistent with an engine-established fact. \
+     Output only the full corrected file as JSON {\"corrected_content\": ...}.";
+
 /// `(event_id, arm_score)` pair returned by each retrieval arm. Used as the
 /// common type for both the vector arm (cosine distance, lower=better) and the
 /// keyword arm (BM25 score, lower=better) before fusion.
@@ -4262,6 +4280,66 @@ impl EventLog {
         Ok(true) // flag never set → default open
     }
 
+    /// Set the M6b reconciliation-proposer on/off switch by appending a control
+    /// `config` event whose content is `{ "proposals_enabled": <enabled> }`
+    /// (M6b §5.3). CLONES the [`EventLog::set_evolve_enabled`] mechanism exactly —
+    /// the only writer of [`PROPOSALS_ENABLED_KEY`], a signed + hash-chained
+    /// control config (so a forged/replayed flip is tamper-evident via
+    /// `verify_chain`). INDEPENDENT of the evolve switch: this gates ONLY the
+    /// autonomous `write_proposal` synthesis, never the curation loop. Carries no
+    /// model fields, so it never disturbs [`EventLog::active_model`].
+    pub fn set_proposals_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(PROPOSALS_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
+    /// Whether the M6b reconciliation proposer is enabled (M6b §5.3 off-switch).
+    ///
+    /// STICKY / fail-closed semantics IDENTICAL to [`EventLog::evolve_enabled`]:
+    /// config events are scanned newest-first and the FIRST one carrying an
+    /// explicit `proposals_enabled` bool wins. Because [`EventLog::set_proposals_enabled`]
+    /// is the only writer of the key, this is exactly "the latest EXPLICIT value":
+    /// once an explicit `false` exists with no LATER explicit `true`, proposals stay
+    /// off — a flag-LESS newer config (e.g. an active-model switch, or an
+    /// `evolve_enabled` flip) does NOT silently re-arm proposals. Default-open
+    /// (`true`) ONLY when the flag was never set at all.
+    ///
+    /// Read once near the top of [`EventLog::evolve_once`] (after the evolve
+    /// off-switch); when `false`, the confirmed-contradiction loop still emits every
+    /// `invalidate` but skips the reconciliation synthesis entirely.
+    pub fn proposals_enabled(&self) -> Result<bool, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let ev: Event = serde_json::from_str(&row?)?;
+            if let Some(flag) = ev.content.get(PROPOSALS_ENABLED_KEY).and_then(|v| v.as_bool()) {
+                return Ok(flag); // newest explicit flag wins → sticky
+            }
+        }
+        Ok(true) // flag never set → default open
+    }
+
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
     /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
     ///
@@ -4784,6 +4862,10 @@ impl EventLog {
             report.skipped_disabled = true;
             return Ok(report);
         }
+        // M6b proposer off-switch (§5.3), read ONCE per tick. INDEPENDENT of the
+        // evolve switch above: when false, curation (invalidate/link) still runs but
+        // the reconciliation synthesis after each confirmed contradiction is skipped.
+        let proposals_on = self.proposals_enabled()?;
         let cursor = self.evolve_cursor()?;
         let batch = self.unprocessed_extractable_since(cursor, EVOLVE_BATCH)?;
         // Within-tick active-key set (Rev 2 F5): seed from the current graph, then
@@ -4952,6 +5034,27 @@ impl EventLog {
                 self.invalidate(&r.src, &r.relation, &r.dst, None, &read_set)?;
                 active_keys.remove(&(r.src.clone(), r.relation.clone(), r.dst.clone()));
                 report.invalidates_emitted += 1;
+
+                // ── 6a′. M6b reconciliation (best-effort, gated). The committed
+                //    invalidate above is NEVER unwound by a reconciliation failure:
+                //    the attempt is wrapped so any Err is logged and the loop
+                //    proceeds (mirrors the per-memory `continue` discipline). The
+                //    backward walk MUST run HERE, while the retired edge is still
+                //    active (the end-of-tick `rebuild_graph` has not yet folded it
+                //    closed), because it relocates the edge via `neighbors` (an
+                //    active-edge lookup). On Unix only — the actuator/gate path
+                //    (M6a) is `#[cfg(unix)]`. ──
+                #[cfg(unix)]
+                if proposals_on {
+                    if let Err(e) = self.reconcile_confirmed_contradiction(
+                        reasoner, r, &read_set, &mut report,
+                    ) {
+                        log::warn!(
+                            "evolve: reconciliation for ({} -{}-> {}) failed (invalidate kept): {e}",
+                            r.src, r.relation, r.dst
+                        );
+                    }
+                }
             }
 
             // ── 6b. emit confirmed relations as machine links on RESOLVED ids,
@@ -5002,6 +5105,168 @@ impl EventLog {
         self.summarize_topics(reasoner, &mut report)?;
 
         Ok(report)
+    }
+
+    /// M6b reconciliation for ONE confirmed contradiction `r` (resolved entity ids),
+    /// called from `evolve_once`'s confirmed-contradiction loop AFTER the `invalidate`
+    /// is committed (spec §5.1–5.3). Best-effort: an `Err` here is logged by the
+    /// caller and the loop proceeds — the committed invalidate is NEVER unwound.
+    ///
+    /// Steps (spec §5.7):
+    /// 1. **Backward walk** `neighbors(&r.src)` → the ACTIVE edge matching
+    ///    `(relation, dst)` → its BARE `edge_id`. (Must run while the edge is still
+    ///    active — before the tick's end-of-loop `rebuild_graph` folds it closed.)
+    /// 2. `reconciliation_lineage(edge_id, read_set)` — the `Err` is PROPAGATED (never
+    ///    `unwrap_or_default`), the fail-closed signal against laundering taint to an
+    ///    empty lineage.
+    /// 3. For each lineage id that `is_reconcilable_target` reports as a still-current
+    ///    tracked file (deduped by canonical path — Q-2: one proposal per distinct
+    ///    file, each against the cap): idempotency-skip, cap-elide, read LIVE bytes,
+    ///    synthesize a corrected rewrite, run the M6a gate, and record either a
+    ///    `write_proposal` (+ proposal bytes) or a `write_rejected`.
+    ///
+    /// **`write_rejected` is reserved for genuine synthesis/gate failures**
+    /// (unrenderable target, empty rewrite, a gate `reject_reason`). The cap-elision
+    /// and the off-switch (handled by the caller) MUST NOT emit `write_rejected` — a
+    /// rejection PERMANENTLY suppresses that `(path, inducing_key)` (T6), so those
+    /// deferrals only `continue`/count to stay retryable on a later tick.
+    #[cfg(unix)]
+    fn reconcile_confirmed_contradiction(
+        &self,
+        reasoner: &dyn crate::reason::Reasoner,
+        r: &crate::extract::ProposedRetraction,
+        read_set: &[String],
+        report: &mut EvolveReport,
+    ) -> Result<(), BossclawError> {
+        use sha2::{Digest, Sha256};
+
+        // ── 1. Backward walk to the retired edge's BARE event id. `neighbors` is the
+        //    active-edge lookup; the edge is still active here (pre rebuild_graph). ──
+        let edge_id = match self
+            .neighbors(&r.src)?
+            .into_iter()
+            .find(|e| e.relation == r.relation && e.dst == r.dst)
+        {
+            Some(e) => e.edge_id, // `edge_id == ev.id` — exactly the bare link-event id
+            None => return Ok(()), // no active edge (shouldn't happen for a confirmed retraction)
+        };
+
+        // ── 2. Engine-gathered lineage (D8). Propagate the Err — never launder to []. ──
+        let lineage = self.reconciliation_lineage(&edge_id, read_set)?;
+
+        // ── 3. Find distinct current target files in the lineage, deduped by path. ──
+        let mut seen_paths: HashSet<String> = HashSet::new();
+        for id in &lineage {
+            let Some(rec) = self.is_reconcilable_target(id)? else { continue };
+            if !seen_paths.insert(rec.canonical_path.clone()) {
+                continue; // already proposed against this file this contradiction
+            }
+
+            // a. inducing_key = the RESOLVED contradiction (entity ids).
+            let inducing_key = serde_json::json!({
+                "src": r.src, "relation": r.relation, "dst": r.dst,
+            });
+
+            // b. idempotency: skip if already pending/rejected for (path, key).
+            if self.is_proposal_suppressed(&rec.canonical_path, &inducing_key)? {
+                continue;
+            }
+
+            // c. cap: elide (count, do NOT reject) once the per-tick max is reached.
+            if report.proposals_emitted >= crate::extract::MAX_PROPOSALS_PER_TICK {
+                report.proposals_elided_cap += 1;
+                continue;
+            }
+
+            // d. read LIVE bytes. A read failure, an oversized file, or non-UTF-8
+            //    content is a genuine synthesis failure → write_rejected (terminal).
+            //    Read once, size-check, then convert in ONE fallible step (no second
+            //    UTF-8 pass): `from_utf8` is the validation, its `Err` is the reject.
+            let within_cap = std::fs::read(&rec.canonical_path)
+                .ok()
+                .filter(|bytes| bytes.len() <= crate::extract::MAX_INPUT_TEXT_BYTES);
+            let live_text = match within_cap.map(String::from_utf8) {
+                Some(Ok(text)) => text,
+                _ => {
+                    self.append_write_rejected(
+                        Some(&rec.canonical_path),
+                        "unrenderable_target",
+                        &inducing_key,
+                        &lineage,
+                    )?;
+                    report.proposals_rejected += 1;
+                    continue;
+                }
+            };
+
+            // e. The engine-rendered fact (build_rewrite_prompt sanitizes it).
+            let engine_fact = format!("{} -{}-> {}", r.src, r.relation, r.dst);
+
+            // f. Synthesize the corrected rewrite. A missing/empty `corrected_content`
+            //    is a genuine synthesis failure → write_rejected (terminal).
+            let prompt = crate::reconcile::build_rewrite_prompt(&engine_fact, &live_text);
+            let out = reasoner.complete_json(
+                RECONCILE_SYSTEM,
+                &prompt,
+                &crate::reconcile::rewrite_schema(),
+            )?;
+            let corrected = out.get("corrected_content").and_then(|v| v.as_str()).unwrap_or("");
+            if corrected.is_empty() {
+                self.append_write_rejected(
+                    Some(&rec.canonical_path),
+                    "empty_rewrite",
+                    &inducing_key,
+                    &lineage,
+                )?;
+                report.proposals_rejected += 1;
+                continue;
+            }
+
+            // g. Hash the proposed bytes EXACTLY as the engine hashes file content.
+            let bytes = corrected.as_bytes().to_vec();
+            let hash = hex::encode(Sha256::digest(&bytes));
+
+            // h. Run the M6a write gate (taint anchor, eligibility, op×existence).
+            let gated = self.propose_write(crate::actuator::WriteProposal {
+                target: rec.canonical_path.clone().into(),
+                new_content: bytes.clone(),
+                op: crate::actuator::WriteOp::Edit,
+                source_event_ids: lineage.clone(),
+                rationale: engine_fact.clone(),
+            })?;
+
+            // i. A gate reject_reason is a genuine gate failure → write_rejected.
+            if let Some(reason) = gated.verdict.reject_reason.as_deref() {
+                self.append_write_rejected(
+                    Some(&rec.canonical_path),
+                    reason,
+                    &inducing_key,
+                    &lineage,
+                )?;
+                report.proposals_rejected += 1;
+                continue;
+            }
+
+            // j. Record the gated proposal + its bytes (the worklist side table).
+            let verdict_summary = serde_json::json!({
+                "requires_loud_modal": gated.verdict.requires_loud_modal,
+                "taint": format!("{:?}", gated.verdict.taint),
+                "allowed": gated.verdict.allowed,
+            });
+            let pid = self.append_write_proposal(
+                &rec.canonical_path,
+                "edit",
+                &hash,
+                bytes.len() as u64,
+                &engine_fact,
+                &inducing_key,
+                &verdict_summary,
+                &lineage,
+            )?;
+            self.put_proposal_bytes(&pid, &bytes, &hash)?;
+            report.proposals_emitted += 1;
+        }
+        Ok(())
     }
 
     /// Resolve one `mention` to an entity id, minting a signed `entity` event +

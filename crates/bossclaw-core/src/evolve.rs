@@ -24,7 +24,7 @@
 /// Max memories processed per evolve tick (re-exported from the pure-consts
 /// module so the "evolve consts" grouping reads naturally without a second
 /// source of truth — single-sourced in [`crate::extract`], no cycle).
-pub use crate::extract::{EVOLVE_BATCH, EVOLVE_DEBOUNCE_MS};
+pub use crate::extract::{EVOLVE_BATCH, EVOLVE_DEBOUNCE_MS, MAX_PROPOSALS_PER_TICK};
 
 /// What one [`crate::log::EventLog::evolve_once`] tick did (spec §8 observability
 /// + the test oracle). Counts are per-tick, not cumulative.
@@ -44,6 +44,19 @@ pub struct EvolveReport {
     pub pages_superseded: usize,
     /// Memories processed this tick (≤ [`EVOLVE_BATCH`]).
     pub memories_processed: usize,
+    /// Reconciliation `write_proposal`s emitted this tick (M6b §5.2): one per
+    /// distinct current file whose lineage traced from a confirmed file-backed
+    /// contradiction and that passed synthesis + the M6a write gate.
+    pub proposals_emitted: usize,
+    /// Reconciliation attempts that ended in a `write_rejected` this tick (M6b):
+    /// a genuine synthesis/gate failure (unrenderable target, empty rewrite, or a
+    /// gate `reject_reason`). NOT incremented for cap-elision or the off-switch —
+    /// those stay retryable (a `write_rejected` is terminal for its (path, key), T6).
+    pub proposals_rejected: usize,
+    /// Reconciliation proposals skipped this tick because the per-tick cap
+    /// ([`MAX_PROPOSALS_PER_TICK`]) was already reached (M6b §5.2). Elided, never
+    /// rejected — the (path, inducing_key) is left to retry on a later tick.
+    pub proposals_elided_cap: usize,
     /// True iff the tick short-circuited because the off-switch is engaged.
     pub skipped_disabled: bool,
 }

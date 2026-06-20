@@ -315,3 +315,542 @@ fn proposal_suppression_is_scoped_to_path_and_key() {
     common::append_rejected(&log, &canonical, &key_a, "unrenderable_target");
     assert!(!log.is_proposal_suppressed(&canonical, &key_b).unwrap(), "rejected key_a does not suppress key_b");
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Task 7 — evolve_once integration: the reconciliation proposer end-to-end.
+//
+// These tests drive the WHOLE evolve tick (recall → Pass A → resolve → Pass B →
+// invalidate → reconciliation synthesis → write_proposal) with NO live model. The
+// challenge (test-reasoner guidance, plan §"Test-reasoner guidance"): `evolve_once`
+// calls the reasoner MULTIPLE times per tick — Pass A, Pass B, and now the M6b
+// rewrite. The `DispatchReasoner` below intercepts the rewrite call (its prompt is
+// the literal `build_rewrite_prompt` frame, recognizable by "You are correcting a
+// file") and delegates EVERY other turn to an inner `ScriptedReasoner` scripted
+// exactly the way `tests/evolve.rs` + `tests/extraction.rs` script a contradiction.
+// ══════════════════════════════════════════════════════════════════════════════
+
+use bossclaw_core::embed::MockEmbedder;
+use bossclaw_core::event::Event;
+use bossclaw_core::extract::{
+    build_pass_a_prompt, build_pass_b_prompt, parse_proposals, verify_floor, MAX_PROPOSALS_PER_TICK,
+    PASS_A_SYSTEM, PASS_B_SYSTEM,
+};
+use bossclaw_core::reason::{Reasoner, ScriptedReasoner};
+use bossclaw_core::recall::RecallOptions;
+use serde_json::Value;
+
+/// The exact corrected body the rewrite turn returns for the Alice/Globex fixture.
+const CORRECTED_BODY: &str = "Alice works at Globex.\n";
+
+/// A reasoner that dispatches on the call shape: the M6b whole-file rewrite (whose
+/// prompt is `build_rewrite_prompt`'s frame, identifiable by the literal lead line
+/// "You are correcting a file") returns a fixed `{ "corrected_content": ... }`;
+/// every OTHER turn (Pass A, Pass B, entity adjudication, summarize compose) is
+/// delegated to the inner `ScriptedReasoner`. This is the recommended seam from the
+/// plan: it lets the contradiction be scripted with the proven `scripted_both_passes`
+/// pattern while the rewrite — whose prompt is laborious to reproduce byte-exactly —
+/// is matched structurally instead.
+struct DispatchReasoner {
+    inner: ScriptedReasoner,
+    corrected: String,
+}
+
+impl DispatchReasoner {
+    fn new(inner: ScriptedReasoner) -> Self {
+        Self { inner, corrected: CORRECTED_BODY.to_string() }
+    }
+    /// Override the rewrite body (used by the cap test to keep each proposal valid).
+    fn with_corrected(mut self, body: &str) -> Self {
+        self.corrected = body.to_string();
+        self
+    }
+}
+
+impl Reasoner for DispatchReasoner {
+    fn complete_json(
+        &self,
+        system: &str,
+        prompt: &str,
+        schema: &Value,
+    ) -> Result<Value, bossclaw_core::error::BossclawError> {
+        // The rewrite prompt is `build_rewrite_prompt`'s frame; its lead instruction
+        // line is engine-fixed (the file body is fenced BELOW, so this marker can
+        // only come from the trusted frame, never the untrusted file text).
+        if prompt.contains("You are correcting a file") {
+            return Ok(serde_json::json!({ "corrected_content": self.corrected }));
+        }
+        self.inner.complete_json(system, prompt, schema)
+    }
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+}
+
+fn mk_memory_ev(text: &str) -> Event {
+    Event {
+        id: String::new(),
+        ts: String::new(),
+        valid_time: None,
+        event_type: "memory".to_string(),
+        content: serde_json::json!({ "text": text }),
+        model_meta: None,
+        prev_hash: String::new(),
+        hash: None,
+        signed_by_did: "did:wba:AIR-TEST".to_string(),
+        signature: None,
+    }
+}
+
+/// Append a memory and bring every derived structure current (the production
+/// open→derive→rebuild lifecycle — mirrors `tests/evolve.rs::seed_memory`).
+fn seed_memory_full(log: &bossclaw_core::EventLog, emb: &MockEmbedder, text: &str) -> String {
+    let id = log.append(mk_memory_ev(text)).unwrap();
+    log.rederive_pending(emb).unwrap();
+    log.rebuild_indexes(emb).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(emb).unwrap();
+    id
+}
+
+/// Ingest a `.md` under the granted dir and bring every derived structure current,
+/// so the `file_ingested` event is a ready evolve SUBJECT (Door C). Returns
+/// `(file_event_id, stored_content_text)` — the stored text is the `source` string
+/// `evolve_once` feeds Pass A (so the scripted prompt matches byte-for-byte).
+fn ingest_md_full(
+    log: &bossclaw_core::EventLog,
+    emb: &MockEmbedder,
+    dir: &std::path::Path,
+    name: &str,
+    body: &[u8],
+) -> (String, String) {
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    let id = common::ingest_one(log, &path);
+    log.rederive_pending(emb).unwrap();
+    log.rebuild_indexes(emb).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(emb).unwrap();
+    let text = log
+        .event_by_id(&id)
+        .unwrap()
+        .unwrap()
+        .content
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap()
+        .to_string();
+    (id, text)
+}
+
+/// Pass-A payload for an "X works_at Y" subject: two entities + one `works_at` link
+/// whose `supported_by` span is the whole `source` (so `verify_floor` keeps it).
+fn works_at_pass_a(x: &str, y: &str, source: &str) -> Value {
+    serde_json::json!({
+        "entities": [
+            { "mention": x, "entity_type": "person", "confidence": 0.95 },
+            { "mention": y, "entity_type": "org",    "confidence": 0.95 }
+        ],
+        "relations": [{
+            "src": x, "relation": "works_at", "dst": y,
+            "confidence": 0.92, "supported_by": source
+        }],
+        "retractions": []
+    })
+}
+
+/// Pass-A payload that RETRACTS `(x, works_at, old)` and asserts `(x, works_at, new)`.
+/// The retraction is expressed in MENTIONS; `evolve_once` remaps them to resolved ids
+/// before confirming against the active edge keys (F4).
+fn correction_pass_a(x: &str, old: &str, new: &str, source: &str) -> Value {
+    serde_json::json!({
+        "entities": [
+            { "mention": x,   "entity_type": "person", "confidence": 0.95 },
+            { "mention": new, "entity_type": "org",    "confidence": 0.95 }
+        ],
+        "relations": [{
+            "src": x, "relation": "works_at", "dst": new,
+            "confidence": 0.92, "supported_by": source
+        }],
+        "retractions": [{
+            "src": x, "relation": "works_at", "dst": old,
+            "reason": "the source corrects the employer", "confidence": 0.95
+        }]
+    })
+}
+
+/// Script BOTH passes of ONE subject into `reasoner`, under EACH recall context in
+/// `recall_ctxs` (Door B can surface earlier subjects, so Pass A must be scripted for
+/// every context that can occur). `neighborhood` is the cheat-sheet the loop builds
+/// for Pass B. The Pass-B echo returns the floor-verified relations + retractions so
+/// `intersect_keep_floor` keeps them. Mirrors `tests/evolve.rs::scripted_both_passes`
+/// but threaded onto an existing builder so several subjects compose into one reasoner.
+fn add_both_passes(
+    mut reasoner: ScriptedReasoner,
+    source: &str,
+    recall_ctxs: &[Vec<String>],
+    neighborhood: &[String],
+    pass_a: Value,
+) -> ScriptedReasoner {
+    for ctx in recall_ctxs {
+        let a_prompt = build_pass_a_prompt(source, ctx);
+        reasoner = reasoner.with_response(PASS_A_SYSTEM, &a_prompt, pass_a.clone());
+    }
+    let floor = verify_floor(&parse_proposals(&pass_a).unwrap(), source);
+    let b_response = serde_json::json!({
+        "entities": [],
+        "relations": floor.relations.iter().map(|r| serde_json::json!({
+            "src": r.src, "relation": r.relation, "dst": r.dst,
+            "confidence": r.confidence, "supported_by": r.supported_by,
+        })).collect::<Vec<_>>(),
+        "retractions": floor.retractions.iter().map(|r| serde_json::json!({
+            "src": r.src, "relation": r.relation, "dst": r.dst,
+            "reason": r.reason, "confidence": r.confidence,
+        })).collect::<Vec<_>>(),
+    });
+    let b_prompt = build_pass_b_prompt(source, &floor, neighborhood);
+    reasoner.with_response(PASS_B_SYSTEM, &b_prompt, b_response)
+}
+
+/// Replicate the EXACT recall context `evolve_once` builds for a subject `text` whose
+/// own event id is `self_id`: the loop calls `recall(emb, text, GRAPH_CONTEXT_K,
+/// {exclude_pages, !exclude_files})`, drops the subject's own id, and maps the rest to
+/// their `content.text` (recall-rank order). Used so a scripted Pass A keys on the SAME
+/// `(system, prompt)` the loop will produce — the deterministic way to script a subject
+/// whose in-loop recall is not provably empty (graph-proximity boost can surface
+/// neighbors). Mirrors the loop's recall block in `EventLog::evolve_once`.
+fn loop_recall_texts(
+    log: &bossclaw_core::EventLog,
+    emb: &MockEmbedder,
+    text: &str,
+    self_id: &str,
+) -> Vec<String> {
+    let hits = log
+        .recall(
+            emb,
+            text,
+            bossclaw_core::extract::GRAPH_CONTEXT_K,
+            &RecallOptions { exclude_pages: true, exclude_files: false, ..Default::default() },
+        )
+        .unwrap_or_default();
+    hits.into_iter()
+        .map(|h| h.event_id)
+        .filter(|id| id != self_id)
+        // Map to content.text verbatim, in rank order, dropping ids with no text
+        // (exactly what the loop's private `texts_for_ids` does).
+        .filter_map(|id| {
+            log.event_by_id(&id)
+                .ok()
+                .flatten()
+                .and_then(|ev| ev.content.get("text").and_then(|t| t.as_str()).map(str::to_string))
+        })
+        .collect()
+}
+
+/// Count CURRENT `write_proposal` events whose `target` equals `canonical`.
+fn proposals_targeting(log: &bossclaw_core::EventLog, canonical: &str) -> usize {
+    log.stream_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == bossclaw_core::graph::WRITE_PROPOSAL_EVENT_TYPE)
+        .filter(|e| e.content.get("target").and_then(|t| t.as_str()) == Some(canonical))
+        .count()
+}
+
+/// END-TO-END: a `.md` asserts "Alice works at Acme"; a memory corrects it to Globex.
+/// One `evolve_once` (a) confirms the contradiction (`invalidate`) AND (b) synthesizes
+/// a corrected rewrite, recording exactly one `write_proposal` whose target is the
+/// ingested file's canonical path.
+#[test]
+fn evolve_once_emits_reconciliation_proposal_for_file_backed_contradiction() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+
+    // ── Tick 1: the FILE establishes "Alice works_at Acme". Its file_ingested id
+    //    flows into the works_at edge's source_event_ids (Door C), so the retired
+    //    edge later traces back to this still-current file. ──
+    let (file_id, file_src) = ingest_md_full(&log, &emb, &dir, "notes.md", b"Alice works at Acme.\n");
+    let canonical = std::fs::canonicalize(dir.join("notes.md")).unwrap().to_string_lossy().to_string();
+
+    let r1 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        &file_src,
+        &[vec![]], // single subject in the store → recall is empty
+        &[],
+        works_at_pass_a("Alice", "Acme", &file_src),
+    ));
+    let rep1 = log.evolve_once(&emb, &r1).unwrap();
+    assert!(rep1.links_emitted >= 1, "the file established the works_at edge");
+    assert_eq!(rep1.proposals_emitted, 0, "no contradiction yet → no proposal");
+    log.rebuild_graph().unwrap();
+
+    // Resolve Alice/Acme to ids so we know the neighborhood line Pass B will see.
+    let entities = log.all_entities().unwrap();
+    let alice = entities.iter().find(|e| e.label == "Alice").unwrap().entity_id.clone();
+    let acme = entities.iter().find(|e| e.label == "Acme").unwrap().entity_id.clone();
+
+    // ── Tick 2: a memory corrects the employer. recall for the memory may surface
+    //    the file text (Door B open), so script Pass A under BOTH recall contexts. ──
+    let corr = "Correction: Alice works at Globex, not Acme.";
+    let mem_id = seed_memory_full(&log, &emb, corr);
+
+    // The neighborhood the loop renders for Pass B uses the surface mentions present
+    // in THIS subject; "Alice" and "Acme" both appear in `corr`, so the active edge
+    // renders by name.
+    let nbh = vec!["Alice -works_at-> Acme".to_string()];
+    let inner2 = add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[vec![], vec![file_src.clone()]],
+        &nbh,
+        correction_pass_a("Alice", "Acme", "Globex", corr),
+    );
+    let r2 = DispatchReasoner::new(inner2);
+    let rep2 = log.evolve_once(&emb, &r2).unwrap();
+
+    assert!(rep2.invalidates_emitted >= 1, "the contradiction was confirmed (invalidate)");
+    assert_eq!(rep2.proposals_emitted, 1, "exactly one reconciliation proposal");
+    assert_eq!(rep2.proposals_rejected, 0, "the rewrite + gate succeeded");
+    assert_eq!(rep2.proposals_elided_cap, 0, "well under the per-tick cap");
+
+    // Exactly one write_proposal, targeting the ingested file's canonical path.
+    assert_eq!(proposals_targeting(&log, &canonical), 1, "one proposal targets notes.md");
+
+    let prop = log
+        .stream_all()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.event_type == bossclaw_core::graph::WRITE_PROPOSAL_EVENT_TYPE)
+        .unwrap();
+    // The inducing_key is the RESOLVED contradiction (entity ids), and the lineage
+    // carries the still-current file id (so the proposal anchors to the right target).
+    assert_eq!(prop.content["inducing_key"]["src"], serde_json::json!(alice));
+    assert_eq!(prop.content["inducing_key"]["dst"], serde_json::json!(acme));
+    assert_eq!(prop.content["inducing_key"]["relation"], serde_json::json!("works_at"));
+    let lineage = prop.model_meta.as_ref().unwrap().source_event_ids.clone();
+    assert!(lineage.contains(&file_id), "lineage carries the asserting file id");
+    assert!(lineage.contains(&mem_id), "lineage carries the correcting memory id");
+    log.verify_chain().unwrap();
+}
+
+/// A contradiction whose BOTH facts come only from memories (no file in the lineage)
+/// confirms the `invalidate` but synthesizes NO proposal — there is nothing on disk to
+/// rewrite.
+#[test]
+fn memory_only_contradiction_emits_no_proposal() {
+    let (log, _home, _dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+
+    // Tick 1: memory establishes the edge.
+    let src1 = "Bob works at Initech.";
+    seed_memory_full(&log, &emb, src1);
+    let r1 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        src1,
+        &[vec![]],
+        &[],
+        works_at_pass_a("Bob", "Initech", src1),
+    ));
+    let rep1 = log.evolve_once(&emb, &r1).unwrap();
+    assert!(rep1.links_emitted >= 1, "edge established from a memory");
+    log.rebuild_graph().unwrap();
+
+    // Tick 2: memory corrects it.
+    let corr = "Correction: Bob works at Globex, not Initech.";
+    seed_memory_full(&log, &emb, corr);
+    let nbh = vec!["Bob -works_at-> Initech".to_string()];
+    let r2 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[vec![], vec![src1.to_string()]],
+        &nbh,
+        correction_pass_a("Bob", "Initech", "Globex", corr),
+    ));
+    let rep2 = log.evolve_once(&emb, &r2).unwrap();
+
+    assert!(rep2.invalidates_emitted >= 1, "the contradiction still fires");
+    assert_eq!(rep2.proposals_emitted, 0, "memory-only lineage → nothing on disk to propose against");
+    assert_eq!(rep2.proposals_rejected, 0, "no synthesis was even attempted");
+    log.verify_chain().unwrap();
+}
+
+/// The off-switch suppresses ONLY the proposal layer: with proposals disabled, evolve
+/// curation still confirms the contradiction (`invalidate`), but no `write_proposal` is
+/// synthesized. (And no `write_rejected` either — the gate suppression must stay
+/// retryable, so the off-switch is a plain skip.)
+#[test]
+fn proposals_offswitch_suppresses_only_proposals() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+    log.set_proposals_enabled(false).unwrap();
+
+    let (_file_id, file_src) = ingest_md_full(&log, &emb, &dir, "notes.md", b"Alice works at Acme.\n");
+    let canonical = std::fs::canonicalize(dir.join("notes.md")).unwrap().to_string_lossy().to_string();
+    let r1 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        &file_src,
+        &[vec![]],
+        &[],
+        works_at_pass_a("Alice", "Acme", &file_src),
+    ));
+    log.evolve_once(&emb, &r1).unwrap();
+    log.rebuild_graph().unwrap();
+
+    let corr = "Correction: Alice works at Globex, not Acme.";
+    seed_memory_full(&log, &emb, corr);
+    let nbh = vec!["Alice -works_at-> Acme".to_string()];
+    let r2 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[vec![], vec![file_src.clone()]],
+        &nbh,
+        correction_pass_a("Alice", "Acme", "Globex", corr),
+    ));
+    let rep2 = log.evolve_once(&emb, &r2).unwrap();
+
+    assert!(rep2.invalidates_emitted >= 1, "curation still runs with proposals OFF");
+    assert_eq!(rep2.proposals_emitted, 0, "off-switch suppresses the proposal");
+    assert_eq!(rep2.proposals_rejected, 0, "off-switch is a plain skip — NEVER a write_rejected (T6 retryable)");
+    assert_eq!(proposals_targeting(&log, &canonical), 0, "no proposal event was written");
+    // And no write_rejected was recorded for this (path,key) → a later re-enable can still propose.
+    let key = serde_json::json!({"src":"entity:alice","relation":"works_at","dst":"entity:acme"});
+    // (Exact ids differ; assert via the absence of ANY write_rejected event instead.)
+    let _ = key;
+    let rejected = log
+        .stream_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == bossclaw_core::graph::WRITE_REJECTED_EVENT_TYPE)
+        .count();
+    assert_eq!(rejected, 0, "no write_rejected emitted by the off-switch path");
+    log.verify_chain().unwrap();
+}
+
+/// GUARD TEST (revert-sensitive): the backward walk to the retired edge MUST run while
+/// that edge is still ACTIVE — i.e. INSIDE the confirmed-contradiction loop, BEFORE the
+/// end-of-tick `rebuild_graph` folds it closed. This is the same e2e setup; a regression
+/// that moved the walk AFTER `rebuild_graph` would read the now-closed edge via
+/// `neighbors` (active-edge lookup), find nothing, and emit 0 proposals. Asserting 1
+/// here locks the ordering.
+#[test]
+fn walk_runs_against_active_edge_within_the_loop() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+
+    let (_file_id, file_src) = ingest_md_full(&log, &emb, &dir, "notes.md", b"Alice works at Acme.\n");
+    let canonical = std::fs::canonicalize(dir.join("notes.md")).unwrap().to_string_lossy().to_string();
+    let r1 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        &file_src,
+        &[vec![]],
+        &[],
+        works_at_pass_a("Alice", "Acme", &file_src),
+    ));
+    log.evolve_once(&emb, &r1).unwrap();
+    log.rebuild_graph().unwrap();
+
+    let corr = "Correction: Alice works at Globex, not Acme.";
+    seed_memory_full(&log, &emb, corr);
+    let nbh = vec!["Alice -works_at-> Acme".to_string()];
+    let r2 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[vec![], vec![file_src.clone()]],
+        &nbh,
+        correction_pass_a("Alice", "Acme", "Globex", corr),
+    ));
+    let rep2 = log.evolve_once(&emb, &r2).unwrap();
+    // If the walk ran after rebuild_graph (edge folded closed), neighbors() would
+    // return no active edge → 0 proposals. 1 proves the walk read the LIVE edge.
+    assert_eq!(rep2.proposals_emitted, 1, "walk must run while the retired edge is still active");
+    assert_eq!(proposals_targeting(&log, &canonical), 1);
+    log.verify_chain().unwrap();
+}
+
+/// CAP: when ONE confirmed contradiction's lineage fans out to MORE than
+/// `MAX_PROPOSALS_PER_TICK` DISTINCT current files (Q-2: one proposal per distinct file),
+/// at most `MAX_PROPOSALS_PER_TICK` proposals are emitted and the rest are COUNTED in
+/// `proposals_elided_cap` — never rejected (an elided `(path,key)` stays retryable; a
+/// `write_rejected` would permanently suppress it, T6).
+///
+/// Hermetic construction (single contradiction, multi-file lineage — far simpler to
+/// script than N contradictions under recall fan-out): ingest N tracked files with
+/// token-DISJOINT "archive" text (so recall never surfaces them), mint two entities, and
+/// seed ONE machine edge that cites ALL N file ids as its `source_event_ids`. Advance the
+/// evolve cursor past everything seeded so the single capped tick processes ONLY the
+/// correcting memory, whose Pass A retracts that one edge. The reconciliation walk then
+/// finds N reconcilable targets in the edge's lineage and the cap bounds the proposals.
+#[test]
+fn cap_bounds_proposals_per_tick_and_counts_the_overflow() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+    let n = MAX_PROPOSALS_PER_TICK + 2; // two over the cap
+
+    // N tracked files whose text shares NO tokens with the correcting memory, so the
+    // memory's in-loop recall stays empty (MockEmbedder is bag-of-words). Each is a
+    // current, reconcilable target; collect their file_ingested ids for the edge lineage.
+    let mut file_ids: Vec<String> = Vec::new();
+    for i in 0..n {
+        let path = dir.join(format!("archive{i}.md"));
+        std::fs::write(&path, format!("ARCHIVE BLOB ZZ{i} QQ{i}\n").as_bytes()).unwrap();
+        file_ids.push(common::ingest_one(&log, &path));
+    }
+
+    // Mint the two endpoints, then ONE machine edge citing ALL N files as its sources.
+    // `entity()` does NOT store a resolution vector, so derive each one explicitly —
+    // otherwise `rebuild_entity_index` can't index it and the memory's mentions would
+    // mint fresh entities instead of resolving to these (so the retraction would miss).
+    let cap_person = log.entity("CapPerson", &[], "person", "m6b-test-seed", &file_ids).unwrap();
+    let cap_org = log.entity("CapOrg", &[], "org", "m6b-test-seed", &file_ids).unwrap();
+    log.derive_entity_vector(&emb, &cap_person, "CapPerson").unwrap();
+    log.derive_entity_vector(&emb, &cap_org, "CapOrg").unwrap();
+    let _edge = common::seed_edge_with_sources(&log, &cap_person, "works_at", &cap_org, &file_ids);
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(&emb).unwrap();
+
+    // Skip every event seeded so far as an evolve subject: seq is a 1-based autoincrement
+    // with no deletes, so the event count IS the current tip seq. The next tick then sees
+    // only the later-appended memory.
+    let tip = log.stream_all().unwrap().len() as i64;
+    log.set_evolve_cursor(tip).unwrap();
+
+    // The single correcting memory: mentions resolve to the seeded entities (same path the
+    // e2e test exercises), and its Pass A retracts the one edge.
+    let corr = "CapPerson no longer works at CapOrg.";
+    let mem_id = seed_memory_full(&log, &emb, corr);
+    let pass_a = serde_json::json!({
+        "entities": [
+            { "mention": "CapPerson", "entity_type": "person", "confidence": 0.95 },
+            { "mention": "CapOrg",    "entity_type": "org",    "confidence": 0.95 }
+        ],
+        "relations": [],
+        "retractions": [{
+            "src": "CapPerson", "relation": "works_at", "dst": "CapOrg",
+            "reason": "left", "confidence": 0.95
+        }]
+    });
+    // Pass B neighborhood: the one active edge, rendered by the surface mentions present
+    // in this memory ("CapPerson"/"CapOrg").
+    let nbh = vec!["CapPerson -works_at-> CapOrg".to_string()];
+    // Script Pass A under the EXACT recall context the loop will build (graph-proximity
+    // boost can surface the edge's neighbor/lineage, so the context is not provably empty).
+    let recall_ctx = loop_recall_texts(&log, &emb, corr, &mem_id);
+    let r = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[recall_ctx],
+        &nbh,
+        pass_a,
+    ))
+    .with_corrected("corrected\n");
+    let rep = log.evolve_once(&emb, &r).unwrap();
+
+    assert_eq!(rep.invalidates_emitted, 1, "the single contradiction is confirmed");
+    assert_eq!(rep.proposals_emitted, MAX_PROPOSALS_PER_TICK, "proposals capped at the per-tick max");
+    assert_eq!(
+        rep.proposals_elided_cap,
+        n - MAX_PROPOSALS_PER_TICK,
+        "the overflow is counted, not rejected"
+    );
+    assert_eq!(rep.proposals_rejected, 0, "cap-elision is NOT a rejection");
+    log.verify_chain().unwrap();
+}
