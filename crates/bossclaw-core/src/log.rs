@@ -378,6 +378,21 @@ impl EventLog {
                 created_at        TEXT NOT NULL
             )",
         )?;
+        // M6b proposal-bytes side table (spec §5.6/§7/Q-3): the corrected whole-file
+        // bytes a `write_proposal` proposes are NOT stored in the signed event — they
+        // live HERE, keyed by the proposal's event id, with `content_hash` recorded in
+        // the signed event. SECURITY INVARIANT: this is an audit/worklist CACHE, never an
+        // authorization source — at confirm the bytes are re-hashed against the recorded
+        // hash and re-gated through the full M6a path. Lives inside the same SQLCipher
+        // `Store` as `undo_state` (encrypted at rest; model output over untrusted input).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS proposal_bytes (
+                proposal_id  TEXT PRIMARY KEY,
+                content      BLOB NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            )",
+        )?;
         // Summarize progress high-water-mark (spec §6 / F1) — sibling of
         // evolve_cursor. NOT a fold: losing it only re-derives the dirty set
         // (idempotent via the cited-set check). Single row.
@@ -1963,6 +1978,80 @@ impl EventLog {
         }
         let content = serde_json::json!({ "resolves_proposal": proposal_id, "reason": reason });
         self.append(self.build_m6b_event(crate::graph::WRITE_DECLINED_EVENT_TYPE, content, &sources))
+    }
+
+    /// Store the proposed corrected bytes for a `write_proposal`, keyed by its event id.
+    /// The bytes live in the SQLCipher `Store` (encrypted at rest) because they are model
+    /// output over untrusted input — NOT in the signed event, which records only
+    /// `new_content_hash`. `INSERT OR REPLACE` so a re-proposal at the same id overwrites.
+    ///
+    /// SECURITY: this row is an audit/worklist CACHE, never an authorization source. It is
+    /// validated against the signed-event hash at read time
+    /// ([`Self::get_proposal_bytes_checked`]) and re-gated through the full M6a path at
+    /// confirm — a tampered row fails closed BEFORE any write.
+    #[cfg(unix)]
+    pub fn put_proposal_bytes(
+        &self,
+        proposal_id: &str,
+        content: &[u8],
+        content_hash: &str,
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO proposal_bytes
+               (proposal_id, content, content_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![proposal_id, content, content_hash, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Read back the proposed bytes and verify they STILL hash to `expected_hash` (the
+    /// hash the signed `write_proposal` recorded). The table NEVER authorizes; it only
+    /// caches for preview, so this fails closed unless BOTH hold:
+    /// - the freshly recomputed hash equals the row's stored `content_hash` (the row was
+    ///   not tampered after it was written), AND
+    /// - that hash equals `expected_hash` (the row matches the signed event).
+    ///
+    /// The recompute uses the SAME hasher the engine uses for `file_written.content_hash`
+    /// (`hex::encode(Sha256::digest(..))`), so the comparison is against the canonical
+    /// content hash, not a second scheme. A missing row, a tampered row, or a row that no
+    /// longer matches the signed event all return `Err` — the caller never sees bytes it
+    /// cannot vouch for.
+    #[cfg(unix)]
+    pub fn get_proposal_bytes_checked(
+        &self,
+        proposal_id: &str,
+        expected_hash: &str,
+    ) -> Result<Vec<u8>, BossclawError> {
+        let fail =
+            |why: &str| -> BossclawError { BossclawError::InvalidInput(format!("proposal_bytes fail-closed: {why}")) };
+
+        let (content, stored_hash): (Vec<u8>, String) = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT content, content_hash FROM proposal_bytes WHERE proposal_id = ?1",
+                rusqlite::params![proposal_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| fail("no cached bytes for this proposal id (unknown or GC'd)"))?
+        };
+
+        // Recompute with the engine's canonical content hasher and gate on BOTH equalities.
+        let actual = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&content))
+        };
+        if actual != stored_hash {
+            return Err(fail("cached bytes no longer match their stored content_hash (row tampered)"));
+        }
+        if actual != expected_hash {
+            return Err(fail("cached bytes do not match the signed proposal's recorded hash"));
+        }
+        Ok(content)
     }
 
     /// Shared M6b Tier-B event builder (producer = m6b-reconciler; lineage = engine-gathered).

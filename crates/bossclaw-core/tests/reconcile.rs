@@ -191,3 +191,74 @@ fn reconciliation_lineage_unknown_edge_preserves_read_set() {
     expected.dedup();
     assert_eq!(lineage, expected, "missing edge contributes nothing; read_set is preserved");
 }
+
+/// SEC#5: the side table is a cache, never an authorization source. Bytes whose hash
+/// no longer matches the recorded content_hash fail closed at confirm-readback.
+#[test]
+fn proposal_bytes_tamper_fails_closed() {
+    let (log, _home, _dir) = common::open_log_with_write_grant();
+    let pid = "01PROPOSALID";
+    let bytes = b"corrected contents\n";
+    let hash = common::sha256_hex(bytes); // use the SAME hasher the engine uses for content_hash
+    log.put_proposal_bytes(pid, bytes, &hash).unwrap();
+    assert_eq!(log.get_proposal_bytes_checked(pid, &hash).unwrap(), bytes.to_vec());
+    // wrong expected hash (as if the signed event recorded a different one) → fail closed:
+    assert!(log.get_proposal_bytes_checked(pid, "00deadbeef").is_err());
+}
+
+/// §8.14 confirm-path round-trip: stored corrected bytes are re-read, re-hashed, then run
+/// through `propose_write → execute_write_resolving` (the full M6a gate). The on-disk file
+/// gains the corrected bytes, the `file_written` back-references the proposal, and
+/// `undo_write` restores the original — proving the side table only CACHES; the gate (grant
+/// + (dev,ino,size) + base-hash) re-runs from scratch and the write is fully undoable.
+#[test]
+fn proposal_bytes_round_trip_through_execute_write_resolving() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    use serde_json::json;
+
+    let (log, _home, dir) = common::open_log_with_write_grant();
+
+    // Ingest a real `.md` target under the write grant; capture the original bytes.
+    let target = dir.join("page.md");
+    let original = b"Alice works at Acme.\n";
+    std::fs::write(&target, original).unwrap();
+    let file_id = common::ingest_one(&log, &target);
+    let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+
+    // Synthesize corrected bytes + their (engine) hash; stash them in the side table keyed
+    // by a real-ish proposal id minted by appending a `write_proposal` with this hash.
+    let corrected = b"Alice works at Globex.\n";
+    let hash = common::sha256_hex(corrected);
+    let pid = log
+        .append_write_proposal(
+            &canonical, "edit", &hash, corrected.len() as u64, "reconcile: Acme -> Globex",
+            &json!({"src": "entity:alice", "relation": "works_at", "dst": "entity:globex"}),
+            &json!({"allowed": true}),
+            std::slice::from_ref(&file_id),
+        )
+        .unwrap();
+    log.put_proposal_bytes(&pid, corrected, &hash).unwrap();
+
+    // Confirm path: re-read (re-hashed against the signed-event hash) → gate → resolving write.
+    let bytes = log.get_proposal_bytes_checked(&pid, &hash).unwrap();
+    let gated = log
+        .propose_write(WriteProposal {
+            target: target.clone(),
+            new_content: bytes,
+            op: WriteOp::Edit,
+            source_event_ids: vec![file_id.clone()], // reconciliation lineage
+            rationale: "apply reconciliation proposal".to_string(),
+        })
+        .expect("propose_write");
+    let written_id = log.execute_write_resolving(gated, &pid).expect("execute_write_resolving");
+
+    // The file now holds the corrected bytes, and the record back-references the proposal.
+    assert_eq!(std::fs::read(&target).unwrap(), corrected.to_vec());
+    let written = log.event_by_id(&written_id).unwrap().unwrap();
+    assert_eq!(written.event_type, "file_written");
+    assert_eq!(written.content["resolves_proposal"], json!(pid));
+
+    // Undo restores the original bytes (the resolving write is a normal, undoable Edit).
+    log.undo_write(&written_id).expect("undo_write");
+    assert_eq!(std::fs::read(&target).unwrap(), original.to_vec());
+}

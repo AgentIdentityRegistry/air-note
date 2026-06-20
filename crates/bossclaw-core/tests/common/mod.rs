@@ -122,3 +122,12 @@ pub fn seed_memory(log: &EventLog, text: &str) -> String {
     })
     .expect("seed memory event")
 }
+
+/// Hex SHA-256 of `bytes`, replicating EXACTLY the engine's `file_written.content_hash`
+/// computation (`hex::encode(Sha256::digest(..))` in `log.rs`). Tests use this so a hash
+/// they hand to `put_proposal_bytes` / `append_write_proposal` equals what the signed
+/// event records and what `get_proposal_bytes_checked` recomputes — no second hasher.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
