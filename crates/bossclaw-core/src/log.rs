@@ -2689,12 +2689,17 @@ impl EventLog {
         Ok(true) // flag never set → default open
     }
 
-    /// The `(seq, id, text)` of each unprocessed `memory` event strictly after the
-    /// cursor, in `seq ASC` order, capped at `limit` (the per-tick batch). Only
-    /// `memory` events are processed (the evolve unit of work; `file_ingested`
-    /// extraction is deferred — M4a scope). Returns owned data so the store lock
-    /// is released before any model/embedder call (lock discipline).
-    fn unprocessed_memories_since(
+    /// The `(seq, id, text)` of each unprocessed extractable event strictly after
+    /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
+    ///
+    /// Extractable subjects are `memory` events (user-authored notes) and
+    /// `file_ingested` events (imported file text). Derived events — `entity`,
+    /// `link`, `page` — are NEVER subjects: facts derived from a subject inherit
+    /// the subject's `source_event_ids` rather than being re-extracted themselves.
+    ///
+    /// Returns owned data so the store lock is released before any model/embedder
+    /// call (lock discipline).
+    fn unprocessed_extractable_since(
         &self,
         cursor: i64,
         limit: usize,
@@ -2703,10 +2708,10 @@ impl EventLog {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT seq, id, payload FROM events
-             WHERE event_type = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+             WHERE event_type IN (?1, ?2) AND seq > ?3 ORDER BY seq ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(
-            rusqlite::params![MEMORY_EVENT_TYPE, cursor, limit as i64],
+            rusqlite::params![MEMORY_EVENT_TYPE, crate::graph::FILE_INGESTED_EVENT_TYPE, cursor, limit as i64],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
         )?;
         let mut out = Vec::new();
@@ -3179,7 +3184,7 @@ impl EventLog {
             return Ok(report);
         }
         let cursor = self.evolve_cursor()?;
-        let batch = self.unprocessed_memories_since(cursor, EVOLVE_BATCH)?;
+        let batch = self.unprocessed_extractable_since(cursor, EVOLVE_BATCH)?;
         // Within-tick active-key set (Rev 2 F5): seed from the current graph, then
         // grow as this tick emits — so a duplicate edge across two memories in the
         // SAME tick is skipped, not double-emitted.
@@ -3496,19 +3501,20 @@ impl EventLog {
     }
 
     /// A snapshot of evolve-loop health (spec §8). `queue_depth` = unprocessed
-    /// `memory` events behind the cursor (LIVE); `enabled` reflects the sticky
-    /// off-switch (LIVE). `last_tick_ms`/`error_count`/`last_error` are honest
-    /// M4a stubs (`None`/`0`/`None`) — the running tick/error counters are owned
-    /// by M7's long-lived loop driver, not persisted here, so this method stays a
-    /// pure read and is unit-testable.
+    /// extractable (`memory` + `file_ingested`) events behind the cursor (LIVE);
+    /// `enabled` reflects the sticky off-switch (LIVE).
+    /// `last_tick_ms`/`error_count`/`last_error` are honest M4a stubs
+    /// (`None`/`0`/`None`) — the running tick/error counters are owned by M7's
+    /// long-lived loop driver, not persisted here, so this method stays a pure
+    /// read and is unit-testable.
     pub fn evolve_status(&self) -> Result<EvolveStatus, BossclawError> {
         let cursor = self.evolve_cursor()?;
         let queue_depth = {
             let store = self.inner.lock().expect(POISON);
             let conn = store.conn();
             conn.query_row(
-                "SELECT count(*) FROM events WHERE event_type = ?1 AND seq > ?2",
-                rusqlite::params![MEMORY_EVENT_TYPE, cursor],
+                "SELECT count(*) FROM events WHERE event_type IN (?1, ?2) AND seq > ?3",
+                rusqlite::params![MEMORY_EVENT_TYPE, crate::graph::FILE_INGESTED_EVENT_TYPE, cursor],
                 |r| r.get::<_, i64>(0),
             )? as usize
         };

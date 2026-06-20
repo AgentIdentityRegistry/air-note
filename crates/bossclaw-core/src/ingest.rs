@@ -1227,9 +1227,9 @@ mod orchestrator_tests {
             "a revoked grant's files do not surface in recall");
     }
 
-    // Door (1): files are never an evolve extraction SUBJECT (the cursor is memory-only).
+    // Door A OPEN: a file_ingested event IS now an evolve extraction subject.
     #[test]
-    fn ingested_files_are_excluded_from_the_evolve_cursor() {
+    fn ingested_files_are_evolve_subjects() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("notes");
         std::fs::create_dir(&folder).unwrap();
@@ -1239,10 +1239,8 @@ mod orchestrator_tests {
         log.add_grant(&folder).unwrap();
         let canonical = std::fs::canonicalize(&folder).unwrap();
         assert_eq!(run_ingest(&log, &canonical, &ParserRouter::native_only(), &emb).ingested, 1);
-
-        // The evolve queue depth counts ONLY memory events; file_ingested must not appear.
-        let depth = log.evolve_status().unwrap();
-        assert_eq!(depth.queue_depth, 0, "file_ingested events are never an evolve work-unit (cursor door)");
+        assert_eq!(log.evolve_status().unwrap().queue_depth, 1,
+            "file_ingested events are now evolve subjects (Door A)");
     }
 
     // Door (2): the evolve loop's internal recall must NOT surface file text as context.

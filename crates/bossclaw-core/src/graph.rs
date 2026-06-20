@@ -18,7 +18,7 @@ pub const MANUAL_LINK_PRODUCER: &str = "manual";
 /// `EventLog::entity` stamps it — single-sourced so they cannot drift).
 pub const ENTITY_EVENT_TYPE: &str = "entity";
 /// The `event_type` discriminator for memory events — the evolve unit of work
-/// (the loop's `unprocessed_memories_since` / queue-depth queries filter on it).
+/// (the loop's `unprocessed_extractable_since` / queue-depth queries filter on it).
 /// Single-sourced so the SQL filters cannot drift from what `append` stamps.
 pub const MEMORY_EVENT_TYPE: &str = "memory";
 /// The `event_type` discriminator for control `config` events (active-model
