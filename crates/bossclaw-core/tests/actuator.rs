@@ -668,3 +668,409 @@ fn reject_empty_source_event_ids() {
         "empty source_event_ids must be rejected (Tier-B needs lineage)"
     );
 }
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  T4: execute_write — critical-section re-check + atomic mutate + record    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+/// Read the appended `file_written` event back through the PUBLIC API. Asserts the
+/// type so a wrong-id read is caught loudly.
+fn file_written_event(log: &EventLog, id: &str) -> Event {
+    let ev = log
+        .event_by_id(id)
+        .unwrap()
+        .expect("file_written event must be readable via the public API");
+    assert_eq!(
+        ev.event_type,
+        bossclaw_core::graph::FILE_WRITTEN_EVENT_TYPE,
+        "execute_write must append a file_written event"
+    );
+    ev
+}
+
+// ── Happy paths: Create / Edit / Delete mutate the FS + record correctly ──────
+
+#[test]
+fn execute_create_writes_file_and_records_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let target = dir.path().join("new.txt");
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Create, b"fresh bytes", std::slice::from_ref(&clean)))
+        .unwrap();
+    let id = log.execute_write(gated).unwrap();
+
+    // FS mutated: the file now exists with EXACTLY the proposed bytes.
+    assert_eq!(std::fs::read(&target).unwrap(), b"fresh bytes");
+
+    // Event recorded with the right shape (spec §7.2).
+    let ev = file_written_event(&log, &id);
+    assert_eq!(ev.content["op"], "create");
+    let canonical_target = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+    assert_eq!(ev.content["target"], serde_json::Value::String(canonical_target));
+    let expected_hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(b"fresh bytes"))
+    };
+    assert_eq!(ev.content["content_hash"], expected_hash);
+    assert_eq!(ev.content["byte_size"], 11);
+    // Create has NO prev_content_hash (omitted entirely).
+    assert!(ev.content.get("prev_content_hash").is_none(), "Create omits prev_content_hash");
+    // Tier-B by construction (model_meta set, prompt_hash empty).
+    let meta = ev.model_meta.expect("file_written is always Tier-B");
+    assert_eq!(meta.model_id, "m6a-actuator");
+    assert_eq!(meta.prompt_hash, "");
+    assert_eq!(meta.source_event_ids, vec![clean]);
+}
+
+#[test]
+fn execute_edit_overwrites_file_and_records_prev_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"old contents").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Edit, b"new contents here", &[clean]))
+        .unwrap();
+    let id = log.execute_write(gated).unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"new contents here");
+
+    let ev = file_written_event(&log, &id);
+    assert_eq!(ev.content["op"], "edit");
+    let (new_hash, old_hash) = {
+        use sha2::{Digest, Sha256};
+        (hex::encode(Sha256::digest(b"new contents here")), hex::encode(Sha256::digest(b"old contents")))
+    };
+    assert_eq!(ev.content["content_hash"], new_hash);
+    assert_eq!(ev.content["prev_content_hash"], old_hash, "Edit records the prior content hash");
+    assert_eq!(ev.content["byte_size"], 17);
+}
+
+#[test]
+fn execute_delete_hard_deletes_file_and_records_zero_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("doomed.txt");
+    std::fs::write(&target, b"delete me").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Delete, b"", &[clean]))
+        .unwrap();
+    let id = log.execute_write(gated).unwrap();
+
+    // Hard-deleted: the file is GONE (no OS trash — spec W5).
+    assert!(!target.exists(), "delete must hard-remove the file");
+
+    let ev = file_written_event(&log, &id);
+    assert_eq!(ev.content["op"], "delete");
+    assert_eq!(ev.content["byte_size"], 0, "a delete records byte_size 0");
+    // content_hash == prev_content_hash == the deleted file's hash (spec §7.2 reading).
+    let deleted_hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(b"delete me"))
+    };
+    assert_eq!(ev.content["content_hash"], deleted_hash);
+    assert_eq!(ev.content["prev_content_hash"], deleted_hash);
+}
+
+// ── TOCTOU path-swap: pass the gate, swap the target out-of-grant, then execute ─
+//
+// The benign target passes propose; before execute we replace it with a SYMLINK
+// pointing outside the grant. The execute-time fd-relative NOFOLLOW open must
+// refuse the symlinked final component ⇒ fail-closed, and the outside file is
+// untouched.
+#[test]
+fn execute_toctou_path_swap_to_symlink_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"benign original").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    // A sentinel OUTSIDE the grant that the swap would aim at.
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"do not touch").unwrap();
+
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Edit, b"payload", &[clean]))
+        .unwrap();
+    assert!(gated.verdict.reject_reason.is_none(), "gate passes for the benign target");
+
+    // TOCTOU: replace the real target with a symlink to the outside secret.
+    std::fs::remove_file(&target).unwrap();
+    std::os::unix::fs::symlink(&secret, &target).unwrap();
+
+    let err = log.execute_write(gated);
+    assert!(err.is_err(), "a final-component swapped to a symlink must fail closed");
+    assert_eq!(
+        std::fs::read(&secret).unwrap(),
+        b"do not touch",
+        "the out-of-grant secret must be untouched by the refused write"
+    );
+}
+
+// ── Same-content / different-inode swap (REVERT-SENSITIVE) ────────────────────
+//
+// Replace the target with a SAME-BYTES, DIFFERENT-INODE file between propose and
+// execute. The content hash still matches, so ONLY the (dev,ino) half of the base
+// guard can catch it. Must FAIL if that half is dropped.
+//
+// REVERT-SENSITIVITY: comment out the `now_identity != want_identity` check in
+// `execute_write` step 3 → this test goes from fail-closed (Err) to a SUCCESSFUL
+// overwrite of the swapped-in inode, so the assertion `err.is_err()` fails.
+// (Demonstrated below — see the build report.)
+#[test]
+fn execute_same_content_different_inode_swap_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"identical bytes").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Edit, b"payload", &[clean]))
+        .unwrap();
+    let ino_before = std::fs::metadata(&target).unwrap().ino_u64();
+
+    // Swap: remove the target and recreate it with the SAME bytes → a NEW inode.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::write(&target, b"identical bytes").unwrap();
+    let ino_after = std::fs::metadata(&target).unwrap().ino_u64();
+    assert_ne!(ino_before, ino_after, "the swap must produce a different inode (else the test is moot)");
+
+    let err = log.execute_write(gated);
+    assert!(
+        err.is_err(),
+        "a same-content different-inode swap must fail closed on the (dev,ino) half of the guard"
+    );
+    // The swapped-in file is left UNCHANGED (still the identical bytes, not 'payload').
+    assert_eq!(std::fs::read(&target).unwrap(), b"identical bytes");
+}
+
+// ── Base content-change between propose and execute → fail-closed ─────────────
+#[test]
+fn execute_base_content_change_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"version one").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Edit, b"payload", &[clean]))
+        .unwrap();
+
+    // Mutate the base bytes IN PLACE (same inode, different content) after propose.
+    std::fs::write(&target, b"version two changed").unwrap();
+
+    let err = log.execute_write(gated);
+    assert!(err.is_err(), "a base content change since propose must fail closed");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"version two changed",
+        "the changed file must NOT be clobbered by the stale write"
+    );
+}
+
+// ── Create-of-existing (racing a file in) → fail-closed (no-clobber) ──────────
+#[test]
+fn execute_create_racing_existing_file_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let target = dir.path().join("racer.txt");
+    // Gate passes while the target is absent.
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Create, b"mine", &[clean]))
+        .unwrap();
+    assert!(gated.verdict.reject_reason.is_none(), "Create of an absent target passes the gate");
+
+    // RACE: a file appears at the target name before execute.
+    std::fs::write(&target, b"someone else got here first").unwrap();
+
+    let err = log.execute_write(gated);
+    assert!(err.is_err(), "Create must not clobber a file that raced into place");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"someone else got here first",
+        "the racing file's bytes must be preserved (no-clobber)"
+    );
+}
+
+// ── Grant revoked between propose and execute → fail-closed ───────────────────
+#[test]
+fn execute_grant_revoked_between_propose_and_execute_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"original").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Edit, b"payload", &[clean]))
+        .unwrap();
+    assert!(gated.verdict.allowed, "granted at propose time");
+
+    // Revoke the write grant AFTER propose. execute re-checks → fail-closed.
+    log.revoke_write_grant(dir.path()).unwrap();
+
+    let err = log.execute_write(gated);
+    assert!(err.is_err(), "a grant revoked since propose must fail closed at execute");
+    assert_eq!(std::fs::read(&target).unwrap(), b"original", "the file is untouched after a revoked-grant reject");
+}
+
+// ── A verdict carrying a reject_reason cannot be executed ─────────────────────
+#[test]
+fn execute_refuses_a_rejected_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    // Edit of an ABSENT target → the gate sets reject_reason.
+    let absent = dir.path().join("nope.txt");
+    let gated = log
+        .propose_write(proposal(&absent, WriteOp::Edit, b"x", &[clean]))
+        .unwrap();
+    assert!(gated.verdict.reject_reason.is_some(), "precondition: the verdict is rejected");
+
+    assert!(
+        log.execute_write(gated).is_err(),
+        "execute must refuse a verdict that carries a reject_reason"
+    );
+}
+
+// ── No Tier-A `file_written`: the sole-constructor invariant ──────────────────
+//
+// The ONLY public way to produce a `file_written` is execute_write, which ALWAYS
+// sets model_meta. So no `file_written` in the log can have model_meta: None.
+#[test]
+fn no_tier_a_file_written_can_be_produced() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    // Produce several file_written events across all three ops.
+    let create_t = dir.path().join("a.txt");
+    let g = log.propose_write(proposal(&create_t, WriteOp::Create, b"a", std::slice::from_ref(&clean))).unwrap();
+    log.execute_write(g).unwrap();
+
+    let edit_t = dir.path().join("b.txt");
+    std::fs::write(&edit_t, b"old").unwrap();
+    let g = log.propose_write(proposal(&edit_t, WriteOp::Edit, b"new", std::slice::from_ref(&clean))).unwrap();
+    log.execute_write(g).unwrap();
+
+    let del_t = dir.path().join("c.txt");
+    std::fs::write(&del_t, b"bye").unwrap();
+    let g = log.propose_write(proposal(&del_t, WriteOp::Delete, b"", &[clean])).unwrap();
+    log.execute_write(g).unwrap();
+
+    // EVERY file_written in the log is Tier-B (model_meta is Some, with non-empty sources).
+    let all = log.stream_all().unwrap();
+    let written: Vec<_> = all
+        .iter()
+        .filter(|e| e.event_type == bossclaw_core::graph::FILE_WRITTEN_EVENT_TYPE)
+        .collect();
+    assert_eq!(written.len(), 3, "all three writes were recorded");
+    for ev in written {
+        let meta = ev
+            .model_meta
+            .as_ref()
+            .expect("a file_written must be Tier-B (model_meta: Some) — no Tier-A is possible");
+        assert!(!meta.source_event_ids.is_empty(), "Tier-B requires non-empty sources");
+    }
+}
+
+// ── L11 end-to-end (REVERT-SENSITIVE): editing a tracked ingested file stamps
+// ── the recorded file_written `origin: "external"`, even citing only clean ids ─
+//
+// The chokepoint stamps `origin: external` iff a source is external. execute_write
+// step 4 RE-DERIVES the target's `file_ingested` id and unions it into the recorded
+// sources — so a write to a tracked external file is stamped external by
+// construction, MATCHING the propose-time verdict (L11). Citing only a clean id
+// must NOT launder this.
+//
+// REVERT-SENSITIVITY: drop step 4's source augmentation in `execute_write` (do not
+// push `rec.file_event_id`) → the recorded sources are clean-only → the chokepoint
+// does NOT stamp `origin` → this test's `origin == "external"` assertion fails.
+// (Demonstrated below — see the build report.)
+#[test]
+fn execute_l11_tracked_file_edit_is_stamped_external() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+
+    // F is an ingested file under a READ grant → an external `file_ingested`.
+    let f_canonical = ingest_file(&log, &emb, dir.path(), "notes.md", b"ingested body");
+    // Also write-grant F's directory so the write is allowed.
+    log.add_write_grant(&dir.path().join("g")).unwrap();
+    // The attacker cites ONLY a clean memory id (the cite-around).
+    let clean = seed_memory(&log, &emb, "totally benign memory");
+
+    let gated = log
+        .propose_write(proposal(&f_canonical, WriteOp::Edit, b"attacker payload", std::slice::from_ref(&clean)))
+        .unwrap();
+    // The verdict already says Untrusted (propose-side L11); now prove the PERSISTED
+    // event matches (execute-side L11 augmentation + chokepoint stamp).
+    assert_eq!(gated.verdict.taint, Taint::Untrusted, "propose-side anchor flags it");
+
+    let id = log.execute_write(gated).unwrap();
+    let ev = file_written_event(&log, &id);
+
+    // The chokepoint stamped the signed content external (because a re-derived source
+    // — F's file_ingested — is external). This is the verdict ≡ persisted-stamp law.
+    assert_eq!(
+        ev.content["origin"], "external",
+        "a write to a tracked external file must be stamped origin:external in the signed event \
+         (if absent, step 4's source augmentation was dropped)"
+    );
+    // And the recorded sources include the engine-derived file_ingested id (not just
+    // the clean citation), so the lineage is honest.
+    let meta = ev.model_meta.expect("Tier-B");
+    assert!(meta.source_event_ids.len() >= 2, "the clean cite PLUS the engine-derived id");
+    assert!(meta.source_event_ids.contains(&clean), "the caller's clean cite is preserved");
+    // The extra id resolves to a file_ingested event (the engine anchor).
+    let extra: Vec<_> = meta.source_event_ids.iter().filter(|s| **s != clean).collect();
+    assert_eq!(extra.len(), 1, "exactly one engine-derived source was added");
+    let extra_ev = log.event_by_id(extra[0]).unwrap().expect("the augmented source resolves");
+    assert_eq!(extra_ev.event_type, bossclaw_core::graph::FILE_INGESTED_EVENT_TYPE);
+}
+
+/// Tiny extension trait so the tests can read a unix inode without repeating the
+/// `MetadataExt` import dance at each call site.
+trait InoExt {
+    fn ino_u64(&self) -> u64;
+}
+impl InoExt for std::fs::Metadata {
+    fn ino_u64(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        self.ino()
+    }
+}

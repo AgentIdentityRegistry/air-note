@@ -153,6 +153,28 @@ pub struct EventLog {
     rename_lock: Mutex<()>,
 }
 
+/// Read an OPEN file descriptor to end-of-file via `rustix::io::read`, returning
+/// all bytes. Borrows the fd (does not consume it) so the same fd is reused for
+/// the `fstat` identity check, this content re-hash, and (for Delete) the audit
+/// bytes — all from ONE fd-relative open, never re-resolving the path string
+/// (`execute_write`'s base guard, spec §9 step 3). Mirrors the EINTR-retry +
+/// short-read loop discipline of `actuator::atomic_write`'s write loop.
+#[cfg(unix)]
+fn read_fd_to_end(fd: &std::os::fd::OwnedFd) -> Result<Vec<u8>, BossclawError> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match rustix::io::read(fd, &mut chunk) {
+            Ok(0) => break, // EOF
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // EINTR → retry; any other errno is fatal.
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(BossclawError::Io(std::io::Error::other(e.to_string()))),
+        }
+    }
+    Ok(buf)
+}
+
 impl EventLog {
     /// Open (creating if needed) an event log at `path`, encrypted with `dek`,
     /// signing with `key`.
@@ -2233,6 +2255,321 @@ impl EventLog {
             reject_reason,
         };
         Ok(GatedProposal { proposal: p, verdict })
+    }
+
+    /// Execute a gated write **inside the actuator rename critical section** (spec
+    /// §9) — the confused-deputy defense's TOCTOU close. Re-derives every FS-mutable
+    /// security fact AT EXECUTE (never trusting the propose-time verdict blindly),
+    /// mutates atomically, and appends the SOLE-CONSTRUCTOR `file_written` event.
+    /// Returns the appended event's id.
+    ///
+    /// The whole window — re-canonicalize → re-check grant → base guard → mutate →
+    /// append — is serialized by [`rename_lock`](Self::rename_lock), so a second
+    /// `execute_write` cannot interleave its base read against a half-applied first
+    /// write. Anything diverged since propose ⇒ **fail-closed reject** (the app must
+    /// re-propose); failure leaves the filesystem unchanged.
+    ///
+    /// Steps (spec §9, scoped to T4 — NO undo store/capture, that is T5):
+    /// 1. **Re-check the verdict + re-canonicalize.** A verdict carrying a
+    ///    `reject_reason`, or not `allowed`, is refused outright. The target (parent,
+    ///    for Create) is re-canonicalized and re-run through `is_write_allowed` — a
+    ///    grant revoked since propose ⇒ fail-closed.
+    /// 2. **Open the parent dir fd** via the writable careful-open (fd-relative anchor).
+    /// 3. **Base guard (Edit/Delete):** open the target fd-relative (NOFOLLOW),
+    ///    `fstat` it, and require BOTH `(dev,ino,size) == verdict.base_identity` AND a
+    ///    re-hash of the current bytes `== verdict.base_content_hash`. Either diverged
+    ///    ⇒ fail-closed (closes the content-change race AND the same-content/
+    ///    different-inode swap). Create's no-clobber is enforced by `atomic_write`.
+    /// 4. **Re-derive engine target-provenance (L11, defense-in-depth):** using the
+    ///    re-canonicalized path + the target's freshly-`fstat`'d `(dev,ino)`, re-run
+    ///    the path/inode anchor; if the target is a tracked ingested file, capture its
+    ///    `file_ingested` id so the recorded sources carry it (verdict ≡ persisted
+    ///    stamp). NOT trusted from the verdict — re-derived here.
+    /// 5. **Mutate atomically:** Create/Edit → `atomic_write` (no-clobber iff Create);
+    ///    Delete → fd-relative `unlinkat` (**hard-delete, NO OS trash** — spec W5).
+    /// 6. **Append** the Tier-B `file_written` with `source_event_ids = dedup(caller
+    ///    cites ∪ {re-derived file_ingested id})`. The append chokepoint stamps it
+    ///    `origin:"external"` automatically whenever a source is external, so a write
+    ///    to a tracked file is taint-stamped by construction.
+    #[cfg(unix)]
+    pub fn execute_write(
+        &self,
+        confirmed: crate::actuator::GatedProposal,
+    ) -> Result<String, BossclawError> {
+        use crate::actuator::WriteOp;
+        use std::os::unix::ffi::OsStrExt;
+
+        let crate::actuator::GatedProposal { proposal, verdict } = confirmed;
+
+        // A single fail-closed reject helper so every divergence reads the same way.
+        let reject = |why: &str| -> BossclawError {
+            BossclawError::InvalidInput(format!("execute_write fail-closed: {why}"))
+        };
+
+        // ── Step 1a: the verdict itself must permit the write ─────────────────────
+        // A reject_reason (op×existence, unresolvable target, empty sources) or a
+        // not-`allowed` verdict means the proposal never cleared the gate; refuse
+        // BEFORE acquiring the lock or touching the FS.
+        if let Some(reason) = &verdict.reject_reason {
+            return Err(reject(&format!("verdict carries reject_reason: {reason}")));
+        }
+        if !verdict.allowed {
+            return Err(reject("verdict.allowed is false (target not under an active write grant)"));
+        }
+
+        // The whole TOCTOU-critical window is held under the rename mutex (spec §9).
+        let _rename_guard = self.rename_lock().lock().expect(POISON);
+
+        // ── Step 1b: re-canonicalize + re-check the grant (a revoke since propose
+        // ── must fail closed). For Create the target is absent ⇒ key off the PARENT.
+        let (parent_dir, final_name): (std::path::PathBuf, std::ffi::OsString) = match proposal.op {
+            WriteOp::Create => {
+                let parent = proposal
+                    .target
+                    .parent()
+                    .ok_or_else(|| reject("create target has no parent"))?;
+                let real_parent = std::fs::canonicalize(parent)
+                    .map_err(|e| reject(&format!("create parent not resolvable: {e}")))?;
+                let name = proposal
+                    .target
+                    .file_name()
+                    .ok_or_else(|| reject("create target has no final component"))?
+                    .to_os_string();
+                (real_parent, name)
+            }
+            WriteOp::Edit | WriteOp::Delete => {
+                let real = std::fs::canonicalize(&proposal.target)
+                    .map_err(|e| reject(&format!("target not resolvable: {e}")))?;
+                let parent = real
+                    .parent()
+                    .ok_or_else(|| reject("target has no parent"))?
+                    .to_path_buf();
+                let name = real
+                    .file_name()
+                    .ok_or_else(|| reject("target has no final component"))?
+                    .to_os_string();
+                (parent, name)
+            }
+        };
+        // The canonical target path (parent/name) — the recorded `target` + the L11
+        // path-anchor key. For Create the file does not exist yet, so it is built
+        // from the real parent + the proposed name; for Edit/Delete it is the
+        // canonicalized real path.
+        let canonical_target = parent_dir.join(&final_name);
+
+        // Re-check the write-grant against the freshly-resolved real path. A grant
+        // revoked between propose and execute makes this false ⇒ fail-closed.
+        if !self
+            .is_write_allowed(&canonical_target)
+            .map_err(|e| reject(&format!("write-grant re-check errored: {e}")))?
+        {
+            return Err(reject("target is no longer under an active write grant"));
+        }
+
+        // ── Step 2: open the parent dir fd (the fd-relative anchor) ───────────────
+        let dir_fd = crate::actuator::open_dir_for_write(&parent_dir)
+            .map_err(|e| reject(&format!("parent dir careful-open failed: {e}")))?;
+
+        // ── Step 3: base guard (Edit/Delete) — identity AND content, fd-relative ──
+        // Open the target fd-relative from the dir_fd with NOFOLLOW (so a final
+        // component swapped to a symlink AFTER propose is refused here, not followed),
+        // fstat it, and require BOTH the (dev,ino,size) identity AND a re-hash of the
+        // current bytes to equal the verdict's. This single open is reused for the
+        // identity check, the content re-hash, and the delete bytes (if any).
+        let deleted_bytes: Option<Vec<u8>> = match proposal.op {
+            WriteOp::Create => None,
+            WriteOp::Edit | WriteOp::Delete => {
+                let want_identity = verdict
+                    .base_identity
+                    .ok_or_else(|| reject("edit/delete verdict missing base_identity"))?;
+                let want_hash = verdict
+                    .base_content_hash
+                    .as_deref()
+                    .ok_or_else(|| reject("edit/delete verdict missing base_content_hash"))?;
+
+                // Fd-relative NOFOLLOW open of the existing target.
+                let target_fd = rustix::fs::openat(
+                    &dir_fd,
+                    final_name.as_bytes(),
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(|e| reject(&format!("target re-open failed: {e}")))?;
+
+                let st = rustix::fs::fstat(&target_fd)
+                    .map_err(|e| reject(&format!("target fstat failed: {e}")))?;
+                // It must still be a regular file (a swap to a dir/fifo/device is a
+                // divergence, and reading it could hang or mislead the guard).
+                if rustix::fs::FileType::from_raw_mode(st.st_mode)
+                    != rustix::fs::FileType::RegularFile
+                {
+                    return Err(reject("target is no longer a regular file"));
+                }
+                // Identity half (L12): dev/ino/size must match the propose-time stat.
+                // The `as u64` casts mirror the propose-time capture (ingest.rs), so
+                // the two sides are compared on the same widths.
+                let now_identity = crate::actuator::FileId {
+                    dev: st.st_dev as u64,
+                    ino: st.st_ino as u64,
+                    size: st.st_size as u64,
+                };
+                if now_identity != want_identity {
+                    return Err(reject(
+                        "base identity (dev,ino,size) diverged since propose (TOCTOU swap)",
+                    ));
+                }
+                // Content half: re-hash the CURRENT bytes through the same fd.
+                let current = read_fd_to_end(&target_fd)
+                    .map_err(|e| reject(&format!("target re-read failed: {e}")))?;
+                let now_hash = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&current))
+                };
+                if now_hash != want_hash {
+                    return Err(reject("base content hash diverged since propose"));
+                }
+                // For a Delete, the bytes we just read ARE the pre-delete content; the
+                // recorded hash is their hash (== want_hash). T5 will durably capture
+                // these for undo; T4 only needs the hash, so the bytes are dropped.
+                match proposal.op {
+                    WriteOp::Delete => Some(current),
+                    _ => None,
+                }
+            }
+        };
+
+        // ── Step 4: re-derive engine target-provenance (L11, defense-in-depth) ────
+        // Do NOT trust verdict.provenance: re-derive from the re-canonicalized path
+        // OR the target's freshly-stat'd (dev,ino) (the hardlink-alias path). If the
+        // target is a tracked ingested file, its `file_ingested` id is unioned into
+        // the recorded sources so the append chokepoint stamps the write external —
+        // making the persisted stamp identical to the verdict (L11).
+        let mut sources: Vec<String> = proposal.source_event_ids.clone();
+        let real_str = canonical_target.to_string_lossy().to_string();
+        let anchored = match self.current_file_for_path(&real_str)? {
+            Some(rec) => Some(rec),
+            // Inode fallback only applies to an existing target (Edit/Delete); a
+            // Create has no on-disk inode yet, so there is nothing to alias.
+            None => match (proposal.op, verdict.base_identity) {
+                (WriteOp::Edit | WriteOp::Delete, Some(id)) => {
+                    self.tracked_file_with_identity(id.dev, id.ino)?
+                }
+                _ => None,
+            },
+        };
+        if let Some(rec) = anchored {
+            if !sources.contains(&rec.file_event_id) {
+                sources.push(rec.file_event_id);
+            }
+        }
+        // The Tier-B non-empty invariant is structurally guaranteed (the caller's
+        // cites were validated non-empty at propose), but assert it again here so the
+        // sole constructor never emits a Tier-B event with empty lineage.
+        if sources.is_empty() {
+            return Err(reject("file_written would have empty source_event_ids"));
+        }
+
+        // ── Step 5: mutate atomically (failure leaves the FS unchanged) ───────────
+        match proposal.op {
+            WriteOp::Create => crate::actuator::atomic_write(
+                &dir_fd,
+                &final_name,
+                &proposal.new_content,
+                true, // no_clobber: a Create must not overwrite a racing file
+            )
+            .map_err(|e| reject(&format!("atomic create failed: {e}")))?,
+            WriteOp::Edit => crate::actuator::atomic_write(
+                &dir_fd,
+                &final_name,
+                &proposal.new_content,
+                false, // overwrite is intended for an Edit
+            )
+            .map_err(|e| reject(&format!("atomic edit failed: {e}")))?,
+            WriteOp::Delete => {
+                // Hard-delete, fd-relative, NO OS trash (spec L1/W5). The base guard
+                // already proved this fd is the exact file the verdict measured.
+                rustix::fs::unlinkat(&dir_fd, final_name.as_bytes(), rustix::fs::AtFlags::empty())
+                    .map_err(|e| reject(&format!("unlinkat (hard-delete) failed: {e}")))?;
+            }
+        }
+
+        // ── Step 6: append the SOLE-CONSTRUCTOR Tier-B `file_written` event ───────
+        // content shape (spec §7.2). For Delete: byte_size 0 and content_hash is the
+        // deleted file's hash (== prev_content_hash) — content_hash is non-optional in
+        // the schema, so a Delete records the bytes it removed, not an absent hash.
+        let (content_hash, prev_content_hash, byte_size): (String, Option<String>, u64) =
+            match proposal.op {
+                WriteOp::Create => {
+                    use sha2::{Digest, Sha256};
+                    (
+                        hex::encode(Sha256::digest(&proposal.new_content)),
+                        None, // a Create has no prior content
+                        proposal.new_content.len() as u64,
+                    )
+                }
+                WriteOp::Edit => {
+                    use sha2::{Digest, Sha256};
+                    (
+                        hex::encode(Sha256::digest(&proposal.new_content)),
+                        // prev = the base hash the guard just re-confirmed.
+                        verdict.base_content_hash.clone(),
+                        proposal.new_content.len() as u64,
+                    )
+                }
+                WriteOp::Delete => {
+                    // The deleted file's hash (== verdict.base_content_hash, which the
+                    // guard re-confirmed against the freshly-read `deleted_bytes`).
+                    let h = verdict
+                        .base_content_hash
+                        .clone()
+                        .ok_or_else(|| reject("delete missing base_content_hash for record"))?;
+                    // `deleted_bytes` was read for the guard; it is the audit subject.
+                    // (Bound here so the read is not dead; T5 will persist it for undo.)
+                    let _ = &deleted_bytes;
+                    (h.clone(), Some(h), 0)
+                }
+            };
+
+        let op_str = match proposal.op {
+            WriteOp::Create => "create",
+            WriteOp::Edit => "edit",
+            WriteOp::Delete => "delete",
+        };
+        // Build content as a JSON OBJECT (the chokepoint only stamps `origin` when
+        // `content.as_object_mut()` is Some — spec §6 M1). `prev_content_hash` is
+        // omitted entirely for Create (skip-if-None via not inserting it).
+        let mut content = serde_json::Map::new();
+        content.insert("target".to_string(), serde_json::Value::String(real_str));
+        content.insert("op".to_string(), serde_json::Value::String(op_str.to_string()));
+        content.insert("content_hash".to_string(), serde_json::Value::String(content_hash));
+        if let Some(prev) = prev_content_hash {
+            content.insert("prev_content_hash".to_string(), serde_json::Value::String(prev));
+        }
+        content.insert("byte_size".to_string(), serde_json::Value::Number(byte_size.into()));
+
+        let event = Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::FILE_WRITTEN_EVENT_TYPE.to_string(),
+            content: serde_json::Value::Object(content),
+            // ALWAYS Tier-B (spec L9/W6): the sole constructor unconditionally sets
+            // model_meta, so no Tier-A `file_written` can dodge the taint stamp.
+            model_meta: Some(crate::event::ModelMeta {
+                model_id: crate::graph::ACTUATOR_PRODUCER.to_string(),
+                prompt_hash: String::new(), // no prompt — explicit caller (spec W10)
+                source_event_ids: sources,
+            }),
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        };
+        // `append` re-checks the Tier-B non-empty invariant and runs the chokepoint
+        // (which stamps `origin:"external"` if any source is external) BEFORE hashing.
+        self.append(event)
     }
 
     /// Every CURRENT file (one per path), `ORDER BY canonical_path ASC`. Tier-A read.

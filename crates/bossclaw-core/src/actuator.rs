@@ -388,7 +388,7 @@ pub(crate) fn open_dir_for_write(
 const NEW_FILE_MODE: rustix::fs::Mode = rustix::fs::Mode::from_bits_truncate(0o644);
 
 /// Mint a collision-resistant temp file name in the form `.{name}.{ulid}.tmp`.
-/// The ULID (already a crate dependency — used for event ids, `log.rs:422`) plus
+/// The ULID (already a crate dependency — used for event ids in the append path) plus
 /// the `O_EXCL` create below makes a name clash astronomically unlikely AND
 /// detected: `O_EXCL` fails rather than reusing a stale temp, so freshness does
 /// not rest on the name alone. Leading `.` keeps the temp hidden during its

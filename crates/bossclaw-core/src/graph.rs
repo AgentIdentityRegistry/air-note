@@ -63,6 +63,20 @@ pub const WRITE_REVOKE_EVENT_TYPE: &str = "write_revoke";
 /// Single-sourced so the stamp site and the `is_external` classifier cannot drift.
 pub const EXTERNAL_ORIGIN: &str = "external";
 
+/// The `event_type` discriminator for a `file_written` actuator event (M6a, T4).
+/// **Always Tier-B by construction** (spec L9/W6): `EventLog::execute_write` is the
+/// SOLE constructor and unconditionally sets `model_meta: Some{..}` with a validated
+/// non-empty source list, so no Tier-A `file_written` can exist to dodge the
+/// append-chokepoint's taint stamp. Deliberately **NOT** in `EMBEDDABLE_EVENT_TYPES`
+/// (`log.rs`) — a write record is an audit fact, not a recallable memory.
+pub const FILE_WRITTEN_EVENT_TYPE: &str = "file_written";
+
+/// The `model_meta.model_id` (producer) stamped on every `file_written` event
+/// (M6a, T4). The explicit caller has no model prompt, so `prompt_hash` is empty
+/// (spec W10, matching `link_machine`/`entity`). Single-sourced so the constructor
+/// and any test/assertion reference the same producer string.
+pub const ACTUATOR_PRODUCER: &str = "m6a-actuator";
+
 /// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
 /// links reference this exact form, so it is single-sourced.
 pub const ENTITY_NODE_PREFIX: &str = "entity:";
@@ -634,6 +648,22 @@ mod tests {
         ] {
             assert_ne!(WRITE_GRANT_EVENT_TYPE, other);
             assert_ne!(WRITE_REVOKE_EVENT_TYPE, other);
+        }
+    }
+
+    #[test]
+    fn m6a_file_written_consts_are_distinct_and_stable() {
+        // Stable wire strings (the type lands in signed content + the rebuild filter).
+        assert_eq!(FILE_WRITTEN_EVENT_TYPE, "file_written");
+        assert_eq!(ACTUATOR_PRODUCER, "m6a-actuator");
+        // `file_written` must not collide with any other event type — it rides the
+        // append chokepoint as its own discriminator.
+        for other in [
+            MEMORY_EVENT_TYPE, PAGE_EVENT_TYPE, SUPERSEDE_EVENT_TYPE, ENTITY_EVENT_TYPE,
+            CONFIG_EVENT_TYPE, FILE_INGESTED_EVENT_TYPE, GRANT_EVENT_TYPE, REVOKE_EVENT_TYPE,
+            WRITE_GRANT_EVENT_TYPE, WRITE_REVOKE_EVENT_TYPE,
+        ] {
+            assert_ne!(FILE_WRITTEN_EVENT_TYPE, other);
         }
     }
 
