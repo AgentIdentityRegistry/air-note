@@ -269,6 +269,62 @@ fn taint_engine_anchored_cite_around_is_untrusted() {
     );
 }
 
+// ── L11 hardlink-alias (REVERT-SENSITIVE — T2 review Critical) ────────────────
+//
+// A hardlink is a second directory entry with a DIFFERENT name but the SAME inode.
+// `canonicalize` does NOT collapse it to the tracked file's path, so a PATH-only
+// anchor misses a write made through the alias. The IDENTITY anchor `(dev,ino)`
+// catches it: editing `alias` (a hardlink to tracked external F) with a clean-only
+// citation MUST still be `Untrusted` + loud.
+//
+// REVERT-SENSITIVITY: this MUST fail if the inode match (`by_inode` /
+// `tracked_file_with_identity`) is removed from step 4 — then the gate sees only
+// the alias's unique path, finds no tracked record, and reads `Clean`/quiet.
+// (Verified by temporarily dropping `by_inode` — see the fix report.)
+#[test]
+fn taint_engine_anchored_hardlink_alias_is_untrusted() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+
+    // F is an ingested file under a READ grant → tracked, external `file_ingested`.
+    let f_canonical = ingest_file(&log, &emb, dir.path(), "tracked.md", b"ingested body");
+
+    // A SECOND name in the same dir, hardlinked to F: different path, SAME inode.
+    let alias = f_canonical.parent().unwrap().join("alias.md");
+    std::fs::hard_link(&f_canonical, &alias).unwrap();
+    // Precondition: the alias is genuinely NOT the tracked canonical path.
+    assert_ne!(
+        std::fs::canonicalize(&alias).unwrap(),
+        f_canonical,
+        "the hardlink alias must have a distinct canonical path (else the test is moot)"
+    );
+
+    // WRITE grant over F's dir, and a CLEAN-only citation (the laundering attempt).
+    log.add_write_grant(&dir.path().join("g")).unwrap();
+    let clean_id = seed_memory(&log, &emb, "totally benign memory");
+
+    let gated = log
+        .propose_write(proposal(&alias, WriteOp::Edit, b"attacker payload", &[clean_id]))
+        .unwrap();
+
+    assert_eq!(
+        gated.verdict.taint,
+        Taint::Untrusted,
+        "editing a HARDLINK ALIAS of a tracked external file is Untrusted (identity \
+         anchor) — if this reads Clean the inode match was removed"
+    );
+    assert!(
+        gated.verdict.requires_loud_modal,
+        "an Untrusted write must force the loud modal"
+    );
+    // The alias resolves to the SAME file_event_id, so the engine provenance is shown.
+    assert!(
+        gated.verdict.provenance.iter().any(|p| p.is_external),
+        "the engine-anchored external provenance must be surfaced for the alias too"
+    );
+}
+
 // ── L10 fail-closed-over-set (REVERT-SENSITIVE) ───────────────────────────────
 //
 // One clean id + one NON-EXISTENT id. The whole proposal MUST be `Untrusted`

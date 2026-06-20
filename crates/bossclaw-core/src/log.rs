@@ -1980,17 +1980,18 @@ impl EventLog {
     /// resolve (spec L10: `is_external` is not self-fail-closed).
     #[cfg(unix)]
     fn provenance_from_event(ev: &crate::event::Event) -> crate::actuator::Provenance {
-        // A `file_ingested` event nests its origin path + ingest provenance; other
-        // event kinds carry neither, so both stay `None` for them.
-        let prov = ev.content.get("provenance");
-        let origin_path = prov
+        // A `file_ingested` event nests its origin path; other event kinds carry
+        // none, so `origin_path` stays `None` for them. `ingested_at` is the EVENT's
+        // `ts` (the true time we learned the content), NOT the file's `modified_at`
+        // mtime — sourcing it from mtime would display a dishonest lineage time
+        // (T2 review). An empty `ts` (an un-appended event in a unit test) → `None`.
+        let origin_path = ev
+            .content
+            .get("provenance")
             .and_then(|p| p.get("canonical_path"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let ingested_at = prov
-            .and_then(|p| p.get("modified_at"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let ingested_at = if ev.ts.is_empty() { None } else { Some(ev.ts.clone()) };
         crate::actuator::Provenance {
             event_id: ev.id.clone(),
             kind: ev.event_type.clone(),
@@ -2097,19 +2098,34 @@ impl EventLog {
         }
         // `is_write_allowed` already canonicalizes (target, else parent) internally,
         // so it is correct for all three ops; advisory only (the fd-relative open at
-        // execute time is the real boundary, §6 #1).
-        let allowed = self.is_write_allowed(&p.target).unwrap_or(false);
+        // execute time is the real boundary, §6 #1). FAIL CLOSED on Err: surface a
+        // reject_reason rather than masking the error as a silent `allowed=false`
+        // (T2 review) — a swallowed error must never read as a benign deny.
+        let allowed = match self.is_write_allowed(&p.target) {
+            Ok(a) => a,
+            Err(e) => {
+                reject_reason
+                    .get_or_insert_with(|| format!("write-grant check failed: {e}"));
+                false
+            }
+        };
 
         // ── Step 3: op × existence matrix ─────────────────────────────────────────
         // One `symlink_metadata` probe (NOFOLLOW semantics: it describes the final
         // component itself, so a symlink there is seen as a symlink). A missing
         // target reads as "does not exist". The pure classifier holds the matrix.
+        // The same probe yields the target's ON-DISK identity `(dev,ino,size)`,
+        // reused by BOTH the step-4 inode anchor and the step-5 base_identity.
         let final_meta = std::fs::symlink_metadata(&p.target);
         let exists = final_meta.is_ok();
         let is_symlink = final_meta
             .as_ref()
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
+        let target_identity: Option<FileId> = final_meta.as_ref().ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            FileId { dev: m.dev(), ino: m.ino(), size: m.size() }
+        });
         if let Some(reason) = classify_op_existence(p.op, exists, is_symlink).reject_reason() {
             reject_reason.get_or_insert(reason);
         }
@@ -2121,9 +2137,23 @@ impl EventLog {
         // cited only clean events. This is the floor that a confused-deputy
         // cite-around cannot bypass, because it is derived from the TARGET, never
         // the citation list. Unioned with step 1's result (taint only escalates).
+        //
+        // The anchor matches on PATH **OR** INODE IDENTITY: a hardlink alias of a
+        // tracked file has a DIFFERENT canonical path but the SAME `(dev,ino)`, so a
+        // path-only match would miss it and launder the taint (T2 review Critical).
+        // Both resolve to the same `file_event_id`, so the provenance de-dupe below
+        // (keyed on the event id) is correct for either match.
         if let Some(real) = &canonical {
             let real_str = real.to_string_lossy().to_string();
-            if let Some(rec) = self.current_file_for_path(&real_str)? {
+            let by_path = self.current_file_for_path(&real_str)?;
+            let anchored = match by_path {
+                Some(rec) => Some(rec),
+                None => match target_identity {
+                    Some(id) => self.tracked_file_with_identity(id.dev, id.ino)?,
+                    None => None,
+                },
+            };
+            if let Some(rec) = anchored {
                 taint = Taint::Untrusted;
                 // Surface the engine-anchored provenance too, de-duped against any
                 // identical id the caller already cited (so the same file_ingested
@@ -2150,11 +2180,10 @@ impl EventLog {
                     use sha2::{Digest, Sha256};
                     hex::encode(Sha256::digest(&bytes))
                 });
-                let identity = final_meta.as_ref().ok().map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    FileId { dev: m.dev(), ino: m.ino(), size: m.size() }
-                });
-                (hash, identity)
+                // Reuse the single `symlink_metadata` identity captured in step 3
+                // (no second stat) — the (dev,ino,size) anchor the execute-time
+                // guard re-asserts (L12).
+                (hash, target_identity)
             }
         };
 
@@ -2212,6 +2241,36 @@ impl EventLog {
             }),
         ).optional()?;
         Ok(row)
+    }
+
+    /// The CURRENT tracked file whose ON-DISK identity is `(dev, ino)`, or `None`.
+    /// The INODE-keyed sibling of [`current_file_for_path`](Self::current_file_for_path),
+    /// for the write gate's engine anchor (M6a, T2 review).
+    ///
+    /// **Why identity, not just path (the hardlink-alias close):** a hardlink is a
+    /// second directory entry with a DIFFERENT name but the SAME inode.
+    /// `std::fs::canonicalize` collapses symlinks and `..` but does NOT collapse a
+    /// hardlink to a canonical name — so a path-only anchor MISSES a write made
+    /// through a hardlink alias of a tracked external file, laundering the taint.
+    /// This stats each current tracked path (via `symlink_metadata`, never
+    /// following a link) and returns the record whose `(st_dev, st_ino)` equals the
+    /// target's. Cross-device hardlinks are impossible, so `(dev, ino)` is a sound
+    /// identity within the grant tree. A tracked path that no longer stats (since
+    /// deleted/moved) is skipped — it cannot be the live target's alias.
+    #[cfg(unix)]
+    pub(crate) fn tracked_file_with_identity(
+        &self,
+        dev: u64,
+        ino: u64,
+    ) -> Result<Option<crate::graph::FileRecord>, BossclawError> {
+        use std::os::unix::fs::MetadataExt;
+        for rec in self.current_files()? {
+            match std::fs::symlink_metadata(&rec.canonical_path) {
+                Ok(m) if m.dev() == dev && m.ino() == ino => return Ok(Some(rec)),
+                _ => continue, // mismatch, or no longer stat-able → not this alias
+            }
+        }
+        Ok(None)
     }
 
     /// Event ids of CURRENT files whose grant root is still ACTIVE (revoked = 0).
