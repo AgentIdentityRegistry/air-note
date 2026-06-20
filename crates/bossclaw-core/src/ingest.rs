@@ -1243,11 +1243,11 @@ mod orchestrator_tests {
             "file_ingested events are now evolve subjects (Door A)");
     }
 
-    // Door (2): the evolve loop's internal recall must NOT surface file text as context.
-    // Assert the EXACT RecallOptions the loop uses returns ZERO file hits, while
-    // user-facing recall (defaults) DOES — proving the knob, not an empty corpus, hides it.
+    // Door B OPEN: the evolve loop's internal recall now SURFACES file text as context.
+    // Assert the EXACT RecallOptions the loop uses returns file hits, while
+    // user-facing recall (defaults) also does — proving the door is open.
     #[test]
-    fn evolve_context_recall_excludes_file_text() {
+    fn evolve_context_recall_includes_file_text() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("notes");
         std::fs::create_dir(&folder).unwrap();
@@ -1263,10 +1263,11 @@ mod orchestrator_tests {
         // User-facing recall surfaces the file…
         let user = log.recall(&emb, "zztoken", 10, &Default::default()).unwrap();
         assert!(user.iter().any(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE), "default recall returns the file");
-        // …the evolve-context recall (the loop's exact options) does NOT.
-        let ctx = log.recall(&emb, "zztoken", 10, &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() }).unwrap();
-        assert!(ctx.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
-            "exclude_files drops file text from the reasoner's extraction context (no laundering)");
+        // Door B OPEN: the evolve-context recall (the loop's exact options) now SURFACES the file.
+        // The taint chokepoint + the Pass-A fence keep it safe.
+        let ctx = log.recall(&emb, "zztoken", 10, &RecallOptions { exclude_pages: true, exclude_files: false, ..Default::default() }).unwrap();
+        assert!(ctx.iter().any(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE),
+            "Door B: file text is available as evolve context");
     }
 
     #[test]

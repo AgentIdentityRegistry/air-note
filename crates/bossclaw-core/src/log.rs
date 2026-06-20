@@ -3208,19 +3208,19 @@ impl EventLog {
             let text = crate::extract::truncate_for_reasoner(&full_text).to_string();
 
             // ── 1. recall context (M2). entity-kind is excluded from recall by
-            //    construction (separate index); `exclude_pages: true` drops pages
-            //    and `exclude_files: true` drops external file text (M5a Task 9,
-            //    evolve door 2) — so extraction context is raw memories only, the
-            //    one-way rule (F3, defense-in-depth with `fact_texts_for_ids`).
-            //    External file text must never be laundered into auto-derived
-            //    links/entities. The read-set is EVENT ids only (never
-            //    entity:<ulid>), spec §16. ──
+            //    construction (separate index); `exclude_pages: true` drops pages.
+            //    Door B OPEN: `exclude_files: false` — external file text CAN now
+            //    serve as extraction context. Any file hit in the read-set taints
+            //    the derived fact via the append chokepoint (extraction-from-files
+            //    D2), and the Pass-A cheat-sheet is fenced (extract.rs §3) so
+            //    external context cannot inject instructions. The read-set is EVENT
+            //    ids only (never entity:<ulid>), spec §16. ──
             let recalled: Vec<String> = self
                 .recall(
                     embedder,
                     &text,
                     crate::extract::GRAPH_CONTEXT_K,
-                    &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() },
+                    &RecallOptions { exclude_pages: true, exclude_files: false, ..Default::default() },
                 )
                 .map(|hits| {
                     hits.into_iter()
