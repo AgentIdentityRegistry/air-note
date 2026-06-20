@@ -3110,6 +3110,51 @@ impl EventLog {
         Ok(row)
     }
 
+    /// Reverse accessor: map a `file_ingested` event id → the projection's CURRENT
+    /// FileRecord for it (the live on-disk path). Returns None if that id is no longer
+    /// the current file at its path (superseded by a re-ingest) or never tracked.
+    ///
+    /// M6b reconciliation-proposer plumbing (§5.3): the proposer holds a lineage file
+    /// id and needs the live path to read + rewrite. `pub` so the M6b integration tests
+    /// in `tests/reconcile.rs` exercise it directly, mirroring the other `pub` read
+    /// accessors ([`current_files`](Self::current_files)).
+    #[cfg(unix)]
+    pub fn current_path_for_file_event(
+        &self,
+        file_event_id: &str,
+    ) -> Result<Option<crate::graph::FileRecord>, BossclawError> {
+        for rec in self.current_files()? {
+            if rec.file_event_id == file_event_id {
+                return Ok(Some(rec));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns Some(FileRecord) iff the lineage file id is still the CURRENT tracked file
+    /// at its path AND the on-disk target is a regular file (not a symlink/dir). The
+    /// freshness guard (M6b §5.3).
+    ///
+    /// M6b reconciliation-proposer plumbing: the proposer only rewrites a target that is
+    /// still the live, un-superseded, regular-file version of what it reasoned about —
+    /// a superseded id, a re-pointed symlink, or a vanished path all fail closed. `pub`
+    /// for the same reason as [`current_path_for_file_event`](Self::current_path_for_file_event).
+    #[cfg(unix)]
+    pub fn is_reconcilable_target(
+        &self,
+        lineage_file_id: &str,
+    ) -> Result<Option<crate::graph::FileRecord>, BossclawError> {
+        let Some(rec) = self.current_path_for_file_event(lineage_file_id)? else { return Ok(None) };
+        match self.current_file_for_path(&rec.canonical_path)? {
+            Some(cur) if cur.file_event_id == lineage_file_id => {}
+            _ => return Ok(None),
+        }
+        match std::fs::symlink_metadata(&rec.canonical_path) {
+            Ok(m) if m.file_type().is_file() => Ok(Some(rec)),
+            _ => Ok(None),
+        }
+    }
+
     /// The CURRENT tracked file whose ON-DISK identity is `(dev, ino)`, or `None`.
     /// The INODE-keyed sibling of [`current_file_for_path`](Self::current_file_for_path),
     /// for the write gate's engine anchor (M6a, T2 review).
