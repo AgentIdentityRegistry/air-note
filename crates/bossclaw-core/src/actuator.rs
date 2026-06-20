@@ -816,9 +816,14 @@ mod tests {
             fs::write(&target, b"original").expect("seed");
             let old_id = file_id(&target);
 
-            // Swap: same NAME, new INODE (remove + recreate with different bytes).
-            fs::remove_file(&target).expect("rm");
-            fs::write(&target, b"swapped in by a racer").expect("recreate");
+            // Swap: same NAME, new INODE. Use a COEXISTING decoy + rename, NOT
+            // remove+recreate-at-same-name — Linux (ext4/tmpfs) REUSES the freed
+            // inode number, so remove+recreate yields the SAME inode and the swap is
+            // moot. A decoy that coexists with the target has a distinct inode;
+            // renaming it over the target transfers that distinct inode on every FS.
+            let decoy = dir.path().join(".swap-decoy");
+            fs::write(&decoy, b"swapped in by a racer").expect("decoy");
+            fs::rename(&decoy, &target).expect("swap");
             assert_ne!(old_id.ino, file_id(&target).ino, "the swap must change the inode");
 
             let fd = open_dir_for_write(dir.path()).expect("open dir fd");
@@ -863,9 +868,11 @@ mod tests {
             super::super::restat_identity_matches(&fd, OsStr::new("f.txt"), id)
                 .expect("matching identity is Ok");
 
-            // Swap the inode under the same name → Err.
-            fs::remove_file(&target).expect("rm");
-            fs::write(&target, b"b").expect("recreate");
+            // Swap the inode under the same name → Err. Coexisting decoy + rename,
+            // not remove+recreate (Linux reuses the freed inode number).
+            let decoy = dir.path().join(".swap-decoy");
+            fs::write(&decoy, b"b").expect("decoy");
+            fs::rename(&decoy, &target).expect("swap");
             assert!(
                 super::super::restat_identity_matches(&fd, OsStr::new("f.txt"), id).is_err(),
                 "a changed inode under the same name must be rejected"

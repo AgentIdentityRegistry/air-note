@@ -849,9 +849,13 @@ fn execute_same_content_different_inode_swap_fails_closed() {
         .unwrap();
     let ino_before = std::fs::metadata(&target).unwrap().ino_u64();
 
-    // Swap: remove the target and recreate it with the SAME bytes → a NEW inode.
-    std::fs::remove_file(&target).unwrap();
-    std::fs::write(&target, b"identical bytes").unwrap();
+    // Swap: same NAME, SAME bytes, NEW inode. Coexisting decoy + rename, NOT
+    // remove+recreate-at-same-name — Linux (ext4/tmpfs) reuses the freed inode, so
+    // remove+recreate yields the same inode and the swap is moot. The decoy coexists
+    // with the target (distinct inode); rename transfers it on every filesystem.
+    let decoy = dir.path().join(".swap-decoy");
+    std::fs::write(&decoy, b"identical bytes").unwrap();
+    std::fs::rename(&decoy, &target).unwrap();
     let ino_after = std::fs::metadata(&target).unwrap().ino_u64();
     assert_ne!(ino_before, ino_after, "the swap must produce a different inode (else the test is moot)");
 
@@ -1281,8 +1285,10 @@ fn undo_re_gates_target_identity_swap_fails_closed() {
 
     // Swap the target for a DIFFERENT inode (same name) — same bytes as the
     // current v1, so only the (dev,ino) half of the guard can catch it.
-    std::fs::remove_file(&target).unwrap();
-    std::fs::write(&target, b"v1 edited").unwrap();
+    // Coexisting decoy + rename, NOT remove+recreate (Linux reuses the freed inode).
+    let decoy = dir.path().join(".swap-decoy");
+    std::fs::write(&decoy, b"v1 edited").unwrap();
+    std::fs::rename(&decoy, &target).unwrap();
     let ino_swapped = std::fs::metadata(&target).unwrap().ino_u64();
     assert_ne!(ino_v1, ino_swapped, "the swap must change the inode (else the test is moot)");
 
