@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod actuator;
 pub mod embed;
 pub mod error;
 pub mod event;
@@ -38,6 +39,10 @@ pub mod sign;
 pub mod summarize;
 pub mod store;
 
+pub use actuator::{
+    classify_op_existence, diff_guard, DiffFlags, FileId, GatedProposal, OpExistence, Provenance,
+    Taint, WriteOp, WriteProposal, WriteVerdict,
+};
 pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};

@@ -1969,6 +1969,221 @@ impl EventLog {
         Ok(false)
     }
 
+    /// Build a [`Provenance`] record from a resolved cited source event, noting
+    /// whether it carries the external taint stamp. Pulls `origin_path` +
+    /// `ingested_at` from a `file_ingested` event's provenance block when present
+    /// (so the verdict can show "this edit came from ~/x/README.md, ingested …").
+    ///
+    /// `is_external` here is the O(1) [`crate::ingest::is_external`] stamp read; the
+    /// gate's FAIL-CLOSED rule (an UNRESOLVABLE source taints the whole proposal)
+    /// is enforced by the caller, NOT here — this only describes a source that DID
+    /// resolve (spec L10: `is_external` is not self-fail-closed).
+    #[cfg(unix)]
+    fn provenance_from_event(ev: &crate::event::Event) -> crate::actuator::Provenance {
+        // A `file_ingested` event nests its origin path + ingest provenance; other
+        // event kinds carry neither, so both stay `None` for them.
+        let prov = ev.content.get("provenance");
+        let origin_path = prov
+            .and_then(|p| p.get("canonical_path"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let ingested_at = prov
+            .and_then(|p| p.get("modified_at"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        crate::actuator::Provenance {
+            event_id: ev.id.clone(),
+            kind: ev.event_type.clone(),
+            origin_path,
+            ingested_at,
+            is_external: crate::ingest::is_external(ev),
+        }
+    }
+
+    /// The PURE write gate (spec §8) — compute a [`crate::actuator::WriteVerdict`]
+    /// for `p` **without mutating the filesystem**. This is the confused-deputy
+    /// defense (spec §4): provenance + an engine-anchored, fail-closed taint
+    /// verdict + target eligibility + an advisory diff-guard + the concurrency base
+    /// hash AND identity. It never writes; execute (T4) re-checks the FS-mutable
+    /// facts inside a critical section.
+    ///
+    /// Gate logic, IN ORDER (each step's rationale is inline):
+    /// 1. **Sources** — empty `source_event_ids` is rejected. Each cited source is
+    ///    resolved via [`event_by_id`](Self::event_by_id); if **ANY** is
+    ///    unresolvable the WHOLE proposal is `Untrusted` (fail-closed OVER THE SET,
+    ///    L10 — never `filter_map` the resolvable ones), else a [`Provenance`] is
+    ///    built and `is_external` noted.
+    /// 2. **Canonicalize** — Edit/Delete canonicalize the target; Create
+    ///    canonicalizes the PARENT (the target is absent). Unresolvable ⇒
+    ///    `reject_reason`. `allowed = is_write_allowed(target)`.
+    /// 3. **op × existence** — Create-of-existing, Edit/Delete-of-absent, and a
+    ///    symlink final component each set `reject_reason`.
+    /// 4. **Engine-anchored taint (THE D8-FOR-WRITES FIX, L11)** — INDEPENDENTLY of
+    ///    the citations, the files projection is consulted: if `target_canonical`
+    ///    is a currently-tracked ingested file, its `file_ingested` event is
+    ///    external by construction ⇒ `Untrusted`, UNIONED with step 1. A
+    ///    confused-deputy caller citing only clean events while editing a tainted
+    ///    file is caught HERE, from the target itself.
+    /// 5. **Base capture (Edit/Delete)** — the current file is read for
+    ///    `base_content_hash` (hex SHA-256) + `base_identity` (`dev,ino,size` via
+    ///    `symlink_metadata`). Create ⇒ both `None`.
+    /// 6. **Loud modal** — `requires_loud_modal = Untrusted || Delete ||
+    ///    diff_flags.any()` (MONOTONIC — the diff-guard can only escalate).
+    ///
+    /// [`Provenance`]: crate::actuator::Provenance
+    #[cfg(unix)]
+    pub fn propose_write(
+        &self,
+        p: crate::actuator::WriteProposal,
+    ) -> Result<crate::actuator::GatedProposal, BossclawError> {
+        use crate::actuator::{
+            classify_op_existence, diff_guard, FileId, GatedProposal, Provenance, Taint,
+            WriteOp, WriteVerdict,
+        };
+
+        // A verdict accumulator. `reject_reason` short-circuits the meaning of the
+        // verdict (the proposal cannot proceed) but we still return a fully-formed
+        // verdict so the app can show WHY. Taint starts Clean and only escalates.
+        let mut taint = Taint::Clean;
+        let mut provenance: Vec<Provenance> = Vec::new();
+        let mut reject_reason: Option<String> = None;
+
+        // ── Step 1: sources (fail-closed OVER THE SET — L10) ──────────────────────
+        // An empty cite list is a hard reject (a Tier-B write needs lineage, spec
+        // §4 key invariant). For a NON-empty list, we resolve EVERY id: a single
+        // unresolvable id taints the WHOLE proposal. We deliberately do NOT
+        // `filter_map` to the resolvable subset and judge only those — that would
+        // let a confused-deputy hide the inducing event behind a bogus id that
+        // reads "clean" because it is simply absent.
+        if p.source_event_ids.is_empty() {
+            reject_reason.get_or_insert_with(|| "source_event_ids is empty".to_string());
+        } else {
+            for src in &p.source_event_ids {
+                match self.event_by_id(src)? {
+                    Some(ev) => {
+                        let prov = Self::provenance_from_event(&ev);
+                        if prov.is_external {
+                            taint = Taint::Untrusted;
+                        }
+                        provenance.push(prov);
+                    }
+                    None => {
+                        // Unresolvable cited source ⇒ fail closed over the set.
+                        taint = Taint::Untrusted;
+                    }
+                }
+            }
+        }
+
+        // ── Step 2: canonicalize target (Create ⇒ parent) + eligibility ───────────
+        // Reuse the SAME parent-canonicalize logic `is_write_allowed` documents:
+        // for Create the target is absent, so we resolve and key off the PARENT.
+        let canonical: Option<std::path::PathBuf> = match p.op {
+            WriteOp::Create => match p.target.parent() {
+                Some(parent) => match std::fs::canonicalize(parent) {
+                    Ok(real_parent) => p
+                        .target
+                        .file_name()
+                        .map(|name| real_parent.join(name)),
+                    Err(_) => None,
+                },
+                None => None,
+            },
+            WriteOp::Edit | WriteOp::Delete => std::fs::canonicalize(&p.target).ok(),
+        };
+        if canonical.is_none() {
+            reject_reason
+                .get_or_insert_with(|| "write target path is not resolvable".to_string());
+        }
+        // `is_write_allowed` already canonicalizes (target, else parent) internally,
+        // so it is correct for all three ops; advisory only (the fd-relative open at
+        // execute time is the real boundary, §6 #1).
+        let allowed = self.is_write_allowed(&p.target).unwrap_or(false);
+
+        // ── Step 3: op × existence matrix ─────────────────────────────────────────
+        // One `symlink_metadata` probe (NOFOLLOW semantics: it describes the final
+        // component itself, so a symlink there is seen as a symlink). A missing
+        // target reads as "does not exist". The pure classifier holds the matrix.
+        let final_meta = std::fs::symlink_metadata(&p.target);
+        let exists = final_meta.is_ok();
+        let is_symlink = final_meta
+            .as_ref()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if let Some(reason) = classify_op_existence(p.op, exists, is_symlink).reject_reason() {
+            reject_reason.get_or_insert(reason);
+        }
+
+        // ── Step 4: engine-anchored taint (D8-for-writes — L11, SECURITY-CRITICAL) ─
+        // INDEPENDENTLY of the caller's citations, ask the engine "is this target a
+        // file I currently track as ingested?". If so, its `file_ingested` event is
+        // external BY CONSTRUCTION, so the write is tainted — even if the caller
+        // cited only clean events. This is the floor that a confused-deputy
+        // cite-around cannot bypass, because it is derived from the TARGET, never
+        // the citation list. Unioned with step 1's result (taint only escalates).
+        if let Some(real) = &canonical {
+            let real_str = real.to_string_lossy().to_string();
+            if let Some(rec) = self.current_file_for_path(&real_str)? {
+                taint = Taint::Untrusted;
+                // Surface the engine-anchored provenance too, de-duped against any
+                // identical id the caller already cited (so the same file_ingested
+                // event is not listed twice).
+                if !provenance.iter().any(|pr| pr.event_id == rec.file_event_id) {
+                    if let Some(ev) = self.event_by_id(&rec.file_event_id)? {
+                        provenance.push(Self::provenance_from_event(&ev));
+                    }
+                }
+            }
+        }
+
+        // ── Step 5: base hash + identity + (display) diff for Edit/Delete ─────────
+        // Create leaves both `None` (there is no base). For Edit/Delete we read the
+        // CURRENT bytes for the concurrency hash and stat the final component (via
+        // symlink_metadata, NOT following a link) for the (dev,ino,size) anchor the
+        // execute-time guard re-asserts (L12). Best-effort: an unreadable base does
+        // not crash the gate — it simply leaves the field `None` (execute fails
+        // closed later if it cannot re-establish the anchor).
+        let (base_content_hash, base_identity) = match p.op {
+            WriteOp::Create => (None, None),
+            WriteOp::Edit | WriteOp::Delete => {
+                let hash = std::fs::read(&p.target).ok().map(|bytes| {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&bytes))
+                });
+                let identity = final_meta.as_ref().ok().map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    FileId { dev: m.dev(), ino: m.ino(), size: m.size() }
+                });
+                (hash, identity)
+            }
+        };
+
+        // ── Step 6: advisory diff-guard + the MONOTONIC loud-modal verdict ────────
+        // For Delete there is no new content to scan, so the diff-guard sees empty
+        // bytes (no flags) — but Delete forces the loud modal anyway via the rule
+        // below, so the modal is never downgraded by an empty Delete diff.
+        let diff_flags = match p.op {
+            WriteOp::Delete => crate::actuator::DiffFlags::default(),
+            WriteOp::Create | WriteOp::Edit => diff_guard(&p.new_content),
+        };
+        let requires_loud_modal = matches!(taint, Taint::Untrusted)
+            || matches!(p.op, WriteOp::Delete)
+            || diff_flags.any();
+
+        let verdict = WriteVerdict {
+            target_canonical: canonical,
+            allowed,
+            taint,
+            provenance,
+            diff_flags,
+            base_content_hash,
+            base_identity,
+            requires_loud_modal,
+            reject_reason,
+        };
+        Ok(GatedProposal { proposal: p, verdict })
+    }
+
     /// Every CURRENT file (one per path), `ORDER BY canonical_path ASC`. Tier-A read.
     pub fn current_files(&self) -> Result<Vec<crate::graph::FileRecord>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
