@@ -140,6 +140,17 @@ pub struct EventLog {
     /// `None` until [`EventLog::rebuild_entity_index`]; rebuilt from the encrypted
     /// log on open (zero plaintext index on disk, like the recall index).
     entity_index: Mutex<Option<Box<dyn VectorIndex>>>,
+    /// The actuator rename mutex (spec §9). DISTINCT from `inner` (the SQLite
+    /// append serializer): the M6a `execute_write` (T4) will hold THIS across its
+    /// entire re-canonicalize → re-check → base-guard → temp-write → finalize-rename
+    /// window, so a second write cannot interleave its base read against a
+    /// half-applied first write. It guards `()` because it serializes a
+    /// code-section, not in-memory state. T3 only CREATES it; T4 acquires it.
+    // `dead_code`-allowed: first read by `execute_write` (T4); the field +
+    // accessor are the forward seam T3 lands so T4 can lock without a
+    // visibility change.
+    #[allow(dead_code)]
+    rename_lock: Mutex<()>,
 }
 
 impl EventLog {
@@ -326,7 +337,18 @@ impl EventLog {
             highwater: None,
             vector_index: Mutex::new(None),
             entity_index: Mutex::new(None),
+            rename_lock: Mutex::new(()),
         })
+    }
+
+    /// The actuator rename mutex (spec §9). `execute_write` (T4) acquires this to
+    /// serialize its TOCTOU-critical re-check → write → finalize window across
+    /// threads. Exposed `pub(crate)` so the in-crate actuator engine can lock it
+    /// without widening the field's visibility.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub(crate) fn rename_lock(&self) -> &Mutex<()> {
+        &self.rename_lock
     }
 
     /// Append an event. `id`, `ts`, `prev_hash`, `hash`, `signature` are assigned

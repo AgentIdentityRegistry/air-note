@@ -298,6 +298,239 @@ fn is_shell_rc_line(line: &str) -> bool {
     trimmed.starts_with("#!") || trimmed.starts_with("export ")
 }
 
+// ── M6a filesystem write PRIMITIVES (T3) ────────────────────────────────────
+//
+// `#[cfg(unix)]` because they are fd-relative `openat`/`renameat` mechanics
+// (spec L5). They are the *tools* the execute step (T4 `execute_write`) drives
+// inside the actuator rename critical section (spec §9 steps 2 & 5); T3 builds
+// ONLY these primitives + their tests, no `execute_write`/undo (YAGNI).
+//
+// `forbid(unsafe_code)` holds: every syscall goes through `rustix::fs::*`, never
+// raw libc, never `unsafe`.
+
+/// Open a DIRECTORY fd for fd-relative writes, refusing a symlinked final
+/// component (the writable analogue of the RDONLY, `pub(crate)`
+/// [`crate::ingest::careful_open_file`], which cannot be reused for writes —
+/// seam-map §6 M1). Subsequent `atomic_write` steps are fd-relative against the
+/// returned fd, so the path string is resolved exactly ONCE here.
+///
+/// Platform split mirrors `careful_open_file` (spec §9 step 2):
+/// - **Linux:** `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` so NO
+///   component (intermediate or final) may be a symlink and nothing may escape
+///   `dir`; falls back to `openat` + `O_NOFOLLOW` on a pre-5.6 kernel (`ENOSYS`),
+///   which still refuses a final-component symlink.
+/// - **macOS / other non-Linux:** `openat` from `CWD` with
+///   `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. `O_NOFOLLOW` refuses ONLY a
+///   final-component symlink; an INTERMEDIATE directory that is a symlink is NOT
+///   rejected here. That residual is acceptable because the caller (T4) has
+///   already canonicalized `dir` and checked it against an active write-grant —
+///   `open_dir_for_write` is the fd-relative anchor, not the authorization
+///   boundary (spec §6 flag 1, §8/§9).
+///
+/// `O_DIRECTORY` makes the open fail (`ENOTDIR`) if `dir` is not a directory, so
+/// a file or a symlink-to-file at `dir` cannot slip through as a write anchor.
+// `dead_code`-allowed: this is a forward-seam primitive built in T3 and CONSUMED
+// by `execute_write` in T4 (spec §9 step 2). The in-crate `fs_primitives` tests
+// exercise it today; the allow keeps a plain (non-test) build warning-free until
+// T4 wires the non-test caller. Mirrors `ingest::careful_open_windows`'s pattern.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn open_dir_for_write(
+    dir: &std::path::Path,
+) -> Result<std::os::fd::OwnedFd, crate::error::BossclawError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::ffi::OsStrExt;
+
+    let containment = |e: rustix::io::Errno| {
+        crate::error::BossclawError::Io(std::io::Error::other(e.to_string()))
+    };
+
+    // A directory fd used only as a rename/openat anchor needs no read/write
+    // access mode beyond O_DIRECTORY; RDONLY is the conventional choice.
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{openat2, ResolveFlags};
+        match openat2(
+            rustix::fs::CWD,
+            dir.as_os_str().as_bytes(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => Ok(fd),
+            // Pre-5.6 kernels lack openat2 → fall back to a NOFOLLOW open, which
+            // still refuses a final-component symlink.
+            Err(rustix::io::Errno::NOSYS) => rustix::fs::openat(
+                rustix::fs::CWD,
+                dir.as_os_str().as_bytes(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(containment),
+            Err(e) => Err(containment(e)),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        rustix::fs::openat(
+            rustix::fs::CWD,
+            dir.as_os_str().as_bytes(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(containment)
+    }
+}
+
+/// `rw-r--r--` (0o644) — the mode new files are created with. A module const so
+/// the temp-create and any future direct-create share one value.
+#[cfg(unix)]
+const NEW_FILE_MODE: rustix::fs::Mode = rustix::fs::Mode::from_bits_truncate(0o644);
+
+/// Mint a collision-resistant temp file name in the form `.{name}.{ulid}.tmp`.
+/// The ULID (already a crate dependency — used for event ids, `log.rs:422`) plus
+/// the `O_EXCL` create below makes a name clash astronomically unlikely AND
+/// detected: `O_EXCL` fails rather than reusing a stale temp, so freshness does
+/// not rest on the name alone. Leading `.` keeps the temp hidden during its
+/// brief life. The name is purely a tmp handle — it is renamed onto `final_name`.
+#[cfg(unix)]
+fn temp_name_for(final_name: &std::ffi::OsStr) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt;
+    let mut name = std::ffi::OsString::from(".");
+    // `final_name` bytes are preserved verbatim (it may be non-UTF-8) so the temp
+    // visibly relates to its target; correctness rests on the ULID + O_EXCL.
+    name.push(std::ffi::OsStr::from_bytes(final_name.as_bytes()));
+    name.push(".");
+    name.push(ulid::Ulid::new().to_string());
+    name.push(".tmp");
+    name
+}
+
+/// Atomically write `bytes` to `final_name` inside `dir_fd`: a uniquely-named
+/// `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC` temp in the SAME directory →
+/// write all bytes → `fsync` → per-OS finalize rename (spec L13/§9 step 5). All
+/// operations are fd-relative against `dir_fd`; the path string is never
+/// re-resolved here. On ANY error after the temp is created, the temp is
+/// `unlinkat`-removed so no `*.tmp` is ever left behind.
+///
+/// `no_clobber` selects the create-vs-edit finalize:
+/// - **`true` (Create):** the rename MUST NOT overwrite an existing `final_name`.
+///   - *Linux:* `renameat2(.., RenameFlags::NOREPLACE)` — kernel-atomic
+///     no-clobber (exposed as `renameat_with` in pinned rustix 0.38.44;
+///     `#[cfg(linux_kernel)]`).
+///   - *macOS / non-Linux:* `statat(.., SYMLINK_NOFOLLOW)` existence pre-check
+///     (inside whatever lock the caller holds) → if `final_name` exists, error;
+///     else `renameat`. This is **NOT** `O_EXCL`-atomic: a foreign process that
+///     creates `final_name` in the microsecond between the `statat` and the
+///     `renameat` would be overwritten. That race is the **documented residual**
+///     for the macOS create path (spec L13/§9) — it is NOT claimed atomic.
+/// - **`false` (Edit):** plain `renameat` — overwrite of `final_name` is intended.
+///
+/// `O_NOFOLLOW` on the temp create guarantees the temp name cannot resolve
+/// through a symlink an attacker pre-planted at the temp path.
+// `dead_code`-allowed: forward-seam primitive (T3) CONSUMED by `execute_write`
+// in T4 (spec §9 step 5). Exercised by the `fs_primitives` tests today.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub(crate) fn atomic_write(
+    dir_fd: &std::os::fd::OwnedFd,
+    final_name: &std::ffi::OsStr,
+    bytes: &[u8],
+    no_clobber: bool,
+) -> Result<(), crate::error::BossclawError> {
+    use rustix::fs::{AtFlags, OFlags};
+    use std::os::unix::ffi::OsStrExt;
+
+    let io = |e: rustix::io::Errno| crate::error::BossclawError::Io(std::io::Error::other(e.to_string()));
+
+    let tmp_name = temp_name_for(final_name);
+
+    // O_EXCL → fail (rather than reuse) if the freshly-minted name somehow exists;
+    // O_NOFOLLOW → never create/follow through a symlink planted at the temp name.
+    let tmp_fd = rustix::fs::openat(
+        dir_fd,
+        tmp_name.as_bytes(),
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        NEW_FILE_MODE,
+    )
+    .map_err(io)?;
+
+    // From here on, any failure must unlink the temp before returning so no
+    // `*.tmp` is left behind (spec §9 "failure leaves the FS unchanged").
+    let cleanup = |err: crate::error::BossclawError| -> crate::error::BossclawError {
+        // Best-effort: the original error is what the caller sees; a failed
+        // cleanup cannot mask it (and there is nothing better to do).
+        let _ = rustix::fs::unlinkat(dir_fd, tmp_name.as_bytes(), AtFlags::empty());
+        err
+    };
+
+    // Write every byte (handle short writes by advancing the slice).
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match rustix::io::write(&tmp_fd, remaining) {
+            Ok(0) => {
+                return Err(cleanup(crate::error::BossclawError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "atomic_write: write returned 0 before all bytes were written",
+                ))));
+            }
+            Ok(n) => remaining = &remaining[n..],
+            // EINTR → retry the same slice; any other errno is fatal.
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(cleanup(io(e))),
+        }
+    }
+
+    // Durability: flush file data+metadata before the rename publishes it.
+    rustix::fs::fsync(&tmp_fd).map_err(|e| cleanup(io(e)))?;
+    // Drop the temp write fd before renaming (the rename is dir-fd-relative; the
+    // file fd is no longer needed and closing it early is tidy).
+    drop(tmp_fd);
+
+    let finalize: Result<(), crate::error::BossclawError> = if no_clobber {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::RenameFlags;
+            // Kernel-atomic no-clobber: fails with EEXIST if `final_name` exists.
+            rustix::fs::renameat_with(
+                dir_fd,
+                tmp_name.as_bytes(),
+                dir_fd,
+                final_name.as_bytes(),
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(io)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS: no renameat2. Pre-check existence fd-relative (SYMLINK_NOFOLLOW
+            // so a symlink AT `final_name` counts as "exists" and is refused), then
+            // renameat. NOT O_EXCL-atomic — the statat→renameat gap is the
+            // documented residual (a foreign process winning that microsecond race
+            // would be overwritten); the real boundary is the caller's rename mutex
+            // + grant check, not this pre-check.
+            match rustix::fs::statat(dir_fd, final_name.as_bytes(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => Err(crate::error::BossclawError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "atomic_write: create no-clobber target already exists",
+                ))),
+                // ENOENT is the only "safe to proceed" outcome; any other stat
+                // error is fail-closed.
+                Err(rustix::io::Errno::NOENT) => {
+                    rustix::fs::renameat(dir_fd, tmp_name.as_bytes(), dir_fd, final_name.as_bytes())
+                        .map_err(io)
+                }
+                Err(e) => Err(io(e)),
+            }
+        }
+    } else {
+        // Edit: overwrite is intended.
+        rustix::fs::renameat(dir_fd, tmp_name.as_bytes(), dir_fd, final_name.as_bytes()).map_err(io)
+    };
+
+    finalize.map_err(cleanup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +613,127 @@ mod tests {
     fn diff_guard_non_utf8_is_flag_free() {
         // Binary content cannot match a text pattern; it is the human confirm's job.
         assert!(!diff_guard(&[0xFF, 0xFE, 0x00, 0x01]).any());
+    }
+
+    // ── T3 filesystem-primitive tests (unix-only) ───────────────────────────
+    #[cfg(unix)]
+    mod fs_primitives {
+        use super::super::{atomic_write, open_dir_for_write};
+        use std::ffi::OsStr;
+        use std::fs;
+        use std::path::Path;
+
+        /// Count the `*.tmp` leftovers in `dir` — every successful or failed
+        /// `atomic_write` must leave ZERO (the atomicity guarantee).
+        fn tmp_count(dir: &Path) -> usize {
+            fs::read_dir(dir)
+                .expect("read_dir")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .ends_with(".tmp")
+                })
+                .count()
+        }
+
+        #[test]
+        fn atomic_write_create_leaves_exact_bytes_and_no_tmp() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fd = open_dir_for_write(dir.path()).expect("open dir fd");
+
+            atomic_write(&fd, OsStr::new("note.txt"), b"hello world", true)
+                .expect("create write");
+
+            let target = dir.path().join("note.txt");
+            assert_eq!(fs::read(&target).expect("read target"), b"hello world");
+            assert_eq!(tmp_count(dir.path()), 0, "no *.tmp may survive a create");
+        }
+
+        #[test]
+        fn atomic_write_edit_overwrites_atomically_and_no_tmp() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("note.txt");
+            fs::write(&target, b"old contents").expect("seed file");
+
+            let fd = open_dir_for_write(dir.path()).expect("open dir fd");
+            // Edit (no_clobber = false) over an existing file replaces its bytes.
+            atomic_write(&fd, OsStr::new("note.txt"), b"brand new bytes", false)
+                .expect("edit write");
+
+            assert_eq!(fs::read(&target).expect("read target"), b"brand new bytes");
+            assert_eq!(tmp_count(dir.path()), 0, "no *.tmp may survive an edit");
+        }
+
+        #[test]
+        fn atomic_write_create_no_clobber_refuses_existing_and_preserves_bytes() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("note.txt");
+            fs::write(&target, b"do not touch").expect("seed file");
+
+            let fd = open_dir_for_write(dir.path()).expect("open dir fd");
+            // Create onto an existing name must Err (no-clobber), leave the
+            // original bytes UNCHANGED, and leave no `*.tmp` behind. This also
+            // exercises the error-cleanup path (the temp is created, then the
+            // finalize fails → the temp must be unlinked).
+            let err = atomic_write(&fd, OsStr::new("note.txt"), b"payload", true);
+            assert!(err.is_err(), "create onto existing name must be refused");
+
+            assert_eq!(
+                fs::read(&target).expect("read target"),
+                b"do not touch",
+                "the original file's bytes must be untouched by a refused create"
+            );
+            assert_eq!(
+                tmp_count(dir.path()),
+                0,
+                "the failed-create temp must be cleaned up (no *.tmp leftover)"
+            );
+        }
+
+        #[test]
+        fn open_dir_for_write_refuses_symlinked_final_component() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let real = dir.path().join("real_dir");
+            fs::create_dir(&real).expect("mkdir real");
+            let link = dir.path().join("link_dir");
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+            // The final component `link_dir` is a symlink → O_NOFOLLOW (macOS) /
+            // RESOLVE_NO_SYMLINKS (Linux) must refuse it as a write anchor.
+            assert!(
+                open_dir_for_write(&link).is_err(),
+                "a symlinked final dir component must be refused"
+            );
+            // Sanity: the real directory itself opens fine.
+            assert!(
+                open_dir_for_write(&real).is_ok(),
+                "the real (non-symlink) directory must open"
+            );
+        }
+
+        #[test]
+        fn atomic_write_temp_create_cannot_follow_symlink_at_temp_path() {
+            // The temp is created with O_EXCL|O_NOFOLLOW. Even if an attacker
+            // pre-plants a symlink whose name collides with a temp, O_EXCL (name
+            // freshness) plus O_NOFOLLOW (no symlink traversal) means the create
+            // either picks an unused ULID name or fails — it can NEVER write
+            // through a planted symlink to clobber an outside target. We assert the
+            // positive end-to-end property: a normal create lands the bytes in the
+            // intended dir-relative target and nowhere else.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let outside = dir.path().join("OUTSIDE_must_not_be_written");
+            fs::write(&outside, b"sentinel").expect("seed sentinel");
+
+            let fd = open_dir_for_write(dir.path()).expect("open dir fd");
+            atomic_write(&fd, OsStr::new("inside.txt"), b"safe", true).expect("create");
+
+            assert_eq!(fs::read(dir.path().join("inside.txt")).expect("read"), b"safe");
+            assert_eq!(
+                fs::read(&outside).expect("read sentinel"),
+                b"sentinel",
+                "the write must not have leaked outside the intended target name"
+            );
+        }
     }
 }
