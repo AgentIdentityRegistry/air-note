@@ -10,6 +10,7 @@ use bossclaw_core::event::Event;
 use bossclaw_core::ingest::ParserRouter;
 use bossclaw_core::EventLog;
 use ed25519_dalek::SigningKey;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
@@ -130,4 +131,55 @@ pub fn seed_memory(log: &EventLog, text: &str) -> String {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Like [`open_log_with_write_grant`], and ALSO write + ingest a tracked `n.md` under the
+/// files dir so a real EXTERNAL reconciliation target exists. The `n.md` `file_ingested`
+/// id is recoverable via the public `current_files()` projection (used by the proposal/
+/// rejection helpers below to supply a non-empty, tracked-file lineage). Returns the dir.
+pub fn open_write_grant_and_external_target() -> (EventLog, TempDir, PathBuf) {
+    let (log, home, dir) = open_log_with_write_grant();
+    let path = dir.join("n.md");
+    std::fs::write(&path, b"Alice works at Acme.\n").expect("write n.md target");
+    ingest_one(&log, &path);
+    (log, home, dir)
+}
+
+/// The `file_ingested` event id for an already-ingested target at `canonical`. Reads the
+/// public `current_files()` projection — the same lookup `ingest_one` uses — so proposal
+/// lineage cites a real, tracked file (satisfying Tier-B + taint-stamp invariants).
+fn tracked_file_id(log: &EventLog, canonical: &str) -> String {
+    log.current_files()
+        .expect("read current_files")
+        .into_iter()
+        .find(|rec| rec.canonical_path == canonical)
+        .map(|rec| rec.file_event_id)
+        .unwrap_or_else(|| panic!("no current file_ingested event for {canonical}"))
+}
+
+/// Append a minimal OPEN `write_proposal` for `(canonical, key)` and return its id. The
+/// lineage cites the tracked target file at `canonical` (non-empty + a real file, so the
+/// Tier-B taint-stamp invariants hold). Mirrors the builder call shape the proposer uses.
+pub fn append_minimal_proposal(log: &EventLog, canonical: &str, key: &Value) -> String {
+    let file_id = tracked_file_id(log, canonical);
+    log.append_write_proposal(
+        canonical,
+        "edit",
+        "deadbeef",
+        0,
+        "rationale",
+        key,
+        &serde_json::json!({}),
+        std::slice::from_ref(&file_id),
+    )
+    .expect("append minimal write_proposal")
+}
+
+/// Append an engine-side `write_rejected` for `(canonical, key)` and return its id. Cites
+/// the tracked target file as lineage; this independently suppresses re-attempts but is NOT
+/// a proposal and NEVER resolves one.
+pub fn append_rejected(log: &EventLog, canonical: &str, key: &Value, reason: &str) -> String {
+    let file_id = tracked_file_id(log, canonical);
+    log.append_write_rejected(Some(canonical), reason, key, std::slice::from_ref(&file_id))
+        .expect("append write_rejected")
 }

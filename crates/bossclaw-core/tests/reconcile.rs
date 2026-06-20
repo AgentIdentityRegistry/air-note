@@ -272,3 +272,25 @@ fn proposal_bytes_round_trip_through_execute_write_resolving() {
     log.undo_write(&written_id).expect("undo_write");
     assert_eq!(std::fs::read(&target).unwrap(), original.to_vec());
 }
+
+/// A write_proposal is OPEN until a human-terminal event references it; an engine
+/// write_rejected suppresses re-attempts for (path, key) but does NOT "resolve" a proposal;
+/// write_declined and file_written{resolves_proposal} both close it.
+#[test]
+fn pending_projection_open_close_and_suppress() {
+    let (log, _home, dir) = common::open_write_grant_and_external_target();
+    let path = dir.join("n.md");
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let key = serde_json::json!({"src":"entity:a","relation":"rel","dst":"entity:b"});
+
+    assert!(!log.is_proposal_suppressed(&canonical, &key).unwrap(), "nothing yet → may propose");
+
+    let pid = common::append_minimal_proposal(&log, &canonical, &key);
+    assert!(log.is_proposal_suppressed(&canonical, &key).unwrap(), "an OPEN proposal suppresses");
+
+    log.decline_write_proposal(&pid, "not now").unwrap();
+    assert!(!log.is_proposal_suppressed(&canonical, &key).unwrap(), "declined → no longer open");
+
+    common::append_rejected(&log, &canonical, &key, "stale_target");
+    assert!(log.is_proposal_suppressed(&canonical, &key).unwrap(), "a write_rejected suppresses re-attempts");
+}

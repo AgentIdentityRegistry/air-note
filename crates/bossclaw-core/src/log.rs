@@ -1980,6 +1980,53 @@ impl EventLog {
         self.append(self.build_m6b_event(crate::graph::WRITE_DECLINED_EVENT_TYPE, content, &sources))
     }
 
+    /// Idempotency (§5.7): suppress a new proposal for (canonical_path, inducing_key) if
+    /// EITHER an OPEN write_proposal exists for it OR a write_rejected was recorded for it.
+    /// A write_proposal is OPEN until a later file_written/write_declined carries
+    /// resolves_proposal == its id. Engine write_rejected never resolves a proposal.
+    /// inducing_key is the RESOLVED (entity-id, relation, entity-id) — never surface forms.
+    ///
+    /// O(n) fold over the (low-volume) actuator events — acceptable for v1; a dedicated
+    /// projection table is a future optimization.
+    #[cfg(unix)]
+    pub fn is_proposal_suppressed(
+        &self,
+        canonical_path: &str,
+        inducing_key: &serde_json::Value,
+    ) -> Result<bool, BossclawError> {
+        let mut open_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ev in self.events_of_types(&[
+            crate::graph::WRITE_PROPOSAL_EVENT_TYPE,
+            crate::graph::WRITE_REJECTED_EVENT_TYPE,
+            crate::graph::WRITE_DECLINED_EVENT_TYPE,
+            crate::graph::FILE_WRITTEN_EVENT_TYPE,
+        ])? {
+            match ev.event_type.as_str() {
+                t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    if ev.content.get("target").and_then(|v| v.as_str()) == Some(canonical_path)
+                        && ev.content.get("inducing_key") == Some(inducing_key)
+                    {
+                        open_ids.insert(ev.id.clone());
+                    }
+                }
+                t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
+                    if ev.content.get("target").and_then(|v| v.as_str()) == Some(canonical_path)
+                        && ev.content.get("inducing_key") == Some(inducing_key)
+                    {
+                        return Ok(true);
+                    }
+                }
+                _ => {
+                    if let Some(rid) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        resolved.insert(rid.to_string());
+                    }
+                }
+            }
+        }
+        Ok(open_ids.iter().any(|id| !resolved.contains(id)))
+    }
+
     /// Store the proposed corrected bytes for a `write_proposal`, keyed by its event id.
     /// The bytes live in the SQLCipher `Store` (encrypted at rest) because they are model
     /// output over untrusted input — NOT in the signed event, which records only
@@ -4242,6 +4289,35 @@ impl EventLog {
             if let Some(text) = ev.content.get("text").and_then(|t| t.as_str()) {
                 out.push((seq, id, text.to_string()));
             }
+        }
+        Ok(out)
+    }
+
+    /// Every `Event` whose `event_type` is in `types`, in `seq ASC` (append) order.
+    /// A parameterized `WHERE event_type IN (?1, ?2, ...)` over the events table — no
+    /// value interpolation. Returns owned `Event`s so the store lock is released before
+    /// the caller folds over them. Used by the M6b pending-proposal projection.
+    pub(crate) fn events_of_types(
+        &self,
+        types: &[&str],
+    ) -> Result<Vec<Event>, BossclawError> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String =
+            (0..types.len()).map(|i| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT payload FROM events WHERE event_type IN ({placeholders}) ORDER BY seq ASC"
+        );
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            types.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str::<Event>(&row?)?);
         }
         Ok(out)
     }
