@@ -686,6 +686,85 @@ fn memory_only_contradiction_emits_no_proposal() {
     log.verify_chain().unwrap();
 }
 
+/// Spec §9 B-2: a MANUAL (user-asserted) edge with NO file in its lineage yields NO
+/// proposal. The manual `link()` API defaults `source_event_ids` to `[src, dst]` — two
+/// `entity:<ulid>` ids — which can never equal a `file_event_id`, so
+/// `is_reconcilable_target` returns `None` for every lineage id and the proposer finds
+/// no target. This is correct-by-construction; the test PINS it so a future change to the
+/// manual-link default (or the lineage union) can't silently start proposing rewrites of
+/// files that a manual edge never came from.
+///
+/// Driven through the FULL loop (the contradiction is confirmed → `invalidates_emitted ==
+/// 1`) AND cross-checked at the unit level (the edge's `[src,dst]` lineage carries no
+/// reconcilable file). No file is ingested anywhere in this test.
+#[test]
+fn manual_edge_with_no_file_lineage_yields_no_proposal() {
+    let (log, _home, _dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+
+    // Two entities with resolution vectors so the correcting memory's mentions resolve to
+    // THEM (the proven manual-seed resolution path). Their own lineage cites a memory —
+    // there is NO file anywhere in this test.
+    let seed_mem = common::seed_memory(&log, "Manual fact: Dana works at Hooli.");
+    let dana = log.entity("Dana", &[], "person", "m6b-test-seed", std::slice::from_ref(&seed_mem)).unwrap();
+    let hooli = log.entity("Hooli", &[], "org", "m6b-test-seed", std::slice::from_ref(&seed_mem)).unwrap();
+    log.derive_entity_vector(&emb, &dana, "Dana").unwrap();
+    log.derive_entity_vector(&emb, &hooli, "Hooli").unwrap();
+
+    // The user-asserted edge via the REAL manual `link()` API: `&[]` makes its sources
+    // default to `[dana, hooli]` (two entity ids, NO file). This is the §9 B-2 subject.
+    let edge_id = log.link(&dana, "works_at", &hooli, None, &[]).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(&emb).unwrap();
+
+    // UNIT-LEVEL cross-check: the manual edge's lineage (its [src,dst] default, unioned
+    // with an empty read_set) carries NO reconcilable file — every lineage id maps to
+    // None. This is the property the no-proposal behavior rests on.
+    let lineage = log.reconciliation_lineage(&edge_id, &[]).unwrap();
+    assert!(!lineage.is_empty(), "manual edge lineage is its [src,dst] endpoints, not empty");
+    for id in &lineage {
+        assert!(
+            log.is_reconcilable_target(id).unwrap().is_none(),
+            "no entity-id lineage member is ever a reconcilable file ({id})"
+        );
+    }
+
+    // Skip the seeded events as evolve subjects; the next tick sees only the memory.
+    let tip = log.stream_all().unwrap().len() as i64;
+    log.set_evolve_cursor(tip).unwrap();
+
+    // FULL-LOOP: one correcting memory retracts the manual edge. The contradiction fires
+    // (the manual edge IS retired) but no proposal is synthesized (no file lineage).
+    let corr = "Dana no longer works at Hooli.";
+    let mem_id = seed_memory_full(&log, &emb, corr);
+    let pass_a = serde_json::json!({
+        "entities": [
+            { "mention": "Dana",  "entity_type": "person", "confidence": 0.95 },
+            { "mention": "Hooli", "entity_type": "org",    "confidence": 0.95 }
+        ],
+        "relations": [],
+        "retractions": [{
+            "src": "Dana", "relation": "works_at", "dst": "Hooli",
+            "reason": "left", "confidence": 0.95
+        }]
+    });
+    let nbh = vec!["Dana -works_at-> Hooli".to_string()];
+    let recall_ctx = loop_recall_texts(&log, &emb, corr, &mem_id);
+    let r = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[recall_ctx],
+        &nbh,
+        pass_a,
+    ));
+    let rep = log.evolve_once(&emb, &r).unwrap();
+
+    assert_eq!(rep.invalidates_emitted, 1, "the manual edge is retracted (contradiction confirmed)");
+    assert_eq!(rep.proposals_emitted, 0, "a manual edge with no file lineage proposes nothing");
+    assert_eq!(rep.proposals_rejected, 0, "no synthesis was attempted (no reconcilable target)");
+    log.verify_chain().unwrap();
+}
+
 /// The off-switch suppresses ONLY the proposal layer: with proposals disabled, evolve
 /// curation still confirms the contradiction (`invalidate`), but no `write_proposal` is
 /// synthesized. (And no `write_rejected` either — the gate suppression must stay
