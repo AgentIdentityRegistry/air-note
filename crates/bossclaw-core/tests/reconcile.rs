@@ -202,8 +202,18 @@ fn proposal_bytes_tamper_fails_closed() {
     let hash = common::sha256_hex(bytes); // use the SAME hasher the engine uses for content_hash
     log.put_proposal_bytes(pid, bytes, &hash).unwrap();
     assert_eq!(log.get_proposal_bytes_checked(pid, &hash).unwrap(), bytes.to_vec());
-    // wrong expected hash (as if the signed event recorded a different one) → fail closed:
+    // Branch 1 — wrong expected hash (as if the signed event recorded a different one):
     assert!(log.get_proposal_bytes_checked(pid, "00deadbeef").is_err());
+
+    // Branch 2 — the row itself is tampered: stored bytes that do NOT hash to the stored
+    // content_hash. Even when read back with the "correct" expected hash, the recomputed
+    // hash of the stored bytes != stored_hash → fail closed, no bytes returned. (Driven
+    // purely through the public API: store CONTENT and HASH that disagree.)
+    log.put_proposal_bytes("01TAMPERED", b"ATTACKER-SWAPPED BYTES", &hash).unwrap();
+    assert!(
+        log.get_proposal_bytes_checked("01TAMPERED", &hash).is_err(),
+        "stored bytes that don't match the recorded content_hash must fail closed"
+    );
 }
 
 /// §8.14 confirm-path round-trip: stored corrected bytes are re-read, re-hashed, then run
