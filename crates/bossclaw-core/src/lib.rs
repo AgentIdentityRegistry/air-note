@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod actuator;
 pub mod embed;
 pub mod error;
 pub mod event;
@@ -38,13 +39,17 @@ pub mod sign;
 pub mod summarize;
 pub mod store;
 
+pub use actuator::{
+    classify_op_existence, diff_guard, DiffFlags, FileId, GatedProposal, OpExistence, Provenance,
+    Taint, WriteOp, WriteProposal, WriteVerdict,
+};
 pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};
 pub use evolve::{EvolveReport, EvolveStatus};
 #[cfg(feature = "fastembed")]
 pub use fastembed::FastEmbed;
-pub use graph::{AsOf, Edge, Entity, Node, Page};
+pub use graph::{AsOf, Edge, Entity, Grant, Node, Page, WriteGrant};
 pub use index::{HnswIndex, VectorIndex};
 pub use log::{ActiveModel, EventLog, ReembedStats, SCHEMA_VERSION};
 pub use model2vec::Model2Vec;

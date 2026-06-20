@@ -51,11 +51,31 @@ pub const FILE_INGESTED_EVENT_TYPE: &str = "file_ingested";
 pub const GRANT_EVENT_TYPE: &str = "grant";
 /// The `event_type` discriminator for a folder-revoke event (M5a). Ground-truth.
 pub const REVOKE_EVENT_TYPE: &str = "revoke";
+/// The `event_type` discriminator for a folder-WRITE-grant event (M6a). Ground-truth.
+/// Structurally distinct from [`GRANT_EVENT_TYPE`] so a read grant can NEVER
+/// authorize a write: the two grant kinds share no event type, fold, or projection.
+pub const WRITE_GRANT_EVENT_TYPE: &str = "write_grant";
+/// The `event_type` discriminator for a folder-WRITE-revoke event (M6a). Ground-truth.
+pub const WRITE_REVOKE_EVENT_TYPE: &str = "write_revoke";
 /// The taint stamp written at `content["origin"]` of every `file_ingested` event
 /// (M5a, D4). Distinct from the `edges.origin` column (`"manual"`/`"machine"`):
 /// this marks external-origin content so the M6 lineage walk can fail closed.
 /// Single-sourced so the stamp site and the `is_external` classifier cannot drift.
 pub const EXTERNAL_ORIGIN: &str = "external";
+
+/// The `event_type` discriminator for a `file_written` actuator event (M6a, T4).
+/// **Always Tier-B by construction** (spec L9/W6): `EventLog::execute_write` is the
+/// SOLE constructor and unconditionally sets `model_meta: Some{..}` with a validated
+/// non-empty source list, so no Tier-A `file_written` can exist to dodge the
+/// append-chokepoint's taint stamp. Deliberately **NOT** in `EMBEDDABLE_EVENT_TYPES`
+/// (`log.rs`) — a write record is an audit fact, not a recallable memory.
+pub const FILE_WRITTEN_EVENT_TYPE: &str = "file_written";
+
+/// The `model_meta.model_id` (producer) stamped on every `file_written` event
+/// (M6a, T4). The explicit caller has no model prompt, so `prompt_hash` is empty
+/// (spec W10, matching `link_machine`/`entity`). Single-sourced so the constructor
+/// and any test/assertion reference the same producer string.
+pub const ACTUATOR_PRODUCER: &str = "m6a-actuator";
 
 /// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
 /// links reference this exact form, so it is single-sourced.
@@ -396,6 +416,46 @@ pub fn fold_grants(events: &[Event]) -> Vec<Grant> {
     by_root.into_values().collect()
 }
 
+/// A folded folder WRITE-grant (M6a): the CURRENT state of one write-granted root.
+/// A deterministic fold over `write_grant`/`write_revoke` events; rebuilt by
+/// `rebuild_graph`. Structurally PARALLEL to (and fully independent of) the read-side
+/// [`Grant`]: a `grant`/`revoke` event never touches a `WriteGrant`, and vice-versa,
+/// so a read grant can never authorize a write. `revoked` rows stay in the log forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteGrant {
+    /// The canonicalized absolute folder path (the write-grant's identity key).
+    pub canonical_root: String,
+    /// RFC 3339 ts of the latest `write_grant` event for this root (provenance).
+    pub granted_at: String,
+    /// True iff the latest event for this root is a `write_revoke`.
+    pub revoked: bool,
+}
+
+/// Fold `write_grant`/`write_revoke` events (MUST be in `seq` order) into the current
+/// write-grant per root (last-writer-wins). A `write_grant` (re)activates and stamps
+/// `granted_at`; a `write_revoke` marks an EXISTING root revoked. A `write_revoke` with
+/// no prior write-grant is ignored. Deterministic → byte-identical rebuild. Mirrors
+/// [`fold_grants`] but over the WRITE event types only — it ignores `grant`/`revoke`
+/// entirely, keeping the read and write authorities independent.
+pub fn fold_write_grants(events: &[Event]) -> Vec<WriteGrant> {
+    use std::collections::BTreeMap;
+    let mut by_root: BTreeMap<String, WriteGrant> = BTreeMap::new();
+    for ev in events {
+        let root = match parse_grant_content(&ev.content) {
+            Some(r) => r,
+            None => continue,
+        };
+        if ev.event_type == WRITE_GRANT_EVENT_TYPE {
+            by_root.insert(root.clone(), WriteGrant { canonical_root: root, granted_at: ev.ts.clone(), revoked: false });
+        } else if ev.event_type == WRITE_REVOKE_EVENT_TYPE {
+            if let Some(g) = by_root.get_mut(&root) {
+                g.revoked = true;
+            }
+        }
+    }
+    by_root.into_values().collect()
+}
+
 /// A folded ingested-file record (M5a): the CURRENT (un-superseded) `file_ingested`
 /// event for one `canonical_path`. A deterministic fold over `file_ingested` +
 /// `supersede` events; rebuilt by `rebuild_graph`. Keyed on path, NOT on bytes:
@@ -571,6 +631,91 @@ mod tests {
             signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
         };
         assert!(fold_grants(&[ev]).is_empty(), "a revoke with no prior grant yields no row");
+    }
+
+    #[test]
+    fn m6a_write_event_type_consts_are_distinct_and_stable() {
+        // Stable wire strings (these land in signed content + the byte-identical rebuild).
+        assert_eq!(WRITE_GRANT_EVENT_TYPE, "write_grant");
+        assert_eq!(WRITE_REVOKE_EVENT_TYPE, "write_revoke");
+        // The write discriminators must NOT collide with the read ones (or any other),
+        // which is what keeps the read and write authorities structurally separate.
+        assert_ne!(WRITE_GRANT_EVENT_TYPE, GRANT_EVENT_TYPE);
+        assert_ne!(WRITE_REVOKE_EVENT_TYPE, REVOKE_EVENT_TYPE);
+        for other in [
+            MEMORY_EVENT_TYPE, PAGE_EVENT_TYPE, SUPERSEDE_EVENT_TYPE, ENTITY_EVENT_TYPE,
+            CONFIG_EVENT_TYPE, FILE_INGESTED_EVENT_TYPE, GRANT_EVENT_TYPE, REVOKE_EVENT_TYPE,
+        ] {
+            assert_ne!(WRITE_GRANT_EVENT_TYPE, other);
+            assert_ne!(WRITE_REVOKE_EVENT_TYPE, other);
+        }
+    }
+
+    #[test]
+    fn m6a_file_written_consts_are_distinct_and_stable() {
+        // Stable wire strings (the type lands in signed content + the rebuild filter).
+        assert_eq!(FILE_WRITTEN_EVENT_TYPE, "file_written");
+        assert_eq!(ACTUATOR_PRODUCER, "m6a-actuator");
+        // `file_written` must not collide with any other event type — it rides the
+        // append chokepoint as its own discriminator.
+        for other in [
+            MEMORY_EVENT_TYPE, PAGE_EVENT_TYPE, SUPERSEDE_EVENT_TYPE, ENTITY_EVENT_TYPE,
+            CONFIG_EVENT_TYPE, FILE_INGESTED_EVENT_TYPE, GRANT_EVENT_TYPE, REVOKE_EVENT_TYPE,
+            WRITE_GRANT_EVENT_TYPE, WRITE_REVOKE_EVENT_TYPE,
+        ] {
+            assert_ne!(FILE_WRITTEN_EVENT_TYPE, other);
+        }
+    }
+
+    #[test]
+    fn fold_write_grants_is_last_writer_wins_per_root() {
+        // write_grant A, write_grant B, write_revoke A, write_grant A again →
+        // A active (re-granted), B active. Mirrors fold_grants_is_last_writer_wins_per_root.
+        let mk = |etype: &str, root: &str, ts: &str| Event {
+            id: String::new(), ts: ts.to_string(), valid_time: None,
+            event_type: etype.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        let events = vec![
+            mk(WRITE_GRANT_EVENT_TYPE, "/a", "2026-06-18T00:00:00Z"),
+            mk(WRITE_GRANT_EVENT_TYPE, "/b", "2026-06-18T00:00:01Z"),
+            mk(WRITE_REVOKE_EVENT_TYPE, "/a", "2026-06-18T00:00:02Z"),
+            mk(WRITE_GRANT_EVENT_TYPE, "/a", "2026-06-18T00:00:03Z"),
+        ];
+        let mut grants = fold_write_grants(&events);
+        grants.sort_by(|x, y| x.canonical_root.cmp(&y.canonical_root));
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[0].canonical_root, "/a");
+        assert!(!grants[0].revoked, "/a was re-granted after revoke → active");
+        assert_eq!(grants[0].granted_at, "2026-06-18T00:00:03Z", "granted_at = latest grant ts");
+        assert!(!grants[1].revoked, "/b never revoked");
+    }
+
+    #[test]
+    fn folds_are_independent_read_and_write_do_not_cross() {
+        // The crux of M6a T1: a read `grant`/`revoke` must NEVER produce a WriteGrant,
+        // and a `write_grant`/`write_revoke` must NEVER produce a (read) Grant. Feeding
+        // BOTH event streams to BOTH folds must keep them in their own lanes.
+        let mk = |etype: &str, root: &str| Event {
+            id: String::new(), ts: "2026-06-18T00:00:00Z".to_string(), valid_time: None,
+            event_type: etype.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        };
+        let mixed = vec![
+            mk(GRANT_EVENT_TYPE, "/read-only"),
+            mk(WRITE_GRANT_EVENT_TYPE, "/write-only"),
+        ];
+        let read = fold_grants(&mixed);
+        assert_eq!(read.len(), 1, "only the `grant` event reaches the read fold");
+        assert_eq!(read[0].canonical_root, "/read-only");
+
+        let write = fold_write_grants(&mixed);
+        assert_eq!(write.len(), 1, "only the `write_grant` event reaches the write fold");
+        assert_eq!(write[0].canonical_root, "/write-only");
     }
 
     fn mk_file_ingested(path: &str, content_hash: &str, grant_root: &str) -> Event {

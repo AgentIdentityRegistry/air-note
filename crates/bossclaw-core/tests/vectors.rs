@@ -175,3 +175,39 @@ fn tainted_page_canonicalization_is_frozen() {
     let expected = "09ce409a1d0f82d97356ffb43cb3b6fda8f2985283eb4c3b5ce071ccad26e816";
     assert_eq!(got, expected, "tainted page canonicalization changed (got {got}); update only if intentional");
 }
+
+// FREEZE: a `file_written` actuator event (M6a, T4) — locks the JCS-SHA256 of the
+// signed bytes for the write-record path. Tier-B (model_meta with empty
+// prompt_hash, spec W10); content is the spec §7.2 object shape for an EDIT
+// (target/op/content_hash/prev_content_hash/byte_size). Run once with a dummy
+// expected to print the actual hex, paste it, re-run → PASS.
+#[test]
+fn file_written_canonicalization_is_frozen() {
+    let ev = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FD0".to_string(),
+        ts: "2026-06-20T00:00:00+00:00".to_string(),
+        valid_time: None,
+        event_type: "file_written".to_string(),
+        content: serde_json::json!({
+            "target": "/x/notes.md",
+            "op": "edit",
+            "content_hash": "ccc",
+            "prev_content_hash": "ddd",
+            "byte_size": 12,
+        }),
+        model_meta: Some(ModelMeta {
+            model_id: "m6a-actuator".to_string(),
+            prompt_hash: String::new(),
+            source_event_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()],
+        }),
+        prev_hash: "0".repeat(64),
+        hash: None,
+        signed_by_did: "did:wba:bossclaw-engine".to_string(),
+        signature: None,
+    };
+    let canon = canonical_bytes(&ev).unwrap();
+    let got = hex::encode(Sha256::digest(&canon));
+    // FREEZE: run once; copy the printed hex into `expected`; re-run → PASS.
+    let expected = "d24e379a745411617eeb735971dc4ad594602816ccf635616dc5265018085dfb";
+    assert_eq!(got, expected, "file_written canonicalization changed (got {got}); update only if intentional");
+}
