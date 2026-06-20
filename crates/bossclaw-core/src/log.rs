@@ -3238,6 +3238,17 @@ impl EventLog {
     /// union( the retired edge's own source_event_ids , the inducing read_set ).
     /// Deliberately EXCLUDES the endpoints' entity lineage (over-reach: an entity accretes
     /// lineage from every memory that mentioned it). The model's citations are NEVER consulted.
+    ///
+    /// # Caller contract (anti-laundering — load-bearing)
+    /// - `retired_edge_id` MUST be a bare link-EVENT id (an [`Edge::edge_id`](crate::graph::Edge::edge_id)
+    ///   from [`fold_edges`](crate::graph::fold_edges)), NEVER an `entity:<ulid>` node id.
+    ///   The internal `source_ids_of_event` read does NOT strip the `entity:` prefix,
+    ///   so an entity id would silently resolve to `None` and DROP the asserting file's lineage —
+    ///   a laundering hole. Pass the edge id, not an endpoint.
+    /// - Callers MUST propagate the `Err` (use `?`), NEVER `.unwrap_or_default()`. The error is the
+    ///   fail-closed signal for a corrupt/unparseable event payload; swallowing it would convert a
+    ///   hard failure into a silently-empty lineage (taint laundered to nothing). This is the
+    ///   contract the evolve-loop caller (Task 7) relies on.
     #[cfg(unix)]
     pub fn reconciliation_lineage(
         &self,

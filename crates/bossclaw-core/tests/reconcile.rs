@@ -170,3 +170,24 @@ fn correcting_file_is_recorded_in_lineage() {
     let lineage = log.reconciliation_lineage(&edge_id, std::slice::from_ref(&file_b)).unwrap();
     assert!(lineage.contains(&file_b), "the correcting file MUST be recorded (no laundering)");
 }
+
+/// Fail-closed: an edge id that resolves to NO lineage (unknown/nonexistent) contributes
+/// nothing, but MUST NOT drop the read_set — the result is exactly the sorted/deduped
+/// read_set, never a silent empty. Guards against a future refactor to `.unwrap_or_default()`
+/// (or an entity-id misuse) that would launder the correcting source away.
+#[test]
+fn reconciliation_lineage_unknown_edge_preserves_read_set() {
+    let (log, _home, _dir) = common::open_log_with_write_grant();
+    let file_b = common::seed_external_event(&log, "Alice works at Globex");
+    let mem_c = common::seed_memory(&log, "and reports to Carol");
+    // Intentionally bogus edge id: no such event → source_ids_of_event yields None.
+    let read_set = vec![file_b, mem_c];
+    let lineage = log
+        .reconciliation_lineage("01NONEXISTENTEDGE0000000000", &read_set)
+        .unwrap();
+
+    let mut expected = read_set.clone();
+    expected.sort();
+    expected.dedup();
+    assert_eq!(lineage, expected, "missing edge contributes nothing; read_set is preserved");
+}
