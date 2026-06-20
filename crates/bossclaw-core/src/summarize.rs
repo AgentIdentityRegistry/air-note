@@ -141,11 +141,21 @@ pub fn compose_schema() -> serde_json::Value {
 /// - **`\u{2028}` / `\u{2029}`** — LINE / PARAGRAPH SEPARATOR (Unicode `Zl`/`Zp`),
 ///   newline-equivalent to many consumers.
 /// - **`\u{0085}`** (NEL) — covered by `is_control` (it is in `Cc`).
+/// - **`\u{061C}`** (ARABIC LETTER MARK / ALM) — `Bidi_Control=Yes`, `Bidi_Class=AL`;
+///   `is_control` is false for it and it sits outside the ranges below, so it is
+///   listed explicitly. The one bidi control that is not contiguous with the others.
 /// - **`\u{200B}`..=`\u{200F}`** — zero-width space/joiners + LRM/RLM (`Cf`); these
 ///   can hide structure and inject directionality.
 /// - **`\u{2066}`..=`\u{2069}`** — bidi isolates (`Cf`).
 /// - **`\u{202A}`..=`\u{202E}`** — bidi embeddings/overrides (`Cf`); an override can
 ///   visually reorder a label so the rendered text differs from the bytes.
+///
+/// Together these cover all **12/12** Unicode bidi-control characters (ALM + LRM/RLM +
+/// the 4 isolates + the 5 embeddings/overrides). Zero-width obfuscators that are
+/// neither line-breakers nor bidi-controls (e.g. U+2060 WJ, U+FEFF BOM, U+00AD) are
+/// intentionally NOT stripped: they cannot forge an instruction line or reorder text,
+/// and a full `General_Category=Cf` strip would need a Unicode-property dependency this
+/// milestone's zero-new-deps rule forbids.
 ///
 /// The filter is strictly *more* stripping than the ASCII version, so it is safe
 /// for every label-defense caller. This helper is **shared**: it also defends the
@@ -160,7 +170,8 @@ pub(crate) fn sanitize_ident(s: &str) -> String {
         .filter(|c| {
             !c.is_control() // Cc (incl. NEL U+0085 and ASCII controls)
                 && !matches!(c,
-                    '\u{2028}' | '\u{2029}'        // LINE / PARAGRAPH SEPARATOR (Zl/Zp)
+                    '\u{061C}'                     // ARABIC LETTER MARK (ALM) — bidi control
+                        | '\u{2028}' | '\u{2029}'  // LINE / PARAGRAPH SEPARATOR (Zl/Zp)
                         | '\u{200B}'..='\u{200F}'  // zero-width + LRM/RLM (Cf)
                         | '\u{2066}'..='\u{2069}'  // bidi isolates (Cf)
                         | '\u{202A}'..='\u{202E}') // bidi embeddings/overrides (Cf)
