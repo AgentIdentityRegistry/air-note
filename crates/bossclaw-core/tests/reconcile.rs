@@ -867,3 +867,124 @@ fn cap_bounds_proposals_per_tick_and_counts_the_overflow() {
     assert_eq!(rep.proposals_rejected, 0, "cap-elision is NOT a rejection");
     log.verify_chain().unwrap();
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Task 8 — the WHOLE M6b lifecycle in one test: EMIT (autonomous) → CONFIRM
+// (app-side) → EXECUTE → RESOLVE → UNDO. Where the cap/off-switch/e2e tests above
+// each lock ONE property of the EMIT half, this proves the proposal an autonomous
+// `evolve_once` produces can be carried all the way to a confirmed, undoable disk
+// write whose record closes the proposal — the full app contract end to end.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// FULL ROUND-TRIP. Drive the proven T7 e2e setup so ONE real `write_proposal` is
+/// emitted autonomously for an ingested target, then walk the app-side CONFIRM path
+/// against THAT proposal's OWN recorded fields (target, new_content_hash, lineage):
+/// `get_proposal_bytes_checked → propose_write → execute_write_resolving`. Assert the
+/// lifecycle closes — the file gains the corrected bytes, the `file_written`
+/// back-references the proposal, the OPEN proposal is no longer suppressing (resolved),
+/// and `undo_write` restores the original on-disk bytes.
+#[test]
+fn proposal_round_trip_emit_confirm_execute_resolve_undo() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+
+    // ── EMIT: reuse the T7 two-tick fixture verbatim. Tick 1 — the file asserts
+    //    "Alice works_at Acme" (its file_ingested id flows into the edge lineage). ──
+    let original = b"Alice works at Acme.\n";
+    let (file_id, file_src) = ingest_md_full(&log, &emb, &dir, "notes.md", original);
+    let target_path = dir.join("notes.md");
+    let canonical = std::fs::canonicalize(&target_path).unwrap().to_string_lossy().to_string();
+    // Snapshot the ORIGINAL on-disk bytes BEFORE confirm (the undo oracle).
+    let original_on_disk = std::fs::read(&target_path).unwrap();
+
+    let r1 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        &file_src,
+        &[vec![]],
+        &[],
+        works_at_pass_a("Alice", "Acme", &file_src),
+    ));
+    let rep1 = log.evolve_once(&emb, &r1).unwrap();
+    assert_eq!(rep1.proposals_emitted, 0, "no contradiction yet");
+    log.rebuild_graph().unwrap();
+
+    // Tick 2 — a memory corrects the employer → confirmed contradiction + ONE proposal.
+    let corr = "Correction: Alice works at Globex, not Acme.";
+    seed_memory_full(&log, &emb, corr);
+    let nbh = vec!["Alice -works_at-> Acme".to_string()];
+    let r2 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[vec![], vec![file_src.clone()]],
+        &nbh,
+        correction_pass_a("Alice", "Acme", "Globex", corr),
+    ));
+    let rep2 = log.evolve_once(&emb, &r2).unwrap();
+    assert_eq!(rep2.proposals_emitted, 1, "exactly one reconciliation proposal was emitted");
+    assert_eq!(rep2.proposals_rejected, 0, "the synthesis + gate succeeded");
+
+    // Capture the emitted proposal and EVERYTHING the confirm path consumes from it:
+    // its id, target (canonical), new_content_hash, inducing_key, and recorded lineage.
+    let prop = log
+        .stream_all()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.event_type == bossclaw_core::graph::WRITE_PROPOSAL_EVENT_TYPE)
+        .expect("the emitted write_proposal");
+    let pid = prop.id.clone();
+    let recorded_target = prop.content["target"].as_str().unwrap().to_string();
+    assert_eq!(recorded_target, canonical, "the proposal targets the ingested file");
+    let hash = prop.content["new_content_hash"].as_str().unwrap().to_string();
+    let inducing_key = prop.content["inducing_key"].clone();
+    // The engine-gathered lineage (non-empty → Tier-B holds for the confirm write).
+    let lineage = prop.model_meta.as_ref().expect("Tier-B proposal").source_event_ids.clone();
+    assert!(lineage.contains(&file_id), "lineage carries the asserting file id");
+
+    // While the proposal is OPEN, (path, key) is suppressed (no re-proposal would fire).
+    assert!(
+        log.is_proposal_suppressed(&canonical, &inducing_key).unwrap(),
+        "an OPEN proposal suppresses re-attempts for (path, key)"
+    );
+
+    // ── CONFIRM (app-side): re-read the cached bytes against the SIGNED hash, then
+    //    re-run the full M6a gate and execute as a resolving write. ──
+    let bytes = log.get_proposal_bytes_checked(&pid, &hash).unwrap();
+    let gated = log
+        .propose_write(WriteProposal {
+            target: target_path.clone(),
+            new_content: bytes.clone(),
+            op: WriteOp::Edit,
+            source_event_ids: lineage.clone(), // the proposal's recorded lineage
+            rationale: "confirm".to_string(),
+        })
+        .expect("propose_write");
+    assert!(
+        gated.verdict.reject_reason.is_none(),
+        "fresh, write-granted target → the gate passes (reject_reason: {:?})",
+        gated.verdict.reject_reason
+    );
+    let fw_id = log.execute_write_resolving(gated, &pid).expect("execute_write_resolving");
+
+    // ── Assert the lifecycle CLOSES. ──
+    // 1. the on-disk target now holds the corrected bytes the side table cached.
+    assert_eq!(std::fs::read(&target_path).unwrap(), bytes, "the file gained the corrected bytes");
+    // 2. the file_written record back-references the proposal it resolved.
+    let fw = log.event_by_id(&fw_id).unwrap().unwrap();
+    assert_eq!(fw.event_type, "file_written");
+    assert_eq!(fw.content["resolves_proposal"], serde_json::json!(pid));
+    // 3. the OPEN proposal is now RESOLVED → no longer suppressing (lifecycle closed).
+    assert!(
+        !log.is_proposal_suppressed(&canonical, &inducing_key).unwrap(),
+        "file_written{{resolves_proposal}} closed the proposal → (path,key) no longer suppressed"
+    );
+    // 4. undo restores the file to its ORIGINAL pre-confirm bytes.
+    log.undo_write(&fw_id).expect("undo_write");
+    assert_eq!(
+        std::fs::read(&target_path).unwrap(),
+        original_on_disk,
+        "undo_write reverts the resolving Edit to the original on-disk bytes"
+    );
+    assert_eq!(original_on_disk, original.to_vec(), "sanity: the snapshot equals the seeded body");
+
+    log.verify_chain().unwrap();
+}
