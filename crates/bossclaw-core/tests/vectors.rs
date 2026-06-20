@@ -211,3 +211,75 @@ fn file_written_canonicalization_is_frozen() {
     let expected = "d24e379a745411617eeb735971dc4ad594602816ccf635616dc5265018085dfb";
     assert_eq!(got, expected, "file_written canonicalization changed (got {got}); update only if intentional");
 }
+
+// FREEZE: an M6b `write_proposal` event — locks the JCS-SHA256 of the signed bytes
+// for the proposer path. Tier-B (model_meta producer `m6b-reconciler`, empty
+// prompt_hash); content is the spec §7.2 proposer shape; `origin:"external"` is
+// included (the append chokepoint stamps it whenever a source is a tracked file, so
+// the frozen bytes are the post-stamp shape — same convention as `tainted_link`).
+#[test]
+fn write_proposal_canonicalization_is_frozen() {
+    let ev = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FE0".to_string(),
+        ts: "2026-06-20T00:00:00+00:00".to_string(),
+        valid_time: None,
+        event_type: "write_proposal".to_string(),
+        content: serde_json::json!({
+            "target": "/x/notes.md",
+            "op": "edit",
+            "new_content_hash": "ccc",
+            "byte_size": 12,
+            "rationale": "reconcile: A -rel-> B",
+            "inducing_key": { "src": "entity:01AAA", "relation": "rel", "dst": "entity:01BBB" },
+            "verdict_summary": { "requires_loud_modal": true, "taint": "Untrusted", "allowed": true },
+            "origin": "external",
+        }),
+        model_meta: Some(ModelMeta {
+            model_id: "m6b-reconciler".to_string(),
+            prompt_hash: String::new(),
+            source_event_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()],
+        }),
+        prev_hash: "0".repeat(64),
+        hash: None,
+        signed_by_did: "did:wba:bossclaw-engine".to_string(),
+        signature: None,
+    };
+    let canon = canonical_bytes(&ev).unwrap();
+    let got = hex::encode(Sha256::digest(&canon));
+    // FREEZE: run once; copy the printed hex into `expected`; re-run → PASS.
+    let expected = "866193d7cc0bcba21b9683758b587b9edbce28c2aabb0d65d92cb34c9c16b936";
+    assert_eq!(got, expected, "write_proposal canonicalization changed (got {got}); update only if intentional");
+}
+
+// FREEZE: an M6b `write_rejected` event — the terminal audit marker emitted INSTEAD
+// of a proposal on synthesis/gate failure. Tier-B; content is the rejected shape
+// (target/reason/inducing_key); `origin:"external"` post-stamp shape.
+#[test]
+fn write_rejected_canonicalization_is_frozen() {
+    let ev = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FF0".to_string(),
+        ts: "2026-06-20T00:00:00+00:00".to_string(),
+        valid_time: None,
+        event_type: "write_rejected".to_string(),
+        content: serde_json::json!({
+            "target": "/x/notes.md",
+            "reason": "target no longer reconcilable",
+            "inducing_key": { "src": "entity:01AAA", "relation": "rel", "dst": "entity:01BBB" },
+            "origin": "external",
+        }),
+        model_meta: Some(ModelMeta {
+            model_id: "m6b-reconciler".to_string(),
+            prompt_hash: String::new(),
+            source_event_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()],
+        }),
+        prev_hash: "0".repeat(64),
+        hash: None,
+        signed_by_did: "did:wba:bossclaw-engine".to_string(),
+        signature: None,
+    };
+    let canon = canonical_bytes(&ev).unwrap();
+    let got = hex::encode(Sha256::digest(&canon));
+    // FREEZE: run once; copy the printed hex into `expected`; re-run → PASS.
+    let expected = "b638559d9de336cc56aeff7caabfbf15c0ec13403ad0fde058daf9bf44593e97";
+    assert_eq!(got, expected, "write_rejected canonicalization changed (got {got}); update only if intentional");
+}

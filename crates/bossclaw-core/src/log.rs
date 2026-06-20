@@ -1926,6 +1926,60 @@ impl EventLog {
         }
     }
 
+    /// Append a signed Tier-B `write_proposal`. `source_event_ids` MUST be the engine-
+    /// gathered lineage (Task 3), non-empty. Bytes are NOT in the event (Task 5 side table).
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_write_proposal(
+        &self, target_canonical: &str, op: &str, new_content_hash: &str, byte_size: u64,
+        rationale: &str, inducing_key: &serde_json::Value, verdict_summary: &serde_json::Value,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        let content = serde_json::json!({
+            "target": target_canonical, "op": op,
+            "new_content_hash": new_content_hash, "byte_size": byte_size,
+            "rationale": rationale, "inducing_key": inducing_key, "verdict_summary": verdict_summary,
+        });
+        self.append(self.build_m6b_event(crate::graph::WRITE_PROPOSAL_EVENT_TYPE, content, source_event_ids))
+    }
+
+    /// Append a signed Tier-B `write_rejected` (emitted INSTEAD of a proposal on synthesis/
+    /// gate failure; a terminal audit marker — never resolves a proposal).
+    #[cfg(unix)]
+    pub fn append_write_rejected(
+        &self, target_canonical: Option<&str>, reason: &str,
+        inducing_key: &serde_json::Value, source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        let content = serde_json::json!({ "target": target_canonical, "reason": reason, "inducing_key": inducing_key });
+        self.append(self.build_m6b_event(crate::graph::WRITE_REJECTED_EVENT_TYPE, content, source_event_ids))
+    }
+
+    /// App-facing: a human declined a proposal. Appends a `write_declined` that RESOLVES it.
+    #[cfg(unix)]
+    pub fn decline_write_proposal(&self, proposal_id: &str, reason: &str) -> Result<String, BossclawError> {
+        let sources = self.source_ids_of_event(proposal_id)?.unwrap_or_default();
+        if sources.is_empty() {
+            return Err(BossclawError::InvalidInput("unknown or non-Tier-B proposal id".into()));
+        }
+        let content = serde_json::json!({ "resolves_proposal": proposal_id, "reason": reason });
+        self.append(self.build_m6b_event(crate::graph::WRITE_DECLINED_EVENT_TYPE, content, &sources))
+    }
+
+    /// Shared M6b Tier-B event builder (producer = m6b-reconciler; lineage = engine-gathered).
+    #[cfg(unix)]
+    fn build_m6b_event(&self, event_type: &str, content: serde_json::Value, source_event_ids: &[String]) -> crate::event::Event {
+        crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: event_type.to_string(), content,
+            model_meta: Some(crate::event::ModelMeta {
+                model_id: crate::graph::M6B_PROPOSER_PRODUCER.to_string(),
+                prompt_hash: String::new(), source_event_ids: source_event_ids.to_vec(),
+            }),
+            prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        }
+    }
+
     /// Every CURRENT page (one per topic), `ORDER BY topic_id ASC`. Tier-A read.
     pub fn current_pages(&self) -> Result<Vec<crate::graph::Page>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
@@ -2371,8 +2425,23 @@ impl EventLog {
         &self,
         confirmed: crate::actuator::GatedProposal,
     ) -> Result<String, BossclawError> {
-        // The public entry: a normal (non-undo) write carries no `undo_of`.
-        self.execute_write_inner(confirmed, None)
+        // The public entry: a normal (non-undo) write carries no `undo_of` and
+        // resolves no proposal (the recorded `file_written` is byte-identical to M6a).
+        self.execute_write_inner(confirmed, None, None)
+    }
+
+    /// As [`execute_write`](Self::execute_write), but records that this write RESOLVES
+    /// the M6b `write_proposal` whose id is `resolves_proposal` — stamping
+    /// `content["resolves_proposal"]` on the `file_written`. The write itself (re-checks,
+    /// base guard, atomic mutate, undo capture, sole-constructor append) is identical;
+    /// only the recorded provenance gains the back-reference. Carries no `undo_of`.
+    #[cfg(unix)]
+    pub fn execute_write_resolving(
+        &self,
+        confirmed: crate::actuator::GatedProposal,
+        resolves_proposal: &str,
+    ) -> Result<String, BossclawError> {
+        self.execute_write_inner(confirmed, None, Some(resolves_proposal))
     }
 
     /// The shared execute path for both [`execute_write`](Self::execute_write) (the
@@ -2387,6 +2456,7 @@ impl EventLog {
         &self,
         confirmed: crate::actuator::GatedProposal,
         undo_of: Option<&str>,
+        resolves_proposal: Option<&str>,
     ) -> Result<String, BossclawError> {
         use crate::actuator::WriteOp;
         use std::os::unix::ffi::OsStrExt;
@@ -2780,6 +2850,13 @@ impl EventLog {
         if let Some(undone) = undo_of {
             content.insert("undo_of".to_string(), serde_json::Value::String(undone.to_string()));
         }
+        // M6b: stamp the back-reference to the resolved `write_proposal` iff this write
+        // was confirmed via `execute_write_resolving` (skip-if-None, exactly like
+        // `prev_content_hash`/`undo_of` above). Absent when None ⇒ the M6a `file_written`
+        // content is byte-identical to before M6b (the frozen vector is unperturbed).
+        if let Some(resolved) = resolves_proposal {
+            content.insert("resolves_proposal".to_string(), serde_json::Value::String(resolved.to_string()));
+        }
 
         let event = Event {
             id: String::new(),
@@ -3027,7 +3104,9 @@ impl EventLog {
         if let Some(reason) = &gated.verdict.reject_reason {
             return Err(fail(&format!("re-gated undo proposal rejected: {reason}")));
         }
-        let undo_event_id = self.execute_write_inner(gated, Some(file_written_id))?;
+        // An undo records NO frame and resolves NO M6b proposal (it carries `undo_of`,
+        // not `resolves_proposal`).
+        let undo_event_id = self.execute_write_inner(gated, Some(file_written_id), None)?;
 
         // ── Pop this frame + hand the stack top off to the previous frame ─────────
         // The undo succeeded, so this frame is consumed: delete it. Then, if a previous

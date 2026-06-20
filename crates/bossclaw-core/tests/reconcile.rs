@@ -5,6 +5,9 @@
 #![cfg(unix)]
 mod common;
 
+use bossclaw_core::actuator::{WriteOp, WriteProposal};
+use serde_json::json;
+
 /// Given a file_ingested event id, the reverse accessor returns the CURRENT FileRecord
 /// for that id, and None once the file is superseded by a re-ingest at the same path.
 #[test]
@@ -37,4 +40,103 @@ fn is_reconcilable_target_rejects_superseded_and_symlinked() {
     std::fs::remove_file(&path).unwrap();
     std::os::unix::fs::symlink(dir.join("elsewhere"), &path).unwrap();
     assert!(log.is_reconcilable_target(&id).unwrap().is_none(), "symlinked target is rejected");
+}
+
+/// A write_proposal is Tier-B, a JSON object, carries the inducing lineage, and is
+/// stamped origin:"external" when a source is a tracked file.
+#[test]
+fn write_proposal_event_is_tier_b_object_and_taint_stamped() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let path = dir.join("n.md");
+    std::fs::write(&path, b"fact\n").unwrap();
+    let file_id = common::ingest_one(&log, &path); // external source
+
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let pid = log.append_write_proposal(
+        &canonical, "edit", "deadbeef", 12, "reconcile: A -rel-> B",
+        &json!({"src":"entity:a","relation":"rel","dst":"entity:b"}),
+        &json!({"requires_loud_modal":true,"taint":"Untrusted","allowed":true}),
+        std::slice::from_ref(&file_id),
+    ).unwrap();
+
+    let ev = log.event_by_id(&pid).unwrap().unwrap();
+    assert_eq!(ev.event_type, "write_proposal");
+    assert!(ev.content.is_object(), "content must be a JSON object (chokepoint stamps objects only)");
+    assert_eq!(ev.content["origin"], json!("external"), "tracked-file source taints the proposal");
+    let meta = ev.model_meta.as_ref().expect("Tier-B");
+    assert_eq!(meta.model_id, "m6b-reconciler");
+    assert!(meta.source_event_ids.contains(&file_id));
+}
+
+/// The `file_written` record gains `resolves_proposal` ONLY when the write was
+/// confirmed via `execute_write_resolving`; the plain `execute_write` path omits it
+/// entirely (the M6a content shape is byte-identical to before M6b).
+#[test]
+fn file_written_records_resolves_proposal_only_when_set() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    // A real, citeable source event (an external file_ingested) for the write lineage.
+    let src = dir.join("src.md");
+    std::fs::write(&src, b"seed\n").unwrap();
+    let file_id = common::ingest_one(&log, &src);
+
+    // Helper: gate a Create of `name` citing `file_id`, returning the GatedProposal.
+    let gate_create = |name: &str| {
+        let target = dir.join(name);
+        log.propose_write(WriteProposal {
+            target,
+            new_content: b"body".to_vec(),
+            op: WriteOp::Create,
+            source_event_ids: vec![file_id.clone()],
+            rationale: "test".to_string(),
+        })
+        .expect("propose_write")
+    };
+
+    // Plain write → no `resolves_proposal` key.
+    let plain_id = log.execute_write(gate_create("plain.txt")).expect("execute_write");
+    let plain = log.event_by_id(&plain_id).unwrap().unwrap();
+    assert_eq!(plain.event_type, "file_written");
+    assert!(
+        plain.content.get("resolves_proposal").is_none(),
+        "execute_write must omit resolves_proposal entirely"
+    );
+
+    // Resolving write → the key carries the proposal id.
+    let resolved_id = log
+        .execute_write_resolving(gate_create("resolved.txt"), "prop-xyz")
+        .expect("execute_write_resolving");
+    let resolved = log.event_by_id(&resolved_id).unwrap().unwrap();
+    assert_eq!(resolved.content["resolves_proposal"], json!("prop-xyz"));
+}
+
+/// `decline_write_proposal` appends a `write_declined` that RESOLVES the proposal,
+/// inheriting its lineage; an unknown id is rejected.
+#[test]
+fn decline_write_proposal_resolves_and_inherits_lineage() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let path = dir.join("d.md");
+    std::fs::write(&path, b"fact\n").unwrap();
+    let file_id = common::ingest_one(&log, &path);
+
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let pid = log
+        .append_write_proposal(
+            &canonical, "edit", "deadbeef", 12, "reconcile",
+            &json!({"src": "entity:a", "relation": "rel", "dst": "entity:b"}),
+            &json!({"allowed": true}),
+            std::slice::from_ref(&file_id),
+        )
+        .unwrap();
+
+    let did = log.decline_write_proposal(&pid, "user said no").unwrap();
+    let ev = log.event_by_id(&did).unwrap().unwrap();
+    assert_eq!(ev.event_type, "write_declined");
+    assert_eq!(ev.content["resolves_proposal"], json!(pid));
+    assert_eq!(ev.content["reason"], json!("user said no"));
+    // Lineage inherited from the proposal (so the decline carries the same taint root).
+    let meta = ev.model_meta.as_ref().expect("Tier-B");
+    assert!(meta.source_event_ids.contains(&file_id));
+
+    // An unknown / non-Tier-B id is rejected (no sources to inherit).
+    assert!(log.decline_write_proposal("01BOGUS", "x").is_err());
 }
