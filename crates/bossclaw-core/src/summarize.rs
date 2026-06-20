@@ -57,6 +57,10 @@ pub struct FactSet {
     pub edges: Vec<String>,
     /// `(event_id, text)` of the cited memories.
     pub memories: Vec<(String, String)>,
+    /// D8: the engine-computed gather lineage (sorted+deduped union of the topic
+    /// entity's + its edges' `source_event_ids`) — the page's taint anchor. A file
+    /// in the lineage taints the dossier regardless of which sources the model cited.
+    pub source_ids: Vec<String>,
 }
 
 impl FactSet {

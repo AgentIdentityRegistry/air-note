@@ -14,6 +14,7 @@ use bossclaw_core::extract::{
 };
 use bossclaw_core::log::EventLog;
 use bossclaw_core::reason::ScriptedReasoner;
+use bossclaw_core::summarize::{build_compose_prompt, SUMMARIZE_SYSTEM};
 use ed25519_dalek::SigningKey;
 use serde_json::{json, Value};
 
@@ -313,4 +314,75 @@ fn re_asserting_an_edge_does_not_duplicate_it() {
         .filter(|e| e.relation == "knows")
         .count();
     assert_eq!(n1, n2, "re-asserting an edge must not duplicate it (M4 dedup)");
+}
+
+// ── Task 5 helpers ────────────────────────────────────────────────────────────
+
+fn empty_pass_a() -> Value {
+    json!({ "entities": [], "relations": [], "retractions": [] })
+}
+
+/// Seed an entity + machine link citing `lineage`, rebuild, return the topic id.
+fn seed_topic_citing(log: &EventLog, src_label: &str, dst_label: &str, lineage: &[String]) -> String {
+    let topic = log.entity(src_label, &[], "org", "scripted", lineage).unwrap();
+    let dst   = log.entity(dst_label, &[], "thing", "scripted", lineage).unwrap();
+    log.link_machine(&topic, "shipped", &dst, 0.9, "scripted", lineage).unwrap();
+    log.rebuild_graph().unwrap();
+    topic
+}
+
+// ── Task 5 tests ──────────────────────────────────────────────────────────────
+
+// Door C + D8: a dossier whose gather lineage cites a file is external, AND the
+// file TEXT reaches the (fenced) compose prompt.
+#[test]
+fn dossier_from_file_includes_text_and_is_external() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(64);
+    let log = EventLog::open_with_recall(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+    ingest_file(&log, &emb, dir.path(), "f.md", b"Acme shipped widget X.");
+    let (file_id, _) = file_event(&log);
+    let topic = seed_topic_citing(&log, "Acme", "widgetX", std::slice::from_ref(&file_id));
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts = log.gather_fact_set(&entity).unwrap();
+    assert!(facts.memories.iter().any(|(id, _)| id == &file_id), "Door C: file text is in the fact-set");
+    let compose = build_compose_prompt(&facts);
+    assert!(compose.contains("<<<SOURCE_BEGIN>>>"), "file text is fenced in the compose prompt (§6.5)");
+
+    let reasoner = scripted_both_passes("scripted", "x", &[], &[], empty_pass_a())
+        .with_response(SUMMARIZE_SYSTEM, &compose,
+            serde_json::json!({ "title": "Acme", "claims": [{ "text": "Acme shipped widget X.", "cites": [file_id] }] }));
+    log.set_evolve_enabled(true).unwrap();
+    log.evolve_once(&emb, &reasoner).unwrap();
+
+    let page = first_event_of_type(&log, "page");
+    assert!(bossclaw_core::is_external(&page), "a dossier synthesized from file content is external");
+}
+
+// D8 anti-laundering (§6.4): the composing model cites ONLY a clean memory, but a
+// file is in the gather lineage → the page is STILL external (taint anchored to
+// the engine lineage, NOT the model's cites). This FAILS before the D8 change.
+#[test]
+fn dossier_stays_external_even_when_model_cites_around_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(64);
+    let log = EventLog::open_with_recall(&dir.path().join("m.db"), &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+    ingest_file(&log, &emb, dir.path(), "f.md", b"Acme shipped widget X.");
+    let (file_id, _) = file_event(&log);
+    let clean = seed_memory(&log, &emb, "Acme is a company."); // clean source the model WILL cite
+    let topic = seed_topic_citing(&log, "Acme", "widgetX", &[file_id.clone(), clean.clone()]);
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts = log.gather_fact_set(&entity).unwrap();
+    let compose = build_compose_prompt(&facts);
+
+    // ADVERSARIAL: cite ONLY the clean memory, never the file.
+    let reasoner = scripted_both_passes("scripted", "x", &[], &[], empty_pass_a())
+        .with_response(SUMMARIZE_SYSTEM, &compose,
+            serde_json::json!({ "title": "Acme", "claims": [{ "text": "Acme is a company.", "cites": [clean] }] }));
+    log.set_evolve_enabled(true).unwrap();
+    log.evolve_once(&emb, &reasoner).unwrap();
+
+    let page = first_event_of_type(&log, "page");
+    assert!(bossclaw_core::is_external(&page),
+        "D8: page is external because the gather lineage has the file, even though the model cited only the clean memory");
 }

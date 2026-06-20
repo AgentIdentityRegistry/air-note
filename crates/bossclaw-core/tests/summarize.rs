@@ -18,6 +18,7 @@ fn facts_with_label(label: &str) -> FactSet {
         },
         edges: vec![],
         memories: vec![("01MEM".into(), "some text.".into())],
+        source_ids: vec!["01MEM".into()],
     }
 }
 
@@ -31,6 +32,7 @@ fn facts() -> FactSet {
         },
         edges: vec!["entity:01K -works_at-> entity:01A".into()],
         memories: vec![("01MEM".into(), "Kenny works at Acme.".into())],
+        source_ids: vec!["01MEM".into()],
     }
 }
 

@@ -2840,7 +2840,9 @@ impl EventLog {
     /// Like [`EventLog::texts_for_ids`], but DROPS any `page`-typed id by
     /// construction — the one-way rule enforced at fact-set materialization
     /// (spec §7 / M4b F3). A page id reaching the fact-set is a contract
-    /// violation, never silently summarized back into a summary. One `IN (?,...)`
+    /// violation, never silently summarized back into a summary. File-typed rows
+    /// are included (Door C): file text may feed a dossier; the dossier inherits
+    /// external taint via D8 (engine gather lineage). One `IN (?,...)`
     /// query (mirrors [`EventLog::texts_for_ids`]); caller id order is preserved
     /// on the way out (the gather sorts lineage before calling, but preserving
     /// order is a defensive courtesy and costs nothing).
@@ -2865,16 +2867,13 @@ impl EventLog {
             ))
         })?;
         // Build a by-id map; skip page-typed rows (F3: a summary never feeds
-        // summary-generation) and file-typed rows (M5a Task 9: external file
-        // text is never laundered into a summary — defense-in-depth, the root
-        // fix is closing the evolve context recall door so a file id never
-        // reaches a lineage in the first place).
+        // summary-generation). File-typed rows are NO LONGER skipped (Door C):
+        // file text may feed a dossier; the dossier inherits the external taint
+        // via D8 (engine lineage).
         let mut by_id: HashMap<String, String> = HashMap::new();
         for row in rows {
             let (id, etype, payload) = row?;
-            if etype == crate::graph::PAGE_EVENT_TYPE
-                || etype == crate::graph::FILE_INGESTED_EVENT_TYPE
-            {
+            if etype == crate::graph::PAGE_EVENT_TYPE {
                 continue;
             }
             let ev: Event = serde_json::from_str(&payload)?;
@@ -3001,7 +3000,7 @@ impl EventLog {
         lineage.sort();
         lineage.dedup();
         let memories = self.fact_texts_for_ids(&lineage)?;
-        Ok(crate::summarize::FactSet { entity: entity.clone(), edges, memories })
+        Ok(crate::summarize::FactSet { entity: entity.clone(), edges, memories, source_ids: lineage })
     }
 
     /// The summarize phase of one tick (spec §3, §6 / M4b). For each dirty topic
@@ -3096,7 +3095,7 @@ impl EventLog {
                 claims_capped,
                 &[],
                 reasoner.model_id(),
-                &rendered.cites,
+                &facts.source_ids, // D8: engine gather lineage (taint anchor), not model cites
                 prior_id,
             ) {
                 Ok((_pid, superseded)) => {
