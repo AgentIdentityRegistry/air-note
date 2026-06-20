@@ -126,14 +126,46 @@ pub fn compose_schema() -> serde_json::Value {
     })
 }
 
-/// Strip ASCII control characters (including CR/LF) from `s` and truncate to
-/// `MAX_PROMPT_IDENT_LEN` bytes on a UTF-8 char boundary. Used to sanitize
-/// model-produced entity labels and types before they are interpolated into the
-/// instruction tier of the compose prompt — prevents a multi-line label from
-/// escaping the identity slot and injecting instructions above the fenced
-/// sources.
+/// Strip line-breaking and direction-controlling characters from `s` and truncate
+/// to `MAX_PROMPT_IDENT_LEN` bytes on a UTF-8 char boundary. Used to sanitize
+/// model-produced (and file-derived) entity labels and types before they are
+/// interpolated into the instruction tier of a prompt — prevents a multi-line or
+/// bidi-spoofed label from escaping the identity slot and injecting instructions
+/// above the fenced sources.
+///
+/// SECURITY (SEC-C1): the strip is **Unicode-class aware**, not ASCII-only. An
+/// ASCII-only filter (`is_ascii_control`) would let several non-ASCII characters
+/// that many parsers and LLM tokenizers treat as line breaks or that reorder
+/// rendered text slip into the trusted frame — a real prompt-injection /
+/// confused-deputy hole. We therefore also drop:
+/// - **`\u{2028}` / `\u{2029}`** — LINE / PARAGRAPH SEPARATOR (Unicode `Zl`/`Zp`),
+///   newline-equivalent to many consumers.
+/// - **`\u{0085}`** (NEL) — covered by `is_control` (it is in `Cc`).
+/// - **`\u{200B}`..=`\u{200F}`** — zero-width space/joiners + LRM/RLM (`Cf`); these
+///   can hide structure and inject directionality.
+/// - **`\u{2066}`..=`\u{2069}`** — bidi isolates (`Cf`).
+/// - **`\u{202A}`..=`\u{202E}`** — bidi embeddings/overrides (`Cf`); an override can
+///   visually reorder a label so the rendered text differs from the bytes.
+///
+/// The filter is strictly *more* stripping than the ASCII version, so it is safe
+/// for every label-defense caller. This helper is **shared**: it also defends the
+/// M4b neighborhood/dossier prompt path ([`crate::log::EventLog`]'s
+/// `neighborhood_lines`) and the M6b rewrite-prompt engine-fact frame
+/// ([`crate::reconcile`]). Stripping `\u{200B}` here is intentional: it
+/// canonicalizes the input before any caller's later fence-marker re-neutralization
+/// re-inserts a zero-width space into a *real* marker.
 pub(crate) fn sanitize_ident(s: &str) -> String {
-    let cleaned: String = s.chars().filter(|c| !c.is_ascii_control()).collect();
+    let cleaned: String = s
+        .chars()
+        .filter(|c| {
+            !c.is_control() // Cc (incl. NEL U+0085 and ASCII controls)
+                && !matches!(c,
+                    '\u{2028}' | '\u{2029}'        // LINE / PARAGRAPH SEPARATOR (Zl/Zp)
+                        | '\u{200B}'..='\u{200F}'  // zero-width + LRM/RLM (Cf)
+                        | '\u{2066}'..='\u{2069}'  // bidi isolates (Cf)
+                        | '\u{202A}'..='\u{202E}') // bidi embeddings/overrides (Cf)
+        })
+        .collect();
     if cleaned.len() <= MAX_PROMPT_IDENT_LEN {
         cleaned
     } else {
