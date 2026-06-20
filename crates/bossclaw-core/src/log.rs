@@ -44,6 +44,12 @@ use crate::store::Store;
 /// source for what value gets written today.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Per-target depth of the N-deep recoverable-undo store (M6a, spec L3 §7.3).
+/// After each write, older `undo_state` rows for the same `canonical_target` are
+/// GC'd so at most this many remain (by `created_at`/rowid order). `16` is the
+/// spec default; a single source so the capture, the GC, and the test agree.
+const UNDO_DEPTH: usize = 16;
+
 /// Statistics returned by [`EventLog::reembed_migration`].
 ///
 /// Provides the §15 time-budget observability signal: callers (and handoff
@@ -175,6 +181,39 @@ fn read_fd_to_end(fd: &std::os::fd::OwnedFd) -> Result<Vec<u8>, BossclawError> {
     Ok(buf)
 }
 
+/// Pack an optional [`crate::actuator::FileId`] into the three nullable SQLite
+/// INTEGER columns (`post_dev`/`post_ino`/`post_size`) the undo store persists.
+/// `None` → all-NULL (a Delete-undo, which leaves no post-write file). The `as i64`
+/// casts are the lossless round-trip [`unpack_post_identity`] reverses (compared for
+/// equality, never arithmetic), so the cast contract lives in exactly these two fns.
+#[cfg(unix)]
+fn pack_post_identity(
+    id: Option<crate::actuator::FileId>,
+) -> (Option<i64>, Option<i64>, Option<i64>) {
+    id.map_or((None, None, None), |f| {
+        (Some(f.dev as i64), Some(f.ino as i64), Some(f.size as i64))
+    })
+}
+
+/// Inverse of [`pack_post_identity`]: rebuild a [`crate::actuator::FileId`] from the
+/// three nullable columns. They are written together (Create/Edit) or all-NULL
+/// (Delete), so any-one-`None` ⇒ `None`.
+#[cfg(unix)]
+fn unpack_post_identity(
+    dev: Option<i64>,
+    ino: Option<i64>,
+    size: Option<i64>,
+) -> Option<crate::actuator::FileId> {
+    match (dev, ino, size) {
+        (Some(d), Some(i), Some(s)) => Some(crate::actuator::FileId {
+            dev: d as u64,
+            ino: i as u64,
+            size: s as u64,
+        }),
+        _ => None,
+    }
+}
+
 impl EventLog {
     /// Open (creating if needed) an event log at `path`, encrypted with `dek`,
     /// signing with `key`.
@@ -301,6 +340,42 @@ impl EventLog {
                 file_event_id  TEXT NOT NULL,
                 content_hash   TEXT NOT NULL,
                 grant_root     TEXT NOT NULL
+            )",
+        )?;
+        // N-deep recoverable-undo store (M6a, T5 — spec §7.3). Lives INSIDE the
+        // SQLCipher DB, so the captured pre-bytes are encrypted at rest automatically
+        // (no plaintext sidecar). NOT a Tier-A fold: it is recovery convenience, never
+        // authoritative — tampering can lose undo ability but cannot forge a signed
+        // write (writes are signed; `undo_write` re-verifies pre_bytes against the
+        // recorded hash before restoring). Therefore `rebuild_graph` does NOT touch it
+        // (like `summarize_cursor`/`evolve_cursor`).
+        //
+        // KEYED BY ITS OWN `undo_id` (a fresh ULID), NOT the `file_written` id: the
+        // crash-safe ordering (W8) captures + COMMITS this row BEFORE the FS mutate,
+        // but the `file_written` event id is not minted until the post-mutate append
+        // (the append chokepoint, `append_event_in_tx`, mints the event id itself —
+        // it is NOT weakened to accept a pre-set id). So `file_written_id` starts NULL
+        // and is BACKFILLED after the append. `undo_write(file_written_id)` looks the
+        // row up by that backfilled column. `pre_bytes` = the bytes to restore (Edit ⇒
+        // old content; Delete ⇒ deleted content; Create ⇒ NULL → undo removes the file).
+        // `post_dev`/`post_ino`/`post_size` record the identity the write LEFT on
+        // disk (Create/Edit), captured after the mutate and backfilled with
+        // `file_written_id`. They are NULL for a Delete (no post-write file). `undo_write`
+        // re-asserts the CURRENT target still has this identity before restoring — so a
+        // foreign-process inode swap BETWEEN the write and the undo is caught
+        // (fail-closed), closing the same-name/different-inode divergence at undo time.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS undo_state (
+                undo_id           TEXT PRIMARY KEY,
+                file_written_id   TEXT,
+                canonical_target  TEXT NOT NULL,
+                op                TEXT NOT NULL,
+                pre_bytes         BLOB,
+                base_content_hash TEXT NOT NULL,
+                post_dev          INTEGER,
+                post_ino          INTEGER,
+                post_size         INTEGER,
+                created_at        TEXT NOT NULL
             )",
         )?;
         // Summarize progress high-water-mark (spec §6 / F1) — sibling of
@@ -2269,7 +2344,7 @@ impl EventLog {
     /// write. Anything diverged since propose ⇒ **fail-closed reject** (the app must
     /// re-propose); failure leaves the filesystem unchanged.
     ///
-    /// Steps (spec §9, scoped to T4 — NO undo store/capture, that is T5):
+    /// Steps (spec §9):
     /// 1. **Re-check the verdict + re-canonicalize.** A verdict carrying a
     ///    `reject_reason`, or not `allowed`, is refused outright. The target (parent,
     ///    for Create) is re-canonicalized and re-run through `is_write_allowed` — a
@@ -2295,6 +2370,23 @@ impl EventLog {
     pub fn execute_write(
         &self,
         confirmed: crate::actuator::GatedProposal,
+    ) -> Result<String, BossclawError> {
+        // The public entry: a normal (non-undo) write carries no `undo_of`.
+        self.execute_write_inner(confirmed, None)
+    }
+
+    /// The shared execute path for both [`execute_write`](Self::execute_write) (the
+    /// public, `undo_of = None` entry) and [`undo_write`](Self::undo_write) (which
+    /// passes `Some(original_file_written_id)` so the recorded `file_written` carries
+    /// `undo_of`). Factoring it keeps the public `execute_write` signature exactly as
+    /// the spec dictates while letting undo stamp the discriminator + lineage — all
+    /// re-checks, the base guard, the durable undo capture (W8), the atomic mutate,
+    /// and the sole-constructor append run identically for a write and its undo.
+    #[cfg(unix)]
+    fn execute_write_inner(
+        &self,
+        confirmed: crate::actuator::GatedProposal,
+        undo_of: Option<&str>,
     ) -> Result<String, BossclawError> {
         use crate::actuator::WriteOp;
         use std::os::unix::ffi::OsStrExt;
@@ -2387,7 +2479,7 @@ impl EventLog {
         // it — the statat→mutate gap remains, exactly like the macOS create residual,
         // spec §9). `guard_identity` (the value asserted here) is the comparison
         // anchor for that re-stat.
-        let (deleted_bytes, guard_identity): (Option<Vec<u8>>, Option<crate::actuator::FileId>) =
+        let (pre_bytes, guard_identity): (Option<Vec<u8>>, Option<crate::actuator::FileId>) =
             match proposal.op {
                 WriteOp::Create => (None, None),
                 WriteOp::Edit | WriteOp::Delete => {
@@ -2442,15 +2534,13 @@ impl EventLog {
                     if now_hash != want_hash {
                         return Err(reject("base content hash diverged since propose"));
                     }
-                    // For a Delete, the bytes we just read ARE the pre-delete content;
-                    // the recorded hash is their hash (== want_hash). T5 will durably
-                    // capture these for undo; T4 only needs the hash, so the bytes are
-                    // dropped. `now_identity` is carried out as the step-5 re-stat anchor.
-                    let bytes = match proposal.op {
-                        WriteOp::Delete => Some(current),
-                        _ => None,
-                    };
-                    (bytes, Some(now_identity))
+                    // The bytes we just read ARE the pre-mutate content — the undo
+                    // pre-bytes (T5). For BOTH Edit and Delete we keep them so step 4.5
+                    // can durably capture them to the undo store BEFORE the FS mutate
+                    // (W8). For an Edit they are the old content (undo = restore them);
+                    // for a Delete they are the deleted content (undo = recreate from
+                    // them). `now_identity` is carried out as the step-5 re-stat anchor.
+                    (Some(current), Some(now_identity))
                 }
             };
 
@@ -2489,6 +2579,74 @@ impl EventLog {
         // sole constructor never emits a Tier-B event with empty lineage.
         if sources.is_empty() {
             return Err(reject("file_written would have empty source_event_ids"));
+        }
+
+        let op_str = match proposal.op {
+            WriteOp::Create => "create",
+            WriteOp::Edit => "edit",
+            WriteOp::Delete => "delete",
+        };
+
+        // ── Step 4.5: durably capture the undo pre-bytes BEFORE mutating (W8) ─────
+        // Crash-safety ordering (spec §7.3/§9 step 4): the undo row is INSERTed and
+        // COMMITTED to the encrypted store BEFORE the FS mutation is observable, so a
+        // crash after the mutate always leaves recoverable pre-bytes. The row is keyed
+        // by its OWN fresh ULID with `file_written_id` NULL; the real event id is
+        // backfilled AFTER the post-mutate append (step 6.5). The append chokepoint
+        // mints the event id itself and is NOT weakened to accept a pre-set id — the
+        // backfill is how the two are bound without touching the chokepoint.
+        //
+        // ONLY a normal write captures a frame: an UNDO (`undo_of.is_some()`) is a
+        // recovery action, not a new user write, so it neither captures a new frame nor
+        // GCs (spec §7.3 "recovery convenience"). This keeps the per-target frame stack
+        // a pure record of forward writes — a LIFO walk of undos cannot evict the very
+        // frames it is walking. (v1 has no redo, so an undo needs no recovery point.)
+        //
+        // `record_hash` is the hash the undo will later re-verify the pre_bytes
+        // against (W9). For Create there are no pre-bytes (pre_bytes = NULL → undo
+        // removes the file); the recorded hash is the new content's hash, but it is
+        // never used to gate a Create-undo (which simply deletes). For Edit/Delete it
+        // is `verdict.base_content_hash` (the guard just re-confirmed the on-disk bytes
+        // hash to this), so the captured pre_bytes provably hash to it.
+        let undo_id = Ulid::new().to_string();
+        let capture_frame = undo_of.is_none();
+        if capture_frame {
+            let record_hash: String = match (&verdict.base_content_hash, proposal.op) {
+                (Some(h), _) => h.clone(),
+                // Create has no base; record the would-be new-content hash so the column
+                // is non-NULL (it is never used to gate a Create-undo).
+                (None, WriteOp::Create) => {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&proposal.new_content))
+                }
+                (None, _) => {
+                    return Err(reject("edit/delete missing base_content_hash for undo capture"))
+                }
+            };
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO undo_state
+                   (undo_id, file_written_id, canonical_target, op, pre_bytes, base_content_hash, created_at)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    undo_id,
+                    real_str,
+                    op_str,
+                    pre_bytes,      // Option<Vec<u8>> → NULL for Create, bytes otherwise
+                    record_hash,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            tx.commit()?; // ← pre-bytes durable on disk before any FS mutation below.
+
+            // TEST-ONLY crash-ordering seam (W8): fires immediately AFTER the undo row
+            // is durably committed and immediately BEFORE the FS mutate. The in-crate
+            // test installs a probe that asserts the row is readable at this instant,
+            // proving the durable-before-mutate ordering. Compiled out of non-test builds.
+            #[cfg(test)]
+            undo_test_hooks::fire_pre_mutate(&undo_id);
         }
 
         // ── Step 5: mutate atomically (failure leaves the FS unchanged) ───────────
@@ -2530,6 +2688,39 @@ impl EventLog {
             }
         }
 
+        // ── Step 5.5: capture the POST-write identity (Create/Edit) for the undo ──
+        // The identity the write LEFT on disk: `undo_write` re-asserts the CURRENT
+        // target still has it before restoring, so a foreign-process inode swap BETWEEN
+        // the write and a later undo is caught (W9 "identity diverged ⇒ fail-closed").
+        // Opened fd-relative NOFOLLOW from the same dir_fd (never re-resolving the path
+        // string). A Delete leaves no file, so its post-identity is None. Only computed
+        // when a frame was captured (a non-undo write); an undo records no frame.
+        let post_identity: Option<crate::actuator::FileId> = if capture_frame {
+            match proposal.op {
+                WriteOp::Delete => None,
+                WriteOp::Create | WriteOp::Edit => {
+                    let written_fd = rustix::fs::openat(
+                        &dir_fd,
+                        final_name.as_bytes(),
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map_err(|e| reject(&format!("post-write re-open failed: {e}")))?;
+                    let st = rustix::fs::fstat(&written_fd)
+                        .map_err(|e| reject(&format!("post-write fstat failed: {e}")))?;
+                    Some(crate::actuator::FileId {
+                        dev: st.st_dev as u64,
+                        ino: st.st_ino as u64,
+                        size: st.st_size as u64,
+                    })
+                }
+            }
+        } else {
+            None
+        };
+
         // ── Step 6: append the SOLE-CONSTRUCTOR Tier-B `file_written` event ───────
         // content shape (spec §7.2).
         //
@@ -2559,26 +2750,25 @@ impl EventLog {
                 }
                 WriteOp::Delete => {
                     // The deleted file's hash (== verdict.base_content_hash, which the
-                    // guard re-confirmed against the freshly-read `deleted_bytes`).
+                    // guard re-confirmed against the freshly-read `pre_bytes`).
                     let h = verdict
                         .base_content_hash
                         .clone()
                         .ok_or_else(|| reject("delete missing base_content_hash for record"))?;
-                    // `deleted_bytes` was read for the guard; it is the audit subject.
-                    // (Bound here so the read is not dead; T5 will persist it for undo.)
-                    let _ = &deleted_bytes;
                     (h.clone(), Some(h), 0)
                 }
             };
 
-        let op_str = match proposal.op {
-            WriteOp::Create => "create",
-            WriteOp::Edit => "edit",
-            WriteOp::Delete => "delete",
-        };
+        // `op_str` was already computed in step 4.5 (the undo capture). Reuse it so
+        // the recorded `op` and the captured `undo_state.op` cannot drift.
+        //
         // Build content as a JSON OBJECT (the chokepoint only stamps `origin` when
         // `content.as_object_mut()` is Some — spec §6 M1). `prev_content_hash` is
-        // omitted entirely for Create (skip-if-None via not inserting it).
+        // omitted entirely for Create (skip-if-None via not inserting it). `undo_of`
+        // is present iff this write IS an undo (spec §7.2) — the undo discriminator.
+        // Keep a copy of the canonical target for the post-append undo GC (the
+        // original `real_str` is moved into the content map just below).
+        let gc_target = real_str.clone();
         let mut content = serde_json::Map::new();
         content.insert("target".to_string(), serde_json::Value::String(real_str));
         content.insert("op".to_string(), serde_json::Value::String(op_str.to_string()));
@@ -2587,6 +2777,9 @@ impl EventLog {
             content.insert("prev_content_hash".to_string(), serde_json::Value::String(prev));
         }
         content.insert("byte_size".to_string(), serde_json::Value::Number(byte_size.into()));
+        if let Some(undone) = undo_of {
+            content.insert("undo_of".to_string(), serde_json::Value::String(undone.to_string()));
+        }
 
         let event = Event {
             id: String::new(),
@@ -2608,7 +2801,283 @@ impl EventLog {
         };
         // `append` re-checks the Tier-B non-empty invariant and runs the chokepoint
         // (which stamps `origin:"external"` if any source is external) BEFORE hashing.
-        self.append(event)
+        let file_written_id = self.append(event)?;
+
+        // ── Step 6.5: bind the durable undo row to the now-minted event id + GC ───
+        // Backfill `file_written_id` (NULL until now — the append chokepoint minted the
+        // id) AND the post-write identity, so `undo_write` can look the row up by the
+        // event id and re-assert the target identity. Then GC older rows so at most
+        // UNDO_DEPTH remain per canonical_target (spec L3 §7.3). Skipped for an undo
+        // (no frame was captured). Both run AFTER the mutate + append succeeded; a crash
+        // before this leaves an orphan undo row (harmless — keyed by its own id, never
+        // surfaced without a backfilled file_written_id; re-running adds a fresh row).
+        if capture_frame {
+            self.bind_and_gc_undo(&undo_id, &file_written_id, &gc_target, post_identity)?;
+        }
+
+        Ok(file_written_id)
+    }
+
+    /// Backfill an `undo_state` row's `file_written_id` (NULL until the append minted
+    /// the id) and GC older rows so at most [`UNDO_DEPTH`] remain per
+    /// `canonical_target` (spec L3 §7.3). One transaction: the bind + the GC commit
+    /// together. GC orders by `created_at` ASC then `rowid` ASC (a stable tiebreak for
+    /// rows minted in the same RFC-3339 second) and deletes all but the newest
+    /// `UNDO_DEPTH` rows for that target — so the oldest pre-bytes drop out first.
+    #[cfg(unix)]
+    fn bind_and_gc_undo(
+        &self,
+        undo_id: &str,
+        file_written_id: &str,
+        canonical_target: &str,
+        post_identity: Option<crate::actuator::FileId>,
+    ) -> Result<(), BossclawError> {
+        let (post_dev, post_ino, post_size) = pack_post_identity(post_identity);
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE undo_state
+               SET file_written_id = ?1, post_dev = ?2, post_ino = ?3, post_size = ?4
+             WHERE undo_id = ?5",
+            rusqlite::params![file_written_id, post_dev, post_ino, post_size, undo_id],
+        )?;
+        // Keep the newest UNDO_DEPTH rows for this target; delete the rest. The
+        // subquery selects the survivors (newest by created_at, rowid as tiebreak);
+        // anything for this target NOT in that set is GC'd. `rowid` is SQLite's
+        // implicit monotonic insert key, so it disambiguates same-second rows.
+        tx.execute(
+            "DELETE FROM undo_state
+             WHERE canonical_target = ?1
+               AND undo_id NOT IN (
+                   SELECT undo_id FROM undo_state
+                   WHERE canonical_target = ?1
+                   ORDER BY created_at DESC, rowid DESC
+                   LIMIT ?2
+               )",
+            rusqlite::params![canonical_target, UNDO_DEPTH as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Recoverable N-deep undo of a recorded `file_written` (M6a, T5 — spec §7.3/W9).
+    /// Re-establishes the PRE-write state of `file_written_id`'s target by rebuilding a
+    /// [`crate::actuator::WriteProposal`] from the captured `undo_state` row and running
+    /// it through the **FULL** [`propose_write`](Self::propose_write) →
+    /// [`execute_write`](Self::execute_write) path against the **CURRENT** grants +
+    /// identity. The undo is itself recorded as a `file_written` carrying
+    /// `undo_of: <file_written_id>` and `source_event_ids = [<file_written_id>]`.
+    ///
+    /// Returns the undo event's id.
+    ///
+    /// **The undo RE-GATES (W9) — it is NOT a privileged direct write:**
+    /// - The rebuilt proposal goes through `propose_write` (so a target no longer under
+    ///   an active write grant, or whose identity diverged, is caught) AND through
+    ///   `execute_write`'s critical-section re-checks (grant re-check, base guard).
+    ///   Anything diverged ⇒ **fail-closed**.
+    /// - Before writing, the restored `pre_bytes` are **hash-verified against the
+    ///   recorded `base_content_hash`** — a tampered undo row (bytes whose hash no
+    ///   longer matches) **fails closed**, so the recovery store cannot be turned into
+    ///   an injection vector.
+    ///
+    /// **The inverse op (spec §7.2):**
+    /// - undo of an **Edit** ⇒ an Edit restoring the old `pre_bytes`.
+    /// - undo of a **Create** ⇒ a Delete of the created file (`pre_bytes` is NULL).
+    /// - undo of a **Delete** ⇒ a Create of the file from the deleted `pre_bytes`.
+    #[cfg(unix)]
+    pub fn undo_write(&self, file_written_id: &str) -> Result<String, BossclawError> {
+        use crate::actuator::{WriteOp, WriteProposal};
+
+        let fail = |why: &str| -> BossclawError {
+            BossclawError::InvalidInput(format!("undo_write fail-closed: {why}"))
+        };
+
+        // ── Load the undo_state frame + its target's stack top in ONE query ───────
+        // `undo_id` + `rowid` identify the frame in the per-target stack; `rowid` is
+        // SQLite's monotonic insert order, so the MAX-rowid frame for a target is the
+        // stack top (the most recent forward write). The correlated `top_rowid`
+        // subquery fetches that top in the SAME row read, so the load and the LIFO
+        // top-of-stack check are one lock + one round trip (and a consistent snapshot).
+        #[allow(clippy::type_complexity)]
+        let (undo_id, rowid, top_rowid, orig_op, canonical_target, pre_bytes, base_content_hash, post_id): (
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            Option<Vec<u8>>,
+            String,
+            Option<crate::actuator::FileId>,
+        ) = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT undo_id, rowid,
+                        (SELECT MAX(rowid) FROM undo_state u2
+                          WHERE u2.canonical_target = u1.canonical_target) AS top_rowid,
+                        op, canonical_target, pre_bytes, base_content_hash,
+                        post_dev, post_ino, post_size
+                 FROM undo_state u1 WHERE file_written_id = ?1",
+                rusqlite::params![file_written_id],
+                |r| {
+                    let post = unpack_post_identity(r.get(7)?, r.get(8)?, r.get(9)?);
+                    Ok((
+                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                        r.get(6)?, post,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                fail("no undo record for this file_written id (GC'd past N-deep, or unknown id)")
+            })?
+        };
+
+        // ── This frame must be the TOP of its target's undo stack (LIFO) ──────────
+        // The undo store is an N-deep stack PER target (spec L3/§7.3): only the most
+        // recent forward write can be undone (you cannot undo write 5 while 6.. are
+        // still applied — their inodes have moved on). After this frame is popped, the
+        // next undo targets the new top. Enforcing top-of-stack is what makes the
+        // recorded post-identity check below sound across a multi-step LIFO walk.
+        if rowid != top_rowid {
+            return Err(fail(
+                "not the most recent write to this target — undo is LIFO (undo newer writes first)",
+            ));
+        }
+
+        // ── Re-assert the target identity has NOT diverged since the write (W9) ───
+        // The undo store recorded the identity the write LEFT on disk (Create/Edit).
+        // If a foreign process swapped the target for a different inode AFTER the write
+        // but BEFORE this undo, the current on-disk identity will differ — fail closed
+        // rather than clobber a file that is no longer the one we wrote. A Delete-undo
+        // has no recorded post identity (the file was removed), so the recreate's
+        // no-clobber handles a racing file instead. `symlink_metadata` (NOFOLLOW) so a
+        // symlink swapped in at the name reads as a different inode and is rejected.
+        if let Some(want) = post_id {
+            use std::os::unix::fs::MetadataExt;
+            let now = std::fs::symlink_metadata(&canonical_target).map_err(|e| {
+                fail(&format!(
+                    "undo target no longer stat-able (diverged/removed since the write): {e}"
+                ))
+            })?;
+            let now_id = crate::actuator::FileId {
+                dev: now.dev(),
+                ino: now.ino(),
+                size: now.size(),
+            };
+            if now_id != want {
+                return Err(fail(
+                    "target identity (dev,ino,size) diverged since the write (foreign swap) — refusing undo",
+                ));
+            }
+        }
+
+        // ── Verify the captured pre_bytes still hash to the recorded base hash (W9) ─
+        // A tampered undo row (pre_bytes whose hash != base_content_hash) must fail
+        // closed BEFORE any FS write, so the recovery store can never be used to inject
+        // content. Create has NULL pre_bytes (undo = delete), so there is nothing to
+        // verify — the recorded hash there is the (unused) new-content hash.
+        if let Some(bytes) = &pre_bytes {
+            use sha2::{Digest, Sha256};
+            let actual = hex::encode(Sha256::digest(bytes));
+            if actual != base_content_hash {
+                return Err(fail(
+                    "captured pre_bytes hash != recorded base_content_hash (tampered undo row)",
+                ));
+            }
+        }
+
+        // ── Rebuild the inverse-op proposal (spec §7.2) ──────────────────────────
+        let target = std::path::PathBuf::from(&canonical_target);
+        let (undo_op, new_content): (WriteOp, Vec<u8>) = match orig_op.as_str() {
+            // Undo an Edit ⇒ Edit restoring the old bytes.
+            "edit" => (
+                WriteOp::Edit,
+                pre_bytes.ok_or_else(|| fail("edit undo row missing pre_bytes"))?,
+            ),
+            // Undo a Create ⇒ Delete the created file (no content needed).
+            "create" => (WriteOp::Delete, Vec::new()),
+            // Undo a Delete ⇒ Create the file from the deleted bytes.
+            "delete" => (
+                WriteOp::Create,
+                pre_bytes.ok_or_else(|| fail("delete undo row missing pre_bytes"))?,
+            ),
+            other => return Err(fail(&format!("unknown undo op '{other}'"))),
+        };
+
+        // The undo's lineage cites the original write id (spec §7.2 / R4): the append
+        // chokepoint re-stamps taint via this source, so undoing a write to a tainted
+        // file is itself stamped external by construction.
+        let proposal = WriteProposal {
+            target,
+            new_content,
+            op: undo_op,
+            source_event_ids: vec![file_written_id.to_string()],
+            rationale: format!("undo of {file_written_id}"),
+        };
+
+        // ── RE-GATE through the full propose path, then execute carrying undo_of ──
+        // `propose_write` recomputes eligibility + base hash/identity against the
+        // CURRENT filesystem; `execute_write_inner` re-checks the grant + base guard
+        // inside the critical section. A diverged grant ⇒ fail-closed here. The undo
+        // itself records NO new frame (`undo_of.is_some()`), so the stack is a pure
+        // record of forward writes.
+        let gated = self.propose_write(proposal)?;
+        if let Some(reason) = &gated.verdict.reject_reason {
+            return Err(fail(&format!("re-gated undo proposal rejected: {reason}")));
+        }
+        let undo_event_id = self.execute_write_inner(gated, Some(file_written_id))?;
+
+        // ── Pop this frame + hand the stack top off to the previous frame ─────────
+        // The undo succeeded, so this frame is consumed: delete it. Then, if a previous
+        // forward-write frame for this target remains (the new top), update its recorded
+        // post-identity to the inode this undo just left on disk — so a subsequent LIFO
+        // undo's identity check compares against the live inode, not the now-gone one
+        // the previous write originally produced. A Create-undo removed the file, so the
+        // new identity is None (no file); the recreate's no-clobber would guard a racer.
+        let new_post: Option<crate::actuator::FileId> = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(&canonical_target).ok().map(|m| crate::actuator::FileId {
+                dev: m.dev(),
+                ino: m.ino(),
+                size: m.size(),
+            })
+        };
+        self.pop_and_handoff_undo(&undo_id, &canonical_target, new_post)?;
+
+        Ok(undo_event_id)
+    }
+
+    /// LIFO stack maintenance after a successful undo (M6a, T5): delete the consumed
+    /// frame `undo_id`, then update the NEW top frame for `canonical_target` (the
+    /// remaining MAX-rowid frame) so its recorded post-identity is `new_post` — the
+    /// inode the undo just left on disk. One transaction. If no previous frame remains,
+    /// only the delete happens.
+    #[cfg(unix)]
+    fn pop_and_handoff_undo(
+        &self,
+        undo_id: &str,
+        canonical_target: &str,
+        new_post: Option<crate::actuator::FileId>,
+    ) -> Result<(), BossclawError> {
+        let (dev, ino, size) = pack_post_identity(new_post);
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM undo_state WHERE undo_id = ?1",
+            rusqlite::params![undo_id],
+        )?;
+        // Re-point the new top (if any) at the live inode. Scoped to a single rowid so
+        // only the top frame is touched.
+        tx.execute(
+            "UPDATE undo_state SET post_dev = ?1, post_ino = ?2, post_size = ?3
+             WHERE rowid = (SELECT MAX(rowid) FROM undo_state WHERE canonical_target = ?4)",
+            rusqlite::params![dev, ino, size, canonical_target],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Every CURRENT file (one per path), `ORDER BY canonical_path ASC`. Tier-A read.
@@ -4452,6 +4921,46 @@ pub fn resolve_arms(
     }
 }
 
+/// TEST-ONLY seams for the N-deep undo store (M6a, T5). Compiled out of every
+/// non-test build (`#[cfg(test)]`), so there is NO production "undo hook" surface.
+/// The W8 crash-ordering test installs a `pre_mutate` probe that fires inside
+/// `execute_write_inner` at the exact instant AFTER the undo row is durably
+/// committed and BEFORE the FS mutate, letting the test prove the ordering.
+#[cfg(test)]
+pub(crate) mod undo_test_hooks {
+    use std::cell::RefCell;
+
+    /// A pre-mutate probe: receives the just-committed `undo_id`. Boxed so a test can
+    /// install an arbitrary closure; aliased so the thread-local type stays simple.
+    type PreMutateProbe = Box<dyn FnMut(&str)>;
+
+    thread_local! {
+        /// The installed probe, if any. A thread-local (not a global) so parallel
+        /// tests cannot collide.
+        static PRE_MUTATE_PROBE: RefCell<Option<PreMutateProbe>> = const { RefCell::new(None) };
+    }
+
+    /// Install a probe fired right after the undo row commit + right before the FS
+    /// mutate. Replaces any previous probe on this thread.
+    pub(crate) fn install_pre_mutate_probe(f: PreMutateProbe) {
+        PRE_MUTATE_PROBE.with(|p| *p.borrow_mut() = Some(f));
+    }
+
+    /// Remove the installed probe (so later same-thread tests are unaffected).
+    pub(crate) fn clear_pre_mutate_probe() {
+        PRE_MUTATE_PROBE.with(|p| *p.borrow_mut() = None);
+    }
+
+    /// Fire the installed probe (no-op if none). Called by `execute_write_inner`.
+    pub(crate) fn fire_pre_mutate(undo_id: &str) {
+        PRE_MUTATE_PROBE.with(|p| {
+            if let Some(f) = p.borrow_mut().as_mut() {
+                f(undo_id);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4586,6 +5095,160 @@ mod tests {
         assert_eq!(
             hops, expected,
             "BFS must reach b at hop 1 and c at hop 2, excluding the seed a"
+        );
+    }
+
+    // ── T5 in-crate undo tests (need the private store / the test hook) ──────────
+
+    /// Seed a clean memory id for the actuator unit tests (mirrors the integration
+    /// harness, kept local). No embedder rebuild needed — `propose_write`'s taint
+    /// gate only reads the event by id, not the vector index.
+    #[cfg(unix)]
+    fn seed_clean(log: &EventLog) -> String {
+        log.append(mk_memory("clean inducing memory")).unwrap()
+    }
+
+    /// W8 CRASH-ORDERING: the `undo_state` row for a write MUST be durably COMMITTED
+    /// before the FS mutation is observable, so a crash after the mutate always
+    /// leaves recoverable pre-bytes (spec §7.3/§9 step 4).
+    ///
+    /// We install a `pre_mutate` probe that fires at the exact instant between the
+    /// undo-row commit and the FS mutate. The probe opens an INDEPENDENT SQLCipher
+    /// connection to the same DB and asserts the row is already present — proving it
+    /// is COMMITTED (a still-open/uncommitted tx would not be visible to a separate
+    /// connection under WAL). Without the durable-before-mutate ordering, the probe
+    /// would not find the row.
+    #[cfg(unix)]
+    #[test]
+    fn undo_row_is_committed_before_fs_mutate() {
+        use crate::actuator::{WriteOp, WriteProposal};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let target = dir.path().join("p.txt");
+        std::fs::write(&target, b"base bytes").unwrap();
+
+        let log = open_log(dir.path());
+        log.add_write_grant(dir.path()).unwrap();
+        let clean = seed_clean(&log);
+
+        // Shared flags the probe writes and the test reads after execute returns.
+        let row_seen = Arc::new(AtomicBool::new(false));
+        let probe_fired = Arc::new(AtomicBool::new(false));
+        let target_str = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+        {
+            let row_seen = Arc::clone(&row_seen);
+            let probe_fired = Arc::clone(&probe_fired);
+            let db = db.clone();
+            let target_for_probe = target.clone();
+            undo_test_hooks::install_pre_mutate_probe(Box::new(move |undo_id: &str| {
+                probe_fired.store(true, Ordering::SeqCst);
+                // The file must NOT yet be mutated at this instant: the base bytes
+                // are still on disk (the mutate happens AFTER this probe returns).
+                assert_eq!(
+                    std::fs::read(&target_for_probe).unwrap(),
+                    b"base bytes",
+                    "the FS must be unmutated when the undo row is committed"
+                );
+                // Independent connection → only sees COMMITTED rows.
+                let store = crate::store::Store::open(&db, &DEK).unwrap();
+                let present: Option<String> = store
+                    .conn()
+                    .query_row(
+                        "SELECT canonical_target FROM undo_state WHERE undo_id = ?1",
+                        rusqlite::params![undo_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap();
+                if present.as_deref() == Some(target_str.as_str()) {
+                    row_seen.store(true, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        let proposal = WriteProposal {
+            target: target.clone(),
+            new_content: b"mutated bytes".to_vec(),
+            op: WriteOp::Edit,
+            source_event_ids: vec![clean],
+            rationale: "w8 ordering".to_string(),
+        };
+        let gated = log.propose_write(proposal).unwrap();
+        let id = log.execute_write(gated).unwrap();
+        undo_test_hooks::clear_pre_mutate_probe();
+
+        assert!(probe_fired.load(Ordering::SeqCst), "the pre-mutate probe must have fired");
+        assert!(
+            row_seen.load(Ordering::SeqCst),
+            "the undo_state row must be durably committed BEFORE the FS mutate (W8)"
+        );
+        // Sanity: the write did complete (the row is now bound to the event id).
+        assert_eq!(std::fs::read(&target).unwrap(), b"mutated bytes");
+        let ev = log.event_by_id(&id).unwrap().unwrap();
+        assert_eq!(ev.event_type, crate::graph::FILE_WRITTEN_EVENT_TYPE);
+    }
+
+    /// W9 TAMPER (REVERT-SENSITIVE, in-crate because it needs the private store):
+    /// `undo_write` verifies the captured `pre_bytes` hash equals the recorded
+    /// `base_content_hash` before restoring. Corrupting the stored `pre_bytes` so its
+    /// hash no longer matches MUST make the undo fail closed — the recovery store can
+    /// never be turned into an injection vector.
+    ///
+    /// REVERT-SENSITIVITY: delete the hash-check block in `undo_write` (the
+    /// `actual != base_content_hash` guard) → the tampered bytes would be written and
+    /// this test's `is_err()` assertion + the "file untouched" assertion both fail.
+    #[cfg(unix)]
+    #[test]
+    fn undo_tamper_pre_bytes_fails_closed() {
+        use crate::actuator::{WriteOp, WriteProposal};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("p.txt");
+        std::fs::write(&target, b"v0 original").unwrap();
+
+        let log = open_log(dir.path());
+        log.add_write_grant(dir.path()).unwrap();
+        let clean = seed_clean(&log);
+
+        // Edit v0 → v1; this captures "v0 original" as the undo pre_bytes.
+        let proposal = WriteProposal {
+            target: target.clone(),
+            new_content: b"v1 edited bytes".to_vec(),
+            op: WriteOp::Edit,
+            source_event_ids: vec![clean],
+            rationale: "tamper".to_string(),
+        };
+        let gated = log.propose_write(proposal).unwrap();
+        let write_id = log.execute_write(gated).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"v1 edited bytes");
+
+        // Tamper the stored pre_bytes (so its hash != recorded base_content_hash),
+        // reaching the private store directly (no public corruption surface).
+        {
+            let store = log.inner.lock().expect(POISON);
+            let n = store
+                .conn()
+                .execute(
+                    "UPDATE undo_state SET pre_bytes = ?1 WHERE file_written_id = ?2",
+                    rusqlite::params![b"EVIL injected bytes".to_vec(), write_id],
+                )
+                .unwrap();
+            assert_eq!(n, 1, "exactly one undo row must be tampered");
+        }
+
+        // The undo must fail closed (hash mismatch), and the file must NOT receive
+        // the injected bytes — it stays at v1.
+        assert!(
+            log.undo_write(&write_id).is_err(),
+            "a tampered pre_bytes (hash mismatch) must make undo fail closed"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"v1 edited bytes",
+            "the tampered undo must not write the injected bytes"
         );
     }
 }

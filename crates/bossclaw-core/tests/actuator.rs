@@ -1063,6 +1063,239 @@ fn execute_l11_tracked_file_edit_is_stamped_external() {
     assert_eq!(extra_ev.event_type, bossclaw_core::graph::FILE_INGESTED_EVENT_TYPE);
 }
 
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  T5: N-deep undo store + undo_write (re-gated)                             ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+/// Run one Edit `target → new_content`, citing `clean`, and return the
+/// `file_written` id. A small helper so the undo tests read as a sequence of
+/// edits without repeating the propose/execute dance.
+fn do_edit(log: &EventLog, target: &std::path::Path, new_content: &[u8], clean: &str) -> String {
+    let gated = log
+        .propose_write(proposal(target, WriteOp::Edit, new_content, std::slice::from_ref(&clean.to_string())))
+        .unwrap();
+    log.execute_write(gated).unwrap()
+}
+
+// ── undo of Edit restores the prior content + records file_written(undo_of) ────
+#[test]
+fn undo_edit_restores_prior_content_and_records_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"v0 original").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    // Edit v0 → v1. Undoing this must restore v0.
+    let write_id = do_edit(&log, &target, b"v1 edited bytes", &clean);
+    assert_eq!(std::fs::read(&target).unwrap(), b"v1 edited bytes");
+
+    let undo_id = log.undo_write(&write_id).unwrap();
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"v0 original",
+        "undo of an Edit restores the exact prior bytes"
+    );
+
+    // The undo is itself a recorded file_written carrying undo_of + source=[orig].
+    let ev = file_written_event(&log, &undo_id);
+    assert_eq!(ev.content["op"], "edit", "an Edit-restore is recorded as an edit");
+    assert_eq!(
+        ev.content["undo_of"], serde_json::Value::String(write_id.clone()),
+        "the undo records the id it reverses"
+    );
+    let meta = ev.model_meta.expect("undo is Tier-B");
+    assert!(
+        meta.source_event_ids.contains(&write_id),
+        "the undo's lineage cites the original write id"
+    );
+}
+
+// ── undo of Create removes the file ───────────────────────────────────────────
+#[test]
+fn undo_create_removes_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let target = dir.path().join("created.txt");
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Create, b"new file", std::slice::from_ref(&clean)))
+        .unwrap();
+    let write_id = log.execute_write(gated).unwrap();
+    assert!(target.exists(), "precondition: create made the file");
+
+    let undo_id = log.undo_write(&write_id).unwrap();
+    assert!(!target.exists(), "undo of a Create hard-removes the created file");
+
+    let ev = file_written_event(&log, &undo_id);
+    assert_eq!(ev.content["op"], "delete", "undoing a Create is recorded as a delete");
+    assert_eq!(ev.content["undo_of"], serde_json::Value::String(write_id));
+}
+
+// ── undo of Delete recreates the file from the captured pre-bytes ──────────────
+#[test]
+fn undo_delete_recreates_file_from_pre_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("doomed.txt");
+    std::fs::write(&target, b"precious contents").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let gated = log
+        .propose_write(proposal(&target, WriteOp::Delete, b"", std::slice::from_ref(&clean)))
+        .unwrap();
+    let write_id = log.execute_write(gated).unwrap();
+    assert!(!target.exists(), "precondition: delete removed the file");
+
+    let undo_id = log.undo_write(&write_id).unwrap();
+    assert!(target.exists(), "undo of a Delete recreates the file");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"precious contents",
+        "the recreated file has the exact deleted bytes"
+    );
+
+    let ev = file_written_event(&log, &undo_id);
+    assert_eq!(ev.content["op"], "create", "undoing a Delete is recorded as a create");
+    assert_eq!(ev.content["undo_of"], serde_json::Value::String(write_id));
+}
+
+// ── N-deep: N+1 edits → oldest GC'd, last N undo in LIFO order ─────────────────
+//
+// UNDO_DEPTH is 16; do 17 sequential edits, then undo repeatedly. The last 16
+// undo correctly (LIFO: each undo restores the bytes from just before that
+// write). The 17th-from-top (the oldest, whose row was GC'd) can no longer undo.
+#[test]
+fn undo_is_n_deep_with_lifo_and_oldest_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    // Content "state 0" is the base before the FIRST edit.
+    std::fs::write(&target, b"state 0").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    // UNDO_DEPTH = 16; one more than that to force a GC of the oldest row.
+    const DEPTH: usize = 16;
+    let edits = DEPTH + 1; // 17 edits → states 1..=17
+    let mut write_ids = Vec::new();
+    for i in 1..=edits {
+        let content = format!("state {i}");
+        write_ids.push(do_edit(&log, &target, content.as_bytes(), &clean));
+    }
+    assert_eq!(std::fs::read(&target).unwrap(), b"state 17");
+
+    // The oldest write (write_ids[0], which captured "state 0" as its pre-bytes)
+    // had its undo row GC'd once the 17th edit landed → undoing it fails closed.
+    assert!(
+        log.undo_write(&write_ids[0]).is_err(),
+        "the oldest pre-bytes were GC'd (N-deep retention) → its undo must fail closed"
+    );
+
+    // The last DEPTH writes undo in LIFO order: undo write 17 → "state 16",
+    // undo write 16 → "state 15", … undo write 2 → "state 1".
+    for i in (edits - DEPTH + 1..=edits).rev() {
+        log.undo_write(&write_ids[i - 1]).unwrap();
+        let expected = format!("state {}", i - 1);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            expected.as_bytes(),
+            "undoing write {i} (LIFO) must restore the bytes from just before it"
+        );
+    }
+    // After undoing back through write 2, the file holds "state 1".
+    assert_eq!(std::fs::read(&target).unwrap(), b"state 1");
+}
+
+// ── undo RE-GATES (a): grant revoked after the write → undo fails closed ───────
+//
+// REVERT-SENSITIVITY: undo runs the restore through the FULL propose→execute
+// path against CURRENT grants. Revoking the write grant after the original write
+// makes the restore fail the grant gate. If undo_write bypassed the gate (wrote
+// the pre-bytes directly), this would SUCCEED — so the assertion catches a
+// missing re-gate. (Demonstrated in the build report.)
+#[test]
+fn undo_re_gates_revoked_grant_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"v0").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    let write_id = do_edit(&log, &target, b"v1", &clean);
+    assert_eq!(std::fs::read(&target).unwrap(), b"v1");
+
+    // Revoke the write grant, THEN try to undo. The undo restore must be
+    // re-gated against the (now-revoked) grant → fail closed.
+    log.revoke_write_grant(dir.path()).unwrap();
+    assert!(
+        log.undo_write(&write_id).is_err(),
+        "undo must re-gate: a revoked write grant makes the restore fail closed"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"v1",
+        "the file is untouched when the re-gated undo is refused"
+    );
+}
+
+// ── undo RE-GATES (b): target identity diverged (inode swap) → fail closed ─────
+//
+// REVERT-SENSITIVITY: between the write and the undo, swap the target for a
+// different inode with the SAME bytes that the undo expects to overwrite. The
+// undo restore is an Edit whose base guard re-asserts (dev,ino) — the swap
+// diverges it → fail closed. If the identity half of the guard were dropped, the
+// undo would clobber the swapped-in inode. (Demonstrated in the build report.)
+#[test]
+fn undo_re_gates_target_identity_swap_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = open_log(dir.path());
+    let target = dir.path().join("p.txt");
+    std::fs::write(&target, b"v0 original").unwrap();
+    log.add_write_grant(dir.path()).unwrap();
+    let clean = seed_memory(&log, &emb, "m");
+
+    // Edit v0 → v1. The undo of this is an Edit that overwrites the CURRENT file
+    // (whose identity must match what the undo recorded: the v1 inode).
+    let write_id = do_edit(&log, &target, b"v1 edited", &clean);
+    let ino_v1 = std::fs::metadata(&target).unwrap().ino_u64();
+
+    // Swap the target for a DIFFERENT inode (same name) — same bytes as the
+    // current v1, so only the (dev,ino) half of the guard can catch it.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::write(&target, b"v1 edited").unwrap();
+    let ino_swapped = std::fs::metadata(&target).unwrap().ino_u64();
+    assert_ne!(ino_v1, ino_swapped, "the swap must change the inode (else the test is moot)");
+
+    assert!(
+        log.undo_write(&write_id).is_err(),
+        "undo must re-gate: a diverged target identity makes the restore fail closed"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"v1 edited",
+        "the swapped-in inode is untouched by the refused undo"
+    );
+}
+
+// NOTE: undo RE-GATES (c) — the tampered-pre_bytes hash-mismatch revert-sensitive
+// test — lives IN-CRATE (`src/log.rs` `#[cfg(test)]`), because tampering the
+// encrypted `undo_state` row needs the private store handle. Keeping it in-crate
+// avoids exposing any public "corrupt my undo bytes" surface or an extra feature
+// flag, so `cargo test -p bossclaw-core` compiles with zero features. See
+// `undo_tamper_pre_bytes_fails_closed` there.
+
 /// Tiny extension trait so the tests can read a unix inode without repeating the
 /// `MetadataExt` import dance at each call site.
 trait InoExt {
