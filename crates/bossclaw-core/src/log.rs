@@ -363,6 +363,27 @@ impl EventLog {
         Ok(())
     }
 
+    /// True iff the event `id` (read within `tx`) carries the external taint stamp
+    /// (read via [`crate::ingest::is_external`], single-sourced). The append
+    /// chokepoint uses this to propagate taint to Tier-B descendants. Fail-closed: a
+    /// source that cannot be read or parsed is treated as external (spec §7).
+    fn source_is_external_in_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> bool {
+        let payload: Option<String> = match tx
+            .query_row("SELECT payload FROM events WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .optional()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("taint-check: source {id} read failed, treating as external (fail-closed): {e}");
+                None
+            }
+        };
+        match payload.map(|p| serde_json::from_str::<crate::event::Event>(&p)) {
+            Some(Ok(ev)) => crate::ingest::is_external(&ev),
+            _ => true, // fail-closed: missing or unparseable source
+        }
+    }
+
     /// Assign id/ts/prev_hash, hash, sign, and INSERT `event` within `tx`. The
     /// chain tip is read via SQL inside `tx`, so consecutive calls in one tx chain
     /// correctly (the second sees the first's uncommitted insert). Returns the id.
@@ -371,6 +392,20 @@ impl EventLog {
         tx: &rusqlite::Transaction<'_>,
         mut event: Event,
     ) -> Result<String, BossclawError> {
+        // Eager external-taint propagation (extraction-from-files D2): a Tier-B event
+        // whose lineage touches ANY external source inherits the taint, stamped into the
+        // signed content BEFORE hashing. is_external stays O(1) + transitive (a tainted
+        // derived fact is itself stamped, so its descendants inherit). append_event_in_tx
+        // is the SOLE INSERT path → no Tier-B event can bypass it.
+        let tainted = event.model_meta.as_ref().is_some_and(|m| {
+            m.source_event_ids.iter().any(|src| Self::source_is_external_in_tx(tx, src))
+        });
+        if tainted {
+            if let Some(obj) = event.content.as_object_mut() {
+                obj.insert("origin".to_string(),
+                    serde_json::Value::String(crate::graph::EXTERNAL_ORIGIN.to_string()));
+            }
+        }
         let prev_hash: String = tx
             .query_row("SELECT hash FROM events ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
             .unwrap_or_else(|_| GENESIS.to_string());
@@ -391,6 +426,16 @@ impl EventLog {
             rusqlite::params![event.id, event.ts, event.event_type, payload, event.prev_hash, hash_hex],
         )?;
         Ok(event.id)
+    }
+
+    /// Read a full `Event` by id (None if absent). Public read for tests + M6's walk.
+    pub fn event_by_id(&self, id: &str) -> Result<Option<crate::event::Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let payload: Option<String> = store
+            .conn()
+            .query_row("SELECT payload FROM events WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .optional()?;
+        Ok(payload.map(|p| serde_json::from_str(&p)).transpose()?)
     }
 
     /// Number of events in the log.
