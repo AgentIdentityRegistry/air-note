@@ -1005,6 +1005,14 @@ fn no_tier_a_file_written_can_be_produced() {
             .as_ref()
             .expect("a file_written must be Tier-B (model_meta: Some) — no Tier-A is possible");
         assert!(!meta.source_event_ids.is_empty(), "Tier-B requires non-empty sources");
+        // Load-bearing (spec §6 M1): the taint chokepoint only stamps `origin` when
+        // content is a JSON object. A future refactor to a non-object payload would
+        // silently disable taint stamping — assert the invariant directly so it can't
+        // regress unnoticed.
+        assert!(
+            ev.content.is_object(),
+            "file_written content must be a JSON object so the taint chokepoint can stamp origin"
+        );
     }
 }
 
