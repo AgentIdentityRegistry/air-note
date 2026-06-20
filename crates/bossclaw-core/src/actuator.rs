@@ -315,10 +315,14 @@ fn is_shell_rc_line(line: &str) -> bool {
 /// returned fd, so the path string is resolved exactly ONCE here.
 ///
 /// Platform split mirrors `careful_open_file` (spec §9 step 2):
-/// - **Linux:** `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` so NO
-///   component (intermediate or final) may be a symlink and nothing may escape
-///   `dir`; falls back to `openat` + `O_NOFOLLOW` on a pre-5.6 kernel (`ENOSYS`),
-///   which still refuses a final-component symlink.
+/// - **Linux:** `openat2` with `RESOLVE_NO_SYMLINKS` so NO component (intermediate
+///   or final) may be a symlink. `RESOLVE_BENEATH` is deliberately NOT used: `dir`
+///   is an absolute, already-canonicalized + grant-checked path opened from `CWD`,
+///   and `BENEATH` rejects absolute pathnames with `EXDEV` (it only constrains a
+///   relative descent from a base fd, which does not apply here). The caller's
+///   canonicalize + grant-check is the containment boundary; this open is just the
+///   no-symlink anchor. Falls back to `openat` + `O_NOFOLLOW` on a pre-5.6 kernel
+///   (`ENOSYS`), which still refuses a final-component symlink.
 /// - **macOS / other non-Linux:** `openat` from `CWD` with
 ///   `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. `O_NOFOLLOW` refuses ONLY a
 ///   final-component symlink; an INTERMEDIATE directory that is a symlink is NOT
@@ -355,7 +359,7 @@ pub(crate) fn open_dir_for_write(
             dir.as_os_str().as_bytes(),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::NO_SYMLINKS,
         ) {
             Ok(fd) => Ok(fd),
             // Pre-5.6 kernels lack openat2 → fall back to a NOFOLLOW open, which
