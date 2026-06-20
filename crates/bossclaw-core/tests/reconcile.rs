@@ -342,14 +342,16 @@ use serde_json::Value;
 /// The exact corrected body the rewrite turn returns for the Alice/Globex fixture.
 const CORRECTED_BODY: &str = "Alice works at Globex.\n";
 
-/// A reasoner that dispatches on the call shape: the M6b whole-file rewrite (whose
-/// prompt is `build_rewrite_prompt`'s frame, identifiable by the literal lead line
-/// "You are correcting a file") returns a fixed `{ "corrected_content": ... }`;
-/// every OTHER turn (Pass A, Pass B, entity adjudication, summarize compose) is
-/// delegated to the inner `ScriptedReasoner`. This is the recommended seam from the
-/// plan: it lets the contradiction be scripted with the proven `scripted_both_passes`
-/// pattern while the rewrite — whose prompt is laborious to reproduce byte-exactly —
-/// is matched structurally instead.
+/// A reasoner that dispatches on the call shape: the M6b whole-file rewrite is
+/// identified by the literal lead line "You are correcting a file" — which lives in
+/// the `build_rewrite_prompt` FRAME BODY (the `prompt` arg), NOT in the prod system
+/// const `RECONCILE_SYSTEM` ("You correct a file…"); matching on the frame body is why
+/// the detection is robust regardless of the system line. The rewrite turn returns a
+/// fixed `{ "corrected_content": ... }`; every OTHER turn (Pass A, Pass B, entity
+/// adjudication, summarize compose) is delegated to the inner `ScriptedReasoner`. This
+/// is the recommended seam from the plan: it lets the contradiction be scripted with
+/// the proven `scripted_both_passes` pattern while the rewrite — whose prompt is
+/// laborious to reproduce byte-exactly — is matched structurally instead.
 struct DispatchReasoner {
     inner: ScriptedReasoner,
     corrected: String,
@@ -373,9 +375,10 @@ impl Reasoner for DispatchReasoner {
         prompt: &str,
         schema: &Value,
     ) -> Result<Value, bossclaw_core::error::BossclawError> {
-        // The rewrite prompt is `build_rewrite_prompt`'s frame; its lead instruction
-        // line is engine-fixed (the file body is fenced BELOW, so this marker can
-        // only come from the trusted frame, never the untrusted file text).
+        // Match the `build_rewrite_prompt` FRAME BODY (the `prompt` arg), NOT the
+        // system line: its lead instruction is engine-fixed (the file body is fenced
+        // BELOW, so this marker can only come from the trusted frame, never the
+        // untrusted file text).
         if prompt.contains("You are correcting a file") {
             return Ok(serde_json::json!({ "corrected_content": self.corrected }));
         }
@@ -629,6 +632,16 @@ fn evolve_once_emits_reconciliation_proposal_for_file_backed_contradiction() {
     let lineage = prop.model_meta.as_ref().unwrap().source_event_ids.clone();
     assert!(lineage.contains(&file_id), "lineage carries the asserting file id");
     assert!(lineage.contains(&mem_id), "lineage carries the correcting memory id");
+    // INTEGRATION-LAYER taint guard: the WIRED proposal (engine lineage includes the
+    // ingested file) must be stamped `origin:"external"` by the append chokepoint — not
+    // just the unit-layer `write_proposal_event_is_tier_b_object_and_taint_stamped`. A
+    // future wiring regression that broke the stamp would still pass the unit test; this
+    // asserts the assembled flow taints the proposal end-to-end.
+    assert_eq!(
+        prop.content["origin"],
+        serde_json::json!("external"),
+        "the assembled-flow proposal must be taint-stamped (engine lineage includes the ingested file)"
+    );
     log.verify_chain().unwrap();
 }
 
