@@ -1227,9 +1227,9 @@ mod orchestrator_tests {
             "a revoked grant's files do not surface in recall");
     }
 
-    // Door (1): files are never an evolve extraction SUBJECT (the cursor is memory-only).
+    // Door A OPEN: a file_ingested event IS now an evolve extraction subject.
     #[test]
-    fn ingested_files_are_excluded_from_the_evolve_cursor() {
+    fn ingested_files_are_evolve_subjects() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("notes");
         std::fs::create_dir(&folder).unwrap();
@@ -1239,17 +1239,15 @@ mod orchestrator_tests {
         log.add_grant(&folder).unwrap();
         let canonical = std::fs::canonicalize(&folder).unwrap();
         assert_eq!(run_ingest(&log, &canonical, &ParserRouter::native_only(), &emb).ingested, 1);
-
-        // The evolve queue depth counts ONLY memory events; file_ingested must not appear.
-        let depth = log.evolve_status().unwrap();
-        assert_eq!(depth.queue_depth, 0, "file_ingested events are never an evolve work-unit (cursor door)");
+        assert_eq!(log.evolve_status().unwrap().queue_depth, 1,
+            "file_ingested events are now evolve subjects (Door A)");
     }
 
-    // Door (2): the evolve loop's internal recall must NOT surface file text as context.
-    // Assert the EXACT RecallOptions the loop uses returns ZERO file hits, while
-    // user-facing recall (defaults) DOES — proving the knob, not an empty corpus, hides it.
+    // Door B OPEN: the evolve loop's internal recall now SURFACES file text as context.
+    // Assert the EXACT RecallOptions the loop uses returns file hits, while
+    // user-facing recall (defaults) also does — proving the door is open.
     #[test]
-    fn evolve_context_recall_excludes_file_text() {
+    fn evolve_context_recall_includes_file_text() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("notes");
         std::fs::create_dir(&folder).unwrap();
@@ -1265,10 +1263,11 @@ mod orchestrator_tests {
         // User-facing recall surfaces the file…
         let user = log.recall(&emb, "zztoken", 10, &Default::default()).unwrap();
         assert!(user.iter().any(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE), "default recall returns the file");
-        // …the evolve-context recall (the loop's exact options) does NOT.
-        let ctx = log.recall(&emb, "zztoken", 10, &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() }).unwrap();
-        assert!(ctx.iter().all(|h| h.kind != crate::graph::FILE_INGESTED_EVENT_TYPE),
-            "exclude_files drops file text from the reasoner's extraction context (no laundering)");
+        // Door B OPEN: the evolve-context recall (the loop's exact options) now SURFACES the file.
+        // The taint chokepoint + the Pass-A fence keep it safe.
+        let ctx = log.recall(&emb, "zztoken", 10, &RecallOptions { exclude_pages: true, exclude_files: false, ..Default::default() }).unwrap();
+        assert!(ctx.iter().any(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE),
+            "Door B: file text is available as evolve context");
     }
 
     #[test]

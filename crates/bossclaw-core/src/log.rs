@@ -363,6 +363,27 @@ impl EventLog {
         Ok(())
     }
 
+    /// True iff the event `id` (read within `tx`) carries the external taint stamp
+    /// (read via [`crate::ingest::is_external`], single-sourced). The append
+    /// chokepoint uses this to propagate taint to Tier-B descendants. Fail-closed: a
+    /// source that cannot be read or parsed is treated as external (spec §7).
+    fn source_is_external_in_tx(tx: &rusqlite::Transaction<'_>, id: &str) -> bool {
+        let payload: Option<String> = match tx
+            .query_row("SELECT payload FROM events WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .optional()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("taint-check: source {id} read failed, treating as external (fail-closed): {e}");
+                None
+            }
+        };
+        match payload.map(|p| serde_json::from_str::<crate::event::Event>(&p)) {
+            Some(Ok(ev)) => crate::ingest::is_external(&ev),
+            _ => true, // fail-closed: missing or unparseable source
+        }
+    }
+
     /// Assign id/ts/prev_hash, hash, sign, and INSERT `event` within `tx`. The
     /// chain tip is read via SQL inside `tx`, so consecutive calls in one tx chain
     /// correctly (the second sees the first's uncommitted insert). Returns the id.
@@ -371,6 +392,20 @@ impl EventLog {
         tx: &rusqlite::Transaction<'_>,
         mut event: Event,
     ) -> Result<String, BossclawError> {
+        // Eager external-taint propagation (extraction-from-files D2): a Tier-B event
+        // whose lineage touches ANY external source inherits the taint, stamped into the
+        // signed content BEFORE hashing. is_external stays O(1) + transitive (a tainted
+        // derived fact is itself stamped, so its descendants inherit). append_event_in_tx
+        // is the SOLE INSERT path → no Tier-B event can bypass it.
+        let tainted = event.model_meta.as_ref().is_some_and(|m| {
+            m.source_event_ids.iter().any(|src| Self::source_is_external_in_tx(tx, src))
+        });
+        if tainted {
+            if let Some(obj) = event.content.as_object_mut() {
+                obj.insert("origin".to_string(),
+                    serde_json::Value::String(crate::graph::EXTERNAL_ORIGIN.to_string()));
+            }
+        }
         let prev_hash: String = tx
             .query_row("SELECT hash FROM events ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
             .unwrap_or_else(|_| GENESIS.to_string());
@@ -391,6 +426,16 @@ impl EventLog {
             rusqlite::params![event.id, event.ts, event.event_type, payload, event.prev_hash, hash_hex],
         )?;
         Ok(event.id)
+    }
+
+    /// Read a full `Event` by id (None if absent). Public read for tests + M6's walk.
+    pub fn event_by_id(&self, id: &str) -> Result<Option<crate::event::Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let payload: Option<String> = store
+            .conn()
+            .query_row("SELECT payload FROM events WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .optional()?;
+        Ok(payload.map(|p| serde_json::from_str(&p)).transpose()?)
     }
 
     /// Number of events in the log.
@@ -2644,12 +2689,17 @@ impl EventLog {
         Ok(true) // flag never set → default open
     }
 
-    /// The `(seq, id, text)` of each unprocessed `memory` event strictly after the
-    /// cursor, in `seq ASC` order, capped at `limit` (the per-tick batch). Only
-    /// `memory` events are processed (the evolve unit of work; `file_ingested`
-    /// extraction is deferred — M4a scope). Returns owned data so the store lock
-    /// is released before any model/embedder call (lock discipline).
-    fn unprocessed_memories_since(
+    /// The `(seq, id, text)` of each unprocessed extractable event strictly after
+    /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
+    ///
+    /// Extractable subjects are `memory` events (user-authored notes) and
+    /// `file_ingested` events (imported file text). Derived events — `entity`,
+    /// `link`, `page` — are NEVER subjects: facts derived from a subject inherit
+    /// the subject's `source_event_ids` rather than being re-extracted themselves.
+    ///
+    /// Returns owned data so the store lock is released before any model/embedder
+    /// call (lock discipline).
+    fn unprocessed_extractable_since(
         &self,
         cursor: i64,
         limit: usize,
@@ -2658,10 +2708,10 @@ impl EventLog {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT seq, id, payload FROM events
-             WHERE event_type = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+             WHERE event_type IN (?1, ?2) AND seq > ?3 ORDER BY seq ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(
-            rusqlite::params![MEMORY_EVENT_TYPE, cursor, limit as i64],
+            rusqlite::params![MEMORY_EVENT_TYPE, crate::graph::FILE_INGESTED_EVENT_TYPE, cursor, limit as i64],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
         )?;
         let mut out = Vec::new();
@@ -2790,7 +2840,9 @@ impl EventLog {
     /// Like [`EventLog::texts_for_ids`], but DROPS any `page`-typed id by
     /// construction — the one-way rule enforced at fact-set materialization
     /// (spec §7 / M4b F3). A page id reaching the fact-set is a contract
-    /// violation, never silently summarized back into a summary. One `IN (?,...)`
+    /// violation, never silently summarized back into a summary. File-typed rows
+    /// are included (Door C): file text may feed a dossier; the dossier inherits
+    /// external taint via D8 (engine gather lineage). One `IN (?,...)`
     /// query (mirrors [`EventLog::texts_for_ids`]); caller id order is preserved
     /// on the way out (the gather sorts lineage before calling, but preserving
     /// order is a defensive courtesy and costs nothing).
@@ -2815,16 +2867,13 @@ impl EventLog {
             ))
         })?;
         // Build a by-id map; skip page-typed rows (F3: a summary never feeds
-        // summary-generation) and file-typed rows (M5a Task 9: external file
-        // text is never laundered into a summary — defense-in-depth, the root
-        // fix is closing the evolve context recall door so a file id never
-        // reaches a lineage in the first place).
+        // summary-generation). File-typed rows are NO LONGER skipped (Door C):
+        // file text may feed a dossier; the dossier inherits the external taint
+        // via D8 (engine lineage).
         let mut by_id: HashMap<String, String> = HashMap::new();
         for row in rows {
             let (id, etype, payload) = row?;
-            if etype == crate::graph::PAGE_EVENT_TYPE
-                || etype == crate::graph::FILE_INGESTED_EVENT_TYPE
-            {
+            if etype == crate::graph::PAGE_EVENT_TYPE {
                 continue;
             }
             let ev: Event = serde_json::from_str(&payload)?;
@@ -2951,7 +3000,7 @@ impl EventLog {
         lineage.sort();
         lineage.dedup();
         let memories = self.fact_texts_for_ids(&lineage)?;
-        Ok(crate::summarize::FactSet { entity: entity.clone(), edges, memories })
+        Ok(crate::summarize::FactSet { entity: entity.clone(), edges, memories, source_ids: lineage })
     }
 
     /// The summarize phase of one tick (spec §3, §6 / M4b). For each dirty topic
@@ -3046,7 +3095,7 @@ impl EventLog {
                 claims_capped,
                 &[],
                 reasoner.model_id(),
-                &rendered.cites,
+                &facts.source_ids, // D8: engine gather lineage (taint anchor), not model cites
                 prior_id,
             ) {
                 Ok((_pid, superseded)) => {
@@ -3134,7 +3183,7 @@ impl EventLog {
             return Ok(report);
         }
         let cursor = self.evolve_cursor()?;
-        let batch = self.unprocessed_memories_since(cursor, EVOLVE_BATCH)?;
+        let batch = self.unprocessed_extractable_since(cursor, EVOLVE_BATCH)?;
         // Within-tick active-key set (Rev 2 F5): seed from the current graph, then
         // grow as this tick emits — so a duplicate edge across two memories in the
         // SAME tick is skipped, not double-emitted.
@@ -3158,19 +3207,19 @@ impl EventLog {
             let text = crate::extract::truncate_for_reasoner(&full_text).to_string();
 
             // ── 1. recall context (M2). entity-kind is excluded from recall by
-            //    construction (separate index); `exclude_pages: true` drops pages
-            //    and `exclude_files: true` drops external file text (M5a Task 9,
-            //    evolve door 2) — so extraction context is raw memories only, the
-            //    one-way rule (F3, defense-in-depth with `fact_texts_for_ids`).
-            //    External file text must never be laundered into auto-derived
-            //    links/entities. The read-set is EVENT ids only (never
-            //    entity:<ulid>), spec §16. ──
+            //    construction (separate index); `exclude_pages: true` drops pages.
+            //    Door B OPEN: `exclude_files: false` — external file text CAN now
+            //    serve as extraction context. Any file hit in the read-set taints
+            //    the derived fact via the append chokepoint (extraction-from-files
+            //    D2), and the Pass-A cheat-sheet is fenced (extract.rs §3) so
+            //    external context cannot inject instructions. The read-set is EVENT
+            //    ids only (never entity:<ulid>), spec §16. ──
             let recalled: Vec<String> = self
                 .recall(
                     embedder,
                     &text,
                     crate::extract::GRAPH_CONTEXT_K,
-                    &RecallOptions { exclude_pages: true, exclude_files: true, ..Default::default() },
+                    &RecallOptions { exclude_pages: true, exclude_files: false, ..Default::default() },
                 )
                 .map(|hits| {
                     hits.into_iter()
@@ -3441,8 +3490,14 @@ impl EventLog {
                 }
             };
             for edge in edges {
+                // extraction-from-files I2: sanitize file-derived endpoint names and
+                // relation so a control-char/overlong label can't escape the line.
+                // No-op for well-formed names (no control chars, < 200 bytes).
+                let src_name = crate::summarize::sanitize_ident(&render(&edge.src));
+                let rel = crate::summarize::sanitize_ident(&edge.relation);
+                let dst_name = crate::summarize::sanitize_ident(&render(&edge.dst));
                 seen.insert(
-                    format!("{} -{}-> {}", render(&edge.src), edge.relation, render(&edge.dst)),
+                    format!("{src_name} -{rel}-> {dst_name}"),
                     (),
                 );
             }
@@ -3451,19 +3506,20 @@ impl EventLog {
     }
 
     /// A snapshot of evolve-loop health (spec §8). `queue_depth` = unprocessed
-    /// `memory` events behind the cursor (LIVE); `enabled` reflects the sticky
-    /// off-switch (LIVE). `last_tick_ms`/`error_count`/`last_error` are honest
-    /// M4a stubs (`None`/`0`/`None`) — the running tick/error counters are owned
-    /// by M7's long-lived loop driver, not persisted here, so this method stays a
-    /// pure read and is unit-testable.
+    /// extractable (`memory` + `file_ingested`) events behind the cursor (LIVE);
+    /// `enabled` reflects the sticky off-switch (LIVE).
+    /// `last_tick_ms`/`error_count`/`last_error` are honest M4a stubs
+    /// (`None`/`0`/`None`) — the running tick/error counters are owned by M7's
+    /// long-lived loop driver, not persisted here, so this method stays a pure
+    /// read and is unit-testable.
     pub fn evolve_status(&self) -> Result<EvolveStatus, BossclawError> {
         let cursor = self.evolve_cursor()?;
         let queue_depth = {
             let store = self.inner.lock().expect(POISON);
             let conn = store.conn();
             conn.query_row(
-                "SELECT count(*) FROM events WHERE event_type = ?1 AND seq > ?2",
-                rusqlite::params![MEMORY_EVENT_TYPE, cursor],
+                "SELECT count(*) FROM events WHERE event_type IN (?1, ?2) AND seq > ?3",
+                rusqlite::params![MEMORY_EVENT_TYPE, crate::graph::FILE_INGESTED_EVENT_TYPE, cursor],
                 |r| r.get::<_, i64>(0),
             )? as usize
         };

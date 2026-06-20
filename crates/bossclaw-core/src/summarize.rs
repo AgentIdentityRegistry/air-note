@@ -57,6 +57,10 @@ pub struct FactSet {
     pub edges: Vec<String>,
     /// `(event_id, text)` of the cited memories.
     pub memories: Vec<(String, String)>,
+    /// D8: the engine-computed gather lineage (sorted+deduped union of the topic
+    /// entity's + its edges' `source_event_ids`) — the page's taint anchor. A file
+    /// in the lineage taints the dossier regardless of which sources the model cited.
+    pub source_ids: Vec<String>,
 }
 
 impl FactSet {
@@ -128,7 +132,7 @@ pub fn compose_schema() -> serde_json::Value {
 /// instruction tier of the compose prompt — prevents a multi-line label from
 /// escaping the identity slot and injecting instructions above the fenced
 /// sources.
-fn sanitize_ident(s: &str) -> String {
+pub(crate) fn sanitize_ident(s: &str) -> String {
     let cleaned: String = s.chars().filter(|c| !c.is_ascii_control()).collect();
     if cleaned.len() <= MAX_PROMPT_IDENT_LEN {
         cleaned

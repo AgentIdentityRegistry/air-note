@@ -93,6 +93,29 @@ fn ingest_and_evolve(
     log.evolve_once(embedder, reasoner).unwrap()
 }
 
+/// Write `text` to `<dir>/g/<name>`, grant the folder, ingest it read-only, and
+/// bring every derived structure up to date (mirrors `tests/extraction.rs`'s
+/// `ingest_file` — the production grant→ingest→derive lifecycle for a FILE
+/// subject). The file row becomes an evolve subject under Door C.
+fn ingest_file(
+    log: &EventLog,
+    embedder: &MockEmbedder,
+    dir: &std::path::Path,
+    name: &str,
+    text: &[u8],
+) {
+    let folder = dir.join("g");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(name), text).unwrap();
+    log.add_grant(&folder).unwrap();
+    log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), embedder)
+        .unwrap();
+    log.rederive_pending(embedder).unwrap();
+    log.rebuild_indexes(embedder).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(embedder).unwrap();
+}
+
 // ── Property 1: a memory naming a person mints ≥1 entity ───────────────────────
 
 /// A memory like "Kenny Ferris is a software engineer at Acme." → the live model
@@ -590,4 +613,46 @@ fn live_dossier_is_grounded_surfaces_and_supersedes_on_contradiction() {
         "the live model never produced a grounded, recall-surfaced, supersede-on-\
          contradiction dossier across {MAX_ATTEMPTS} attempts — last: {last_failure}"
     );
+}
+
+// ── Property 6 (extraction-from-files headline): a file evolved by the real model
+//    yields an EXTERNAL fact ─────────────────────────────────────────────────────
+
+/// THE Door A taint property, proven LIVE. A real small file ("Alice works at
+/// Acme.") is granted + ingested read-only, then evolved by the real
+/// `qwen2.5:7b-instruct`. The model extracts the stated relationship; the loop
+/// emits a `link`. Because that link's engine lineage reaches the file row, the
+/// taint chokepoint stamps it EXTERNAL — the live analogue of the hermetic
+/// `evolving_a_file_yields_external_facts_and_propagates` gate. We assert the link
+/// exists AND is external (the headline) and, defensively, that it is machine-
+/// origin (the model cannot forge a manual/trusted fact from file content).
+#[test]
+#[ignore = "requires a local Ollama running qwen2.5:7b-instruct"]
+fn live_extraction_from_file_is_external() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    let reasoner = OllamaReasoner::new(MODEL);
+
+    ingest_file(&log, &embedder, dir.path(), "alice.md", b"Alice works at Acme.");
+    let report = log.evolve_once(&embedder, &reasoner).unwrap();
+    assert!(
+        report.links_emitted >= 1,
+        "the real model must extract ≥1 link from the file (live report: {report:?})"
+    );
+
+    let link = log
+        .stream_all()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.event_type == "link")
+        .expect("a link event was emitted from the file");
+    assert!(
+        bossclaw_core::is_external(&link),
+        "Door A (LIVE): a fact extracted from a file must be external"
+    );
+    // The model cannot launder taint into a manual fact (Task 6 property, live).
+    let meta = link.model_meta.as_ref().expect("the link carries lineage");
+    assert_ne!(meta.model_id, "manual", "a file-derived link is machine-origin, never manual");
+    log.verify_chain().unwrap();
 }
