@@ -6,10 +6,12 @@
 #![allow(dead_code)] // helpers are consumed test-by-test; silence until all are used.
 
 use bossclaw_core::embed::MockEmbedder;
+use bossclaw_core::event::Event;
 use bossclaw_core::ingest::ParserRouter;
 use bossclaw_core::EventLog;
 use ed25519_dalek::SigningKey;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
 
 /// Deterministic data-encryption key for the hermetic SQLCipher store.
@@ -59,4 +61,64 @@ pub fn ingest_one(log: &EventLog, path: &Path) -> String {
         .find(|rec| rec.canonical_path == canonical)
         .map(|rec| rec.file_event_id)
         .unwrap_or_else(|| panic!("no current file_ingested event for {canonical}"))
+}
+
+/// Monotonic suffix so every `seed_external_event` writes to a DISTINCT path —
+/// `ingest_one` keys on canonical path, so two calls with identical TEXT must still
+/// land on different files to yield two distinct, independent `file_ingested` ids
+/// (the anti-laundering tests rely on the asserting file ≠ the correcting file).
+static SEED_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Seed a tracked EXTERNAL source: write `text` into a uniquely-named `.md` under the
+/// granted files dir and ingest it, returning its `file_ingested` event id. That id
+/// `is_external`, so a Tier-B event citing it is taint-stamped at the append chokepoint.
+/// Reuses [`ingest_one`] — the simplest hermetic external-event factory.
+pub fn seed_external_event(log: &EventLog, text: &str) -> String {
+    // The files dir is the READ+WRITE-granted sibling created by the log factory; ingest
+    // discovers files anywhere under that active grant root. Recover it from the public
+    // write-grants projection (the harness grants exactly one root).
+    let root = log
+        .write_grants()
+        .expect("read write grants")
+        .into_iter()
+        .find(|g| !g.revoked)
+        .map(|g| g.canonical_root)
+        .expect("an active write-granted files dir exists");
+    let n = SEED_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = PathBuf::from(root).join(format!("seed_{n}.md"));
+    std::fs::write(&path, text.as_bytes()).expect("write seed external file");
+    ingest_one(log, &path)
+}
+
+/// Seed a machine `link` (edge) with the given `source_event_ids`, returning the link
+/// EVENT id — which `fold_edges` adopts verbatim as the `edge_id`. Wraps the real
+/// [`EventLog::link_machine`] API (non-manual producer, fixed confidence); `sources`
+/// becomes its `source_event_ids` so the retired edge carries the asserting file's lineage.
+pub fn seed_edge_with_sources(
+    log: &EventLog,
+    src: &str,
+    relation: &str,
+    dst: &str,
+    sources: &[String],
+) -> String {
+    log.link_machine(src, relation, dst, 0.9, "m6b-test-linker", sources)
+        .expect("seed machine link")
+}
+
+/// Seed a plain `memory` event and return its id. Mirrors the `mk_memory` Event shape
+/// used across the graph tests, appended via the public [`EventLog::append`].
+pub fn seed_memory(log: &EventLog, text: &str) -> String {
+    log.append(Event {
+        id: String::new(),
+        ts: String::new(),
+        valid_time: None,
+        event_type: "memory".to_string(),
+        content: serde_json::json!({ "text": text }),
+        model_meta: None,
+        prev_hash: String::new(),
+        hash: None,
+        signed_by_did: "did:wba:AIR-TEST".to_string(),
+        signature: None,
+    })
+    .expect("seed memory event")
 }

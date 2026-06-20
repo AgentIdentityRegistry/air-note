@@ -3234,6 +3234,26 @@ impl EventLog {
         }
     }
 
+    /// Engine-gathered lineage for a reconciliation proposal (M6b D8, §5.4):
+    /// union( the retired edge's own source_event_ids , the inducing read_set ).
+    /// Deliberately EXCLUDES the endpoints' entity lineage (over-reach: an entity accretes
+    /// lineage from every memory that mentioned it). The model's citations are NEVER consulted.
+    #[cfg(unix)]
+    pub fn reconciliation_lineage(
+        &self,
+        retired_edge_id: &str,
+        read_set: &[String],
+    ) -> Result<Vec<String>, BossclawError> {
+        let mut lineage: Vec<String> = Vec::new();
+        if let Some(ids) = self.source_ids_of_event(retired_edge_id)? {
+            lineage.extend(ids);
+        }
+        lineage.extend(read_set.iter().cloned());
+        lineage.sort();
+        lineage.dedup();
+        Ok(lineage)
+    }
+
     /// The CURRENT tracked file whose ON-DISK identity is `(dev, ino)`, or `None`.
     /// The INODE-keyed sibling of [`current_file_for_path`](Self::current_file_for_path),
     /// for the write gate's engine anchor (M6a, T2 review).

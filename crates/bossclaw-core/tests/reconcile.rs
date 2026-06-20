@@ -140,3 +140,33 @@ fn decline_write_proposal_resolves_and_inherits_lineage() {
     // An unknown / non-Tier-B id is rejected (no sources to inherit).
     assert!(log.decline_write_proposal("01BOGUS", "x").is_err());
 }
+
+/// The recorded lineage is engine-gathered: union(retired edge's source_ids, read_set).
+/// It must include BOTH the asserting file (edge lineage) AND the correcting source
+/// (read_set) — and NEVER depend on model-chosen citations.
+#[test]
+fn reconciliation_lineage_unions_edge_and_read_set_not_entity() {
+    let (log, _home, _dir) = common::open_log_with_write_grant();
+    let file_a = common::seed_external_event(&log, "Alice works at Acme");
+    let edge_id = common::seed_edge_with_sources(&log, "entity:alice", "works_at", "entity:acme", std::slice::from_ref(&file_a));
+    let mem_b = common::seed_memory(&log, "Actually Alice works at Globex");
+    let read_set = vec![mem_b.clone()];
+
+    let lineage = log.reconciliation_lineage(&edge_id, &read_set).unwrap();
+    assert!(lineage.contains(&file_a), "asserting file (edge lineage) present");
+    assert!(lineage.contains(&mem_b),  "correcting source (read_set) present — the SEC-C2 fix");
+    let mut sorted = lineage.clone(); sorted.sort(); sorted.dedup();
+    assert_eq!(lineage, sorted, "sorted + deduped");
+}
+
+/// SEC-C2 revert-sensitive: if the CORRECTING fact is itself file-derived, that file id
+/// MUST be in the lineage (this FAILS if read_set is dropped from the union).
+#[test]
+fn correcting_file_is_recorded_in_lineage() {
+    let (log, _home, _dir) = common::open_log_with_write_grant();
+    let file_a = common::seed_external_event(&log, "Alice works at Acme");
+    let edge_id = common::seed_edge_with_sources(&log, "entity:alice", "works_at", "entity:acme", &[file_a]);
+    let file_b = common::seed_external_event(&log, "Alice works at Globex");
+    let lineage = log.reconciliation_lineage(&edge_id, std::slice::from_ref(&file_b)).unwrap();
+    assert!(lineage.contains(&file_b), "the correcting file MUST be recorded (no laundering)");
+}
