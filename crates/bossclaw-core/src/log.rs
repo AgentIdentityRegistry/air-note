@@ -2376,69 +2376,83 @@ impl EventLog {
         // fstat it, and require BOTH the (dev,ino,size) identity AND a re-hash of the
         // current bytes to equal the verdict's. This single open is reused for the
         // identity check, the content re-hash, and the delete bytes (if any).
-        let deleted_bytes: Option<Vec<u8>> = match proposal.op {
-            WriteOp::Create => None,
-            WriteOp::Edit | WriteOp::Delete => {
-                let want_identity = verdict
-                    .base_identity
-                    .ok_or_else(|| reject("edit/delete verdict missing base_identity"))?;
-                let want_hash = verdict
-                    .base_content_hash
-                    .as_deref()
-                    .ok_or_else(|| reject("edit/delete verdict missing base_content_hash"))?;
+        //
+        // IMPORTANT (honest scope): this proves the IDENTITY OF THE OPEN FD. The
+        // mutate in step 5 acts BY NAME (`renameat`/`unlinkat` re-resolve
+        // `final_name` against `dir_fd`), which is a different operation — so the
+        // guard's fd identity does NOT transfer to the mutate. `rename_lock`
+        // serializes bossclaw's own writers, but a FOREIGN process can still swap
+        // `final_name` to a different inode in the guard→mutate window. Step 5 adds a
+        // fail-closed pre-mutate re-stat to NARROW that window (it cannot eliminate
+        // it — the statat→mutate gap remains, exactly like the macOS create residual,
+        // spec §9). `guard_identity` (the value asserted here) is the comparison
+        // anchor for that re-stat.
+        let (deleted_bytes, guard_identity): (Option<Vec<u8>>, Option<crate::actuator::FileId>) =
+            match proposal.op {
+                WriteOp::Create => (None, None),
+                WriteOp::Edit | WriteOp::Delete => {
+                    let want_identity = verdict
+                        .base_identity
+                        .ok_or_else(|| reject("edit/delete verdict missing base_identity"))?;
+                    let want_hash = verdict
+                        .base_content_hash
+                        .as_deref()
+                        .ok_or_else(|| reject("edit/delete verdict missing base_content_hash"))?;
 
-                // Fd-relative NOFOLLOW open of the existing target.
-                let target_fd = rustix::fs::openat(
-                    &dir_fd,
-                    final_name.as_bytes(),
-                    rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::NOFOLLOW
-                        | rustix::fs::OFlags::CLOEXEC,
-                    rustix::fs::Mode::empty(),
-                )
-                .map_err(|e| reject(&format!("target re-open failed: {e}")))?;
+                    // Fd-relative NOFOLLOW open of the existing target.
+                    let target_fd = rustix::fs::openat(
+                        &dir_fd,
+                        final_name.as_bytes(),
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map_err(|e| reject(&format!("target re-open failed: {e}")))?;
 
-                let st = rustix::fs::fstat(&target_fd)
-                    .map_err(|e| reject(&format!("target fstat failed: {e}")))?;
-                // It must still be a regular file (a swap to a dir/fifo/device is a
-                // divergence, and reading it could hang or mislead the guard).
-                if rustix::fs::FileType::from_raw_mode(st.st_mode)
-                    != rustix::fs::FileType::RegularFile
-                {
-                    return Err(reject("target is no longer a regular file"));
+                    let st = rustix::fs::fstat(&target_fd)
+                        .map_err(|e| reject(&format!("target fstat failed: {e}")))?;
+                    // It must still be a regular file (a swap to a dir/fifo/device is a
+                    // divergence, and reading it could hang or mislead the guard).
+                    if rustix::fs::FileType::from_raw_mode(st.st_mode)
+                        != rustix::fs::FileType::RegularFile
+                    {
+                        return Err(reject("target is no longer a regular file"));
+                    }
+                    // Identity half (L12): dev/ino/size must match the propose-time stat.
+                    // The `as u64` casts mirror the propose-time capture (ingest.rs), so
+                    // the two sides are compared on the same widths.
+                    let now_identity = crate::actuator::FileId {
+                        dev: st.st_dev as u64,
+                        ino: st.st_ino as u64,
+                        size: st.st_size as u64,
+                    };
+                    if now_identity != want_identity {
+                        return Err(reject(
+                            "base identity (dev,ino,size) diverged since propose (TOCTOU swap)",
+                        ));
+                    }
+                    // Content half: re-hash the CURRENT bytes through the same fd.
+                    let current = read_fd_to_end(&target_fd)
+                        .map_err(|e| reject(&format!("target re-read failed: {e}")))?;
+                    let now_hash = {
+                        use sha2::{Digest, Sha256};
+                        hex::encode(Sha256::digest(&current))
+                    };
+                    if now_hash != want_hash {
+                        return Err(reject("base content hash diverged since propose"));
+                    }
+                    // For a Delete, the bytes we just read ARE the pre-delete content;
+                    // the recorded hash is their hash (== want_hash). T5 will durably
+                    // capture these for undo; T4 only needs the hash, so the bytes are
+                    // dropped. `now_identity` is carried out as the step-5 re-stat anchor.
+                    let bytes = match proposal.op {
+                        WriteOp::Delete => Some(current),
+                        _ => None,
+                    };
+                    (bytes, Some(now_identity))
                 }
-                // Identity half (L12): dev/ino/size must match the propose-time stat.
-                // The `as u64` casts mirror the propose-time capture (ingest.rs), so
-                // the two sides are compared on the same widths.
-                let now_identity = crate::actuator::FileId {
-                    dev: st.st_dev as u64,
-                    ino: st.st_ino as u64,
-                    size: st.st_size as u64,
-                };
-                if now_identity != want_identity {
-                    return Err(reject(
-                        "base identity (dev,ino,size) diverged since propose (TOCTOU swap)",
-                    ));
-                }
-                // Content half: re-hash the CURRENT bytes through the same fd.
-                let current = read_fd_to_end(&target_fd)
-                    .map_err(|e| reject(&format!("target re-read failed: {e}")))?;
-                let now_hash = {
-                    use sha2::{Digest, Sha256};
-                    hex::encode(Sha256::digest(&current))
-                };
-                if now_hash != want_hash {
-                    return Err(reject("base content hash diverged since propose"));
-                }
-                // For a Delete, the bytes we just read ARE the pre-delete content; the
-                // recorded hash is their hash (== want_hash). T5 will durably capture
-                // these for undo; T4 only needs the hash, so the bytes are dropped.
-                match proposal.op {
-                    WriteOp::Delete => Some(current),
-                    _ => None,
-                }
-            }
-        };
+            };
 
         // ── Step 4: re-derive engine target-provenance (L11, defense-in-depth) ────
         // Do NOT trust verdict.provenance: re-derive from the re-canonicalized path
@@ -2448,6 +2462,12 @@ impl EventLog {
         // making the persisted stamp identical to the verdict (L11).
         let mut sources: Vec<String> = proposal.source_event_ids.clone();
         let real_str = canonical_target.to_string_lossy().to_string();
+        // DELIBERATE: both anchors read the FULL files projection (`current_files`),
+        // NOT `current_files_active`. Including tracked files whose grant was revoked
+        // is the SAFE direction here: this step can only ADD an external source, and
+        // taint is monotone (it only escalates Clean→Untrusted), so a revoked-grant
+        // tracked file still correctly taints the write. A future "optimization" to
+        // `current_files_active` would WEAKEN taint coverage — do not make it.
         let anchored = match self.current_file_for_path(&real_str)? {
             Some(rec) => Some(rec),
             // Inode fallback only applies to an existing target (Edit/Delete); a
@@ -2472,33 +2492,52 @@ impl EventLog {
         }
 
         // ── Step 5: mutate atomically (failure leaves the FS unchanged) ───────────
+        // The mutate acts BY NAME (`renameat`/`unlinkat` re-resolve `final_name`
+        // against `dir_fd`), so the step-3 fd-identity guard does not transfer here.
+        // For Edit/Delete we pass `guard_identity` so a fail-closed `(dev,ino)`
+        // re-stat runs immediately before the by-name mutate, narrowing the
+        // foreign-process guard→mutate window (it cannot be eliminated — the
+        // re-stat→mutate gap remains, like the macOS create residual; spec §9).
         match proposal.op {
             WriteOp::Create => crate::actuator::atomic_write(
                 &dir_fd,
                 &final_name,
                 &proposal.new_content,
-                true, // no_clobber: a Create must not overwrite a racing file
+                true,           // no_clobber: a Create must not overwrite a racing file
+                None,           // Create has no base identity (the no-clobber handles a racer)
             )
             .map_err(|e| reject(&format!("atomic create failed: {e}")))?,
             WriteOp::Edit => crate::actuator::atomic_write(
                 &dir_fd,
                 &final_name,
                 &proposal.new_content,
-                false, // overwrite is intended for an Edit
+                false,          // overwrite is intended for an Edit
+                guard_identity, // re-stat-before-rename: fail closed on a name swap
             )
             .map_err(|e| reject(&format!("atomic edit failed: {e}")))?,
             WriteOp::Delete => {
-                // Hard-delete, fd-relative, NO OS trash (spec L1/W5). The base guard
-                // already proved this fd is the exact file the verdict measured.
+                // Hard-delete, fd-relative, NO OS trash (spec L1/W5). The step-3 guard
+                // proved the IDENTITY OF AN OPEN FD; `unlinkat` acts BY NAME, so it is
+                // a different operation. Re-stat the name's (dev,ino) against the guard
+                // identity immediately before unlinking and fail closed on a swap —
+                // narrowing (not eliminating) the foreign-process guard→unlink window.
+                if let Some(expected) = guard_identity {
+                    crate::actuator::restat_identity_matches(&dir_fd, &final_name, expected)
+                        .map_err(|e| reject(&format!("pre-unlink re-stat: {e}")))?;
+                }
                 rustix::fs::unlinkat(&dir_fd, final_name.as_bytes(), rustix::fs::AtFlags::empty())
                     .map_err(|e| reject(&format!("unlinkat (hard-delete) failed: {e}")))?;
             }
         }
 
         // ── Step 6: append the SOLE-CONSTRUCTOR Tier-B `file_written` event ───────
-        // content shape (spec §7.2). For Delete: byte_size 0 and content_hash is the
-        // deleted file's hash (== prev_content_hash) — content_hash is non-optional in
-        // the schema, so a Delete records the bytes it removed, not an absent hash.
+        // content shape (spec §7.2).
+        //
+        // CONVENTION (Delete): `content_hash` is non-optional in the schema, so a
+        // Delete sets `content_hash == prev_content_hash` (BOTH the deleted file's
+        // hash) and `byte_size: 0`. There is no post-state content for a delete, so
+        // CONSUMERS MUST branch on `op == "delete"`: do not read `content_hash` as a
+        // "new content" hash for a delete — it is the removed file's hash.
         let (content_hash, prev_content_hash, byte_size): (String, Option<String>, u64) =
             match proposal.op {
                 WriteOp::Create => {

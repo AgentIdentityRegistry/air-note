@@ -387,6 +387,43 @@ pub(crate) fn open_dir_for_write(
 #[cfg(unix)]
 const NEW_FILE_MODE: rustix::fs::Mode = rustix::fs::Mode::from_bits_truncate(0o644);
 
+/// Fail-closed pre-mutate re-stat: `statat(dir_fd, name, SYMLINK_NOFOLLOW)` and
+/// require the result's `(st_dev, st_ino)` to equal `expected`'s (M6a T4 review).
+/// Returns `Ok(())` on match; `Err` (fail-closed) on ANY mismatch, missing file, or
+/// stat error.
+///
+/// This NARROWS — it does not eliminate — the guard→mutate window: the base guard
+/// validated an open FD, but `renameat`/`unlinkat` act BY NAME, so a foreign
+/// process could swap `name` to a different inode after the guard. Re-checking the
+/// name's identity immediately before the mutate shrinks that window to the
+/// statat→mutate gap (the same irreducible residual as the macOS create
+/// no-clobber, spec §9). `SYMLINK_NOFOLLOW` so a symlink swapped in at `name`
+/// is seen as itself (a different inode) and rejected, never followed.
+///
+/// `pub(crate)` so `execute_write`'s Delete path (which mutates via `unlinkat`
+/// directly, not through `atomic_write`) can reuse the exact same fail-closed
+/// re-stat right before the `unlinkat`.
+#[cfg(unix)]
+pub(crate) fn restat_identity_matches(
+    dir_fd: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    expected: FileId,
+) -> Result<(), crate::error::BossclawError> {
+    use std::os::unix::ffi::OsStrExt;
+    let st = rustix::fs::statat(dir_fd, name.as_bytes(), rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| {
+            crate::error::BossclawError::Io(std::io::Error::other(format!(
+                "pre-mutate re-stat failed: {e}"
+            )))
+        })?;
+    if st.st_dev as u64 != expected.dev || st.st_ino as u64 != expected.ino {
+        return Err(crate::error::BossclawError::Io(std::io::Error::other(
+            "target inode changed between guard and mutate (foreign-process swap)",
+        )));
+    }
+    Ok(())
+}
+
 /// Mint a collision-resistant temp file name in the form `.{name}.{ulid}.tmp`.
 /// The ULID (already a crate dependency — used for event ids in the append path) plus
 /// the `O_EXCL` create below makes a name clash astronomically unlikely AND
@@ -426,6 +463,14 @@ fn temp_name_for(final_name: &std::ffi::OsStr) -> std::ffi::OsString {
 ///     for the macOS create path (spec L13/§9) — it is NOT claimed atomic.
 /// - **`false` (Edit):** plain `renameat` — overwrite of `final_name` is intended.
 ///
+/// `expected_identity` (Edit only — the caller passes `None` for Create, which has
+/// no base): when `Some`, a fail-closed `(dev,ino)` re-stat of `final_name` runs
+/// IMMEDIATELY before the overwrite `renameat`, so a foreign-process swap of the
+/// name AFTER the caller's base guard is caught here. This narrows — does not
+/// eliminate — the window: the re-stat→renameat gap remains (same irreducible
+/// residual as the macOS create no-clobber). For Create, `no_clobber`'s
+/// existence check already handles a racing file, so `expected_identity` is unused.
+///
 /// `O_NOFOLLOW` on the temp create guarantees the temp name cannot resolve
 /// through a symlink an attacker pre-planted at the temp path.
 // `dead_code`-allowed: forward-seam primitive (T3) CONSUMED by `execute_write`
@@ -437,6 +482,7 @@ pub(crate) fn atomic_write(
     final_name: &std::ffi::OsStr,
     bytes: &[u8],
     no_clobber: bool,
+    expected_identity: Option<FileId>,
 ) -> Result<(), crate::error::BossclawError> {
     use rustix::fs::{AtFlags, OFlags};
     use std::os::unix::ffi::OsStrExt;
@@ -524,7 +570,16 @@ pub(crate) fn atomic_write(
             }
         }
     } else {
-        // Edit: overwrite is intended.
+        // Edit: overwrite is intended. But first, if the caller passed the base
+        // guard's identity, re-stat `final_name` by name and fail closed if its
+        // (dev,ino) changed since the guard — a foreign-process swap in the
+        // guard→here window. This narrows that window to the re-stat→renameat gap
+        // (the irreducible residual). The temp is cleaned up on a reject (`cleanup`).
+        if let Some(expected) = expected_identity {
+            if let Err(e) = restat_identity_matches(dir_fd, final_name, expected) {
+                return Err(cleanup(e));
+            }
+        }
         rustix::fs::renameat(dir_fd, tmp_name.as_bytes(), dir_fd, final_name.as_bytes()).map_err(io)
     };
 
@@ -642,7 +697,7 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let fd = open_dir_for_write(dir.path()).expect("open dir fd");
 
-            atomic_write(&fd, OsStr::new("note.txt"), b"hello world", true)
+            atomic_write(&fd, OsStr::new("note.txt"), b"hello world", true, None)
                 .expect("create write");
 
             let target = dir.path().join("note.txt");
@@ -658,7 +713,8 @@ mod tests {
 
             let fd = open_dir_for_write(dir.path()).expect("open dir fd");
             // Edit (no_clobber = false) over an existing file replaces its bytes.
-            atomic_write(&fd, OsStr::new("note.txt"), b"brand new bytes", false)
+            // `None` identity → no pre-rename re-stat (the T3 primitive behavior).
+            atomic_write(&fd, OsStr::new("note.txt"), b"brand new bytes", false, None)
                 .expect("edit write");
 
             assert_eq!(fs::read(&target).expect("read target"), b"brand new bytes");
@@ -676,7 +732,7 @@ mod tests {
             // original bytes UNCHANGED, and leave no `*.tmp` behind. This also
             // exercises the error-cleanup path (the temp is created, then the
             // finalize fails → the temp must be unlinked).
-            let err = atomic_write(&fd, OsStr::new("note.txt"), b"payload", true);
+            let err = atomic_write(&fd, OsStr::new("note.txt"), b"payload", true, None);
             assert!(err.is_err(), "create onto existing name must be refused");
 
             assert_eq!(
@@ -726,13 +782,89 @@ mod tests {
             fs::write(&outside, b"sentinel").expect("seed sentinel");
 
             let fd = open_dir_for_write(dir.path()).expect("open dir fd");
-            atomic_write(&fd, OsStr::new("inside.txt"), b"safe", true).expect("create");
+            atomic_write(&fd, OsStr::new("inside.txt"), b"safe", true, None).expect("create");
 
             assert_eq!(fs::read(dir.path().join("inside.txt")).expect("read"), b"safe");
             assert_eq!(
                 fs::read(&outside).expect("read sentinel"),
                 b"sentinel",
                 "the write must not have leaked outside the intended target name"
+            );
+        }
+
+        /// Stat a path's `(dev,ino,size)` into a [`FileId`] for the re-stat tests.
+        fn file_id(path: &Path) -> super::super::FileId {
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::symlink_metadata(path).expect("stat");
+            super::super::FileId { dev: m.dev(), ino: m.ino(), size: m.size() }
+        }
+
+        // ── Pre-mutate re-stat (T4 review): the Edit `expected_identity` guard ────
+        //
+        // Deterministic same-name / different-inode swap done IN-PROCESS between
+        // capturing the identity and the mutate (no foreign process needed): an Edit
+        // carrying the OLD identity must fail closed when the name now points at a
+        // new inode, and must NOT clobber the swapped-in file.
+        #[test]
+        fn atomic_write_edit_restat_rejects_same_name_inode_swap() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("note.txt");
+            fs::write(&target, b"original").expect("seed");
+            let old_id = file_id(&target);
+
+            // Swap: same NAME, new INODE (remove + recreate with different bytes).
+            fs::remove_file(&target).expect("rm");
+            fs::write(&target, b"swapped in by a racer").expect("recreate");
+            assert_ne!(old_id.ino, file_id(&target).ino, "the swap must change the inode");
+
+            let fd = open_dir_for_write(dir.path()).expect("open dir fd");
+            // Edit carrying the STALE identity → the pre-rename re-stat must reject.
+            let err = atomic_write(&fd, OsStr::new("note.txt"), b"payload", false, Some(old_id));
+            assert!(err.is_err(), "a same-name inode swap must fail closed on the re-stat");
+            // The swapped-in file is untouched (NOT overwritten by 'payload'), and no
+            // temp survives the rejected mutate.
+            assert_eq!(fs::read(&target).expect("read"), b"swapped in by a racer");
+            assert_eq!(tmp_count(dir.path()), 0, "the rejected edit must clean up its temp");
+        }
+
+        /// Positive control: when the name still points at the SAME inode the Edit
+        /// identity matches, so the re-stat passes and the overwrite proceeds. Proves
+        /// the rejection above is caused by the swap, not an always-on failure.
+        #[test]
+        fn atomic_write_edit_restat_passes_when_identity_unchanged() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("note.txt");
+            fs::write(&target, b"original").expect("seed");
+            let id = file_id(&target);
+
+            let fd = open_dir_for_write(dir.path()).expect("open dir fd");
+            atomic_write(&fd, OsStr::new("note.txt"), b"new bytes", false, Some(id))
+                .expect("edit with matching identity must succeed");
+            assert_eq!(fs::read(&target).expect("read"), b"new bytes");
+            assert_eq!(tmp_count(dir.path()), 0, "no *.tmp may survive a successful edit");
+        }
+
+        /// The shared `restat_identity_matches` helper (also used by the Delete path
+        /// in `execute_write`): match → Ok, mismatch → Err. Asserts the primitive the
+        /// Delete site relies on, since the Delete swap is otherwise foreign-process.
+        #[test]
+        fn restat_identity_matches_detects_swap() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let target = dir.path().join("f.txt");
+            fs::write(&target, b"a").expect("seed");
+            let id = file_id(&target);
+            let fd = open_dir_for_write(dir.path()).expect("open dir fd");
+
+            // Same inode → Ok.
+            super::super::restat_identity_matches(&fd, OsStr::new("f.txt"), id)
+                .expect("matching identity is Ok");
+
+            // Swap the inode under the same name → Err.
+            fs::remove_file(&target).expect("rm");
+            fs::write(&target, b"b").expect("recreate");
+            assert!(
+                super::super::restat_identity_matches(&fd, OsStr::new("f.txt"), id).is_err(),
+                "a changed inode under the same name must be rejected"
             );
         }
     }
