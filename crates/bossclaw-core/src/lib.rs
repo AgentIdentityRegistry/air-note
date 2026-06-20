@@ -44,7 +44,7 @@ pub use event::{Event, ModelMeta};
 pub use evolve::{EvolveReport, EvolveStatus};
 #[cfg(feature = "fastembed")]
 pub use fastembed::FastEmbed;
-pub use graph::{AsOf, Edge, Entity, Node, Page};
+pub use graph::{AsOf, Edge, Entity, Grant, Node, Page, WriteGrant};
 pub use index::{HnswIndex, VectorIndex};
 pub use log::{ActiveModel, EventLog, ReembedStats, SCHEMA_VERSION};
 pub use model2vec::Model2Vec;

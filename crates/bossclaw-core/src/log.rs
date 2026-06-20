@@ -248,6 +248,16 @@ impl EventLog {
                 revoked        INTEGER NOT NULL DEFAULT 0
             )",
         )?;
+        // Folder WRITE-grant projection (Tier-A; M6a). Structurally SEPARATE from
+        // `grants` (read) so a read grant can never authorize a write. A deterministic
+        // fold over `write_grant`/`write_revoke` events, rebuilt by `rebuild_graph`.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS write_grants (
+                canonical_root TEXT PRIMARY KEY,
+                granted_at     TEXT NOT NULL,
+                revoked        INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
         // Ingested-file projection (Tier-A; M5a). At most one CURRENT file_ingested per
         // canonical_path; a deterministic fold over file_ingested/supersede events,
         // rebuilt by `rebuild_graph`. `content_hash` is the dedup key; `grant_root` lets
@@ -1863,6 +1873,102 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Grant WRITE-access to a folder (M6a). Canonicalizes `path`, appends a
+    /// ground-truth `write_grant` event, and refreshes the write-grants projection.
+    /// Returns the event id. Canonicalization fails closed if the path does not exist.
+    /// Independent of [`add_grant`](Self::add_grant): a write grant is a distinct
+    /// event type and projection, so granting write never grants read (or vice-versa).
+    pub fn add_write_grant(&self, path: &std::path::Path) -> Result<String, BossclawError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| BossclawError::InvalidInput(format!("write-grant path not resolvable: {e}")))?;
+        let root = canonical.to_string_lossy().to_string();
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::WRITE_GRANT_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Revoke a previously-WRITE-granted folder (M6a). Canonicalizes `path`, appends a
+    /// ground-truth `write_revoke` event, and refreshes the write-grants projection.
+    /// Returns the event id. Mirrors [`revoke_grant`](Self::revoke_grant) on the write side.
+    pub fn revoke_write_grant(&self, path: &std::path::Path) -> Result<String, BossclawError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| BossclawError::InvalidInput(format!("write-revoke path not resolvable: {e}")))?;
+        let root = canonical.to_string_lossy().to_string();
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::WRITE_REVOKE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "canonical_root": root }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Every write-grant (active and revoked), `ORDER BY canonical_root ASC`. Tier-A
+    /// read. The write-side sibling of [`grants`](Self::grants); reads a separate table.
+    pub fn write_grants(&self) -> Result<Vec<crate::graph::WriteGrant>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT canonical_root, granted_at, revoked FROM write_grants ORDER BY canonical_root ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::WriteGrant {
+            canonical_root: r.get(0)?, granted_at: r.get(1)?, revoked: r.get::<_, i64>(2)? != 0,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    /// Is `path` authorized for WRITING under some ACTIVE write-grant? (M6a, T1).
+    ///
+    /// Canonicalizes the candidate's REAL path and requires **path-segment descent**
+    /// from an active (`!revoked`) `write_grant` root: the canonical target must EQUAL
+    /// a root or be a descendant of it **by whole path components** (via segment-aware
+    /// [`Path::starts_with`]), so `/a/bc` is NOT under `/a/b`. For a not-yet-existing
+    /// target (a Create), `std::fs::canonicalize` would error — so the PARENT directory
+    /// is canonicalized instead and tested for membership.
+    ///
+    /// **Advisory only.** This is a string-segment check on a canonical path; it is
+    /// WEAKER than the read side's fd-walk, which defends against an intermediate
+    /// symlink being swapped between the check and the open (a TOCTOU race). The real
+    /// write boundary is the execute-time fd-relative open built in a later M6a task;
+    /// this predicate is a fast pre-filter, not the enforcement point.
+    pub fn is_write_allowed(&self, path: &std::path::Path) -> Result<bool, BossclawError> {
+        // Canonicalize the target's real path; if it does not exist yet (Create),
+        // canonicalize the parent and test the parent for membership instead.
+        let canonical = match std::fs::canonicalize(path) {
+            Ok(c) => c,
+            Err(_) => {
+                let parent = path.parent().ok_or_else(|| {
+                    BossclawError::InvalidInput("write target has no parent to resolve".into())
+                })?;
+                std::fs::canonicalize(parent).map_err(|e| {
+                    BossclawError::InvalidInput(format!("write target parent not resolvable: {e}"))
+                })?
+            }
+        };
+        // Membership: descendant-by-path-components of any ACTIVE write-grant root.
+        // `Path::starts_with` is segment-aware (it compares whole components), so a
+        // mere string-prefix sibling like `/a/b-evil` does not match root `/a/b`.
+        for g in self.write_grants()? {
+            if g.revoked {
+                continue;
+            }
+            if canonical.starts_with(std::path::Path::new(&g.canonical_root)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Every CURRENT file (one per path), `ORDER BY canonical_path ASC`. Tier-A read.
     pub fn current_files(&self) -> Result<Vec<crate::graph::FileRecord>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
@@ -2040,6 +2146,12 @@ impl EventLog {
         let grant_events = self.grant_events_ordered()?;
         let grants = crate::graph::fold_grants(&grant_events);
 
+        // Fold write_grant/write_revoke events → current write-grants projection (M6a).
+        // SEPARATE event stream + fold from the read grants above: a `grant`/`revoke`
+        // event cannot reach this projection (the query filters on the write types).
+        let write_grant_events = self.write_grant_events_ordered()?;
+        let write_grants = crate::graph::fold_write_grants(&write_grant_events);
+
         // Fold file_ingested/supersede events → current file per path (M5a).
         let file_events = self.file_and_supersede_events_ordered()?;
         let files = crate::graph::fold_files(&file_events);
@@ -2073,6 +2185,7 @@ impl EventLog {
         tx.execute("DELETE FROM entities", [])?;
         tx.execute("DELETE FROM pages", [])?;
         tx.execute("DELETE FROM grants", [])?;
+        tx.execute("DELETE FROM write_grants", [])?;
         tx.execute("DELETE FROM files", [])?;
         for e in &edges {
             tx.execute(
@@ -2116,6 +2229,12 @@ impl EventLog {
         for g in &grants {
             tx.execute(
                 "INSERT INTO grants (canonical_root, granted_at, revoked) VALUES (?1, ?2, ?3)",
+                rusqlite::params![g.canonical_root, g.granted_at, g.revoked as i64],
+            )?;
+        }
+        for g in &write_grants {
+            tx.execute(
+                "INSERT INTO write_grants (canonical_root, granted_at, revoked) VALUES (?1, ?2, ?3)",
                 rusqlite::params![g.canonical_root, g.granted_at, g.revoked as i64],
             )?;
         }
@@ -2189,6 +2308,23 @@ impl EventLog {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events WHERE event_type IN ('grant', 'revoke') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// All `write_grant`/`write_revoke` events, payload-parsed, in chain (`seq ASC`)
+    /// order. The WRITE-side sibling of [`grant_events_ordered`]: it selects ONLY the
+    /// write event types, so a read `grant`/`revoke` can never feed the write fold.
+    fn write_grant_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('write_grant', 'write_revoke') ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
