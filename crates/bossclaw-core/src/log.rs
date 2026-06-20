@@ -3490,8 +3490,14 @@ impl EventLog {
                 }
             };
             for edge in edges {
+                // extraction-from-files I2: sanitize file-derived endpoint names and
+                // relation so a control-char/overlong label can't escape the line.
+                // No-op for well-formed names (no control chars, < 200 bytes).
+                let src_name = crate::summarize::sanitize_ident(&render(&edge.src));
+                let rel = crate::summarize::sanitize_ident(&edge.relation);
+                let dst_name = crate::summarize::sanitize_ident(&render(&edge.dst));
                 seen.insert(
-                    format!("{} -{}-> {}", render(&edge.src), edge.relation, render(&edge.dst)),
+                    format!("{src_name} -{rel}-> {dst_name}"),
                     (),
                 );
             }

@@ -132,7 +132,7 @@ pub fn compose_schema() -> serde_json::Value {
 /// instruction tier of the compose prompt — prevents a multi-line label from
 /// escaping the identity slot and injecting instructions above the fenced
 /// sources.
-fn sanitize_ident(s: &str) -> String {
+pub(crate) fn sanitize_ident(s: &str) -> String {
     let cleaned: String = s.chars().filter(|c| !c.is_ascii_control()).collect();
     if cleaned.len() <= MAX_PROMPT_IDENT_LEN {
         cleaned

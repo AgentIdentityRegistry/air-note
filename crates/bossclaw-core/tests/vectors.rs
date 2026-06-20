@@ -1,4 +1,4 @@
-use bossclaw_core::event::{canonical_bytes, compute_hash, Event};
+use bossclaw_core::event::{canonical_bytes, compute_hash, Event, ModelMeta};
 use bossclaw_core::sign::{sign_hash, verify_hash};
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
@@ -106,4 +106,72 @@ fn file_ingested_canonicalization_is_frozen() {
     // FREEZE: run once; copy the printed hex into `expected`; re-run → PASS.
     let expected = "3754a3d258b562b999f4e4df214c89db39d5027b4c6c902096193a617b0b83e0";
     assert_eq!(got, expected, "file_ingested canonicalization changed (got {got}); update only if intentional");
+}
+
+// FREEZE: a tainted `link` event — verifies that "origin": "external" is INSIDE
+// the canonicalized signed bytes for the link path.
+// Run once with a dummy expected to print the actual hex, paste it, re-run → PASS.
+#[test]
+fn tainted_link_canonicalization_is_frozen() {
+    let ev = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_string(),
+        ts: "2026-06-18T00:00:00+00:00".to_string(),
+        valid_time: None,
+        event_type: "link".to_string(),
+        content: serde_json::json!({
+            "src": "entity:01AAA",
+            "relation": "knows",
+            "dst": "entity:01BBB",
+            "confidence_milli": 900,
+            "origin": "external",
+        }),
+        model_meta: Some(ModelMeta {
+            model_id: "scripted".to_string(),
+            prompt_hash: String::new(),
+            source_event_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()],
+        }),
+        prev_hash: "0".repeat(64),
+        hash: None,
+        signed_by_did: "did:wba:bossclaw-engine".to_string(),
+        signature: None,
+    };
+    let canon = canonical_bytes(&ev).unwrap();
+    let got = hex::encode(Sha256::digest(&canon));
+    // FREEZE: run once; copy the printed hex into `expected`; re-run → PASS.
+    let expected = "c7c32f2c007464c84cd1afd3d20138d9fb5bd599c6bbb773b3783ea24076cfe7";
+    assert_eq!(got, expected, "tainted link canonicalization changed (got {got}); update only if intentional");
+}
+
+// FREEZE: a tainted `page` (dossier) event — verifies that "origin": "external"
+// is INSIDE the canonicalized signed bytes for the page/dossier path.
+#[test]
+fn tainted_page_canonicalization_is_frozen() {
+    let ev = Event {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FC0".to_string(),
+        ts: "2026-06-18T00:00:00+00:00".to_string(),
+        valid_time: None,
+        event_type: "page".to_string(),
+        content: serde_json::json!({
+            "topic_id": "entity:01AAA",
+            "title": "Acme",
+            "text": "Acme shipped widget X.",
+            "claims": [{ "text": "Acme shipped widget X.", "cites": ["01ARZ3NDEKTSV4RRFFQ69G5FAV"] }],
+            "tags": [],
+            "origin": "external",
+        }),
+        model_meta: Some(ModelMeta {
+            model_id: "scripted".to_string(),
+            prompt_hash: String::new(),
+            source_event_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()],
+        }),
+        prev_hash: "0".repeat(64),
+        hash: None,
+        signed_by_did: "did:wba:bossclaw-engine".to_string(),
+        signature: None,
+    };
+    let canon = canonical_bytes(&ev).unwrap();
+    let got = hex::encode(Sha256::digest(&canon));
+    // FREEZE: run once; copy the printed hex into `expected`; re-run → PASS.
+    let expected = "09ce409a1d0f82d97356ffb43cb3b6fda8f2985283eb4c3b5ce071ccad26e816";
+    assert_eq!(got, expected, "tainted page canonicalization changed (got {got}); update only if intentional");
 }
