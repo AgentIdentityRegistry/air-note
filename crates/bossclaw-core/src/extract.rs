@@ -64,6 +64,16 @@ pub const MAX_ENTITIES_PER_MEMORY: usize = 32;
 /// tick latency so one tick can never starve the writer. Tunable in dogfooding.
 pub const EVOLVE_BATCH: usize = 16;
 
+/// Maximum reconciliation `write_proposal`s emitted per evolve tick (M6b §5.2).
+/// Bounds the autonomous file-write proposal volume one tick can generate: a
+/// single tick that confirms many file-backed contradictions cannot flood the
+/// human worklist with corrected-rewrite proposals. Overflow is COUNTED
+/// (`EvolveReport::proposals_elided_cap`) and skipped — never rejected — so each
+/// elided `(path, inducing_key)` stays retryable on a later tick (a `write_rejected`
+/// would PERMANENTLY suppress it, T6). Sized alongside [`EVOLVE_BATCH`] / the M6a
+/// undo depth; tunable in dogfooding.
+pub const MAX_PROPOSALS_PER_TICK: usize = 8;
+
 /// Maximum topics (re)summarized per evolve tick (spec §11 / M4b). Bounds tick
 /// latency for the summarize phase; overflow stays past `summarize_cursor` for a
 /// later tick (M4b F1). Single-sourced here alongside [`EVOLVE_BATCH`] so the

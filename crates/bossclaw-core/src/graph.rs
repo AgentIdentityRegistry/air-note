@@ -77,6 +77,19 @@ pub const FILE_WRITTEN_EVENT_TYPE: &str = "file_written";
 /// and any test/assertion reference the same producer string.
 pub const ACTUATOR_PRODUCER: &str = "m6a-actuator";
 
+/// M6b reconciliation proposer event type (Tier-B, signed, taint-stamped): the
+/// proposed write awaiting human confirmation. Single-sourced so the builder stamp
+/// site and every fold/projection filter reference the same string.
+pub const WRITE_PROPOSAL_EVENT_TYPE: &str = "write_proposal";
+/// M6b terminal audit marker (Tier-B, signed): emitted INSTEAD of a proposal when
+/// synthesis or the gate fails. Never resolves a proposal. Single-sourced.
+pub const WRITE_REJECTED_EVENT_TYPE: &str = "write_rejected";
+/// M6b human-decline event (Tier-B, signed): RESOLVES a prior `write_proposal`.
+/// Single-sourced so the builder and any resolution scan reference the same string.
+pub const WRITE_DECLINED_EVENT_TYPE: &str = "write_declined";
+/// Producer stamped on M6b-authored events (distinct from ACTUATOR_PRODUCER "m6a-actuator").
+pub const M6B_PROPOSER_PRODUCER: &str = "m6b-reconciler";
+
 /// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
 /// links reference this exact form, so it is single-sourced.
 pub const ENTITY_NODE_PREFIX: &str = "entity:";

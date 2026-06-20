@@ -35,6 +35,7 @@ pub mod model2vec;
 pub mod ollama;
 pub mod reason;
 pub mod recall;
+pub mod reconcile;
 pub mod sign;
 pub mod summarize;
 pub mod store;

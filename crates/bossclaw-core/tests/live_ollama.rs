@@ -656,3 +656,107 @@ fn live_extraction_from_file_is_external() {
     assert_ne!(meta.model_id, "manual", "a file-derived link is machine-origin, never manual");
     log.verify_chain().unwrap();
 }
+
+// ── Property 7 (M6b headline): a file-backed contradiction → the loop autonomously
+//    proposes an edit to the contradicted FILE ─────────────────────────────────────
+
+/// Like [`ingest_file`], but ALSO write-grants the folder so the ingested file is a
+/// valid RECONCILIATION target (the M6b proposer only proposes against a path under an
+/// active WRITE grant — `is_reconcilable_target` + the M6a gate require it). Returns
+/// the file's `(file_ingested event id, canonical path)`, read from the public
+/// `current_files()` projection — what the trigger-path assertions key on.
+fn ingest_writable_file(
+    log: &EventLog,
+    embedder: &MockEmbedder,
+    dir: &std::path::Path,
+    name: &str,
+    text: &[u8],
+) -> (String, String) {
+    let folder = dir.join("w");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join(name);
+    std::fs::write(&path, text).unwrap();
+    log.add_grant(&folder).unwrap(); // READ: so ingest discovers the file
+    log.add_write_grant(&folder).unwrap(); // WRITE: so it is a reconciliation target
+    log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), embedder)
+        .unwrap();
+    log.rederive_pending(embedder).unwrap();
+    log.rebuild_indexes(embedder).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(embedder).unwrap();
+
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let file_event_id = log
+        .current_files()
+        .unwrap()
+        .into_iter()
+        .find(|rec| rec.canonical_path == canonical)
+        .map(|rec| rec.file_event_id)
+        .expect("the ingested file is current");
+    (file_event_id, canonical)
+}
+
+/// THE M6b reconciliation proposer, proven LIVE. A real `.md` asserts "Alice works at
+/// Acme."; it is granted (read+write) + ingested, then evolved by the real
+/// `qwen2.5:7b-instruct` so the `works_at` edge is established. A correcting memory
+/// ("Alice now works at Globex, not Acme.") is then evolved: the live model must
+/// (a) extract the retraction, (b) let the loop confirm the contradiction, and
+/// (c) synthesize a corrected rewrite of the FILE — emitting a `write_proposal`.
+///
+/// ORACLE SCOPE (deliberately narrow): the live model is the oracle for *whether the
+/// reconciliation loop FIRES*, NOT for the rewrite's prose. A 7b produces
+/// plausible-but-varying corrected text, so asserting the exact `corrected_content`
+/// would be flaky. We therefore assert ONLY the trigger path: `proposals_emitted >= 1`
+/// and a `write_proposal` whose `target` is the ingested file's canonical path and
+/// whose lineage carries that file's `file_ingested` id. The byte-exact confirm/undo
+/// round-trip is covered hermetically in `tests/reconcile.rs`.
+#[test]
+#[ignore = "requires a running Ollama with qwen2.5:7b-instruct"]
+fn live_reconciliation_proposes_edit_to_the_contradicted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    let reasoner = OllamaReasoner::new(MODEL);
+
+    // ── Tick 1: the FILE establishes "Alice works_at Acme"; evolve folds the edge,
+    //    carrying the file's still-current file_ingested id into its lineage. ──
+    let (file_id, canonical) =
+        ingest_writable_file(&log, &embedder, dir.path(), "notes.md", b"Alice works at Acme.\n");
+    log.evolve_once(&embedder, &reasoner).unwrap();
+    log.rebuild_graph().unwrap();
+
+    // ── Tick 2: a correcting memory retires the employer → confirmed contradiction,
+    //    then the reconciliation walk synthesizes a corrected rewrite of the file. ──
+    let report = ingest_and_evolve(
+        &log,
+        &embedder,
+        &reasoner,
+        "Correction: Alice now works at Globex, not Acme.",
+    );
+
+    // Trigger path ONLY (the live model is the oracle for the LOOP, not the prose).
+    assert!(
+        report.proposals_emitted >= 1,
+        "the live model must autonomously propose ≥1 reconciliation edit (live report: {report:?})"
+    );
+    let proposal = log
+        .stream_all()
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            e.event_type == bossclaw_core::graph::WRITE_PROPOSAL_EVENT_TYPE
+                && e.content.get("target").and_then(|t| t.as_str()) == Some(canonical.as_str())
+        })
+        .expect("a write_proposal targeting the contradicted file");
+    let lineage = proposal
+        .model_meta
+        .as_ref()
+        .expect("the proposal is Tier-B (carries lineage)")
+        .source_event_ids
+        .clone();
+    assert!(
+        lineage.contains(&file_id),
+        "the proposal's lineage carries the contradicted file's file_ingested id"
+    );
+    log.verify_chain().unwrap();
+}
