@@ -294,3 +294,24 @@ fn pending_projection_open_close_and_suppress() {
     common::append_rejected(&log, &canonical, &key, "stale_target");
     assert!(log.is_proposal_suppressed(&canonical, &key).unwrap(), "a write_rejected suppresses re-attempts");
 }
+
+/// Suppression is SCOPED: an OPEN proposal (or a write_rejected) for one (path,key)
+/// must NOT suppress a DIFFERENT key or a different path — else valid proposals are
+/// silently dropped.
+#[test]
+fn proposal_suppression_is_scoped_to_path_and_key() {
+    let (log, _home, dir) = common::open_write_grant_and_external_target();
+    let path = dir.join("n.md");
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let key_a = serde_json::json!({"src":"entity:a","relation":"rel","dst":"entity:b"});
+    let key_b = serde_json::json!({"src":"entity:a","relation":"rel","dst":"entity:c"}); // different dst
+
+    common::append_minimal_proposal(&log, &canonical, &key_a);
+    assert!(log.is_proposal_suppressed(&canonical, &key_a).unwrap(), "same key suppressed");
+    assert!(!log.is_proposal_suppressed(&canonical, &key_b).unwrap(), "DIFFERENT key not suppressed");
+    assert!(!log.is_proposal_suppressed("/some/other/path.md", &key_a).unwrap(), "DIFFERENT path not suppressed");
+
+    // a write_rejected for key_a must likewise not suppress key_b
+    common::append_rejected(&log, &canonical, &key_a, "unrenderable_target");
+    assert!(!log.is_proposal_suppressed(&canonical, &key_b).unwrap(), "rejected key_a does not suppress key_b");
+}

@@ -2011,6 +2011,11 @@ impl EventLog {
                     }
                 }
                 t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
+                    // By design TERMINAL for this resolved (path,key): a write_rejected
+                    // permanently suppresses re-attempts (never resolved, never re-opened).
+                    // So T7 MUST emit write_rejected ONLY for genuine synthesis/gate
+                    // failures — never for cap-elision or off-switch deferrals, which must
+                    // stay retryable on a later tick.
                     if ev.content.get("target").and_then(|v| v.as_str()) == Some(canonical_path)
                         && ev.content.get("inducing_key") == Some(inducing_key)
                     {
