@@ -423,3 +423,40 @@ fn dossier_stays_external_even_when_model_cites_around_the_file() {
     assert!(bossclaw_core::is_external(&page),
         "D8: page is external because the gather lineage has the file, even though the model cited only the clean memory");
 }
+
+// ── Task 7 test — off-switch gates Door A ────────────────────────────────────
+
+// §6.8 off-switch: the DISABLED evolve loop gates a FILE subject too. With evolve
+// turned off (via the typed setter — the loop ships default-OPEN, per
+// `evolve_enabled`'s "flag never set → default open", so we must explicitly
+// disable it, exactly as `tests/evolve.rs` does), `evolve_once` short-circuits
+// BEFORE any model call — so the no-op reasoner is never invoked — and the file
+// stays queued (queue_depth ≥ 1), untouched. This is Door A's kill-switch leg: the
+// same gate that protects memory subjects protects file subjects.
+#[test]
+fn off_switch_gates_file_subjects() {
+    let dir = tempfile::tempdir().unwrap();
+    let emb = MockEmbedder::new(16);
+    let log = EventLog::open_with_recall(
+        &dir.path().join("m.db"),
+        &DEK,
+        SigningKey::from_bytes(&KEY_BYTES),
+        &emb,
+    )
+    .unwrap();
+    ingest_file(&log, &emb, dir.path(), "f.md", b"Alice knows Bob.");
+    // Hard off-switch via the typed setter (the ONLY writer of evolve_enabled).
+    // The loop is default-open, so an explicit disable is what exercises the gate.
+    log.set_evolve_enabled(false).unwrap();
+    // A no-op reasoner: it must never be called because the off-switch short-circuits first.
+    let reasoner = scripted_both_passes("scripted", "unused", &[], &[], empty_pass_a());
+    let report = log.evolve_once(&emb, &reasoner).unwrap();
+    assert!(
+        report.skipped_disabled,
+        "off-switch short-circuits before any model call"
+    );
+    assert!(
+        log.evolve_status().unwrap().queue_depth >= 1,
+        "the file remains queued, untouched"
+    );
+}
