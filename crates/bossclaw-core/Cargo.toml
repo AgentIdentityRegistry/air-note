@@ -29,6 +29,22 @@ hnsw_rs = "0.3.4"
 # openat/openat2/statat/readdir; `process` is not needed in M5a.
 rustix = { version = "0.38", features = ["fs"] }
 
+# M6c Task 10: the live filesystem watcher's backend. unix-only — the watcher
+# module (`watch.rs`) and everything that touches `notify` are `#[cfg(unix)]`-gated,
+# so a non-unix target never even resolves this dependency. PINNED EXACT (`=8.2.0`,
+# the current max-stable on crates.io as of 2026-06; 9.0.0 is RC-only) so a passive
+# `cargo update` cannot pull a new minor that changes the watcher backend behavior
+# under us. The `notify`-internal `unsafe` (FSEvents/inotify FFI) lives in the
+# `notify` crate, NOT in bossclaw-core, so this crate keeps `#![forbid(unsafe_code)]`.
+# Default features are kept DELIBERATELY MINIMAL: `notify`'s default is exactly
+# `macos_fsevent` (the macOS FSEvents backend we need); we add NO `serde`,
+# `macos_kqueue`, or `serialization-compat-6`. On Linux the inotify backend rides in
+# automatically via a platform-conditional dependency. NOTE FOR THE REVIEWER:
+# `cargo audit` should run pre-merge (this is the first new dependency in several
+# milestones).
+[target.'cfg(unix)'.dependencies]
+notify = "=8.2.0"
+
 [features]
 fastembed = ["dep:fastembed"]
 # The `ollama` feature adds `OllamaReasoner` (loopback HTTP POST to a local

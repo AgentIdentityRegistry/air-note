@@ -40,6 +40,11 @@ pub mod reconcile;
 pub mod sign;
 pub mod summarize;
 pub mod store;
+/// M6c Task 10: the live filesystem watcher + debounced self-driver. unix-only —
+/// it depends on the `notify` crate, which is itself `cfg(unix)`-gated in
+/// `Cargo.toml`, so a non-unix target never pulls it.
+#[cfg(unix)]
+pub mod watch;
 
 pub use actuator::{
     classify_op_existence, diff_guard, DiffFlags, FileId, GatedProposal, OpExistence, Provenance,
@@ -56,6 +61,8 @@ pub use index::{HnswIndex, VectorIndex};
 pub use log::{ActiveModel, EventLog, ReembedStats, SynthCacheRow, SCHEMA_VERSION};
 #[cfg(unix)]
 pub use log::MandateAction;
+#[cfg(unix)]
+pub use watch::MandateWatcher;
 pub use model2vec::Model2Vec;
 #[cfg(feature = "ollama")]
 pub use ollama::OllamaReasoner;
