@@ -2179,6 +2179,84 @@ impl EventLog {
         Ok(open_ids.iter().any(|id| !resolved.contains(id)))
     }
 
+    /// M6c mandate idempotency (spec §5.4) — decline-STICKY suppression keyed on the
+    /// source-state `inducing_key` (`{mandate, target, sources_hash}`). A SMALL DELTA on
+    /// [`Self::is_proposal_suppressed`]: it shares every rule EXCEPT one. For
+    /// `(canonical_path, inducing_key)` it returns `true` when ANY of:
+    /// - a `write_rejected` matches it — TERMINAL suppress (genuine failure), SAME as M6b;
+    /// - an OPEN `write_proposal` matches it (no resolver yet) — don't double-ask, SAME as M6b;
+    /// - a matching `write_proposal` was resolved by a **`write_declined`** — THE NEW RULE:
+    ///   a declined sync is sticky for that source-state, so the engine won't re-nag every
+    ///   tick while the file is still out of sync (M6b's predicate would re-fire here).
+    ///
+    /// A matching `write_proposal` resolved ONLY by a `file_written` (the human accepted)
+    /// does NOT suppress — a later legitimate drift re-syncs via convergence/compare-vs-disk
+    /// (Task 9). Cap-elision and the off-switch emit no event, so they stay retryable.
+    /// Because suppression is keyed on `sources_hash`, a NEW source-state is a fresh key and
+    /// is never suppressed by a prior state's decline.
+    ///
+    /// `is_proposal_suppressed` (M6b) is intentionally left UNCHANGED — only the
+    /// declined-also-suppresses rule differs, captured here by tracking decline-resolvers
+    /// separately from accept-resolvers (`file_written`).
+    ///
+    /// O(n) fold over the (low-volume) actuator events — same posture as the M6b predicate.
+    #[cfg(unix)]
+    pub fn is_mandate_proposal_suppressed(
+        &self,
+        canonical_path: &str,
+        inducing_key: &serde_json::Value,
+    ) -> Result<bool, BossclawError> {
+        // Proposals matching (path, key); the set of ids resolved by a DECLINE (the only
+        // resolver that suppresses under M6c). A `file_written` resolver is deliberately NOT
+        // collected, so an accepted-then-resolved proposal is treated as closed-and-retryable.
+        let mut matching_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut declined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ev in self.events_of_types(&[
+            crate::graph::WRITE_PROPOSAL_EVENT_TYPE,
+            crate::graph::WRITE_REJECTED_EVENT_TYPE,
+            crate::graph::WRITE_DECLINED_EVENT_TYPE,
+            crate::graph::FILE_WRITTEN_EVENT_TYPE,
+        ])? {
+            match ev.event_type.as_str() {
+                t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    if ev.content.get("target").and_then(|v| v.as_str()) == Some(canonical_path)
+                        && ev.content.get("inducing_key") == Some(inducing_key)
+                    {
+                        matching_ids.insert(ev.id.clone());
+                    }
+                }
+                t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
+                    // TERMINAL for this (path,key): a genuine synthesis/gate failure
+                    // permanently suppresses — SAME as M6b.
+                    if ev.content.get("target").and_then(|v| v.as_str()) == Some(canonical_path)
+                        && ev.content.get("inducing_key") == Some(inducing_key)
+                    {
+                        return Ok(true);
+                    }
+                }
+                t if t == crate::graph::WRITE_DECLINED_EVENT_TYPE => {
+                    if let Some(rid) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        declined.insert(rid.to_string());
+                        resolved.insert(rid.to_string());
+                    }
+                }
+                // file_written: closes the proposal (no longer OPEN) but does NOT suppress —
+                // the human accepted, so a later drift may legitimately re-sync.
+                _ => {
+                    if let Some(rid) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        resolved.insert(rid.to_string());
+                    }
+                }
+            }
+        }
+        // Suppress a matching proposal that is either still OPEN (no resolver) OR was closed
+        // by a decline. A proposal closed ONLY by a file_written is neither and does not suppress.
+        Ok(matching_ids
+            .iter()
+            .any(|id| !resolved.contains(id) || declined.contains(id)))
+    }
+
     /// Store the proposed corrected bytes for a `write_proposal`, keyed by its event id.
     /// The bytes live in the SQLCipher `Store` (encrypted at rest) because they are model
     /// output over untrusted input — NOT in the signed event, which records only

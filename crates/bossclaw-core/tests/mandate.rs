@@ -231,3 +231,33 @@ fn cache_write_evicts_prior_states_and_revoke_purges() {
     log.revoke_mandate("M1").ok(); // purges all M1 rows
     assert!(log.get_synthesis_cache("M1", "new").unwrap().is_none());
 }
+
+// TASK 8 — decline-stickiness (spec §5.4): a sync mandate's "stale file" condition
+// PERSISTS after a decline (the file is still out of sync), so M6b's predicate — which
+// lets a declined proposal re-fire — would re-nag every tick. M6c keys suppression on the
+// SOURCE-STATE (`inducing_key` = {mandate, target, sources_hash}) and treats a decline as
+// sticky FOR THAT source-state. A NEW source-state (different `sources_hash`) is a fresh
+// ask. This is the ONLY behavioural delta from `is_proposal_suppressed`; M6b stays green.
+#[test]
+fn declined_sync_is_sticky_for_that_source_state() {
+    let (log, _tmp) = setup();
+    let key = json!({"mandate":"M1","target":"out/i.md","sources_hash":"S1"});
+    assert!(!log.is_mandate_proposal_suppressed("out/i.md", &key).unwrap()); // fresh: not suppressed
+    let pid = log
+        .append_write_proposal_with(
+            "out/i.md",
+            "edit",
+            "h",
+            1,
+            "r",
+            &key,
+            &json!({}),
+            &["M1".into()],
+            bossclaw_core::graph::M6C_PROPOSER_PRODUCER,
+        )
+        .unwrap();
+    log.decline_write_proposal(&pid, "not now").unwrap();
+    assert!(log.is_mandate_proposal_suppressed("out/i.md", &key).unwrap()); // declined → STICKY (no re-nag)
+    let key2 = json!({"mandate":"M1","target":"out/i.md","sources_hash":"S2"});
+    assert!(!log.is_mandate_proposal_suppressed("out/i.md", &key2).unwrap()); // a new source-state is a fresh ask
+}
