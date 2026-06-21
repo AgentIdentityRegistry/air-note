@@ -90,6 +90,19 @@ pub const WRITE_DECLINED_EVENT_TYPE: &str = "write_declined";
 /// Producer stamped on M6b-authored events (distinct from ACTUATOR_PRODUCER "m6a-actuator").
 pub const M6B_PROPOSER_PRODUCER: &str = "m6b-reconciler";
 
+/// Event type for a granted mandate (a signed standing sync goal). Ground-truth.
+pub const MANDATE_GRANT_EVENT_TYPE: &str = "mandate_grant";
+/// Event type that revokes a mandate by its grant event id. Sticky.
+pub const MANDATE_REVOKE_EVENT_TYPE: &str = "mandate_revoke";
+/// `model_meta.model_id` producer stamp for M6c mandate proposals.
+pub const M6C_PROPOSER_PRODUCER: &str = "m6c-mandate-proposer";
+/// Max bytes of a mandate `recipe` (rejected at grant if exceeded).
+pub const MAX_RECIPE_LEN: usize = 2048;
+/// Max `write_proposal`s a single mandate may emit per evolve tick.
+pub const MAX_PROPOSALS_PER_MANDATE_PER_TICK: usize = 1;
+/// Max in-scope source files a mandate will gather per tick (directory-bomb guard).
+pub const MAX_SOURCES_PER_MANDATE: usize = 256;
+
 /// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
 /// links reference this exact form, so it is single-sourced.
 pub const ENTITY_NODE_PREFIX: &str = "entity:";
@@ -467,6 +480,24 @@ pub fn fold_write_grants(events: &[Event]) -> Vec<WriteGrant> {
         }
     }
     by_root.into_values().collect()
+}
+
+/// A signed, bounded standing goal: keep `target` == `recipe(sources under source_scope)`.
+/// Identity is the `mandate_grant` event id. Mirrors `Grant`/`WriteGrant`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mandate {
+    /// The `mandate_grant` event id (the mandate's identity).
+    pub mandate_grant_id: String,
+    /// Canonical path of the brain-owned target file (whole-file owned).
+    pub target: String,
+    /// Canonical single-subtree prefix the sources live under (excludes `target`).
+    pub source_scope: String,
+    /// User-authored plain-English derivation rule (trusted, sanitized into the frame).
+    pub recipe: String,
+    /// RFC-3339 grant timestamp.
+    pub granted_at: String,
+    /// True once revoked (sticky).
+    pub revoked: bool,
 }
 
 /// A folded ingested-file record (M5a): the CURRENT (un-superseded) `file_ingested`
