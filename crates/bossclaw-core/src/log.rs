@@ -177,6 +177,24 @@ pub struct EventLog {
     rename_lock: Mutex<()>,
 }
 
+/// Canonicalize a write target that may not exist yet (a Create): canonicalize the
+/// PARENT directory (resolving `..`/symlinks ABOVE the target) and re-join the final
+/// component verbatim, so the not-yet-created leaf is preserved and a symlinked final
+/// component is NOT followed (its identity is checked separately, NOFOLLOW, at write
+/// time). Returns `None` if the target has no parent or the parent does not resolve
+/// (e.g. a missing intermediate dir). Single-sourced so `propose_write`'s Step-2 Create
+/// arm and `add_mandate`'s grant-time canonicalization agree byte-for-byte. NOT
+/// `#[cfg(unix)]`: `add_mandate` is portable and calls this on every platform.
+fn canonicalize_target_or_parent(target: &std::path::Path) -> Option<std::path::PathBuf> {
+    match target.parent() {
+        Some(parent) => match std::fs::canonicalize(parent) {
+            Ok(real_parent) => target.file_name().map(|name| real_parent.join(name)),
+            Err(_) => None,
+        },
+        None => None,
+    }
+}
+
 /// Read an OPEN file descriptor to end-of-file via `rustix::io::read`, returning
 /// all bytes. Borrows the fd (does not consume it) so the same fd is reused for
 /// the `fstat` identity check, this content re-hash, and (for Delete) the audit
@@ -346,6 +364,23 @@ impl EventLog {
                 canonical_root TEXT PRIMARY KEY,
                 granted_at     TEXT NOT NULL,
                 revoked        INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
+        // Mandate projection (Tier-A; M6c §4.1). A signed, bounded standing goal:
+        // keep `target` == `recipe(sources under source_scope)`. A deterministic fold
+        // over `mandate_grant`/`mandate_revoke` events, rebuilt by `rebuild_graph`.
+        // The PRIMARY KEY is the `mandate_grant` event id (the mandate's identity), NOT
+        // a content path — so the identity is a real, readable ground-truth event id
+        // (load-bearing for taint: citing it never trips the fail-closed "unreadable
+        // source ⇒ external" rule). `revoked` rows stay in the log forever (sticky).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS mandates (
+                mandate_grant_id TEXT PRIMARY KEY,
+                target           TEXT NOT NULL,
+                source_scope     TEXT NOT NULL,
+                recipe           TEXT NOT NULL,
+                granted_at       TEXT NOT NULL,
+                revoked          INTEGER NOT NULL DEFAULT 0
             )",
         )?;
         // Ingested-file projection (Tier-A; M5a). At most one CURRENT file_ingested per
@@ -2259,6 +2294,136 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Grant a standing **mandate** (M6c §4.1/§4.2): a signed, bounded goal to keep
+    /// `target` == `recipe(sources under source_scope)`. Appends a ground-truth
+    /// `mandate_grant` event and refreshes the mandates projection; the returned event
+    /// id IS the mandate's identity. Mirrors [`add_write_grant`](Self::add_write_grant)
+    /// but with the load-bearing grant-time guards.
+    ///
+    /// Guards, IN ORDER (each rejects — never silently truncates or downgrades):
+    /// 1. **Recipe cap (Finding D).** `recipe.len() > MAX_RECIPE_LEN` ⇒ reject, so the
+    ///    signed recipe and the later prompt's recipe can never disagree.
+    /// 2. **Canonicalize.** `source_scope` must resolve (it must exist); `target` is
+    ///    canonicalized via its PARENT when it does not exist yet (a Create), reusing
+    ///    `propose_write`'s logic so all later `starts_with` checks are on real paths.
+    /// 3. **UX guard.** `target` must be under an active WRITE grant
+    ///    ([`is_write_allowed`](Self::is_write_allowed)) — you cannot create a mandate
+    ///    the brain could never act on. (Convenience only; the security boundary is
+    ///    `propose_write`'s re-gate at propose/execute time, §4.3 #1.)
+    /// 4. **LOAD-BEARING self-loop guard (Finding A).** The canonical `target` MUST be
+    ///    OUTSIDE every active READ-grant root, tested with **segment-aware**
+    ///    [`Path::starts_with`] on canonical paths (so `/a/b` never matches `/a/bc`).
+    ///    This structurally guarantees the engine's own confirmed write to `target` can
+    ///    never fire a source watcher event nor be re-ingested as a source — so the
+    ///    recipe can never fold its own output back into its input (convergence holds
+    ///    unconditionally, §6.4 #1).
+    pub fn add_mandate(
+        &self,
+        target: &std::path::Path,
+        source_scope: &std::path::Path,
+        recipe: &str,
+    ) -> Result<String, BossclawError> {
+        // 1. Recipe cap (Finding D) — reject, never truncate.
+        if recipe.len() > crate::graph::MAX_RECIPE_LEN {
+            return Err(BossclawError::InvalidInput("recipe too long".into()));
+        }
+        // 2. Canonicalize source_scope (must exist) and target (else its parent — Create).
+        let canon_scope = std::fs::canonicalize(source_scope).map_err(|e| {
+            BossclawError::InvalidInput(format!("mandate source_scope not resolvable: {e}"))
+        })?;
+        let canon_target = canonicalize_target_or_parent(target).ok_or_else(|| {
+            BossclawError::InvalidInput("mandate target path is not resolvable".into())
+        })?;
+        // 3. UX guard: target must be under an active WRITE grant.
+        if !self.is_write_allowed(target)? {
+            return Err(BossclawError::InvalidInput("target not write-granted".into()));
+        }
+        // 4. Finding A — early-reject a target inside any active READ-grant root. This is
+        //    a TIGHT grant-time guard (defense in depth), NOT the unconditional convergence
+        //    proof: the ultimate enforcer is execute-time `O_NOFOLLOW` + canonical-root-
+        //    anchored ingest (a confirmed write follows no symlink, and ingest only adopts
+        //    files whose canonical path is under a read root). Here we reject as early as
+        //    possible so a misconfigured mandate never even reaches propose-time.
+        //    LEAF-TIGHT: resolve an EXISTING target's final component first
+        //    (`std::fs::canonicalize` follows a leaf symlink), so a symlink AT the leaf that
+        //    points INTO a read root is caught — `canon_target` alone joins the raw leaf
+        //    NOFOLLOW and would miss it. A not-yet-existing Create target fails canonicalize
+        //    → fall back to the parent+leaf form (unchanged). The scan stays segment-aware
+        //    (`Path::starts_with` on `Path`s — `/a/b` never matches `/a/bc`), active grants only.
+        let resolved_target = std::fs::canonicalize(target)
+            .ok()
+            .or_else(|| canonicalize_target_or_parent(target))
+            .ok_or_else(|| {
+                BossclawError::InvalidInput("mandate target path is not resolvable".into())
+            })?;
+        for g in self.grants()? {
+            if !g.revoked
+                && resolved_target.starts_with(std::path::Path::new(&g.canonical_root))
+            {
+                return Err(BossclawError::InvalidInput(
+                    "mandate target must be outside every read-grant root".into(),
+                ));
+            }
+        }
+        // 5. Append the ground-truth `mandate_grant` event (Tier-A, model_meta: None).
+        //    The append chokepoint mints the id = the mandate identity (§4.1). Paths are
+        //    stored canonical so all later `starts_with` checks are on real paths.
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::MANDATE_GRANT_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "target": canon_target.to_string_lossy().to_string(),
+                "source_scope": canon_scope.to_string_lossy().to_string(),
+                "recipe": recipe,
+            }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Revoke a mandate by its `mandate_grant_id` (M6c §4.1). Appends a ground-truth
+    /// `mandate_revoke` event referencing the grant id and refreshes the projection.
+    /// **Sticky + fail-closed:** the fold only ever sets `revoked=1` (there is no
+    /// un-revoke), and a revoke of an unknown id is harmlessly ignored by the fold —
+    /// mirroring `write_revoke`. Returns the revoke event id.
+    pub fn revoke_mandate(&self, mandate_grant_id: &str) -> Result<String, BossclawError> {
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::MANDATE_REVOKE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "mandate_grant_id": mandate_grant_id }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        // cache purge: Task 7 — once `mandate_synthesis_cache` exists, purge all of this
+        // mandate's rows here so the cache cannot outlive the mandate under a live watcher.
+        Ok(id)
+    }
+
+    /// Every ACTIVE (un-revoked) mandate, `ORDER BY granted_at ASC`. Tier-A read; the
+    /// mandate sibling of [`grants`](Self::grants)/[`write_grants`](Self::write_grants).
+    pub fn active_mandates(&self) -> Result<Vec<crate::graph::Mandate>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT mandate_grant_id, target, source_scope, recipe, granted_at, revoked
+             FROM mandates WHERE revoked = 0 ORDER BY granted_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::Mandate {
+            mandate_grant_id: r.get(0)?,
+            target: r.get(1)?,
+            source_scope: r.get(2)?,
+            recipe: r.get(3)?,
+            granted_at: r.get(4)?,
+            revoked: r.get::<_, i64>(5)? != 0,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
     /// Is `path` authorized for WRITING under some ACTIVE write-grant? (M6a, T1).
     ///
     /// Canonicalizes the candidate's REAL path and requires **path-segment descent**
@@ -2410,18 +2575,11 @@ impl EventLog {
 
         // ── Step 2: canonicalize target (Create ⇒ parent) + eligibility ───────────
         // Reuse the SAME parent-canonicalize logic `is_write_allowed` documents:
-        // for Create the target is absent, so we resolve and key off the PARENT.
+        // for Create the target is absent, so we resolve and key off the PARENT
+        // (via the shared [`canonicalize_target_or_parent`] helper, also used by
+        // `add_mandate` so the two agree). Edit/Delete canonicalize the target itself.
         let canonical: Option<std::path::PathBuf> = match p.op {
-            WriteOp::Create => match p.target.parent() {
-                Some(parent) => match std::fs::canonicalize(parent) {
-                    Ok(real_parent) => p
-                        .target
-                        .file_name()
-                        .map(|name| real_parent.join(name)),
-                    Err(_) => None,
-                },
-                None => None,
-            },
+            WriteOp::Create => canonicalize_target_or_parent(&p.target),
             WriteOp::Edit | WriteOp::Delete => std::fs::canonicalize(&p.target).ok(),
         };
         if canonical.is_none() {
@@ -3607,6 +3765,12 @@ impl EventLog {
         let write_grant_events = self.write_grant_events_ordered()?;
         let write_grants = crate::graph::fold_write_grants(&write_grant_events);
 
+        // Fold mandate_grant/mandate_revoke events → current mandates projection (M6c).
+        // SEPARATE event stream + fold from the grants above; keyed on the grant event
+        // id (the mandate identity), with a sticky `revoked` flag.
+        let mandate_events = self.mandate_events_ordered()?;
+        let mandates = crate::graph::fold_mandates(&mandate_events);
+
         // Fold file_ingested/supersede events → current file per path (M5a).
         let file_events = self.file_and_supersede_events_ordered()?;
         let files = crate::graph::fold_files(&file_events);
@@ -3641,6 +3805,7 @@ impl EventLog {
         tx.execute("DELETE FROM pages", [])?;
         tx.execute("DELETE FROM grants", [])?;
         tx.execute("DELETE FROM write_grants", [])?;
+        tx.execute("DELETE FROM mandates", [])?;
         tx.execute("DELETE FROM files", [])?;
         for e in &edges {
             tx.execute(
@@ -3691,6 +3856,21 @@ impl EventLog {
             tx.execute(
                 "INSERT INTO write_grants (canonical_root, granted_at, revoked) VALUES (?1, ?2, ?3)",
                 rusqlite::params![g.canonical_root, g.granted_at, g.revoked as i64],
+            )?;
+        }
+        for m in &mandates {
+            tx.execute(
+                "INSERT INTO mandates
+                   (mandate_grant_id, target, source_scope, recipe, granted_at, revoked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    m.mandate_grant_id,
+                    m.target,
+                    m.source_scope,
+                    m.recipe,
+                    m.granted_at,
+                    m.revoked as i64
+                ],
             )?;
         }
         for f in &files {
@@ -3780,6 +3960,23 @@ impl EventLog {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events WHERE event_type IN ('write_grant', 'write_revoke') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// All `mandate_grant`/`mandate_revoke` events, payload-parsed, in chain (`seq ASC`)
+    /// order (M6c). The mandate sibling of [`write_grant_events_ordered`]: it selects ONLY
+    /// the mandate event types, so a grant/write-grant event can never feed the mandate fold.
+    fn mandate_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('mandate_grant', 'mandate_revoke') ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();

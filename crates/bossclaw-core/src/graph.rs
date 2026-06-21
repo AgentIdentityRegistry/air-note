@@ -500,6 +500,51 @@ pub struct Mandate {
     pub revoked: bool,
 }
 
+/// Fold `mandate_grant`/`mandate_revoke` events (MUST be in `seq` order) into the
+/// current mandate per grant id (last-writer-wins on the `revoked` flag). A
+/// `mandate_grant` inserts a mandate keyed on its OWN event id (the mandate's
+/// identity, §4.1) with the granted target/scope/recipe; a `mandate_revoke` marks
+/// the referenced grant id revoked. Revoke is **sticky + fail-closed**: a revoke
+/// with no prior grant is ignored, and once revoked a mandate is never un-revoked
+/// (there is no un-revoke event). Deterministic → byte-identical rebuild. Mirrors
+/// [`fold_write_grants`] but keyed on the event id (not a content path) and carrying
+/// three content fields.
+pub fn fold_mandates(events: &[Event]) -> Vec<Mandate> {
+    use std::collections::BTreeMap;
+    let mut by_id: BTreeMap<String, Mandate> = BTreeMap::new();
+    for ev in events {
+        if ev.event_type == MANDATE_GRANT_EVENT_TYPE {
+            let (target, source_scope, recipe) = match (
+                ev.content.get("target").and_then(|v| v.as_str()),
+                ev.content.get("source_scope").and_then(|v| v.as_str()),
+                ev.content.get("recipe").and_then(|v| v.as_str()),
+            ) {
+                (Some(t), Some(s), Some(r)) => (t.to_string(), s.to_string(), r.to_string()),
+                // A malformed grant (missing a field) never becomes a mandate.
+                _ => continue,
+            };
+            by_id.insert(
+                ev.id.clone(),
+                Mandate {
+                    mandate_grant_id: ev.id.clone(),
+                    target,
+                    source_scope,
+                    recipe,
+                    granted_at: ev.ts.clone(),
+                    revoked: false,
+                },
+            );
+        } else if ev.event_type == MANDATE_REVOKE_EVENT_TYPE {
+            if let Some(id) = ev.content.get("mandate_grant_id").and_then(|v| v.as_str()) {
+                if let Some(m) = by_id.get_mut(id) {
+                    m.revoked = true;
+                }
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
 /// A folded ingested-file record (M5a): the CURRENT (un-superseded) `file_ingested`
 /// event for one `canonical_path`. A deterministic fold over `file_ingested` +
 /// `supersede` events; rebuilt by `rebuild_graph`. Keyed on path, NOT on bytes:
