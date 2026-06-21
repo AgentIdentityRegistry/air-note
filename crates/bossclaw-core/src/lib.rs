@@ -54,6 +54,8 @@ pub use fastembed::FastEmbed;
 pub use graph::{AsOf, Edge, Entity, Grant, Mandate, Node, Page, WriteGrant, MAX_RECIPE_LEN};
 pub use index::{HnswIndex, VectorIndex};
 pub use log::{ActiveModel, EventLog, ReembedStats, SynthCacheRow, SCHEMA_VERSION};
+#[cfg(unix)]
+pub use log::MandateAction;
 pub use model2vec::Model2Vec;
 #[cfg(feature = "ollama")]
 pub use ollama::OllamaReasoner;

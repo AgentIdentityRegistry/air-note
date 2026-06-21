@@ -108,6 +108,36 @@ pub struct SynthCacheRow {
     pub source_event_ids_at_synth: Vec<String>,
 }
 
+/// The DECISION returned by the gather + cached-or-synth half of the mandate proposer
+/// phase ([`EventLog::mandate_phase_for`], M6c §5.1/§5.2, Task 9a). It carries NO side
+/// effect: producing it appends no event and runs no write gate. Task 9b turns a
+/// [`MandateAction::Propose`] into a gated `write_proposal` and a [`MandateAction::Reject`]
+/// into a recorded `write_rejected`; an [`MandateAction::Elide`] emits nothing and stays
+/// retryable on the next tick.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MandateAction {
+    /// The target is out of sync; synthesis produced new bytes to write. `op` is
+    /// [`WriteOp::Create`] when the target file does not exist yet, else [`WriteOp::Edit`]
+    /// — M6c never deletes. `expected` is the whole-file bytes; `lineage` is the
+    /// engine-gathered, sorted+deduped union of the mandate id with the source event ids
+    /// (NEVER any model-derived id — see the union site in `mandate_phase_for`).
+    Propose {
+        /// The synthesized whole-file bytes the proposal would write.
+        expected: Vec<u8>,
+        /// Engine-gathered lineage (mandate ∪ source event ids), sorted + deduped.
+        lineage: Vec<String>,
+        /// `Create` (target absent) or `Edit` (target present); never `Delete`.
+        op: crate::actuator::WriteOp,
+    },
+    /// Nothing to do — in sync, no in-scope sources, or over a directory-bomb cap. A
+    /// RETRYABLE no-op: it appends NO event, so the same mandate is re-evaluated next tick.
+    Elide,
+    /// A genuine synthesis failure (e.g. the model returned empty content). Task 9b
+    /// records a `write_rejected` for this; the carried string is the reject reason.
+    Reject(String),
+}
+
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -149,6 +179,16 @@ const MANDATES_ENABLED_KEY: &str = "mandates_enabled";
 const RECONCILE_SYSTEM: &str =
     "You correct a file so it is consistent with an engine-established fact. \
      Output only the full corrected file as JSON {\"corrected_content\": ...}.";
+
+/// The instruction channel (`system`) for the M6c mandate synthesis reasoner call
+/// (spec §5.2). The data channel is [`crate::mandate::build_recipe_prompt`]'s fenced
+/// frame (the trusted recipe above, the untrusted sources fenced below); this system
+/// line states the engine's intent so the prompt stays purely about the synthesis.
+/// Mirrors [`RECONCILE_SYSTEM`].
+#[cfg(unix)]
+const MANDATE_SYSTEM: &str =
+    "You synthesize a file from sources per a user recipe. \
+     Output only the full synced content as JSON {\"synced_content\": ...}.";
 
 /// `(event_id, arm_score)` pair returned by each retrieval arm. Used as the
 /// common type for both the vector arm (cosine distance, lower=better) and the
@@ -5627,6 +5667,196 @@ impl EventLog {
         self.summarize_topics(reasoner, &mut report)?;
 
         Ok(report)
+    }
+
+    /// M6c mandate phase — gather + cached-or-synth DECISION for ONE mandate `m`
+    /// (spec §5.1/§5.2, findings E/G, Task 9a). Returns a [`MandateAction`]; it appends
+    /// NO event and runs NO write gate (Task 9b turns the action into a gated
+    /// `write_proposal` / `write_rejected` and wires it into `evolve_once`).
+    ///
+    /// Algorithm:
+    /// 1. **Gather** `current_files()` whose canonical path is segment-aware UNDER
+    ///    `m.source_scope` (the same `Path::starts_with` discipline as `is_write_allowed`
+    ///    / `add_mandate`'s read-root scan) AND not equal to `m.target` (the output is
+    ///    never its own source). Over [`crate::graph::MAX_SOURCES_PER_MANDATE`] → `Elide`
+    ///    (directory-bomb guard, finding E). Empty in-scope set → `Elide` (never
+    ///    synthesize from nothing, finding G).
+    /// 2. **sources_hash** = sha256 over the SORTED `(canonical_path, content_hash)` pairs
+    ///    (deterministic — sort before hashing).
+    /// 3. **cached-or-synth**: a cache HIT (`get_synthesis_cache`) reuses its bytes +
+    ///    `source_event_ids_at_synth` with NO LLM call. A miss reads each source's ON-DISK
+    ///    bytes, fences EACH via [`crate::extract::push_fenced_source`]; if the combined
+    ///    fenced length would exceed [`crate::extract::MAX_INPUT_TEXT_BYTES`] → `Elide` (do
+    ///    NOT truncate, finding E). Otherwise it calls the reasoner EXACTLY as
+    ///    `reconcile_confirmed_contradiction` does the rewrite turn (same `complete_json`,
+    ///    same structured schema, parse-failure → the `?`-propagated `Reject`); an empty
+    ///    `synced_content` → `Reject("empty synthesis")` (finding G). On success it caches
+    ///    the bytes + the engine-gathered source ids just read.
+    /// 4. **Compare vs ON-DISK** (`std::fs::read(&m.target)`, NEVER the stale `files`
+    ///    projection hash): equal → `Elide`. Op = `Create` if the target is absent, else
+    ///    `Edit` (M6c never deletes).
+    /// 5. **Lineage (finding B — anti-laundering union)**: the cache/synth source ids ∪
+    ///    the CURRENT in-scope `file_event_id`s, deduped, fed to
+    ///    [`crate::mandate::mandate_lineage`]. EVERY id is engine-gathered; see the
+    ///    invariant comment at the union site.
+    #[cfg(unix)]
+    pub fn mandate_phase_for(
+        &self,
+        m: &crate::graph::Mandate,
+        reasoner: &dyn crate::reason::Reasoner,
+    ) -> Result<MandateAction, BossclawError> {
+        use sha2::{Digest, Sha256};
+
+        // ── 1. Gather in-scope sources: segment-aware UNDER source_scope, target excluded.
+        //    `Path::starts_with` compares whole components, so a string-prefix sibling of
+        //    the scope (e.g. `/a/bc` under `/a/b`) does NOT match — the same discipline as
+        //    `is_write_allowed` / the `add_mandate` read-root scan. ──
+        let scope = std::path::Path::new(&m.source_scope);
+        let target = std::path::Path::new(&m.target);
+        let in_scope: Vec<crate::graph::FileRecord> = self
+            .current_files()?
+            .into_iter()
+            .filter(|rec| {
+                let p = std::path::Path::new(&rec.canonical_path);
+                p.starts_with(scope) && p != target
+            })
+            .collect();
+
+        // Directory-bomb guard (finding E): too many sources → Elide (retryable, no event).
+        if in_scope.len() > crate::graph::MAX_SOURCES_PER_MANDATE {
+            return Ok(MandateAction::Elide);
+        }
+        // Never synthesize from nothing (finding G): empty in-scope set → Elide.
+        if in_scope.is_empty() {
+            return Ok(MandateAction::Elide);
+        }
+
+        // ── 2. sources_hash: sha256 over the SORTED (canonical_path, content_hash) pairs.
+        //    Sort first so the digest is independent of `current_files()` row order
+        //    (it already orders by path, but we sort explicitly to make the determinism
+        //    a property of THIS code, not of the query). A NUL byte separates fields and
+        //    pairs so no concatenation collision can occur. ──
+        let mut pairs: Vec<(&str, &str)> = in_scope
+            .iter()
+            .map(|rec| (rec.canonical_path.as_str(), rec.content_hash.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        let mut hasher = Sha256::new();
+        for (path, content_hash) in &pairs {
+            hasher.update(path.as_bytes());
+            hasher.update([0x00]);
+            hasher.update(content_hash.as_bytes());
+            hasher.update([0x00]);
+        }
+        let sources_hash = hex::encode(hasher.finalize());
+
+        // The CURRENT in-scope source event ids — engine-gathered, used in BOTH the
+        // synth-time cache lineage and the step-5 anti-laundering union.
+        let current_source_ids: Vec<String> =
+            in_scope.iter().map(|rec| rec.file_event_id.clone()).collect();
+
+        // ── 3. cached-or-synth → (expected_bytes, synth_lineage_ids). ──
+        let (expected_bytes, synth_lineage_ids) =
+            match self.get_synthesis_cache(&m.mandate_grant_id, &sources_hash)? {
+                // Cache HIT: reuse the stored bytes + the exact ids read at synth time. NO
+                // LLM call (convergence + cost: the source-state is byte-identical).
+                Some(row) => (row.expected_bytes, row.source_event_ids_at_synth),
+                // Cache MISS: read each source's ON-DISK bytes and fence EACH as untrusted
+                // DATA into one combined block (mirrors how the reconcile rewrite turn fences
+                // the live file body). FAIL CLOSED on any unusable in-scope source — see the
+                // per-source guards below. The hash already pinned the FULL in-scope set, so
+                // synthesizing from fewer sources than that set names would cache PARTIAL
+                // bytes under the full-set `sources_hash`; because a skipped source's
+                // content_hash is unchanged when it becomes readable again, the cache would
+                // return those partial bytes FOREVER → permanent staleness, convergence
+                // silently broken. So we synthesize ONLY when EVERY in-scope source reads
+                // cleanly as UTF-8 — guaranteeing the cached bytes correspond to exactly the
+                // set `sources_hash` names. An unusable source elides (retryable next tick).
+                None => {
+                    let mut fenced = String::new();
+                    for rec in &in_scope {
+                        // Read-Err (e.g. the file vanished after the projection listed it):
+                        // do NOT skip, synthesize, or cache — Elide and retry once every
+                        // in-scope source is readable again (the source-state is unchanged,
+                        // so a later tick recomputes the same `sources_hash`).
+                        let Ok(bytes) = std::fs::read(&rec.canonical_path) else {
+                            return Ok(MandateAction::Elide);
+                        };
+                        // Require valid UTF-8 ON DISK NOW. A lossy view would synthesize from
+                        // replacement chars (also defeating Elide-convergence), so non-UTF-8
+                        // also fails closed → Elide. The fence neutralizes any embedded
+                        // terminator; the reasoner sees DATA, never instructions.
+                        let Ok(text) = String::from_utf8(bytes) else {
+                            return Ok(MandateAction::Elide);
+                        };
+                        crate::extract::push_fenced_source(&mut fenced, &text);
+                    }
+                    // Over-cap input (finding E): do NOT truncate — Elide and surface nothing
+                    // (stays retryable). Truncating would synthesize from a partial view and
+                    // could silently drop a source's content.
+                    if fenced.len() > crate::extract::MAX_INPUT_TEXT_BYTES {
+                        return Ok(MandateAction::Elide);
+                    }
+                    // Synthesize. Mirrors `reconcile_confirmed_contradiction`'s rewrite turn
+                    // EXACTLY: the same `complete_json` trait method, the same structured
+                    // schema, and a parse/transport failure propagates via `?` (→ the caller
+                    // sees the `Err`; Task 9b leaves the mandate retryable). The trusted
+                    // recipe is the frame; the sources are fenced below.
+                    let prompt = crate::mandate::build_recipe_prompt(&m.recipe, &fenced);
+                    let out = reasoner.complete_json(
+                        MANDATE_SYSTEM,
+                        &prompt,
+                        &crate::mandate::recipe_schema(),
+                    )?;
+                    let synced = out.get("synced_content").and_then(|v| v.as_str()).unwrap_or("");
+                    // Empty synthesis is a genuine failure → Reject (finding G: NEVER truncate
+                    // the target to empty). Mirrors the reconcile `empty_rewrite` reject.
+                    if synced.is_empty() {
+                        return Ok(MandateAction::Reject("empty synthesis".into()));
+                    }
+                    let bytes = synced.as_bytes().to_vec();
+                    let expected_hash = hex::encode(Sha256::digest(&bytes));
+                    // Cache the bytes WITH the engine-gathered ids just read (finding B): a
+                    // later hit unions exactly these — never a model-named id.
+                    self.put_synthesis_cache(
+                        &m.mandate_grant_id,
+                        &sources_hash,
+                        &bytes,
+                        &expected_hash,
+                        &current_source_ids,
+                    )?;
+                    (bytes, current_source_ids.clone())
+                }
+            };
+
+        // ── 4. Compare vs the ON-DISK target (NEVER the stale `files` projection hash:
+        //    it is out of date the instant an actuator write lands). Equal → Elide. ──
+        let actual = std::fs::read(target).ok();
+        if actual.as_deref() == Some(expected_bytes.as_slice()) {
+            return Ok(MandateAction::Elide);
+        }
+        // Op is Create iff the target file does not exist yet, else Edit. M6c NEVER deletes.
+        let op = if target.exists() {
+            crate::actuator::WriteOp::Edit
+        } else {
+            crate::actuator::WriteOp::Create
+        };
+
+        // ── 5. Lineage (finding B — the anti-laundering union). ──
+        // SECURITY INVARIANT (Task-5 carry-forward): every id in `union` is an
+        // ENGINE-GATHERED `file_event_id` — `synth_lineage_ids` comes from the cache row
+        // or the `FileRecord`s read in step 1, and `current_source_ids` are the step-1
+        // `FileRecord.file_event_id`s. NONE is ever derived from the model's
+        // `synced_content` or any model output. The model produces only file BYTES; it
+        // never names a source id. Deriving any lineage id from model output would launder
+        // an attacker-chosen id into the gate's trust set — forbidden.
+        let mut union: Vec<String> = synth_lineage_ids;
+        union.extend(current_source_ids);
+        union.sort();
+        union.dedup();
+        let lineage = crate::mandate::mandate_lineage(&m.mandate_grant_id, &union)?;
+
+        Ok(MandateAction::Propose { expected: expected_bytes, lineage, op })
     }
 
     /// M6b reconciliation for ONE confirmed contradiction `r` (resolved entity ids),
