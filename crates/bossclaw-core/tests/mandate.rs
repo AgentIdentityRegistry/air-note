@@ -202,3 +202,32 @@ fn m6c_proposal_records_its_own_producer() {
         "M6c-path proposal must stamp its own producer, not m6b-reconciler"
     );
 }
+
+// TASK 7 — synthesis cache round-trip: the stored bytes AND the synth-time lineage
+// (Finding B: the exact source ids read at synthesis time) come back together in one row.
+#[test]
+fn cache_roundtrip_returns_bytes_and_synth_lineage() {
+    let (log, _tmp) = setup();
+    log.put_synthesis_cache("M1", "srchash", b"INDEX", "h_expected", &["s1".into(), "s2".into()])
+        .unwrap();
+    let hit = log.get_synthesis_cache("M1", "srchash").unwrap().unwrap();
+    assert_eq!(hit.expected_bytes, b"INDEX");
+    assert_eq!(hit.expected_hash, "h_expected");
+    assert_eq!(
+        hit.source_event_ids_at_synth,
+        vec!["s1".to_string(), "s2".into()]
+    );
+}
+
+// TASK 7 — bounded growth + lifecycle: a write at a NEW source-state evicts prior
+// source-states for the mandate (Finding F), and revoking the mandate purges all its rows.
+#[test]
+fn cache_write_evicts_prior_states_and_revoke_purges() {
+    let (log, _tmp) = setup();
+    log.put_synthesis_cache("M1", "old", b"A", "ha", &["s1".into()]).unwrap();
+    log.put_synthesis_cache("M1", "new", b"B", "hb", &["s1".into()]).unwrap(); // evicts "old"
+    assert!(log.get_synthesis_cache("M1", "old").unwrap().is_none());
+    assert!(log.get_synthesis_cache("M1", "new").unwrap().is_some());
+    log.revoke_mandate("M1").ok(); // purges all M1 rows
+    assert!(log.get_synthesis_cache("M1", "new").unwrap().is_none());
+}

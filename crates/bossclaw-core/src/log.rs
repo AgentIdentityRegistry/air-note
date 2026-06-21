@@ -89,6 +89,25 @@ pub struct ActiveModel {
     pub schema_version: u32,
 }
 
+/// A hit from the M6c synthesis cache ([`EventLog::get_synthesis_cache`]).
+///
+/// Carries the synthesized expected file bytes TOGETHER with the synth-time lineage
+/// that produced them (finding B, spec §5.2/§5.3): `source_event_ids_at_synth` is the
+/// EXACT engine-gathered source ids read at synthesis time, so a later cache HIT can
+/// union it with the then-current in-scope sources without ever silently dropping a
+/// tainted source that left scope between synthesis and the hit. The cache is NEVER an
+/// authorization source — the confirm path re-gates the bytes through the full M6a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthCacheRow {
+    /// The synthesized expected whole-file bytes for this `(mandate, source-state)`.
+    pub expected_bytes: Vec<u8>,
+    /// The content hash recorded for `expected_bytes` at synthesis time.
+    pub expected_hash: String,
+    /// The exact engine-gathered source event ids read at synthesis time (finding B).
+    /// Travels in the SAME row as the bytes so taint lineage can be unioned monotonically.
+    pub source_event_ids_at_synth: Vec<String>,
+}
+
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -453,6 +472,31 @@ impl EventLog {
                 content      BLOB NOT NULL,
                 content_hash TEXT NOT NULL,
                 created_at   TEXT NOT NULL
+            )",
+        )?;
+        // M6c synthesis cache (spec §5.2/§8, finding B + F). Caches the expected file
+        // bytes synthesized ONCE per source-state so they can be reused across ticks
+        // (an LLM is not bit-exact, so re-synthesizing every tick would defeat
+        // convergence). Keyed by (mandate, sources_hash). SECURITY (finding B): the row
+        // carries `source_event_ids_at_synth` — the EXACT engine-gathered source ids read
+        // at synthesis time — ALONGSIDE the bytes, so on a later cache HIT the proposal's
+        // taint lineage is `synth ∪ current-in-scope` (taint is monotone) and a tainted
+        // source that LEFT scope between synth and the hit can never silently drop out of
+        // the lineage. The bytes and the provenance that produced them therefore travel
+        // together in the SAME row. NEVER an authorization source — confirm re-gates the
+        // bytes through the full M6a path. Lives inside the same SQLCipher `Store` as
+        // `proposal_bytes` (encrypted at rest; bytes are derived from possibly-sensitive
+        // source files). NOT a Tier-A fold: it is convergence/efficiency cache, never
+        // authoritative, so `rebuild_graph` does NOT touch it.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS mandate_synthesis_cache (
+                mandate_grant_id          TEXT NOT NULL,
+                sources_hash              TEXT NOT NULL,
+                expected_hash             TEXT NOT NULL,
+                expected_bytes            BLOB NOT NULL,
+                source_event_ids_at_synth BLOB NOT NULL,
+                created_at                TEXT NOT NULL,
+                PRIMARY KEY(mandate_grant_id, sources_hash)
             )",
         )?;
         // Summarize progress high-water-mark (spec §6 / F1) — sibling of
@@ -2209,6 +2253,90 @@ impl EventLog {
         Ok(content)
     }
 
+    /// Store synthesized expected file bytes for a mandate at one source-state, then evict
+    /// the mandate's prior source-states (finding F — bounded growth: keep only the current
+    /// source-state's bytes). `synth_lineage` is the EXACT engine-gathered source ids read
+    /// at synthesis time; it is persisted ALONGSIDE the bytes (finding B) so a later cache
+    /// HIT can union it with the then-current in-scope sources without ever dropping a
+    /// tainted source that left scope. `INSERT OR REPLACE` so a re-synthesis at the same
+    /// `(mandate, sources_hash)` overwrites. The lineage is JSON-encoded into a BLOB column.
+    ///
+    /// SECURITY: this row is a convergence/efficiency CACHE, never an authorization source —
+    /// the confirm path re-gates the bytes through the full M6a path. It lives in the
+    /// SQLCipher `Store` (encrypted at rest) because the bytes are derived from
+    /// possibly-sensitive source files, exactly like [`Self::put_proposal_bytes`].
+    #[cfg(unix)]
+    pub fn put_synthesis_cache(
+        &self,
+        mandate_id: &str,
+        sources_hash: &str,
+        bytes: &[u8],
+        expected_hash: &str,
+        synth_lineage: &[String],
+    ) -> Result<(), BossclawError> {
+        let lineage_blob = serde_json::to_vec(synth_lineage)?;
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO mandate_synthesis_cache
+               (mandate_grant_id, sources_hash, expected_hash, expected_bytes,
+                source_event_ids_at_synth, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                mandate_id,
+                sources_hash,
+                expected_hash,
+                bytes,
+                lineage_blob,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        // Finding F — evict prior source-states for this mandate so cache growth stays
+        // bounded to the current source-state's single row.
+        conn.execute(
+            "DELETE FROM mandate_synthesis_cache
+             WHERE mandate_grant_id = ?1 AND sources_hash <> ?2",
+            rusqlite::params![mandate_id, sources_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Read back a cached synthesis row for `(mandate, sources_hash)`, or `None` on a miss.
+    /// Returns the bytes, their `expected_hash`, and the synth-time lineage decoded from the
+    /// JSON BLOB. Task 9's confirm path unions `source_event_ids_at_synth` with the
+    /// then-current in-scope sources (finding B) and re-gates the bytes — this method only
+    /// returns the stored row; it NEVER authorizes.
+    #[cfg(unix)]
+    pub fn get_synthesis_cache(
+        &self,
+        mandate_id: &str,
+        sources_hash: &str,
+    ) -> Result<Option<SynthCacheRow>, BossclawError> {
+        let row: Option<(Vec<u8>, String, Vec<u8>)> = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT expected_bytes, expected_hash, source_event_ids_at_synth
+                 FROM mandate_synthesis_cache
+                 WHERE mandate_grant_id = ?1 AND sources_hash = ?2",
+                rusqlite::params![mandate_id, sources_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+        };
+        match row {
+            None => Ok(None),
+            Some((expected_bytes, expected_hash, lineage_blob)) => {
+                let source_event_ids_at_synth: Vec<String> = serde_json::from_slice(&lineage_blob)?;
+                Ok(Some(SynthCacheRow {
+                    expected_bytes,
+                    expected_hash,
+                    source_event_ids_at_synth,
+                }))
+            }
+        }
+    }
+
     /// Shared proposer Tier-B event builder. `producer` is stamped as `model_meta.model_id`
     /// (the M6b reconciler and the M6c mandate proposer pass DIFFERENT producers — Task 9's
     /// per-mandate cap distinguishes them by this stamp). Lineage is engine-gathered; the
@@ -2450,8 +2578,17 @@ impl EventLog {
             signed_by_did: self.signer_did(), signature: None,
         })?;
         self.rebuild_graph()?;
-        // cache purge: Task 7 — once `mandate_synthesis_cache` exists, purge all of this
-        // mandate's rows here so the cache cannot outlive the mandate under a live watcher.
+        // Purge all of this mandate's synthesis-cache rows so the cache cannot outlive the
+        // mandate under a live watcher (Task 7). A revoke of an unknown id is a harmless
+        // no-op DELETE — mirroring the fold, which ignores a revoke with no grant.
+        {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.execute(
+                "DELETE FROM mandate_synthesis_cache WHERE mandate_grant_id = ?1",
+                rusqlite::params![mandate_grant_id],
+            )?;
+        }
         Ok(id)
     }
 
