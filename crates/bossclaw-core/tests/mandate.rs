@@ -161,3 +161,15 @@ fn mandate_target_leaf_symlink_into_read_root_rejected() {
         "a leaf symlink resolving into a read root must be rejected"
     );
 }
+
+// M6c §5.5 / D8: the mandate proposer's INDEPENDENT kill switch is default-open,
+// sticky-off, and fail-closed — a direct mirror of `proposals_enabled`.
+#[test]
+fn mandates_enabled_sticky_default_open() {
+    let (log, _tmp) = setup();
+    assert!(log.mandates_enabled().unwrap()); // default-open
+    log.set_mandates_enabled(false).unwrap();
+    assert!(!log.mandates_enabled().unwrap()); // sticky off
+    log.set_mandates_enabled(true).unwrap();
+    assert!(log.mandates_enabled().unwrap()); // later explicit true re-enables
+}

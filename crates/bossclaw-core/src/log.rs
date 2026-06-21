@@ -113,6 +113,15 @@ const EVOLVE_ENABLED_KEY: &str = "evolve_enabled";
 /// `write_proposal` synthesis layered on top of a confirmed contradiction.
 const PROPOSALS_ENABLED_KEY: &str = "proposals_enabled";
 
+/// The `content` key carrying the M6c mandate-proposer on/off switch in a control
+/// `config` event (M6c §5.5 / D8). Single-sourced so the ONE writer
+/// ([`EventLog::set_mandates_enabled`]) and the reader
+/// ([`EventLog::mandates_enabled`]) can never drift the key apart. INDEPENDENT of
+/// [`PROPOSALS_ENABLED_KEY`] and [`EVOLVE_ENABLED_KEY`]: turning mandates off leaves
+/// evolve curation and the M6b reconciliation proposer fully running — it suppresses
+/// ONLY the autonomous mandate-driven `write_proposal` synthesis.
+const MANDATES_ENABLED_KEY: &str = "mandates_enabled";
+
 /// The instruction channel (`system`) for the M6b whole-file rewrite reasoner call
 /// (spec §5.5). The data channel is [`crate::reconcile::build_rewrite_prompt`]'s
 /// fenced frame; this system line states the engine's intent so the prompt itself
@@ -4531,6 +4540,63 @@ impl EventLog {
         for row in rows {
             let ev: Event = serde_json::from_str(&row?)?;
             if let Some(flag) = ev.content.get(PROPOSALS_ENABLED_KEY).and_then(|v| v.as_bool()) {
+                return Ok(flag); // newest explicit flag wins → sticky
+            }
+        }
+        Ok(true) // flag never set → default open
+    }
+
+    /// Set the M6c mandate-proposer on/off switch by appending a control
+    /// `config` event whose content is `{ "mandates_enabled": <enabled> }`
+    /// (M6c §5.5 / D8). CLONES the [`EventLog::set_evolve_enabled`] mechanism exactly —
+    /// the only writer of [`MANDATES_ENABLED_KEY`], a signed + hash-chained
+    /// control config (so a forged/replayed flip is tamper-evident via
+    /// `verify_chain`). INDEPENDENT of the evolve and proposals switches: this gates
+    /// ONLY the autonomous mandate-driven `write_proposal` synthesis, never the
+    /// curation loop. Carries no model fields, so it never disturbs
+    /// [`EventLog::active_model`].
+    pub fn set_mandates_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(MANDATES_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
+    /// Whether the M6c mandate proposer is enabled (M6c §5.5 / D8 off-switch).
+    ///
+    /// STICKY / fail-closed semantics IDENTICAL to [`EventLog::evolve_enabled`]:
+    /// config events are scanned newest-first and the FIRST one carrying an
+    /// explicit `mandates_enabled` bool wins. Because [`EventLog::set_mandates_enabled`]
+    /// is the only writer of the key, this is exactly "the latest EXPLICIT value":
+    /// once an explicit `false` exists with no LATER explicit `true`, mandates stay
+    /// off — a flag-LESS newer config (e.g. an active-model switch, or a
+    /// `proposals_enabled` flip) does NOT silently re-arm mandates. Default-open
+    /// (`true`) ONLY when the flag was never set at all.
+    pub fn mandates_enabled(&self) -> Result<bool, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let ev: Event = serde_json::from_str(&row?)?;
+            if let Some(flag) = ev.content.get(MANDATES_ENABLED_KEY).and_then(|v| v.as_bool()) {
                 return Ok(flag); // newest explicit flag wins → sticky
             }
         }
