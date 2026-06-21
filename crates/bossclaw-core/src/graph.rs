@@ -492,7 +492,8 @@ pub struct Mandate {
     pub target: String,
     /// Canonical single-subtree prefix the sources live under (excludes `target`).
     pub source_scope: String,
-    /// User-authored plain-English derivation rule (trusted, sanitized into the frame).
+    /// User-authored plain-English derivation rule (trusted; control-stripped +
+    /// fence-marker-neutralized into the trusted frame).
     pub recipe: String,
     /// RFC-3339 grant timestamp.
     pub granted_at: String,

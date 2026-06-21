@@ -30,6 +30,7 @@ pub mod index;
 pub mod ingest;
 pub mod keyword;
 pub mod log;
+pub mod mandate;
 pub mod model2vec;
 #[cfg(feature = "ollama")]
 pub mod ollama;

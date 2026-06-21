@@ -187,22 +187,37 @@ pub(crate) fn push_fenced_source(s: &mut String, source: &str) {
     // Neutralize any fence markers EMBEDDED in the untrusted source so it cannot
     // break out of the fence: a file whose text literally contains `<<<SOURCE_END>>>`
     // would otherwise emit an early terminator and smuggle the following lines
-    // OUTSIDE the fence as if they were instructions. A zero-width space breaks the
-    // literal marker match while leaving the text visually intact, so the next
-    // literal `<<<SOURCE_END>>>` the model/parser sees is the real terminator below.
-    // The guard keeps the common (marker-free) path allocation-free. Defense-in-depth:
-    // the load-bearing control is the eager taint stamp (a hostile file's extracted
-    // facts stay `is_external` + machine-origin regardless of any prompt injection).
-    // extraction-from-files design §6.7 / §10 fast-follow.
-    if source.contains("<<<SOURCE_END>>>") || source.contains("<<<SOURCE_BEGIN>>>") {
-        let neutralized = source
-            .replace("<<<SOURCE_END>>>", "<<<SOURCE_END\u{200B}>>>")
-            .replace("<<<SOURCE_BEGIN>>>", "<<<SOURCE_BEGIN\u{200B}>>>");
-        s.push_str(&neutralized);
-    } else {
-        s.push_str(source);
-    }
+    // OUTSIDE the fence as if they were instructions. The single-sourced
+    // [`neutralize_fence_markers`] applies the zero-width-space technique. Defense-in-
+    // depth: the load-bearing control is the eager taint stamp (a hostile file's
+    // extracted facts stay `is_external` + machine-origin regardless of any prompt
+    // injection). extraction-from-files design §6.7 / §10 fast-follow.
+    s.push_str(&neutralize_fence_markers(source));
     s.push_str("\n<<<SOURCE_END>>>\n");
+}
+
+/// Neutralize any EMBEDDED `<<<SOURCE_BEGIN>>>` / `<<<SOURCE_END>>>` fence markers in
+/// `s` by inserting a zero-width space (`\u{200B}`) before each marker's closing
+/// `>>>`, so the literal marker match breaks while the text stays visually intact.
+/// This is the ONE shared fence-neutralization policy:
+/// - [`push_fenced_source`] uses it on untrusted DATA so a source cannot forge an
+///   early terminator and break OUT of the fence;
+/// - the trusted-frame sanitizers ([`crate::reconcile::sanitize_engine_fact`] and
+///   [`crate::mandate::build_recipe_prompt`]) use it on an attacker-influenceable
+///   label / recipe so it cannot forge a fence boundary INSIDE the instruction frame.
+///
+/// Single-sourcing it here (next to the marker literals) means the data-side and
+/// frame-side defenses can never drift on which markers are neutralized or how — a
+/// future edit to one site and not the others would be an injection-containment
+/// regression. The `contains` guard keeps the common (marker-free) path
+/// allocation-free. PURE.
+pub(crate) fn neutralize_fence_markers(s: &str) -> String {
+    if s.contains("<<<SOURCE_END>>>") || s.contains("<<<SOURCE_BEGIN>>>") {
+        s.replace("<<<SOURCE_END>>>", "<<<SOURCE_END\u{200B}>>>")
+            .replace("<<<SOURCE_BEGIN>>>", "<<<SOURCE_BEGIN\u{200B}>>>")
+    } else {
+        s.to_string()
+    }
 }
 
 /// Seed relation vocabulary (spec §6): a small, extensible set of relation
