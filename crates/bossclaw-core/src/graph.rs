@@ -102,6 +102,15 @@ pub const MAX_RECIPE_LEN: usize = 2048;
 pub const MAX_PROPOSALS_PER_MANDATE_PER_TICK: usize = 1;
 /// Max in-scope source files a mandate will gather per tick (directory-bomb guard).
 pub const MAX_SOURCES_PER_MANDATE: usize = 256;
+/// Max bytes of synthesized `synced_content` a mandate proposal may carry (M6c review
+/// carry-forward, Minor #3 — the output-size bound). Mirrors `ingest`'s 10 MiB
+/// `MAX_FILE_BYTES` text-file ceiling: a brain-owned synced file should never exceed
+/// what the engine would itself ingest as a text file. Synthesis over the cap is
+/// `Elide`d (retryable, no event) so the proposal AND the synthesis cache row stay
+/// bounded — an oversized model output can never bloat either. `MAX_FILE_BYTES` is
+/// private to `ingest.rs`, so this is a parallel, documented constant (kept in the M6c
+/// const block) rather than a cross-module re-export.
+pub const MAX_SYNCED_CONTENT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Namespace prefix for entity node ids: `entity:<event-ulid>`. Mint-once, stable;
 /// links reference this exact form, so it is single-sourced.

@@ -129,13 +129,30 @@ pub enum MandateAction {
         lineage: Vec<String>,
         /// `Create` (target absent) or `Edit` (target present); never `Delete`.
         op: crate::actuator::WriteOp,
+        /// The exact `sources_hash` `mandate_phase_for` computed over the SORTED
+        /// `(canonical_path, content_hash)` pairs of the in-scope sources (Task 9a). Task
+        /// 9b folds it into the suppression/recording `inducing_key`
+        /// (`{mandate, target, sources_hash}`, §5.4) so the key matches
+        /// [`EventLog::is_mandate_proposal_suppressed`]'s shape byte-for-byte — returned
+        /// from the phase rather than recomputed so the two sites cannot drift.
+        sources_hash: String,
     },
     /// Nothing to do — in sync, no in-scope sources, or over a directory-bomb cap. A
     /// RETRYABLE no-op: it appends NO event, so the same mandate is re-evaluated next tick.
     Elide,
     /// A genuine synthesis failure (e.g. the model returned empty content). Task 9b
-    /// records a `write_rejected` for this; the carried string is the reject reason.
-    Reject(String),
+    /// records a `write_rejected` for this. `reason` is the reject reason; `sources_hash`
+    /// is the phase's computed source-state digest, carried so the recorded
+    /// `write_rejected`'s `inducing_key` (`{mandate, target, sources_hash}`) is keyed on the
+    /// SAME source-state a `Propose` would use — making the rejection TERMINAL for exactly
+    /// that source-state (a later DIFFERENT source-state is a fresh, non-suppressed ask),
+    /// mirroring M6b's same-key reject.
+    Reject {
+        /// The human-readable reject reason recorded on the `write_rejected`.
+        reason: String,
+        /// The source-state digest for the rejected attempt (keys the `inducing_key`).
+        sources_hash: String,
+    },
 }
 
 const GENESIS: &str =
@@ -5666,6 +5683,39 @@ impl EventLog {
         //    `summarize_cursor` (F1) independent of the extraction cursor above. ──
         self.summarize_topics(reasoner, &mut report)?;
 
+        // ── 10. M6c mandate phase (§5.1/§5.5/§5.6). A NEW top-level phase, AFTER summarize:
+        //    the brain's standing sync goals are evaluated last, so a mandate synthesizes
+        //    over a graph + dossiers that already reflect THIS tick's curation. Skipped
+        //    wholesale when the INDEPENDENT mandate off-switch is engaged (sticky +
+        //    fail-closed, §5.6); the evolve off-switch already returned earlier. The whole
+        //    phase is `#[cfg(unix)]` — the actuator/gate surface (M6a) is Unix-only.
+        //
+        //    Best-effort isolation mirrors the M6b reconciliation wiring EXACTLY: each
+        //    mandate is wrapped so an `Err` is logged and the loop CONTINUES — a single
+        //    mandate failure NEVER unwinds the committed graph/summarize work nor aborts the
+        //    tick. The off-switch is RE-READ per mandate (security M1, fast-kill): flipping
+        //    it mid-phase stops further proposals within the same tick. The shared
+        //    `report.proposals_emitted` counter bounds M6b + M6c proposals together. ──
+        #[cfg(unix)]
+        {
+            if self.mandates_enabled()? {
+                for m in self.active_mandates()? {
+                    // Re-read the off-switch per mandate so a flip mid-phase fast-kills the
+                    // rest of the tick (sticky + fail-closed). A read error aborts the phase
+                    // (fail-closed) but never unwinds committed work.
+                    if !self.mandates_enabled()? {
+                        break;
+                    }
+                    if let Err(e) = self.run_mandate(&m, reasoner, &mut report) {
+                        log::warn!(
+                            "evolve: mandate {} (target {}) failed (committed work kept): {e}",
+                            m.mandate_grant_id, m.target
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(report)
     }
 
@@ -5812,7 +5862,20 @@ impl EventLog {
                     // Empty synthesis is a genuine failure → Reject (finding G: NEVER truncate
                     // the target to empty). Mirrors the reconcile `empty_rewrite` reject.
                     if synced.is_empty() {
-                        return Ok(MandateAction::Reject("empty synthesis".into()));
+                        return Ok(MandateAction::Reject {
+                            reason: "empty synthesis".into(),
+                            sources_hash,
+                        });
+                    }
+                    // Output-size bound (review carry-forward, Minor #3): an over-cap synthesis
+                    // Elides BEFORE it is cached — bounding the synthesis cache row (a runaway
+                    // model output can never bloat the encrypted cache), and, because the phase
+                    // returns Elide, the proposal too. Retryable: the source-state is unchanged,
+                    // so a later tick recomputes the same `sources_hash` (and a model that
+                    // eventually returns in-bound bytes converges). NEVER a Reject — an oversized
+                    // output is a transient model artifact, not a terminal (path,key) failure.
+                    if synced.len() > crate::graph::MAX_SYNCED_CONTENT_BYTES {
+                        return Ok(MandateAction::Elide);
                     }
                     let bytes = synced.as_bytes().to_vec();
                     let expected_hash = hex::encode(Sha256::digest(&bytes));
@@ -5856,7 +5919,180 @@ impl EventLog {
         union.dedup();
         let lineage = crate::mandate::mandate_lineage(&m.mandate_grant_id, &union)?;
 
-        Ok(MandateAction::Propose { expected: expected_bytes, lineage, op })
+        Ok(MandateAction::Propose { expected: expected_bytes, lineage, op, sources_hash })
+    }
+
+    /// M6c — act on ONE mandate `m` this tick (§5.1/§5.5/§5.6, Task 9b). Calls
+    /// [`mandate_phase_for`](Self::mandate_phase_for) for the gather + cached-or-synth
+    /// DECISION, then turns the [`MandateAction`] into the SAME recorded outcomes the M6b
+    /// sibling [`reconcile_confirmed_contradiction`](Self::reconcile_confirmed_contradiction)
+    /// produces — a gated `write_proposal` (+ cached bytes) or a `write_rejected`. The
+    /// EXACT mirror of that method's propose/reject/record half, with the M6c producer
+    /// stamp and the source-state `inducing_key`.
+    ///
+    /// Action handling:
+    /// - [`MandateAction::Elide`] → do nothing, emit NO event (stays retryable next tick).
+    /// - [`MandateAction::Reject`] → record a `write_rejected` (a genuine synthesis
+    ///   failure, e.g. empty synthesis) stamped [`M6C_PROPOSER_PRODUCER`]; `count`.
+    /// - [`MandateAction::Propose`] →
+    ///   1. `inducing_key` = `{mandate, target, sources_hash}` — the SHAPE
+    ///      [`is_mandate_proposal_suppressed`](Self::is_mandate_proposal_suppressed)
+    ///      expects (§5.4); `sources_hash` is the one the phase computed (returned in the
+    ///      action so the two sites cannot drift).
+    ///   2. **Idempotency** — a suppressed `(target, key)` skips (emits nothing).
+    ///   3. **Caps** — the GLOBAL per-tick cap ([`MAX_PROPOSALS_PER_TICK`], SHARED with M6b
+    ///      via `report.proposals_emitted`) OR the per-mandate cap
+    ///      ([`MAX_PROPOSALS_PER_MANDATE_PER_TICK`]) ⇒ ELIDE: no event,
+    ///      `report.proposals_elided_cap += 1` (NEVER a `write_rejected` — a cap is retryable).
+    ///   4. **Gate + record** — `propose_write`; a `reject_reason` (e.g. the target left a
+    ///      write-grant: the never-widen check) records a `write_rejected`; otherwise an
+    ///      `append_write_proposal_with` + `put_proposal_bytes`, `proposals_emitted += 1`.
+    ///
+    /// `proposals_emitted` is the SHARED global counter (M6b increments it too), so the
+    /// global cap bounds M6b + M6c proposals TOGETHER in one tick. Best-effort isolation
+    /// is the CALLER's (`evolve_once` wraps each call so an `Err` is logged + the loop
+    /// continues); this method returns `Err` only on a genuine append/IO failure.
+    #[cfg(unix)]
+    fn run_mandate(
+        &self,
+        m: &crate::graph::Mandate,
+        reasoner: &dyn crate::reason::Reasoner,
+        report: &mut EvolveReport,
+    ) -> Result<(), BossclawError> {
+        let (expected, lineage, op, sources_hash) = match self.mandate_phase_for(m, reasoner)? {
+            // In sync / no sources / over an input cap → nothing to do, stays retryable.
+            MandateAction::Elide => return Ok(()),
+            // A genuine synthesis failure (e.g. empty synthesis) → record a terminal
+            // `write_rejected` for the target, stamped with the M6c producer. `target` is
+            // the mandate's canonical target; the inducing_key carries the source-state so a
+            // later DIFFERENT source-state is a fresh (non-suppressed) ask. Best-effort:
+            // a Reject NEVER unwinds committed work (the caller isolates an Err).
+            MandateAction::Reject { reason, sources_hash } => {
+                // The inducing_key carries the REAL source-state digest, so the
+                // `write_rejected` is terminal for exactly this source-state (a later
+                // DIFFERENT source-state is a fresh ask), mirroring M6b's same-key reject.
+                // Lineage cites the mandate id (a genuine, resolvable Tier-B source).
+                let inducing_key = serde_json::json!({
+                    "mandate": m.mandate_grant_id, "target": m.target, "sources_hash": sources_hash,
+                });
+                self.append_write_rejected_with(
+                    Some(&m.target),
+                    &reason,
+                    &inducing_key,
+                    std::slice::from_ref(&m.mandate_grant_id),
+                    crate::graph::M6C_PROPOSER_PRODUCER,
+                )?;
+                report.proposals_rejected += 1;
+                return Ok(());
+            }
+            MandateAction::Propose { expected, lineage, op, sources_hash } => {
+                (expected, lineage, op, sources_hash)
+            }
+        };
+
+        // ── 1. inducing_key = the SOURCE-STATE key (§5.4): {mandate, target, sources_hash}.
+        //    This is the exact shape `is_mandate_proposal_suppressed` matches on; keying on
+        //    `sources_hash` makes a NEW source-state a fresh ask (a prior state's decline
+        //    cannot suppress it) while a decline is sticky for THIS state. ──
+        let inducing_key = serde_json::json!({
+            "mandate": m.mandate_grant_id, "target": m.target, "sources_hash": sources_hash,
+        });
+
+        // ── 2. Idempotency: a suppressed (target, key) — an OPEN proposal, a prior
+        //    write_rejected, or a DECLINED sync for THIS source-state — skips silently. ──
+        if self.is_mandate_proposal_suppressed(&m.target, &inducing_key)? {
+            return Ok(());
+        }
+
+        // ── 3. Caps (ELIDE, never reject — a cap is retryable). Two bounds:
+        //    - the GLOBAL per-tick cap, SHARED with M6b via `report.proposals_emitted`, so
+        //      M6b + M6c proposals together never exceed MAX_PROPOSALS_PER_TICK in one tick;
+        //    - the per-mandate cap. A mandate owns ONE target, so one `run_mandate` emits at
+        //      most one proposal — the per-mandate bound is structural here; the explicit
+        //      guard encodes it (and is future-proof if a mandate ever fans out). ──
+        let already_emitted_for_mandate = 0usize; // one target per run_mandate call
+        if report.proposals_emitted >= crate::extract::MAX_PROPOSALS_PER_TICK
+            || already_emitted_for_mandate >= crate::graph::MAX_PROPOSALS_PER_MANDATE_PER_TICK
+        {
+            report.proposals_elided_cap += 1;
+            return Ok(());
+        }
+
+        // ── 4. Gate + record. Build the proposal with the engine-gathered lineage (mandate
+        //    ∪ source ids) and the synthesized whole-file bytes; the op is the phase's
+        //    Create/Edit decision (M6c never deletes). The hash is the engine's canonical
+        //    content hash (the same `get_proposal_bytes_checked` recomputes). ──
+        let expected_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&expected))
+        };
+        let gated = self.propose_write(crate::actuator::WriteProposal {
+            target: std::path::PathBuf::from(&m.target),
+            new_content: expected.clone(),
+            op,
+            source_event_ids: lineage.clone(),
+            rationale: m.recipe.clone(),
+        })?;
+
+        // A gate FAILURE is recorded as a `write_rejected` (terminal for this source-state).
+        // TWO distinct failure signals must be honored (the gate separates them):
+        //   - `reject_reason.is_some()` — op×existence, an unresolvable target, or a symlink
+        //     final component; AND
+        //   - `!allowed` — the target is NOT under an active write-grant. This is the
+        //     LOAD-BEARING never-widen check, and the gate signals it via `allowed=false`
+        //     with NO `reject_reason` (a not-granted target is not a malformed proposal, just
+        //     an unauthorized one). Acting only on `reject_reason` would EMIT a proposal for a
+        //     target outside every write-grant — a grant-widening leak. So `!allowed` rejects
+        //     here too (propose-time), and `execute_write_resolving` re-checks it at execute.
+        let gate_reject = gated
+            .verdict
+            .reject_reason
+            .as_deref()
+            .map(str::to_string)
+            .or_else(|| (!gated.verdict.allowed).then(|| "target not under an active write grant".to_string()));
+        if let Some(reason) = gate_reject {
+            self.append_write_rejected_with(
+                Some(&m.target),
+                &reason,
+                &inducing_key,
+                &lineage,
+                crate::graph::M6C_PROPOSER_PRODUCER,
+            )?;
+            report.proposals_rejected += 1;
+            return Ok(());
+        }
+
+        // Record the gated proposal (M6c producer) + its bytes (the side-table cache). The
+        // verdict_summary mirrors M6b's shape so the app surfaces the same fields. The
+        // append chokepoint stamps `origin:"external"` automatically when the lineage cites
+        // an external source — taint is never shed.
+        let op_str = match op {
+            crate::actuator::WriteOp::Create => "create",
+            crate::actuator::WriteOp::Edit => "edit",
+            // M6c never deletes; the phase only ever returns Create/Edit. A Delete here
+            // would be a contract violation, so name it explicitly rather than silently
+            // mislabeling — it cannot occur.
+            crate::actuator::WriteOp::Delete => "delete",
+        };
+        let verdict_summary = serde_json::json!({
+            "requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint),
+            "allowed": gated.verdict.allowed,
+        });
+        let pid = self.append_write_proposal_with(
+            &m.target,
+            op_str,
+            &expected_hash,
+            expected.len() as u64,
+            &m.recipe,
+            &inducing_key,
+            &verdict_summary,
+            &lineage,
+            crate::graph::M6C_PROPOSER_PRODUCER,
+        )?;
+        self.put_proposal_bytes(&pid, &expected, &expected_hash)?;
+        report.proposals_emitted += 1;
+        Ok(())
     }
 
     /// M6b reconciliation for ONE confirmed contradiction `r` (resolved entity ids),

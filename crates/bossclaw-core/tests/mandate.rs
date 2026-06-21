@@ -505,7 +505,7 @@ fn empty_synced_content_rejects() {
 
     let reasoner = SyncReasoner::new(""); // empty synthesis
     let action = log.mandate_phase_for(m, &reasoner).unwrap();
-    assert!(matches!(action, MandateAction::Reject(_)), "empty synced_content → Reject");
+    assert!(matches!(action, MandateAction::Reject { .. }), "empty synced_content → Reject");
 }
 
 // 9a — cache hit skips the LLM: pre-seed the synthesis cache for the EXACT computed
@@ -538,12 +538,15 @@ fn cache_hit_skips_llm() {
     let reasoner = CountingReasoner::new();
     let action = log.mandate_phase_for(m, &reasoner).unwrap();
     match action {
-        MandateAction::Propose { expected, lineage, op } => {
+        MandateAction::Propose { expected, lineage, op, sources_hash: ret_hash } => {
             assert!(expected == cached_bytes, "Propose uses the CACHED bytes");
             assert!(op == WriteOp::Create, "target absent → Create");
             // Lineage is the engine-gathered union (mandate ∪ source id), sorted+deduped.
             assert!(lineage.contains(&id), "lineage carries the mandate id");
             assert!(lineage.contains(&sid), "lineage carries the engine-gathered source id");
+            // The returned sources_hash IS the engine's computed hash (Task 9b threads it
+            // out so the inducing_key cannot drift from the phase's own digest).
+            assert_eq!(ret_hash, sources_hash, "Propose returns the engine-computed sources_hash");
         }
         other => panic!("cache hit must Propose, got {other:?}"),
     }
@@ -580,4 +583,580 @@ fn in_sync_target_elides() {
     let action = log.mandate_phase_for(m, &reasoner).unwrap();
     assert!(matches!(action, MandateAction::Elide), "on-disk == expected → Elide");
     assert!(reasoner.synth_calls() == 0, "in-sync via cache reaches NO LLM call");
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// TASK 9b — the mandate proposer WIRED into `evolve_once` (§7 security capstone).
+//
+// These proofs drive the WHOLE `evolve_once` tick and assert on the RECORDED events.
+// To isolate the mandate phase hermetically, each test advances the evolve cursor PAST
+// every seeded event (`set_evolve_cursor(tip)`) so the memory-extraction batch is empty
+// and the ONLY reasoner calls are the mandate synthesis turns — exactly the cursor
+// trick `tests/reconcile.rs`'s cap test uses. The mandate phase runs AFTER summarize;
+// with no dirty topics, summarize is a no-op, so the synthesis turn is the sole call.
+// ════════════════════════════════════════════════════════════════════════════════
+
+use bossclaw_core::actuator::WriteProposal;
+use bossclaw_core::embed::MockEmbedder;
+use bossclaw_core::extract::MAX_PROPOSALS_PER_TICK;
+use bossclaw_core::graph::{
+    M6C_PROPOSER_PRODUCER, WRITE_PROPOSAL_EVENT_TYPE, WRITE_REJECTED_EVENT_TYPE,
+};
+use std::sync::atomic::AtomicU64;
+
+/// A reasoner that answers EVERY mandate synthesis turn with the SAME fixed bytes
+/// (matched on the `build_recipe_prompt` frame lead). Any non-synthesis turn returns an
+/// empty object so an unexpected summarize/extraction call never crashes the proof
+/// (the cursor trick should prevent those, but failing soft keeps the proof about the
+/// property under test). The full-loop analogue of 9a's `SyncReasoner`.
+struct MandateReasoner {
+    synced: String,
+}
+
+impl MandateReasoner {
+    fn new(synced: &str) -> Self {
+        Self { synced: synced.to_string() }
+    }
+}
+
+impl Reasoner for MandateReasoner {
+    fn complete_json(&self, _system: &str, prompt: &str, _schema: &Value) -> Result<Value, BossclawError> {
+        if prompt.contains(RECIPE_FRAME_LEAD) {
+            return Ok(json!({ "synced_content": self.synced }));
+        }
+        Ok(json!({}))
+    }
+    fn model_id(&self) -> &str {
+        "m6c-mandate-proposer"
+    }
+}
+
+/// A NONDETERMINISTIC reasoner: every synthesis turn returns DIFFERENT bytes (a
+/// monotonically-increasing counter is appended). Proves convergence (proof 4) comes
+/// from the per-source-state synthesis cache (§5.2), NOT from any LLM determinism — if
+/// the phase re-synthesized on an unchanged source-state, this reasoner's ever-changing
+/// output would propose forever.
+struct NondeterministicReasoner {
+    calls: AtomicU64,
+}
+
+impl NondeterministicReasoner {
+    fn new() -> Self {
+        Self { calls: AtomicU64::new(0) }
+    }
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl Reasoner for NondeterministicReasoner {
+    fn complete_json(&self, _system: &str, prompt: &str, _schema: &Value) -> Result<Value, BossclawError> {
+        if prompt.contains(RECIPE_FRAME_LEAD) {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            // A DISTINCT body per call — convergence cannot come from identical output.
+            return Ok(json!({ "synced_content": format!("synthesis variant {n}\n") }));
+        }
+        Ok(json!({}))
+    }
+    fn model_id(&self) -> &str {
+        "m6c-nondeterministic-test"
+    }
+}
+
+/// Advance the evolve cursor PAST every event seeded so far, so the next `evolve_once`
+/// processes NO memory (the seq is a 1-based autoincrement with no deletes → the event
+/// count IS the tip seq). The mandate phase still sees `current_files()` (cursor-
+/// independent), so only the synthesis turn fires. Mirrors the reconcile cap test.
+fn skip_all_as_evolve_subjects(log: &EventLog) {
+    let tip = log.stream_all().unwrap().len() as i64;
+    log.set_evolve_cursor(tip).unwrap();
+}
+
+/// Every CURRENT `write_proposal` event targeting `canonical` (M6c-stamped or not).
+fn proposals_for(log: &EventLog, canonical: &str) -> Vec<bossclaw_core::event::Event> {
+    log.stream_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == WRITE_PROPOSAL_EVENT_TYPE)
+        .filter(|e| e.content.get("target").and_then(|t| t.as_str()) == Some(canonical))
+        .collect()
+}
+
+/// Count ALL `write_rejected` events in the log (used to assert a cap NEVER rejects).
+fn rejected_count(log: &EventLog) -> usize {
+    log.stream_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == WRITE_REJECTED_EVENT_TYPE)
+        .count()
+}
+
+/// The canonical TARGET string the engine records (the form `add_mandate` stores and
+/// `run_mandate` stamps as a proposal/rejection `target`). Mirrors the engine's
+/// `canonicalize_target_or_parent`: canonicalize the path if it exists, else canonicalize
+/// the PARENT and re-join the (not-yet-created) leaf NOFOLLOW. Required because most
+/// mandate targets are Creates that do not exist on disk yet (`fs::canonicalize` would err).
+fn canon(p: &Path) -> String {
+    if let Ok(real) = std::fs::canonicalize(p) {
+        return real.to_string_lossy().to_string();
+    }
+    let parent = std::fs::canonicalize(p.parent().expect("target has a parent")).expect("parent resolves");
+    parent.join(p.file_name().expect("target has a leaf")).to_string_lossy().to_string()
+}
+
+// ── PROOF 1 — cannot widen the grant (propose AND execute). ─────────────────────────
+// (a) With the TARGET's write-grant revoked, the gate rejects at PROPOSE → no proposal,
+//     a `write_rejected` recorded (the never-widen check fires at propose time).
+// (b) With a grant revoked BETWEEN propose and confirm, `execute_write_resolving`'s
+//     re-check rejects → no write. The load-bearing boundary is EXECUTE-time.
+#[test]
+fn proof1a_cannot_widen_grant_rejected_at_propose() {
+    let (log, _tmp, src, out) = phase_log();
+    ingest_source(&log, &src, "a.md", b"Alpha\n");
+    let target = out.join("index.md");
+    log.add_mandate(&target, &src, "index the titles").unwrap();
+    // Revoke the TARGET's write-grant (the `out` dir). The mandate stays active, but the
+    // target is no longer under any active write-grant → the gate must reject.
+    log.revoke_write_grant(&out).unwrap();
+    skip_all_as_evolve_subjects(&log);
+
+    let emb = MockEmbedder::new(64);
+    let reasoner = MandateReasoner::new("INDEX: Alpha\n");
+    let rep = log.evolve_once(&emb, &reasoner).unwrap();
+
+    assert_eq!(rep.proposals_emitted, 0, "a target outside any write-grant cannot be proposed");
+    assert!(rep.proposals_rejected >= 1, "the never-widen gate records a write_rejected");
+    assert!(proposals_for(&log, &canon(&target)).is_empty(), "no write_proposal for the un-granted target");
+    // No file was written (a proposal is not a write anyway; assert the target is absent).
+    assert!(!target.exists(), "no file_written: the proposer never writes, and the gate rejected");
+    log.verify_chain().unwrap();
+}
+
+#[test]
+fn proof1b_cannot_widen_grant_rejected_at_execute_after_revoke() {
+    // Emit a real M6c proposal, then revoke the grant BEFORE confirming. The confirm path
+    // (`propose_write` → `execute_write_resolving`) must fail closed — the execute-time
+    // re-check is the load-bearing boundary.
+    let (log, _tmp, src, out) = phase_log();
+    ingest_source(&log, &src, "a.md", b"Alpha\n");
+    let target = out.join("index.md");
+    log.add_mandate(&target, &src, "index the titles").unwrap();
+    skip_all_as_evolve_subjects(&log);
+
+    let emb = MockEmbedder::new(64);
+    let reasoner = MandateReasoner::new("INDEX: Alpha\n");
+    let rep = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep.proposals_emitted, 1, "with the grant intact, one proposal is emitted");
+
+    // Capture the emitted proposal's own recorded fields for the confirm path.
+    let prop = proposals_for(&log, &canon(&target)).into_iter().next().expect("the M6c proposal");
+    let pid = prop.id.clone();
+    let hash = prop.content["new_content_hash"].as_str().unwrap().to_string();
+    let lineage = prop.model_meta.as_ref().expect("Tier-B").source_event_ids.clone();
+    let bytes = log.get_proposal_bytes_checked(&pid, &hash).unwrap();
+
+    // Now REVOKE the target's write-grant — between propose and confirm.
+    log.revoke_write_grant(&out).unwrap();
+
+    // Re-gate + execute: the gate's `allowed` is now false (and the execute-time re-check
+    // would also fail). Either way the write must be refused and the file must not appear.
+    let gated = log
+        .propose_write(WriteProposal {
+            target: target.clone(),
+            new_content: bytes,
+            op: WriteOp::Create,
+            source_event_ids: lineage,
+            rationale: "confirm".into(),
+        })
+        .expect("propose_write returns a verdict (rejecting, not erroring)");
+    let exec = log.execute_write_resolving(gated, &pid);
+    assert!(exec.is_err(), "execute must fail closed once the grant is revoked (never-widen at execute)");
+    assert!(!target.exists(), "no file was written after the grant was revoked");
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 2 — cannot shed taint. ────────────────────────────────────────────────────
+// A mandate whose source is EXTERNAL (an ingested file, origin:"external") → the emitted
+// `write_proposal` carries that source's `file_ingested` id in `source_event_ids`, is
+// stamped origin:"external", and the gate verdict is Untrusted + requires_loud_modal.
+#[test]
+fn proof2_cannot_shed_taint_external_source_stamps_proposal() {
+    let (log, _tmp, src, out) = phase_log();
+    let sid = ingest_source(&log, &src, "a.md", b"Alpha\n"); // EXTERNAL file_ingested id
+    let target = out.join("index.md");
+    log.add_mandate(&target, &src, "index the titles").unwrap();
+    skip_all_as_evolve_subjects(&log);
+
+    let emb = MockEmbedder::new(64);
+    let reasoner = MandateReasoner::new("INDEX: Alpha\n");
+    let rep = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep.proposals_emitted, 1, "one proposal from the external source");
+
+    let prop = proposals_for(&log, &canon(&target)).into_iter().next().expect("the proposal");
+    // Lineage carries the engine-gathered external source id.
+    let lineage = prop.model_meta.as_ref().expect("Tier-B").source_event_ids.clone();
+    assert!(lineage.contains(&sid), "lineage carries the external source's file_ingested id");
+    // The append chokepoint stamped origin:"external" (taint never shed).
+    assert_eq!(prop.content["origin"], json!("external"), "external source taints the proposal");
+    // The verdict (recorded summary) is Untrusted + loud.
+    assert_eq!(prop.content["verdict_summary"]["taint"], json!("Untrusted"), "verdict taint=Untrusted");
+    assert_eq!(prop.content["verdict_summary"]["requires_loud_modal"], json!(true), "loud modal required");
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 3 — lineage is engine-gathered (model citations are ignored). ─────────────
+// A scripted reasoner emits `synced_content` that EMBEDS an id-looking string trying to
+// "cite" a forbidden id. That string is ABSENT from the proposal's `source_event_ids`;
+// the set == {mandate_id} ∪ {actual in-scope source ids}, nothing the model named.
+#[test]
+fn proof3_lineage_is_engine_gathered_not_model_cited() {
+    let (log, _tmp, src, out) = phase_log();
+    let sid = ingest_source(&log, &src, "a.md", b"Alpha\n");
+    let mid = {
+        let target = out.join("index.md");
+        log.add_mandate(&target, &src, "index the titles").unwrap()
+    };
+    let target = out.join("index.md");
+    skip_all_as_evolve_subjects(&log);
+
+    // The synthesized body literally contains an attacker-chosen id-looking token.
+    let forbidden = "01FORBIDDENIDAAAAAAAAAAAAAA";
+    let emb = MockEmbedder::new(64);
+    let reasoner = MandateReasoner::new(&format!("INDEX cites {forbidden} as a source\n"));
+    let rep = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep.proposals_emitted, 1);
+
+    let prop = proposals_for(&log, &canon(&target)).into_iter().next().unwrap();
+    let lineage = prop.model_meta.as_ref().expect("Tier-B").source_event_ids.clone();
+    assert!(!lineage.contains(&forbidden.to_string()), "a model-named id is NEVER in the lineage");
+    // The set is EXACTLY {mandate} ∪ {in-scope source} (sorted/deduped).
+    let mut expected = vec![mid.clone(), sid.clone()];
+    expected.sort();
+    expected.dedup();
+    let mut got = lineage.clone();
+    got.sort();
+    assert_eq!(got, expected, "lineage == {{mandate}} ∪ {{actual in-scope source ids}}");
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 3b — cache-hit lineage covers DEPARTED taint (Finding B regression guard). ─
+// Seed the synthesis cache with a synth-lineage id (an external source) that is NO LONGER
+// in the current in-scope set, and force a CACHE HIT (the current in-scope set produces a
+// matching `sources_hash` but no longer includes the departed source). The emitted
+// proposal must STILL carry the departed source's `file_ingested` id (from
+// `source_event_ids_at_synth`) AND be origin:"external"+loud. This FAILS against a design
+// that re-derives lineage only from the CURRENT scope.
+#[test]
+fn proof3b_cache_hit_lineage_covers_departed_taint() {
+    use sha2::{Digest, Sha256};
+    let (log, _tmp, src, out) = phase_log();
+    // The CURRENTLY in-scope source (under the mandate's `src` scope; what the hash covers).
+    let current_sid = ingest_source(&log, &src, "current.md", b"Current\n");
+    // A DEPARTED external source living OUTSIDE the mandate's source scope: ingest it under a
+    // SEPARATE read-granted dir (`other`), so it is genuinely NOT in `src`'s in-scope set —
+    // but it IS a real external `file_ingested` (origin:"external"). This models a source that
+    // was in scope at synthesis time and has since left scope (Finding B), via the plan's
+    // "seed the cache directly with a synth-lineage id that's no longer in-scope" route.
+    let other = _tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    read_grant(&log, &other);
+    let departed_sid = ingest_source(&log, &other, "departed.md", b"Departed external\n");
+
+    // Sanity: the current source is in `src`'s in-scope set; the departed source is NOT.
+    let scope = std::fs::canonicalize(&src).unwrap();
+    let in_scope: Vec<String> = log
+        .current_files()
+        .unwrap()
+        .into_iter()
+        .filter(|r| std::path::Path::new(&r.canonical_path).starts_with(&scope))
+        .map(|r| r.file_event_id)
+        .collect();
+    assert!(in_scope.contains(&current_sid), "the current source is in the mandate's scope");
+    assert!(!in_scope.contains(&departed_sid), "the departed source is OUTSIDE the mandate's scope");
+
+    let target = out.join("index.md");
+    let mid = log.add_mandate(&target, &src, "index the titles").unwrap();
+
+    // Compute the sources_hash over the CURRENT in-scope set (just `current.md`) exactly as
+    // the phase does, and SEED the cache under it — but with the synth-lineage carrying the
+    // DEPARTED external id (as if synthesis happened while it was still in scope, Finding B).
+    let sources_hash = sources_hash_for(&log, &current_sid);
+    let cached = b"INDEX (synthesized while departed.md was in scope)\n";
+    log.put_synthesis_cache(
+        &mid,
+        &sources_hash,
+        cached,
+        &hex::encode(Sha256::digest(cached)),
+        std::slice::from_ref(&departed_sid), // the departed external id travels in the cache row
+    )
+    .unwrap();
+
+    skip_all_as_evolve_subjects(&log);
+    let emb = MockEmbedder::new(64);
+    // A reasoner that MUST NOT be called — a cache hit reaches no LLM. If synthesis fires,
+    // the empty-object answer would yield empty synced_content → Reject, failing the proof.
+    let reasoner = CountingReasoner::new();
+    let rep = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep.proposals_emitted, 1, "the cache hit proposes (no LLM call)");
+    assert_eq!(reasoner.synth_calls(), 0, "cache hit reaches NO synthesis turn");
+
+    let prop = proposals_for(&log, &canon(&target)).into_iter().next().unwrap();
+    let lineage = prop.model_meta.as_ref().expect("Tier-B").source_event_ids.clone();
+    assert!(
+        lineage.contains(&departed_sid),
+        "the DEPARTED external source id is STILL in the lineage (from source_event_ids_at_synth)"
+    );
+    // Departed source is external → the proposal must remain origin:"external" + loud.
+    assert_eq!(prop.content["origin"], json!("external"), "departed external taint is NOT shed on a cache hit");
+    assert_eq!(prop.content["verdict_summary"]["requires_loud_modal"], json!(true), "still loud");
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 4 — convergence incl. a NONDETERMINISTIC model. ───────────────────────────
+// After a confirmed write with unchanged sources, the NEXT tick proposes nothing — using
+// a reasoner that returns DIFFERENT bytes each call. Convergence comes from the per-
+// source-state cache (§5.2), not LLM determinism.
+#[test]
+fn proof4_convergence_with_a_nondeterministic_model() {
+    let (log, _tmp, src, out) = phase_log();
+    ingest_source(&log, &src, "a.md", b"Alpha\n");
+    let target = out.join("index.md");
+    log.add_mandate(&target, &src, "index the titles").unwrap();
+    skip_all_as_evolve_subjects(&log);
+
+    let emb = MockEmbedder::new(64);
+    let reasoner = NondeterministicReasoner::new();
+
+    // Tick 1: a proposal is synthesized (first variant). Confirm it onto disk so the target
+    // now equals the cached expected bytes for THIS source-state.
+    let rep1 = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep1.proposals_emitted, 1, "tick 1 proposes");
+    let prop = proposals_for(&log, &canon(&target)).into_iter().next().unwrap();
+    let pid = prop.id.clone();
+    let hash = prop.content["new_content_hash"].as_str().unwrap().to_string();
+    let lineage = prop.model_meta.as_ref().unwrap().source_event_ids.clone();
+    let bytes = log.get_proposal_bytes_checked(&pid, &hash).unwrap();
+    let gated = log
+        .propose_write(WriteProposal {
+            target: target.clone(),
+            new_content: bytes.clone(),
+            op: WriteOp::Create,
+            source_event_ids: lineage,
+            rationale: "confirm".into(),
+        })
+        .unwrap();
+    log.execute_write_resolving(gated, &pid).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), bytes, "the confirmed bytes are on disk");
+    let calls_after_tick1 = reasoner.calls();
+
+    // Tick 2: sources unchanged → cache HIT → on-disk == expected → ELIDE. Even though the
+    // reasoner WOULD return different bytes, it is never called (convergence from the cache).
+    skip_all_as_evolve_subjects(&log);
+    let rep2 = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep2.proposals_emitted, 0, "tick 2 proposes nothing (converged)");
+    assert_eq!(rep2.proposals_rejected, 0, "convergence is an Elide, not a reject");
+    assert_eq!(
+        reasoner.calls(),
+        calls_after_tick1,
+        "the nondeterministic model was NOT called on tick 2 (cache hit) — convergence is from the cache"
+    );
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 5 — decline-stickiness. ───────────────────────────────────────────────────
+// Decline a sync proposal → the next tick (unchanged sources) proposes nothing for that
+// source-state; then CHANGE a source → it proposes the new version.
+#[test]
+fn proof5_decline_is_sticky_until_a_source_changes() {
+    let (log, _tmp, src, out) = phase_log();
+    ingest_source(&log, &src, "a.md", b"Alpha\n");
+    let target = out.join("index.md");
+    log.add_mandate(&target, &src, "index the titles").unwrap();
+    skip_all_as_evolve_subjects(&log);
+
+    let emb = MockEmbedder::new(64);
+    let reasoner = MandateReasoner::new("INDEX v1\n");
+
+    // Tick 1: one proposal. DECLINE it.
+    let rep1 = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep1.proposals_emitted, 1, "tick 1 proposes");
+    let pid = proposals_for(&log, &canon(&target)).into_iter().next().unwrap().id;
+    log.decline_write_proposal(&pid, "not now").unwrap();
+
+    // Tick 2: sources UNCHANGED → the declined source-state is sticky → propose nothing.
+    skip_all_as_evolve_subjects(&log);
+    let rep2 = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep2.proposals_emitted, 0, "a declined source-state does NOT re-nag (sticky)");
+    assert_eq!(rep2.proposals_rejected, 0, "decline-stickiness is an Elide, not a reject");
+
+    // CHANGE a source → a NEW source-state (different sources_hash) → a fresh ask.
+    std::fs::write(src.join("a.md"), b"Alpha CHANGED\n").unwrap();
+    log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &emb).unwrap();
+    skip_all_as_evolve_subjects(&log);
+    let reasoner2 = MandateReasoner::new("INDEX v2\n");
+    let rep3 = log.evolve_once(&emb, &reasoner2).unwrap();
+    assert_eq!(rep3.proposals_emitted, 1, "a changed source is a fresh source-state → proposes again");
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 6 — caps (hermetic, no clock). ────────────────────────────────────────────
+// More "due" mandates than MAX_PROPOSALS_PER_TICK in one tick → only cap-many proposals
+// emitted, the rest ELIDE (no event, retryable). Assert NO permanent write_rejected from
+// the cap, and that an emitted proposal's recorded model_meta.model_id is the M6c stamp.
+#[test]
+fn proof6_caps_elide_the_overflow_and_never_reject() {
+    let (log, _tmp, src, out) = phase_log();
+    // Build MAX_PROPOSALS_PER_TICK + 2 mandates, each with its OWN distinct source + target,
+    // so each is independently "due" this tick. (The global per-tick cap is SHARED across
+    // all mandates via report.proposals_emitted.)
+    let n = MAX_PROPOSALS_PER_TICK + 2;
+    let emb = MockEmbedder::new(64);
+    for i in 0..n {
+        // A distinct source subtree per mandate so their sources_hashes (and targets) differ.
+        let sdir = src.join(format!("s{i}"));
+        std::fs::create_dir_all(&sdir).unwrap();
+        log.add_grant(&sdir).unwrap();
+        std::fs::write(sdir.join("a.md"), format!("Body {i}\n").as_bytes()).unwrap();
+        log.add_mandate(&out.join(format!("index{i}.md")), &sdir, "index it").unwrap();
+    }
+    // Ingest all the sources once.
+    log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &emb).unwrap();
+    skip_all_as_evolve_subjects(&log);
+
+    let reasoner = MandateReasoner::new("INDEX\n");
+    let rep = log.evolve_once(&emb, &reasoner).unwrap();
+
+    assert_eq!(rep.proposals_emitted, MAX_PROPOSALS_PER_TICK, "only cap-many proposals are emitted");
+    assert_eq!(rep.proposals_elided_cap, n - MAX_PROPOSALS_PER_TICK, "the overflow ELIDES (counted)");
+    assert_eq!(rep.proposals_rejected, 0, "a cap is NEVER a write_rejected (retryable)");
+    assert_eq!(rejected_count(&log), 0, "no permanent write_rejected event from the cap");
+
+    // The emitted proposal carries the M6c producer stamp (distinguishes mandate proposals).
+    let emitted: Vec<bossclaw_core::event::Event> = log
+        .stream_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == WRITE_PROPOSAL_EVENT_TYPE)
+        .collect();
+    assert_eq!(emitted.len(), MAX_PROPOSALS_PER_TICK, "exactly cap-many proposal events recorded");
+    for e in &emitted {
+        assert_eq!(
+            e.model_meta.as_ref().expect("Tier-B").model_id,
+            M6C_PROPOSER_PRODUCER,
+            "a mandate proposal records model_id == \"m6c-mandate-proposer\""
+        );
+    }
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 7 — off-switch (sticky + fail-closed). ────────────────────────────────────
+// `set_mandates_enabled(false)` → the mandate phase emits nothing.
+#[test]
+fn proof7_off_switch_suppresses_the_whole_phase() {
+    let (log, _tmp, src, out) = phase_log();
+    ingest_source(&log, &src, "a.md", b"Alpha\n");
+    let target = out.join("index.md");
+    log.add_mandate(&target, &src, "index the titles").unwrap();
+    log.set_mandates_enabled(false).unwrap(); // sticky off
+    skip_all_as_evolve_subjects(&log);
+
+    let emb = MockEmbedder::new(64);
+    let reasoner = MandateReasoner::new("INDEX\n");
+    let rep = log.evolve_once(&emb, &reasoner).unwrap();
+
+    assert_eq!(rep.proposals_emitted, 0, "off-switch suppresses all proposals");
+    assert_eq!(rep.proposals_rejected, 0, "off-switch is a plain skip — never a write_rejected");
+    assert!(proposals_for(&log, &canon(&target)).is_empty(), "no proposal event written");
+    assert_eq!(rejected_count(&log), 0, "no write_rejected from the off-switch path");
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 9 — structural self-loop guard (no re-ingest of own write). ───────────────
+// A mandate whose target is legitimately OUTSIDE the read roots, after a confirmed write,
+// does NOT re-ingest its own write as a source: a second tick with unchanged sources →
+// Elide (proposes nothing). (Task 2 already proved add_mandate rejects a target under a
+// read root; this proves the runtime convergence the structural guard guarantees.)
+#[test]
+fn proof9_confirmed_write_is_not_reingested_as_a_source() {
+    let (log, _tmp, src, out) = phase_log();
+    ingest_source(&log, &src, "a.md", b"Alpha\n");
+    let target = out.join("index.md"); // out is OUTSIDE the read root `src`
+    log.add_mandate(&target, &src, "index the titles").unwrap();
+    skip_all_as_evolve_subjects(&log);
+
+    let emb = MockEmbedder::new(64);
+    let reasoner = MandateReasoner::new("INDEX: Alpha\n");
+
+    // Tick 1: propose + confirm the write onto disk.
+    let rep1 = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep1.proposals_emitted, 1);
+    let prop = proposals_for(&log, &canon(&target)).into_iter().next().unwrap();
+    let pid = prop.id.clone();
+    let hash = prop.content["new_content_hash"].as_str().unwrap().to_string();
+    let lineage = prop.model_meta.as_ref().unwrap().source_event_ids.clone();
+    let bytes = log.get_proposal_bytes_checked(&pid, &hash).unwrap();
+    let gated = log
+        .propose_write(WriteProposal {
+            target: target.clone(),
+            new_content: bytes,
+            op: WriteOp::Create,
+            source_event_ids: lineage,
+            rationale: "confirm".into(),
+        })
+        .unwrap();
+    log.execute_write_resolving(gated, &pid).unwrap();
+
+    // Re-run ingest over the read root: the target lives OUTSIDE it, so the write is NOT
+    // discovered as a source (the structural self-loop guarantee). The sources_hash is
+    // therefore unchanged → tick 2 elides.
+    log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &emb).unwrap();
+    skip_all_as_evolve_subjects(&log);
+    let rep2 = log.evolve_once(&emb, &reasoner).unwrap();
+    assert_eq!(rep2.proposals_emitted, 0, "the engine's own write is never re-ingested → converged");
+    assert_eq!(rep2.proposals_rejected, 0, "convergence is an Elide, not a reject");
+    log.verify_chain().unwrap();
+}
+
+// ── PROOF 10 — elide/reject degenerate cases through the PHASE (recorded events). ────
+// (a) empty-source mandate → the phase Elides end-to-end (no event).
+// (b) empty `synced_content` → the phase records a `write_rejected` (a genuine failure).
+#[test]
+fn proof10_phase_elides_on_empty_source_and_rejects_on_empty_synthesis() {
+    // (a) Empty source scope (no ingested files) → Elide, nothing recorded.
+    {
+        let (log, _tmp, _src, out) = phase_log();
+        let target = out.join("index.md");
+        log.add_mandate(&target, &_src, "index the titles").unwrap();
+        skip_all_as_evolve_subjects(&log);
+        let emb = MockEmbedder::new(64);
+        let reasoner = MandateReasoner::new("INDEX\n");
+        let rep = log.evolve_once(&emb, &reasoner).unwrap();
+        assert_eq!(rep.proposals_emitted, 0, "empty-source mandate emits no proposal");
+        assert_eq!(rep.proposals_rejected, 0, "empty-source is an Elide, not a reject");
+        assert_eq!(rejected_count(&log), 0, "no write_rejected recorded for an empty-source Elide");
+    }
+    // (b) A real source but the model returns empty synced_content → write_rejected recorded.
+    {
+        let (log, _tmp, src, out) = phase_log();
+        ingest_source(&log, &src, "a.md", b"Alpha\n");
+        let target = out.join("index.md");
+        log.add_mandate(&target, &src, "index the titles").unwrap();
+        skip_all_as_evolve_subjects(&log);
+        let emb = MockEmbedder::new(64);
+        let reasoner = MandateReasoner::new(""); // empty synthesis → genuine failure
+        let rep = log.evolve_once(&emb, &reasoner).unwrap();
+        assert_eq!(rep.proposals_emitted, 0, "empty synthesis emits no proposal");
+        assert_eq!(rep.proposals_rejected, 1, "empty synthesis is a genuine failure → write_rejected");
+        assert_eq!(rejected_count(&log), 1, "exactly one write_rejected recorded through the phase");
+        // The recorded write_rejected is M6c-stamped and targets the mandate target.
+        let rej = log
+            .stream_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == WRITE_REJECTED_EVENT_TYPE)
+            .unwrap();
+        assert_eq!(rej.content["target"], json!(canon(&target)), "the rejection targets the mandate target");
+        assert_eq!(rej.model_meta.as_ref().expect("Tier-B").model_id, M6C_PROPOSER_PRODUCER);
+        log.verify_chain().unwrap();
+    }
 }
