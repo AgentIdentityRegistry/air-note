@@ -2003,8 +2003,8 @@ impl EventLog {
         }
     }
 
-    /// Append a signed Tier-B `write_proposal`. `source_event_ids` MUST be the engine-
-    /// gathered lineage (Task 3), non-empty. Bytes are NOT in the event (Task 5 side table).
+    /// Append a signed Tier-B `write_proposal` stamped with the M6b reconciler producer.
+    /// Thin wrapper over [`Self::append_write_proposal_with`] — see it for argument detail.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     pub fn append_write_proposal(
@@ -2012,34 +2012,75 @@ impl EventLog {
         rationale: &str, inducing_key: &serde_json::Value, verdict_summary: &serde_json::Value,
         source_event_ids: &[String],
     ) -> Result<String, BossclawError> {
+        self.append_write_proposal_with(
+            target_canonical, op, new_content_hash, byte_size, rationale,
+            inducing_key, verdict_summary, source_event_ids,
+            crate::graph::M6B_PROPOSER_PRODUCER,
+        )
+    }
+
+    /// Append a signed Tier-B `write_proposal` stamped with `producer` as its
+    /// `model_meta.model_id` (M6b passes `M6B_PROPOSER_PRODUCER`; M6c mandates pass
+    /// `M6C_PROPOSER_PRODUCER`). `source_event_ids` MUST be the engine-gathered lineage
+    /// (Task 3), non-empty. Bytes are NOT in the event (Task 5 side table). The producer
+    /// string is provenance ONLY — it is independent of the taint lineage.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_write_proposal_with(
+        &self, target_canonical: &str, op: &str, new_content_hash: &str, byte_size: u64,
+        rationale: &str, inducing_key: &serde_json::Value, verdict_summary: &serde_json::Value,
+        source_event_ids: &[String], producer: &str,
+    ) -> Result<String, BossclawError> {
         let content = serde_json::json!({
             "target": target_canonical, "op": op,
             "new_content_hash": new_content_hash, "byte_size": byte_size,
             "rationale": rationale, "inducing_key": inducing_key, "verdict_summary": verdict_summary,
         });
-        self.append(self.build_m6b_event(crate::graph::WRITE_PROPOSAL_EVENT_TYPE, content, source_event_ids))
+        self.append(self.build_proposer_event(producer, crate::graph::WRITE_PROPOSAL_EVENT_TYPE, content, source_event_ids))
     }
 
-    /// Append a signed Tier-B `write_rejected` (emitted INSTEAD of a proposal on synthesis/
-    /// gate failure; a terminal audit marker — never resolves a proposal).
+    /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
+    /// Thin wrapper over [`Self::append_write_rejected_with`].
     #[cfg(unix)]
     pub fn append_write_rejected(
         &self, target_canonical: Option<&str>, reason: &str,
         inducing_key: &serde_json::Value, source_event_ids: &[String],
     ) -> Result<String, BossclawError> {
-        let content = serde_json::json!({ "target": target_canonical, "reason": reason, "inducing_key": inducing_key });
-        self.append(self.build_m6b_event(crate::graph::WRITE_REJECTED_EVENT_TYPE, content, source_event_ids))
+        self.append_write_rejected_with(
+            target_canonical, reason, inducing_key, source_event_ids,
+            crate::graph::M6B_PROPOSER_PRODUCER,
+        )
     }
 
-    /// App-facing: a human declined a proposal. Appends a `write_declined` that RESOLVES it.
+    /// Append a signed Tier-B `write_rejected` (emitted INSTEAD of a proposal on synthesis/
+    /// gate failure; a terminal audit marker — never resolves a proposal), stamped with
+    /// `producer` as its `model_meta.model_id`.
+    #[cfg(unix)]
+    pub fn append_write_rejected_with(
+        &self, target_canonical: Option<&str>, reason: &str,
+        inducing_key: &serde_json::Value, source_event_ids: &[String], producer: &str,
+    ) -> Result<String, BossclawError> {
+        let content = serde_json::json!({ "target": target_canonical, "reason": reason, "inducing_key": inducing_key });
+        self.append(self.build_proposer_event(producer, crate::graph::WRITE_REJECTED_EVENT_TYPE, content, source_event_ids))
+    }
+
+    /// App-facing: a human declined a proposal. Appends an M6b-reconciler-stamped
+    /// `write_declined` that RESOLVES it. Thin wrapper over [`Self::decline_write_proposal_with`].
     #[cfg(unix)]
     pub fn decline_write_proposal(&self, proposal_id: &str, reason: &str) -> Result<String, BossclawError> {
+        self.decline_write_proposal_with(proposal_id, reason, crate::graph::M6B_PROPOSER_PRODUCER)
+    }
+
+    /// App-facing: a human declined a proposal. Appends a `write_declined` that RESOLVES it,
+    /// inheriting the proposal's lineage and stamped with `producer` as its `model_meta.model_id`.
+    #[cfg(unix)]
+    pub fn decline_write_proposal_with(&self, proposal_id: &str, reason: &str, producer: &str) -> Result<String, BossclawError> {
         let sources = self.source_ids_of_event(proposal_id)?.unwrap_or_default();
         if sources.is_empty() {
             return Err(BossclawError::InvalidInput("unknown or non-Tier-B proposal id".into()));
         }
         let content = serde_json::json!({ "resolves_proposal": proposal_id, "reason": reason });
-        self.append(self.build_m6b_event(crate::graph::WRITE_DECLINED_EVENT_TYPE, content, &sources))
+        self.append(self.build_proposer_event(producer, crate::graph::WRITE_DECLINED_EVENT_TYPE, content, &sources))
     }
 
     /// Idempotency (§5.7): suppress a new proposal for (canonical_path, inducing_key) if
@@ -2168,14 +2209,17 @@ impl EventLog {
         Ok(content)
     }
 
-    /// Shared M6b Tier-B event builder (producer = m6b-reconciler; lineage = engine-gathered).
+    /// Shared proposer Tier-B event builder. `producer` is stamped as `model_meta.model_id`
+    /// (the M6b reconciler and the M6c mandate proposer pass DIFFERENT producers — Task 9's
+    /// per-mandate cap distinguishes them by this stamp). Lineage is engine-gathered; the
+    /// event shape is otherwise identical regardless of producer.
     #[cfg(unix)]
-    fn build_m6b_event(&self, event_type: &str, content: serde_json::Value, source_event_ids: &[String]) -> crate::event::Event {
+    fn build_proposer_event(&self, producer: &str, event_type: &str, content: serde_json::Value, source_event_ids: &[String]) -> crate::event::Event {
         crate::event::Event {
             id: String::new(), ts: String::new(), valid_time: None,
             event_type: event_type.to_string(), content,
             model_meta: Some(crate::event::ModelMeta {
-                model_id: crate::graph::M6B_PROPOSER_PRODUCER.to_string(),
+                model_id: producer.to_string(),
                 prompt_hash: String::new(), source_event_ids: source_event_ids.to_vec(),
             }),
             prev_hash: String::new(), hash: None,

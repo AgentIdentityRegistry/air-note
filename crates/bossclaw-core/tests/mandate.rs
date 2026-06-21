@@ -14,6 +14,7 @@
 
 use bossclaw_core::{EventLog, MAX_RECIPE_LEN};
 use ed25519_dalek::SigningKey;
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -172,4 +173,32 @@ fn mandates_enabled_sticky_default_open() {
     assert!(!log.mandates_enabled().unwrap()); // sticky off
     log.set_mandates_enabled(true).unwrap();
     assert!(log.mandates_enabled().unwrap()); // later explicit true re-enables
+}
+
+// §5.6 / finding C: a proposal recorded through the M6c path stamps its OWN producer
+// (`m6c-mandate-proposer`), NOT the hardcoded M6b `m6b-reconciler`. The event shape is
+// otherwise unchanged — only `model_meta.model_id` is parameterized. Task 9's per-mandate
+// cap relies on this stamp to distinguish mandate proposals from reconciler proposals.
+#[test]
+fn m6c_proposal_records_its_own_producer() {
+    let (log, _tmp) = setup();
+    let id = log
+        .append_write_proposal_with(
+            "out/i.md",
+            "edit",
+            "deadbeef",
+            3,
+            "sync",
+            &json!({"mandate": "M1", "target": "out/i.md", "sources_hash": "h"}),
+            &json!({}),
+            &["M1".to_string()],
+            bossclaw_core::graph::M6C_PROPOSER_PRODUCER,
+        )
+        .unwrap();
+    let ev = log.event_by_id(&id).unwrap().expect("proposal event readable by id");
+    assert_eq!(
+        ev.model_meta.expect("Tier-B").model_id,
+        "m6c-mandate-proposer",
+        "M6c-path proposal must stamp its own producer, not m6b-reconciler"
+    );
 }
