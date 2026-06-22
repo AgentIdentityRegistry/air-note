@@ -26,6 +26,7 @@ export type EvolveReportDto = {
   pages_emitted: number;
   memories_processed: number;
 };
+export type OllamaStatusDto = { reachable: boolean; model_present: boolean; model_tag: string };
 
 /** Opens the native folder picker; resolves to the chosen path, or null if the user cancels. */
 export const pickFolder = (): Promise<string | null> => invoke<string | null>("engine_pick_folder");
@@ -40,3 +41,4 @@ export const evolveStatus = (): Promise<EvolveStatusDto> => invoke<EvolveStatusD
 export const setEvolveEnabled = (enabled: boolean): Promise<void> =>
   invoke<void>("engine_set_evolve_enabled", { enabled });
 export const evolveNow = (): Promise<EvolveReportDto> => invoke<EvolveReportDto>("engine_evolve_now");
+export const ollamaStatus = (): Promise<OllamaStatusDto> => invoke<OllamaStatusDto>("engine_ollama_status");

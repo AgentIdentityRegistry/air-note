@@ -3,7 +3,9 @@
 
 pub mod embed;
 pub mod keystore;
+pub mod ollama_probe;
 pub mod reason;
+pub mod scheduler;
 
 use crate::engine::keystore::EngineKeystore;
 use crate::secrets::SecretsVault;
@@ -410,6 +412,26 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))??;
         let tel = self.evolve_tel.lock().unwrap_or_else(|p| p.into_inner()).clone();
         Ok((status, tel))
+    }
+
+    /// The evolve off-switch verdict, defaulting to `false` (OFF) on ANY error (not onboarded,
+    /// open failure, …). A thin gate-and-default read the scheduler loop uses each tick — it
+    /// must never propagate an error (a transient read failure must not trip the loop ON).
+    pub async fn evolve_enabled_or_false(&self, onboarded: bool) -> bool {
+        match self.evolve_status(onboarded).await {
+            Ok((status, _telemetry)) => status.enabled,
+            Err(_) => false,
+        }
+    }
+
+    /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
+    /// default read the scheduler loop uses each tick (a `0` makes the tick a no-op, the safe
+    /// default — never run a tick we can't size).
+    pub async fn queue_depth_or_zero(&self, onboarded: bool) -> usize {
+        match self.evolve_status(onboarded).await {
+            Ok((status, _telemetry)) => status.queue_depth,
+            Err(_) => 0,
+        }
     }
 
     /// Flip the sticky engine evolve off-switch (the toggle behind the Memory tab). Gated.

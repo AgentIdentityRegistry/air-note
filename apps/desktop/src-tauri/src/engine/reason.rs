@@ -8,9 +8,8 @@ use bossclaw_core::Reasoner;
 use std::sync::{Arc, Mutex};
 
 /// Single source of truth for the evolve reasoner's Ollama model tag (mirrors
-/// embed::MODEL_ID). Unpinned for SP3 (the user pulls it via `ollama pull`).
-// Used by the Ollama detection probe + scheduler (SP3 Tasks 9–10) and by `reasoner()` below.
-#[allow(dead_code)] // consumed at Task 9 (ollama_probe) / Task 10 (scheduler)
+/// embed::MODEL_ID). Unpinned for SP3 (the user pulls it via `ollama pull`). Consumed by the
+/// Ollama detection probe + scheduler (SP3 Tasks 9–10) and by `reasoner()` below.
 pub const REASONER_MODEL_ID: &str = "qwen2.5:7b-instruct";
 
 /// Builds (and caches) the reasoner. Called on first evolve, never at startup.
@@ -61,7 +60,7 @@ pub struct MockReasonerProvider {
 impl MockReasonerProvider {
     /// A reasoner with NO canned responses (only `model_id` is exercised). Tests that
     /// drive `evolve_once` build a `ScriptedReasoner` with `.with_response(...)` turns
-    /// and wrap it via `from_scripted`.
+    /// and wrap it via `from_reasoner`.
     pub fn new(model_id: &str) -> Self {
         Self { reasoner: Arc::new(bossclaw_core::ScriptedReasoner::new(model_id)) }
     }
