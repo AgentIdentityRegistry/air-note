@@ -87,6 +87,9 @@ pub async fn create_identity(
 pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
     // Clear identity first, then tear the engine down so a re-onboard starts on a clean
     // brain (otherwise the OLD identity's memories silently re-attach — see spec Rev 2).
+    // Both halves are idempotent, so a partial failure is retry-safe: the surfaced error
+    // prompts a retry that completes the rest, and a half-done reset never leaves a brain
+    // reachable by a NEW identity (the onboarding gate + fresh-key mint prevent that).
     state.identity_store.clear()?;
     state.engine.teardown().await.map_err(|e| e.to_string())?;
     Ok(())

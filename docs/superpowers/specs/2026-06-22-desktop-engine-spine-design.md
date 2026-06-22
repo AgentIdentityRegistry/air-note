@@ -59,7 +59,7 @@ A small `EngineKeystore { vault: Arc<dyn SecretsVault> }` owns mint/load/decode 
 
 ### Teardown on identity reset (CRITICAL — from the critic)
 
-`reset_identity` today calls only `IdentityStore::clear()`, which deletes only the `*.agent.*` identity slots + `identity.json` — it leaves the engine keys + `brain.db` intact. Without a fix, reset + re-onboard would silently re-attach the PREVIOUS identity's brain to the new identity (a silent privacy/correctness breach). **SP1 extends reset to a true clean slate:** on `reset_identity`, also `SecretsVault::delete` both engine slots, reset the lazy cell to empty (drop the memoized `Arc<EventLog>`), and delete `app_data_dir()/brain.db`. Reset is best-effort-complete: a failure to delete one part is surfaced, and `get_or_open` additionally fail-closes if it ever finds engine keys present with no identity (defense in depth).
+`reset_identity` today calls only `IdentityStore::clear()`, which deletes only the `*.agent.*` identity slots + `identity.json` — it leaves the engine keys + `brain.db` intact. Without a fix, reset + re-onboard would silently re-attach the PREVIOUS identity's brain to the new identity (a silent privacy/correctness breach). **SP1 extends reset to a true clean slate:** on `reset_identity`, also `SecretsVault::delete` both engine slots, reset the lazy cell to empty (drop the memoized `Arc<EventLog>`), and delete `app_data_dir()/brain.db`. Reset is best-effort-complete: a failure to delete one part is surfaced. (No brain can open without an identity regardless — `get_or_open`'s onboarding gate short-circuits before it ever loads keys, so a half-completed reset can never let a stale brain re-attach to a new identity.)
 
 ### Demonstrable surface
 
