@@ -41,6 +41,19 @@ const MID_DIM: usize = 64;
 /// FTS5 internals, or WAL headers by coincidence.
 const CANARY: &str = "ZqPlaintextLeakCanary42_unmistakable";
 
+/// Canary written into the synthesis cache's `expected_bytes` BLOB column. Proves
+/// the M6c `mandate_synthesis_cache` table (an encrypted side-table sharing the
+/// SQLCipher `Store` with `proposal_bytes`) does not leak its cached file bytes to
+/// disk in plaintext. Unique so a hit in the raw-file scan is unambiguous.
+#[cfg(unix)]
+const CANARY_SYNTH_BYTES: &str = "ZqSynthCacheBytesCanary42_unmistakable";
+
+/// Canary written into the synthesis cache's `source_event_ids_at_synth` lineage
+/// (the finding-B provenance BLOB). Proves the synth-time lineage is likewise
+/// encrypted at rest, not spilled in plaintext alongside the bytes.
+#[cfg(unix)]
+const CANARY_SYNTH_LINEAGE: &str = "ZqSynthCacheLineageCanary42_unmistakable";
+
 fn mk_canary_event() -> Event {
     Event {
         id: String::new(),
@@ -96,6 +109,21 @@ fn no_plaintext_canary_on_disk_and_encrypted_header() {
         log.append(mk_canary_event()).unwrap();
         log.append(mk_canary_event()).unwrap();
 
+        // Write a synthesis-cache row carrying recognizable canaries in BOTH the
+        // `expected_bytes` BLOB and the `source_event_ids_at_synth` lineage BLOB, so
+        // the raw-file scan below actually covers `mandate_synthesis_cache`'s columns
+        // (without this write the scan never touches that table). `#[cfg(unix)]`
+        // because `put_synthesis_cache` is unix-gated, like the rest of the M6 path.
+        #[cfg(unix)]
+        log.put_synthesis_cache(
+            "M_canary",
+            "srchash_canary",
+            CANARY_SYNTH_BYTES.as_bytes(),
+            "h_canary",
+            &[CANARY_SYNTH_LINEAGE.to_string()],
+        )
+        .unwrap();
+
         let embedder = MockEmbedder::new(MID_DIM);
         log.rederive_pending(&embedder).unwrap();
         // rebuild_indexes populates both the vector index and the FTS index.
@@ -112,6 +140,27 @@ fn no_plaintext_canary_on_disk_and_encrypted_header() {
          found {occurrences} occurrence(s) in {:?}",
         dir.path()
     );
+
+    // ── 1b. Synthesis-cache BLOBs (bytes + lineage) are encrypted at rest ─────
+    // The cache row written above must not leak EITHER its `expected_bytes` or its
+    // `source_event_ids_at_synth` lineage as plaintext anywhere on disk.
+    #[cfg(unix)]
+    {
+        let synth_bytes_hits = scan_dir_for_bytes(dir.path(), CANARY_SYNTH_BYTES.as_bytes());
+        assert_eq!(
+            synth_bytes_hits, 0,
+            "synthesis-cache `expected_bytes` canary must not appear in any on-disk file \
+             — found {synth_bytes_hits} occurrence(s) in {:?} (cache table is plaintext)",
+            dir.path()
+        );
+        let synth_lineage_hits = scan_dir_for_bytes(dir.path(), CANARY_SYNTH_LINEAGE.as_bytes());
+        assert_eq!(
+            synth_lineage_hits, 0,
+            "synthesis-cache `source_event_ids_at_synth` lineage canary must not appear in any \
+             on-disk file — found {synth_lineage_hits} occurrence(s) in {:?} (lineage is plaintext)",
+            dir.path()
+        );
+    }
 
     // ── 2. Database file header is NOT the SQLite plaintext magic ────────────
     let db_bytes = fs::read(&db_path).expect("db file not found");

@@ -760,3 +760,273 @@ fn live_reconciliation_proposes_edit_to_the_contradicted_file() {
     );
     log.verify_chain().unwrap();
 }
+
+// ── Property 8 (M6c headline): a STANDING MANDATE keeps an out-of-tree index synced to
+//    two sources — grounded, confirmable, supersede-on-change, convergent ────────────────
+
+/// Make a read-granted `src` dir and a SEPARATE write-granted `out` dir UNDER `dir`, with
+/// `out` OUTSIDE the read root so the M6c Finding-A self-loop guard is satisfied (the
+/// engine's own confirmed write to the target can never be re-ingested as a source).
+/// Mirrors the hermetic `tests/mandate.rs::scoped_dirs` + `phase_log` scaffolding, but for
+/// the live store. Returns `(src, out)`.
+fn mandate_scoped_dirs(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    (src, out)
+}
+
+/// Write `body` into `<src>/<name>` and ingest it read-only, bringing every derived
+/// structure up to date (mirrors the hermetic `ingest_source` + the live `ingest_file`
+/// lifecycle). Returns the file's `file_ingested` event id — the engine-gathered lineage id
+/// the mandate phase unions into every proposal. The CALLER must have already read-granted
+/// `src` (so ingest discovers the file) before the first ingest.
+fn ingest_source_file(
+    log: &EventLog,
+    embedder: &MockEmbedder,
+    src: &std::path::Path,
+    name: &str,
+    body: &[u8],
+) -> String {
+    let path = src.join(name);
+    std::fs::write(&path, body).unwrap();
+    log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), embedder)
+        .unwrap();
+    log.rederive_pending(embedder).unwrap();
+    log.rebuild_indexes(embedder).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rebuild_entity_index(embedder).unwrap();
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    log.current_files()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.canonical_path == canonical)
+        .map(|r| r.file_event_id)
+        .expect("the ingested source is current")
+}
+
+/// Advance the evolve cursor PAST every event seeded so far so the next `evolve_once`
+/// processes NO memory (the seq is a 1-based autoincrement with no deletes → the event
+/// count IS the tip seq). The mandate phase still sees `current_files()` (cursor-
+/// independent), so the live synthesis turn is the sole reasoner call — exactly the cursor
+/// trick the hermetic `tests/mandate.rs` 9b proofs use to isolate the mandate phase. Without
+/// it, the live model would also be asked to extract every seeded memory/file each tick,
+/// multiplying the runtime for no added coverage of the property under test.
+fn skip_seeded_as_evolve_subjects(log: &EventLog) {
+    let tip = log.stream_all().unwrap().len() as i64;
+    log.set_evolve_cursor(tip).unwrap();
+}
+
+/// The CURRENT M6c `write_proposal` events targeting `canonical` (mirrors the hermetic
+/// `proposals_for`). The mandate target is a Create that may not exist on disk, so the
+/// caller passes the engine's canonical target string.
+fn live_proposals_for(log: &EventLog, canonical: &str) -> Vec<Event> {
+    log.stream_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == bossclaw_core::graph::WRITE_PROPOSAL_EVENT_TYPE)
+        .filter(|e| e.content.get("target").and_then(|t| t.as_str()) == Some(canonical))
+        .collect()
+}
+
+/// THE M6c mandate-driven sync loop, proven LIVE (spec §7 proof 11). A standing MANDATE asks
+/// the real `qwen2.5:7b-instruct` to keep an out-of-tree index file (`out/index.md`, OUTSIDE
+/// the read root) synced to a recipe over TWO read-granted source files. This gate asserts
+/// the end-to-end properties against the REAL model:
+///   1. an evolve tick emits ≥1 grounded `write_proposal` whose synthesized `synced_content`
+///      meaningfully references BOTH source files (a keyword/substring check — robust to the
+///      model's prose variance, never an exact-byte assertion);
+///   2. that proposal is CONFIRMABLE: `propose_write` → `execute_write_resolving` writes the
+///      proposed bytes to the target, and the file then exists with exactly those bytes;
+///   3. CHANGING one source + re-ingesting → a NEW proposal (a fresh source-state, §5.4);
+///   4. an UNCHANGED tick → NO new proposal (idempotent / convergent — convergence comes from
+///      the per-source-state synthesis cache, §5.2, NOT from any LLM determinism).
+///
+/// ORACLE SCOPE / ROBUSTNESS (honest note, mirroring Properties 3/5/7): the live model is the
+/// oracle for *whether the sync loop FIRES and converges*, NOT for the index's exact prose. A
+/// 7b produces plausible-but-varying synced content, so we assert the GROUNDING as a property
+/// (the proposed bytes mention a distinctive keyword from EACH source — case-insensitively)
+/// rather than byte-exact text. Because whether one extraction pass mentions both keywords is
+/// model-output variance, the grounding phase runs under bounded retries (fresh stores each
+/// attempt); the confirm + supersede + convergence phases then run once on that store. This is
+/// NOT weakening the property — the property (the live loop MUST be capable of synthesizing a
+/// grounded, confirmable, convergent sync over two sources) is unchanged; the retry only
+/// absorbs run-to-run variance, exactly as the other live gates and M2's recall gate do. If
+/// every attempt fails, the test fails loudly (no tautology, no fake pass). The byte-exact
+/// cache/decline/convergence machinery is covered hermetically in `tests/mandate.rs`.
+#[test]
+#[ignore = "needs a running ollama + qwen2.5:7b"]
+fn m6c_live_sync_end_to_end() {
+    /// Bounded attempts to absorb 7b output variance in the grounding phase.
+    /// Worst case: a few synthesis turns per attempt (~tens of seconds each).
+    const MAX_ATTEMPTS: usize = 3;
+    /// Distinctive, low-collision tokens — one planted in each source body so the
+    /// "references BOTH sources" check keys on content that could ONLY come from that
+    /// source. They are unusual enough that a generic index template would not contain
+    /// them by chance, yet plain enough for a 7b to carry through verbatim.
+    const KEYWORD_A: &str = "Zarembo";
+    const KEYWORD_B: &str = "Quoll";
+
+    let embedder = MockEmbedder::new(MID_DIM);
+    let reasoner = OllamaReasoner::new(MODEL);
+
+    let mut last_failure = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Fresh store + dirs per attempt so a partial earlier attempt cannot leak state.
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let (src, out) = mandate_scoped_dirs(dir.path());
+        // READ-grant the source dir (so ingest discovers + watches the two sources) and
+        // WRITE-grant the out dir (so the mandate target is a valid reconciliation target).
+        log.add_grant(&src).unwrap();
+        log.add_write_grant(&out).unwrap();
+
+        // ── Two read-granted sources, each carrying ITS OWN distinctive keyword. ──
+        let sid_a = ingest_source_file(
+            &log,
+            &embedder,
+            &src,
+            "alpha.md",
+            format!("Alpha note: the {KEYWORD_A} channel runs north.\n").as_bytes(),
+        );
+        let sid_b = ingest_source_file(
+            &log,
+            &embedder,
+            &src,
+            "beta.md",
+            format!("Beta note: the {KEYWORD_B} is a marsupial.\n").as_bytes(),
+        );
+
+        // ── A standing mandate: keep out/index.md synced to a recipe over both sources. ──
+        let target = out.join("index.md");
+        let mandate_id = log
+            .add_mandate(
+                &target,
+                &src,
+                "Write a short combined index that mentions every source's distinctive subject by name.",
+            )
+            .unwrap();
+        let canon_target = std::fs::canonicalize(target.parent().unwrap())
+            .unwrap()
+            .join("index.md")
+            .to_string_lossy()
+            .to_string();
+
+        // Isolate the mandate phase: advance the cursor past the seeded events so the only
+        // live reasoner call this tick is the mandate SYNTHESIS turn (no per-memory/file
+        // extraction). The mandate phase reads current_files() regardless of the cursor.
+        skip_seeded_as_evolve_subjects(&log);
+
+        // ── Property 1: the tick emits a grounded proposal referencing BOTH sources. ──
+        let rep1 = log.evolve_once(&embedder, &reasoner).unwrap();
+        if rep1.proposals_emitted < 1 {
+            last_failure = format!(
+                "attempt {attempt}: the live model emitted no proposal (rep={rep1:?})"
+            );
+            eprintln!("{last_failure}; retrying");
+            continue;
+        }
+        let proposal = match live_proposals_for(&log, &canon_target).into_iter().next() {
+            Some(p) => p,
+            None => {
+                last_failure = format!("attempt {attempt}: a proposal was counted but none targets {canon_target}");
+                eprintln!("{last_failure}; retrying");
+                continue;
+            }
+        };
+        let pid = proposal.id.clone();
+        let new_hash = proposal.content["new_content_hash"].as_str().unwrap().to_string();
+        let lineage = proposal.model_meta.as_ref().expect("Tier-B").source_event_ids.clone();
+        // Lineage is the engine-gathered union {mandate} ∪ {both source ids} (never a model
+        // citation) — the structural grounding, independent of the prose.
+        assert!(lineage.contains(&mandate_id), "lineage carries the mandate id");
+        assert!(lineage.contains(&sid_a), "lineage carries source A's file_ingested id");
+        assert!(lineage.contains(&sid_b), "lineage carries source B's file_ingested id");
+
+        // The synthesized bytes (fetched + hash-checked from the proposal-bytes store — the
+        // model produces only file BYTES, never a citation the engine trusts).
+        let bytes = log.get_proposal_bytes_checked(&pid, &new_hash).unwrap();
+        let synced = String::from_utf8_lossy(&bytes);
+        let mentions_a = synced.to_lowercase().contains(&KEYWORD_A.to_lowercase());
+        let mentions_b = synced.to_lowercase().contains(&KEYWORD_B.to_lowercase());
+        if !(mentions_a && mentions_b) {
+            // CONTENT variance: the model synthesized a proposal but did not carry both
+            // distinctive subjects through. Retry so a fresh synthesis can ground on both.
+            last_failure = format!(
+                "attempt {attempt}: synced content did not reference BOTH sources \
+                 (mentions {KEYWORD_A}={mentions_a}, {KEYWORD_B}={mentions_b}); synced={synced:?}"
+            );
+            eprintln!("{last_failure}; retrying");
+            continue;
+        }
+
+        // ── Property 2: the proposal is CONFIRMABLE → the file appears with the bytes. ──
+        let gated = log
+            .propose_write(bossclaw_core::WriteProposal {
+                target: target.clone(),
+                new_content: bytes.clone(),
+                op: bossclaw_core::WriteOp::Create,
+                source_event_ids: lineage,
+                rationale: "confirm the live mandate sync".into(),
+            })
+            .expect("propose_write returns a verdict");
+        log.execute_write_resolving(gated, &pid)
+            .expect("the grounded proposal confirms onto disk");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            bytes,
+            "the confirmed file holds exactly the proposed synced bytes"
+        );
+
+        // ── Property 4 (checked BEFORE the change): an unchanged tick → NO new proposal. ──
+        // The target now equals the cached expected bytes for this source-state, so the phase
+        // ELIDES (on-disk == expected) — convergence from the per-source-state cache, not the
+        // model (which is never re-called here). Re-run ingest first to prove the engine's own
+        // out-of-tree write is NOT discovered as a source (the structural self-loop guarantee).
+        log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &embedder)
+            .unwrap();
+        skip_seeded_as_evolve_subjects(&log);
+        let rep_idem = log.evolve_once(&embedder, &reasoner).unwrap();
+        assert_eq!(
+            rep_idem.proposals_emitted, 0,
+            "an unchanged source-state proposes nothing (idempotent / convergent via the cache)"
+        );
+        assert_eq!(rep_idem.proposals_rejected, 0, "convergence is an Elide, never a reject");
+
+        // ── Property 3: CHANGE one source + re-ingest → a NEW proposal (fresh source-state). ──
+        std::fs::write(
+            src.join("alpha.md"),
+            format!("Alpha note (updated): the {KEYWORD_A} channel now runs SOUTH.\n").as_bytes(),
+        )
+        .unwrap();
+        log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &embedder)
+            .unwrap();
+        log.rebuild_graph().unwrap();
+        let prior_pid = pid.clone();
+        skip_seeded_as_evolve_subjects(&log);
+        let rep_change = log.evolve_once(&embedder, &reasoner).unwrap();
+        assert!(
+            rep_change.proposals_emitted >= 1,
+            "a changed source is a fresh source-state → the loop proposes again (rep={rep_change:?})"
+        );
+        // The new proposal is a DISTINCT event from the confirmed one (a fresh synthesis at the
+        // new source-state), and the loop is still synthesizing toward this mandate's target.
+        let after_change = live_proposals_for(&log, &canon_target);
+        assert!(
+            after_change.iter().any(|p| p.id != prior_pid),
+            "the changed source yields a NEW proposal event distinct from the confirmed one"
+        );
+
+        log.verify_chain().unwrap();
+        eprintln!(
+            "live M6c sync gate passed on attempt {attempt}/{MAX_ATTEMPTS} \
+             (grounded on {KEYWORD_A}+{KEYWORD_B}, confirmed, converged, re-proposed on change)"
+        );
+        return;
+    }
+    panic!(
+        "the live model never produced a grounded, confirmable, convergent two-source mandate \
+         sync across {MAX_ATTEMPTS} attempts — last: {last_failure}"
+    );
+}

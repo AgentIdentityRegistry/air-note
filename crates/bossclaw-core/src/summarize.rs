@@ -164,19 +164,13 @@ pub fn compose_schema() -> serde_json::Value {
 /// ([`crate::reconcile`]). Stripping `\u{200B}` here is intentional: it
 /// canonicalizes the input before any caller's later fence-marker re-neutralization
 /// re-inserts a zero-width space into a *real* marker.
+///
+/// The character-strip itself is single-sourced in [`strip_bidi_controls`] (M6c-D):
+/// `sanitize_ident` is exactly that strip followed by the [`MAX_PROMPT_IDENT_LEN`]
+/// cap. Callers that need the same strip policy WITHOUT the identifier cap (the M6c
+/// recipe-synthesis path) call `strip_bidi_controls` directly.
 pub(crate) fn sanitize_ident(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| {
-            !c.is_control() // Cc (incl. NEL U+0085 and ASCII controls)
-                && !matches!(c,
-                    '\u{061C}'                     // ARABIC LETTER MARK (ALM) — bidi control
-                        | '\u{2028}' | '\u{2029}'  // LINE / PARAGRAPH SEPARATOR (Zl/Zp)
-                        | '\u{200B}'..='\u{200F}'  // zero-width + LRM/RLM (Cf)
-                        | '\u{2066}'..='\u{2069}'  // bidi isolates (Cf)
-                        | '\u{202A}'..='\u{202E}') // bidi embeddings/overrides (Cf)
-        })
-        .collect();
+    let cleaned = strip_bidi_controls(s);
     if cleaned.len() <= MAX_PROMPT_IDENT_LEN {
         cleaned
     } else {
@@ -186,6 +180,36 @@ pub(crate) fn sanitize_ident(s: &str) -> String {
         }
         cleaned[..end].to_string()
     }
+}
+
+/// Strip every line-breaking and direction-controlling character from `s`, returning
+/// the cleaned text with **no length cap**. This is the single source of the
+/// bidi/control strip policy (M6c, spec §5.2 finding D): the EXACT filter set is
+/// documented on [`sanitize_ident`] — all `char::is_control()` characters (ASCII
+/// controls + NEL U+0085) plus the explicit non-`Cc` set ALM `\u{061C}`,
+/// LINE/PARAGRAPH SEPARATOR `\u{2028}`/`\u{2029}`, the zero-width + LRM/RLM range
+/// `\u{200B}..=\u{200F}`, the bidi isolates `\u{2066}..=\u{2069}`, and the bidi
+/// embeddings/overrides `\u{202A}..=\u{202E}`. Together these cover all 12/12 Unicode
+/// bidi controls; non-bidi zero-width chars (U+2060 WJ, U+FEFF BOM, U+00AD SHY) are
+/// intentionally NOT stripped (see [`sanitize_ident`] for the rationale and the
+/// zero-new-deps constraint).
+///
+/// [`sanitize_ident`] is this strip followed by the [`MAX_PROMPT_IDENT_LEN`] cap;
+/// the M6c recipe-synthesis path needs the same strip but without the identifier
+/// cap, so it calls this directly. Single-sourcing the strip keeps the two paths
+/// from drifting on which code points are dropped. PURE.
+pub(crate) fn strip_bidi_controls(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_control() // Cc (incl. NEL U+0085 and ASCII controls)
+                && !matches!(c,
+                    '\u{061C}'                     // ARABIC LETTER MARK (ALM) — bidi control
+                        | '\u{2028}' | '\u{2029}'  // LINE / PARAGRAPH SEPARATOR (Zl/Zp)
+                        | '\u{200B}'..='\u{200F}'  // zero-width + LRM/RLM (Cf)
+                        | '\u{2066}'..='\u{2069}'  // bidi isolates (Cf)
+                        | '\u{202A}'..='\u{202E}') // bidi embeddings/overrides (Cf)
+        })
+        .collect()
 }
 
 /// Build the Pass-A compose prompt (spec §5): the fenced fact-set (each memory
@@ -288,4 +312,80 @@ pub fn parse_draft(raw: &serde_json::Value) -> Result<DraftPage, BossclawError> 
         }
     }
     Ok(DraftPage { title, claims })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SEC-C1 / M6c-D: `strip_bidi_controls` is the single source of the bidi/control
+    /// strip policy. It must drop all **12/12** Unicode bidi controls (ALM + LRM/RLM +
+    /// the 4 isolates + the 5 embeddings/overrides) AND the line/paragraph separators
+    /// (U+2028/U+2029) AND every `is_control` char (ASCII controls + NEL U+0085), while
+    /// preserving ordinary legible text. This is the byte-for-byte lock on the strip set
+    /// the recipe-synthesis path (Task 5) shares — a revert that adds/drops any code
+    /// point trips this. The cap is NOT this function's job (it has no length bound).
+    #[test]
+    fn strip_bidi_controls_drops_every_control_and_keeps_text() {
+        // The plan's worked example: bidi override + isolate + ZWSP + newline.
+        let evil = "a\u{202E}b\u{2066}c\u{200B}d\n";
+        assert_eq!(strip_bidi_controls(evil), "abcd", "all controls gone, letters kept");
+
+        // The full 12/12 bidi-control roster plus the two separators and a NEL, each
+        // interleaved with a legible char, must all be stripped — none may survive.
+        let all_bad = [
+            '\u{061C}', // ARABIC LETTER MARK (the non-contiguous bidi control)
+            '\u{200E}', '\u{200F}', // LRM / RLM
+            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // 4 isolates
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // 5 embeddings/overrides
+            '\u{2028}', '\u{2029}', // LINE / PARAGRAPH SEPARATOR (Zl/Zp)
+            '\u{0085}', // NEL (is_control / Cc)
+        ];
+        let mut spiked = String::new();
+        for c in all_bad {
+            spiked.push('x');
+            spiked.push(c);
+        }
+        let stripped = strip_bidi_controls(&spiked);
+        for c in all_bad {
+            assert!(!stripped.contains(c), "bidi/control {c:?} must be stripped");
+        }
+        // Every legible 'x' survives, in order — strip removes only the dangerous class.
+        assert_eq!(stripped, "x".repeat(all_bad.len()), "legible text preserved verbatim");
+
+        // Zero-width obfuscators that are neither line-breakers nor bidi controls are
+        // intentionally NOT stripped (documented carve-out: WJ / BOM / SHY).
+        let benign = "a\u{2060}b\u{FEFF}c\u{00AD}d";
+        assert_eq!(strip_bidi_controls(benign), benign, "non-bidi zero-width chars are kept");
+    }
+
+    /// Regression: `sanitize_ident` is behavior-preserving across the extraction — it
+    /// still strips the SAME set (now via `strip_bidi_controls`) AND still applies the
+    /// `MAX_PROMPT_IDENT_LEN` byte cap on a char boundary. The strip-then-cap order and
+    /// both halves must hold; this is the net the M4b/M6b callers rely on.
+    #[test]
+    fn sanitize_ident_still_strips_and_caps() {
+        // Strip half: identical result to strip_bidi_controls for sub-cap input.
+        let evil = "a\u{202E}b\u{2066}c\u{200B}d\n";
+        assert_eq!(sanitize_ident(evil), "abcd", "still strips (regression)");
+
+        // Cap half: an oversized clean label is truncated to MAX_PROMPT_IDENT_LEN bytes.
+        let giant = "A".repeat(MAX_PROMPT_IDENT_LEN + 50);
+        let capped = sanitize_ident(&giant);
+        assert_eq!(capped.len(), MAX_PROMPT_IDENT_LEN, "caps at MAX_PROMPT_IDENT_LEN bytes");
+
+        // strip_bidi_controls, by contrast, has NO cap — it returns the full length.
+        assert_eq!(
+            strip_bidi_controls(&giant).len(),
+            MAX_PROMPT_IDENT_LEN + 50,
+            "strip_bidi_controls does not cap"
+        );
+
+        // Cap respects UTF-8 char boundaries: a 2-byte char straddling the 200-byte
+        // edge is dropped whole, never split into invalid bytes.
+        let straddle = format!("{}é", "A".repeat(MAX_PROMPT_IDENT_LEN - 1));
+        let out = sanitize_ident(&straddle);
+        assert!(out.len() <= MAX_PROMPT_IDENT_LEN, "never exceeds the cap");
+        assert!(out.is_char_boundary(out.len()), "truncates on a char boundary");
+    }
 }

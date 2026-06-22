@@ -89,6 +89,72 @@ pub struct ActiveModel {
     pub schema_version: u32,
 }
 
+/// A hit from the M6c synthesis cache ([`EventLog::get_synthesis_cache`]).
+///
+/// Carries the synthesized expected file bytes TOGETHER with the synth-time lineage
+/// that produced them (finding B, spec §5.2/§5.3): `source_event_ids_at_synth` is the
+/// EXACT engine-gathered source ids read at synthesis time, so a later cache HIT can
+/// union it with the then-current in-scope sources without ever silently dropping a
+/// tainted source that left scope between synthesis and the hit. The cache is NEVER an
+/// authorization source — the confirm path re-gates the bytes through the full M6a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthCacheRow {
+    /// The synthesized expected whole-file bytes for this `(mandate, source-state)`.
+    pub expected_bytes: Vec<u8>,
+    /// The content hash recorded for `expected_bytes` at synthesis time.
+    pub expected_hash: String,
+    /// The exact engine-gathered source event ids read at synthesis time (finding B).
+    /// Travels in the SAME row as the bytes so taint lineage can be unioned monotonically.
+    pub source_event_ids_at_synth: Vec<String>,
+}
+
+/// The DECISION returned by the gather + cached-or-synth half of the mandate proposer
+/// phase ([`EventLog::mandate_phase_for`], M6c §5.1/§5.2, Task 9a). It carries NO side
+/// effect: producing it appends no event and runs no write gate. Task 9b turns a
+/// [`MandateAction::Propose`] into a gated `write_proposal` and a [`MandateAction::Reject`]
+/// into a recorded `write_rejected`; an [`MandateAction::Elide`] emits nothing and stays
+/// retryable on the next tick.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MandateAction {
+    /// The target is out of sync; synthesis produced new bytes to write. `op` is
+    /// [`WriteOp::Create`] when the target file does not exist yet, else [`WriteOp::Edit`]
+    /// — M6c never deletes. `expected` is the whole-file bytes; `lineage` is the
+    /// engine-gathered, sorted+deduped union of the mandate id with the source event ids
+    /// (NEVER any model-derived id — see the union site in `mandate_phase_for`).
+    Propose {
+        /// The synthesized whole-file bytes the proposal would write.
+        expected: Vec<u8>,
+        /// Engine-gathered lineage (mandate ∪ source event ids), sorted + deduped.
+        lineage: Vec<String>,
+        /// `Create` (target absent) or `Edit` (target present); never `Delete`.
+        op: crate::actuator::WriteOp,
+        /// The exact `sources_hash` `mandate_phase_for` computed over the SORTED
+        /// `(canonical_path, content_hash)` pairs of the in-scope sources (Task 9a). Task
+        /// 9b folds it into the suppression/recording `inducing_key`
+        /// (`{mandate, target, sources_hash}`, §5.4) so the key matches
+        /// [`EventLog::is_mandate_proposal_suppressed`]'s shape byte-for-byte — returned
+        /// from the phase rather than recomputed so the two sites cannot drift.
+        sources_hash: String,
+    },
+    /// Nothing to do — in sync, no in-scope sources, or over a directory-bomb cap. A
+    /// RETRYABLE no-op: it appends NO event, so the same mandate is re-evaluated next tick.
+    Elide,
+    /// A genuine synthesis failure (e.g. the model returned empty content). Task 9b
+    /// records a `write_rejected` for this. `reason` is the reject reason; `sources_hash`
+    /// is the phase's computed source-state digest, carried so the recorded
+    /// `write_rejected`'s `inducing_key` (`{mandate, target, sources_hash}`) is keyed on the
+    /// SAME source-state a `Propose` would use — making the rejection TERMINAL for exactly
+    /// that source-state (a later DIFFERENT source-state is a fresh, non-suppressed ask),
+    /// mirroring M6b's same-key reject.
+    Reject {
+        /// The human-readable reject reason recorded on the `write_rejected`.
+        reason: String,
+        /// The source-state digest for the rejected attempt (keys the `inducing_key`).
+        sources_hash: String,
+    },
+}
+
 const GENESIS: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -113,6 +179,15 @@ const EVOLVE_ENABLED_KEY: &str = "evolve_enabled";
 /// `write_proposal` synthesis layered on top of a confirmed contradiction.
 const PROPOSALS_ENABLED_KEY: &str = "proposals_enabled";
 
+/// The `content` key carrying the M6c mandate-proposer on/off switch in a control
+/// `config` event (M6c §5.5 / D8). Single-sourced so the ONE writer
+/// ([`EventLog::set_mandates_enabled`]) and the reader
+/// ([`EventLog::mandates_enabled`]) can never drift the key apart. INDEPENDENT of
+/// [`PROPOSALS_ENABLED_KEY`] and [`EVOLVE_ENABLED_KEY`]: turning mandates off leaves
+/// evolve curation and the M6b reconciliation proposer fully running — it suppresses
+/// ONLY the autonomous mandate-driven `write_proposal` synthesis.
+const MANDATES_ENABLED_KEY: &str = "mandates_enabled";
+
 /// The instruction channel (`system`) for the M6b whole-file rewrite reasoner call
 /// (spec §5.5). The data channel is [`crate::reconcile::build_rewrite_prompt`]'s
 /// fenced frame; this system line states the engine's intent so the prompt itself
@@ -121,6 +196,16 @@ const PROPOSALS_ENABLED_KEY: &str = "proposals_enabled";
 const RECONCILE_SYSTEM: &str =
     "You correct a file so it is consistent with an engine-established fact. \
      Output only the full corrected file as JSON {\"corrected_content\": ...}.";
+
+/// The instruction channel (`system`) for the M6c mandate synthesis reasoner call
+/// (spec §5.2). The data channel is [`crate::mandate::build_recipe_prompt`]'s fenced
+/// frame (the trusted recipe above, the untrusted sources fenced below); this system
+/// line states the engine's intent so the prompt stays purely about the synthesis.
+/// Mirrors [`RECONCILE_SYSTEM`].
+#[cfg(unix)]
+const MANDATE_SYSTEM: &str =
+    "You synthesize a file from sources per a user recipe. \
+     Output only the full synced content as JSON {\"synced_content\": ...}.";
 
 /// `(event_id, arm_score)` pair returned by each retrieval arm. Used as the
 /// common type for both the vector arm (cosine distance, lower=better) and the
@@ -175,6 +260,24 @@ pub struct EventLog {
     // visibility change.
     #[allow(dead_code)]
     rename_lock: Mutex<()>,
+}
+
+/// Canonicalize a write target that may not exist yet (a Create): canonicalize the
+/// PARENT directory (resolving `..`/symlinks ABOVE the target) and re-join the final
+/// component verbatim, so the not-yet-created leaf is preserved and a symlinked final
+/// component is NOT followed (its identity is checked separately, NOFOLLOW, at write
+/// time). Returns `None` if the target has no parent or the parent does not resolve
+/// (e.g. a missing intermediate dir). Single-sourced so `propose_write`'s Step-2 Create
+/// arm and `add_mandate`'s grant-time canonicalization agree byte-for-byte. NOT
+/// `#[cfg(unix)]`: `add_mandate` is portable and calls this on every platform.
+fn canonicalize_target_or_parent(target: &std::path::Path) -> Option<std::path::PathBuf> {
+    match target.parent() {
+        Some(parent) => match std::fs::canonicalize(parent) {
+            Ok(real_parent) => target.file_name().map(|name| real_parent.join(name)),
+            Err(_) => None,
+        },
+        None => None,
+    }
 }
 
 /// Read an OPEN file descriptor to end-of-file via `rustix::io::read`, returning
@@ -348,6 +451,23 @@ impl EventLog {
                 revoked        INTEGER NOT NULL DEFAULT 0
             )",
         )?;
+        // Mandate projection (Tier-A; M6c §4.1). A signed, bounded standing goal:
+        // keep `target` == `recipe(sources under source_scope)`. A deterministic fold
+        // over `mandate_grant`/`mandate_revoke` events, rebuilt by `rebuild_graph`.
+        // The PRIMARY KEY is the `mandate_grant` event id (the mandate's identity), NOT
+        // a content path — so the identity is a real, readable ground-truth event id
+        // (load-bearing for taint: citing it never trips the fail-closed "unreadable
+        // source ⇒ external" rule). `revoked` rows stay in the log forever (sticky).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS mandates (
+                mandate_grant_id TEXT PRIMARY KEY,
+                target           TEXT NOT NULL,
+                source_scope     TEXT NOT NULL,
+                recipe           TEXT NOT NULL,
+                granted_at       TEXT NOT NULL,
+                revoked          INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
         // Ingested-file projection (Tier-A; M5a). At most one CURRENT file_ingested per
         // canonical_path; a deterministic fold over file_ingested/supersede events,
         // rebuilt by `rebuild_graph`. `content_hash` is the dedup key; `grant_root` lets
@@ -409,6 +529,31 @@ impl EventLog {
                 content      BLOB NOT NULL,
                 content_hash TEXT NOT NULL,
                 created_at   TEXT NOT NULL
+            )",
+        )?;
+        // M6c synthesis cache (spec §5.2/§8, finding B + F). Caches the expected file
+        // bytes synthesized ONCE per source-state so they can be reused across ticks
+        // (an LLM is not bit-exact, so re-synthesizing every tick would defeat
+        // convergence). Keyed by (mandate, sources_hash). SECURITY (finding B): the row
+        // carries `source_event_ids_at_synth` — the EXACT engine-gathered source ids read
+        // at synthesis time — ALONGSIDE the bytes, so on a later cache HIT the proposal's
+        // taint lineage is `synth ∪ current-in-scope` (taint is monotone) and a tainted
+        // source that LEFT scope between synth and the hit can never silently drop out of
+        // the lineage. The bytes and the provenance that produced them therefore travel
+        // together in the SAME row. NEVER an authorization source — confirm re-gates the
+        // bytes through the full M6a path. Lives inside the same SQLCipher `Store` as
+        // `proposal_bytes` (encrypted at rest; bytes are derived from possibly-sensitive
+        // source files). NOT a Tier-A fold: it is convergence/efficiency cache, never
+        // authoritative, so `rebuild_graph` does NOT touch it.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS mandate_synthesis_cache (
+                mandate_grant_id          TEXT NOT NULL,
+                sources_hash              TEXT NOT NULL,
+                expected_hash             TEXT NOT NULL,
+                expected_bytes            BLOB NOT NULL,
+                source_event_ids_at_synth BLOB NOT NULL,
+                created_at                TEXT NOT NULL,
+                PRIMARY KEY(mandate_grant_id, sources_hash)
             )",
         )?;
         // Summarize progress high-water-mark (spec §6 / F1) — sibling of
@@ -1959,8 +2104,8 @@ impl EventLog {
         }
     }
 
-    /// Append a signed Tier-B `write_proposal`. `source_event_ids` MUST be the engine-
-    /// gathered lineage (Task 3), non-empty. Bytes are NOT in the event (Task 5 side table).
+    /// Append a signed Tier-B `write_proposal` stamped with the M6b reconciler producer.
+    /// Thin wrapper over [`Self::append_write_proposal_with`] — see it for argument detail.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     pub fn append_write_proposal(
@@ -1968,34 +2113,75 @@ impl EventLog {
         rationale: &str, inducing_key: &serde_json::Value, verdict_summary: &serde_json::Value,
         source_event_ids: &[String],
     ) -> Result<String, BossclawError> {
+        self.append_write_proposal_with(
+            target_canonical, op, new_content_hash, byte_size, rationale,
+            inducing_key, verdict_summary, source_event_ids,
+            crate::graph::M6B_PROPOSER_PRODUCER,
+        )
+    }
+
+    /// Append a signed Tier-B `write_proposal` stamped with `producer` as its
+    /// `model_meta.model_id` (M6b passes `M6B_PROPOSER_PRODUCER`; M6c mandates pass
+    /// `M6C_PROPOSER_PRODUCER`). `source_event_ids` MUST be the engine-gathered lineage
+    /// (Task 3), non-empty. Bytes are NOT in the event (Task 5 side table). The producer
+    /// string is provenance ONLY — it is independent of the taint lineage.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_write_proposal_with(
+        &self, target_canonical: &str, op: &str, new_content_hash: &str, byte_size: u64,
+        rationale: &str, inducing_key: &serde_json::Value, verdict_summary: &serde_json::Value,
+        source_event_ids: &[String], producer: &str,
+    ) -> Result<String, BossclawError> {
         let content = serde_json::json!({
             "target": target_canonical, "op": op,
             "new_content_hash": new_content_hash, "byte_size": byte_size,
             "rationale": rationale, "inducing_key": inducing_key, "verdict_summary": verdict_summary,
         });
-        self.append(self.build_m6b_event(crate::graph::WRITE_PROPOSAL_EVENT_TYPE, content, source_event_ids))
+        self.append(self.build_proposer_event(producer, crate::graph::WRITE_PROPOSAL_EVENT_TYPE, content, source_event_ids))
     }
 
-    /// Append a signed Tier-B `write_rejected` (emitted INSTEAD of a proposal on synthesis/
-    /// gate failure; a terminal audit marker — never resolves a proposal).
+    /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
+    /// Thin wrapper over [`Self::append_write_rejected_with`].
     #[cfg(unix)]
     pub fn append_write_rejected(
         &self, target_canonical: Option<&str>, reason: &str,
         inducing_key: &serde_json::Value, source_event_ids: &[String],
     ) -> Result<String, BossclawError> {
-        let content = serde_json::json!({ "target": target_canonical, "reason": reason, "inducing_key": inducing_key });
-        self.append(self.build_m6b_event(crate::graph::WRITE_REJECTED_EVENT_TYPE, content, source_event_ids))
+        self.append_write_rejected_with(
+            target_canonical, reason, inducing_key, source_event_ids,
+            crate::graph::M6B_PROPOSER_PRODUCER,
+        )
     }
 
-    /// App-facing: a human declined a proposal. Appends a `write_declined` that RESOLVES it.
+    /// Append a signed Tier-B `write_rejected` (emitted INSTEAD of a proposal on synthesis/
+    /// gate failure; a terminal audit marker — never resolves a proposal), stamped with
+    /// `producer` as its `model_meta.model_id`.
+    #[cfg(unix)]
+    pub fn append_write_rejected_with(
+        &self, target_canonical: Option<&str>, reason: &str,
+        inducing_key: &serde_json::Value, source_event_ids: &[String], producer: &str,
+    ) -> Result<String, BossclawError> {
+        let content = serde_json::json!({ "target": target_canonical, "reason": reason, "inducing_key": inducing_key });
+        self.append(self.build_proposer_event(producer, crate::graph::WRITE_REJECTED_EVENT_TYPE, content, source_event_ids))
+    }
+
+    /// App-facing: a human declined a proposal. Appends an M6b-reconciler-stamped
+    /// `write_declined` that RESOLVES it. Thin wrapper over [`Self::decline_write_proposal_with`].
     #[cfg(unix)]
     pub fn decline_write_proposal(&self, proposal_id: &str, reason: &str) -> Result<String, BossclawError> {
+        self.decline_write_proposal_with(proposal_id, reason, crate::graph::M6B_PROPOSER_PRODUCER)
+    }
+
+    /// App-facing: a human declined a proposal. Appends a `write_declined` that RESOLVES it,
+    /// inheriting the proposal's lineage and stamped with `producer` as its `model_meta.model_id`.
+    #[cfg(unix)]
+    pub fn decline_write_proposal_with(&self, proposal_id: &str, reason: &str, producer: &str) -> Result<String, BossclawError> {
         let sources = self.source_ids_of_event(proposal_id)?.unwrap_or_default();
         if sources.is_empty() {
             return Err(BossclawError::InvalidInput("unknown or non-Tier-B proposal id".into()));
         }
         let content = serde_json::json!({ "resolves_proposal": proposal_id, "reason": reason });
-        self.append(self.build_m6b_event(crate::graph::WRITE_DECLINED_EVENT_TYPE, content, &sources))
+        self.append(self.build_proposer_event(producer, crate::graph::WRITE_DECLINED_EVENT_TYPE, content, &sources))
     }
 
     /// Idempotency (§5.7): suppress a new proposal for (canonical_path, inducing_key) if
@@ -2048,6 +2234,84 @@ impl EventLog {
             }
         }
         Ok(open_ids.iter().any(|id| !resolved.contains(id)))
+    }
+
+    /// M6c mandate idempotency (spec §5.4) — decline-STICKY suppression keyed on the
+    /// source-state `inducing_key` (`{mandate, target, sources_hash}`). A SMALL DELTA on
+    /// [`Self::is_proposal_suppressed`]: it shares every rule EXCEPT one. For
+    /// `(canonical_path, inducing_key)` it returns `true` when ANY of:
+    /// - a `write_rejected` matches it — TERMINAL suppress (genuine failure), SAME as M6b;
+    /// - an OPEN `write_proposal` matches it (no resolver yet) — don't double-ask, SAME as M6b;
+    /// - a matching `write_proposal` was resolved by a **`write_declined`** — THE NEW RULE:
+    ///   a declined sync is sticky for that source-state, so the engine won't re-nag every
+    ///   tick while the file is still out of sync (M6b's predicate would re-fire here).
+    ///
+    /// A matching `write_proposal` resolved ONLY by a `file_written` (the human accepted)
+    /// does NOT suppress — a later legitimate drift re-syncs via convergence/compare-vs-disk
+    /// (Task 9). Cap-elision and the off-switch emit no event, so they stay retryable.
+    /// Because suppression is keyed on `sources_hash`, a NEW source-state is a fresh key and
+    /// is never suppressed by a prior state's decline.
+    ///
+    /// `is_proposal_suppressed` (M6b) is intentionally left UNCHANGED — only the
+    /// declined-also-suppresses rule differs, captured here by tracking decline-resolvers
+    /// separately from accept-resolvers (`file_written`).
+    ///
+    /// O(n) fold over the (low-volume) actuator events — same posture as the M6b predicate.
+    #[cfg(unix)]
+    pub fn is_mandate_proposal_suppressed(
+        &self,
+        canonical_path: &str,
+        inducing_key: &serde_json::Value,
+    ) -> Result<bool, BossclawError> {
+        // Proposals matching (path, key); the set of ids resolved by a DECLINE (the only
+        // resolver that suppresses under M6c). A `file_written` resolver is deliberately NOT
+        // collected, so an accepted-then-resolved proposal is treated as closed-and-retryable.
+        let mut matching_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut declined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ev in self.events_of_types(&[
+            crate::graph::WRITE_PROPOSAL_EVENT_TYPE,
+            crate::graph::WRITE_REJECTED_EVENT_TYPE,
+            crate::graph::WRITE_DECLINED_EVENT_TYPE,
+            crate::graph::FILE_WRITTEN_EVENT_TYPE,
+        ])? {
+            match ev.event_type.as_str() {
+                t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    if ev.content.get("target").and_then(|v| v.as_str()) == Some(canonical_path)
+                        && ev.content.get("inducing_key") == Some(inducing_key)
+                    {
+                        matching_ids.insert(ev.id.clone());
+                    }
+                }
+                t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
+                    // TERMINAL for this (path,key): a genuine synthesis/gate failure
+                    // permanently suppresses — SAME as M6b.
+                    if ev.content.get("target").and_then(|v| v.as_str()) == Some(canonical_path)
+                        && ev.content.get("inducing_key") == Some(inducing_key)
+                    {
+                        return Ok(true);
+                    }
+                }
+                t if t == crate::graph::WRITE_DECLINED_EVENT_TYPE => {
+                    if let Some(rid) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        declined.insert(rid.to_string());
+                        resolved.insert(rid.to_string());
+                    }
+                }
+                // file_written: closes the proposal (no longer OPEN) but does NOT suppress —
+                // the human accepted, so a later drift may legitimately re-sync.
+                _ => {
+                    if let Some(rid) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        resolved.insert(rid.to_string());
+                    }
+                }
+            }
+        }
+        // Suppress a matching proposal that is either still OPEN (no resolver) OR was closed
+        // by a decline. A proposal closed ONLY by a file_written is neither and does not suppress.
+        Ok(matching_ids
+            .iter()
+            .any(|id| !resolved.contains(id) || declined.contains(id)))
     }
 
     /// Store the proposed corrected bytes for a `write_proposal`, keyed by its event id.
@@ -2124,14 +2388,101 @@ impl EventLog {
         Ok(content)
     }
 
-    /// Shared M6b Tier-B event builder (producer = m6b-reconciler; lineage = engine-gathered).
+    /// Store synthesized expected file bytes for a mandate at one source-state, then evict
+    /// the mandate's prior source-states (finding F — bounded growth: keep only the current
+    /// source-state's bytes). `synth_lineage` is the EXACT engine-gathered source ids read
+    /// at synthesis time; it is persisted ALONGSIDE the bytes (finding B) so a later cache
+    /// HIT can union it with the then-current in-scope sources without ever dropping a
+    /// tainted source that left scope. `INSERT OR REPLACE` so a re-synthesis at the same
+    /// `(mandate, sources_hash)` overwrites. The lineage is JSON-encoded into a BLOB column.
+    ///
+    /// SECURITY: this row is a convergence/efficiency CACHE, never an authorization source —
+    /// the confirm path re-gates the bytes through the full M6a path. It lives in the
+    /// SQLCipher `Store` (encrypted at rest) because the bytes are derived from
+    /// possibly-sensitive source files, exactly like [`Self::put_proposal_bytes`].
     #[cfg(unix)]
-    fn build_m6b_event(&self, event_type: &str, content: serde_json::Value, source_event_ids: &[String]) -> crate::event::Event {
+    pub fn put_synthesis_cache(
+        &self,
+        mandate_id: &str,
+        sources_hash: &str,
+        bytes: &[u8],
+        expected_hash: &str,
+        synth_lineage: &[String],
+    ) -> Result<(), BossclawError> {
+        let lineage_blob = serde_json::to_vec(synth_lineage)?;
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO mandate_synthesis_cache
+               (mandate_grant_id, sources_hash, expected_hash, expected_bytes,
+                source_event_ids_at_synth, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                mandate_id,
+                sources_hash,
+                expected_hash,
+                bytes,
+                lineage_blob,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        // Finding F — evict prior source-states for this mandate so cache growth stays
+        // bounded to the current source-state's single row.
+        conn.execute(
+            "DELETE FROM mandate_synthesis_cache
+             WHERE mandate_grant_id = ?1 AND sources_hash <> ?2",
+            rusqlite::params![mandate_id, sources_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Read back a cached synthesis row for `(mandate, sources_hash)`, or `None` on a miss.
+    /// Returns the bytes, their `expected_hash`, and the synth-time lineage decoded from the
+    /// JSON BLOB. Task 9's confirm path unions `source_event_ids_at_synth` with the
+    /// then-current in-scope sources (finding B) and re-gates the bytes — this method only
+    /// returns the stored row; it NEVER authorizes.
+    #[cfg(unix)]
+    pub fn get_synthesis_cache(
+        &self,
+        mandate_id: &str,
+        sources_hash: &str,
+    ) -> Result<Option<SynthCacheRow>, BossclawError> {
+        let row: Option<(Vec<u8>, String, Vec<u8>)> = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.query_row(
+                "SELECT expected_bytes, expected_hash, source_event_ids_at_synth
+                 FROM mandate_synthesis_cache
+                 WHERE mandate_grant_id = ?1 AND sources_hash = ?2",
+                rusqlite::params![mandate_id, sources_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+        };
+        match row {
+            None => Ok(None),
+            Some((expected_bytes, expected_hash, lineage_blob)) => {
+                let source_event_ids_at_synth: Vec<String> = serde_json::from_slice(&lineage_blob)?;
+                Ok(Some(SynthCacheRow {
+                    expected_bytes,
+                    expected_hash,
+                    source_event_ids_at_synth,
+                }))
+            }
+        }
+    }
+
+    /// Shared proposer Tier-B event builder. `producer` is stamped as `model_meta.model_id`
+    /// (the M6b reconciler and the M6c mandate proposer pass DIFFERENT producers — Task 9's
+    /// per-mandate cap distinguishes them by this stamp). Lineage is engine-gathered; the
+    /// event shape is otherwise identical regardless of producer.
+    #[cfg(unix)]
+    fn build_proposer_event(&self, producer: &str, event_type: &str, content: serde_json::Value, source_event_ids: &[String]) -> crate::event::Event {
         crate::event::Event {
             id: String::new(), ts: String::new(), valid_time: None,
             event_type: event_type.to_string(), content,
             model_meta: Some(crate::event::ModelMeta {
-                model_id: crate::graph::M6B_PROPOSER_PRODUCER.to_string(),
+                model_id: producer.to_string(),
                 prompt_hash: String::new(), source_event_ids: source_event_ids.to_vec(),
             }),
             prev_hash: String::new(), hash: None,
@@ -2253,6 +2604,145 @@ impl EventLog {
         )?;
         let rows = stmt.query_map([], |r| Ok(crate::graph::WriteGrant {
             canonical_root: r.get(0)?, granted_at: r.get(1)?, revoked: r.get::<_, i64>(2)? != 0,
+        }))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    /// Grant a standing **mandate** (M6c §4.1/§4.2): a signed, bounded goal to keep
+    /// `target` == `recipe(sources under source_scope)`. Appends a ground-truth
+    /// `mandate_grant` event and refreshes the mandates projection; the returned event
+    /// id IS the mandate's identity. Mirrors [`add_write_grant`](Self::add_write_grant)
+    /// but with the load-bearing grant-time guards.
+    ///
+    /// Guards, IN ORDER (each rejects — never silently truncates or downgrades):
+    /// 1. **Recipe cap (Finding D).** `recipe.len() > MAX_RECIPE_LEN` ⇒ reject, so the
+    ///    signed recipe and the later prompt's recipe can never disagree.
+    /// 2. **Canonicalize.** `source_scope` must resolve (it must exist); `target` is
+    ///    canonicalized via its PARENT when it does not exist yet (a Create), reusing
+    ///    `propose_write`'s logic so all later `starts_with` checks are on real paths.
+    /// 3. **UX guard.** `target` must be under an active WRITE grant
+    ///    ([`is_write_allowed`](Self::is_write_allowed)) — you cannot create a mandate
+    ///    the brain could never act on. (Convenience only; the security boundary is
+    ///    `propose_write`'s re-gate at propose/execute time, §4.3 #1.)
+    /// 4. **LOAD-BEARING self-loop guard (Finding A).** The canonical `target` MUST be
+    ///    OUTSIDE every active READ-grant root, tested with **segment-aware**
+    ///    [`Path::starts_with`] on canonical paths (so `/a/b` never matches `/a/bc`).
+    ///    This structurally guarantees the engine's own confirmed write to `target` can
+    ///    never fire a source watcher event nor be re-ingested as a source — so the
+    ///    recipe can never fold its own output back into its input (convergence holds
+    ///    unconditionally, §6.4 #1).
+    pub fn add_mandate(
+        &self,
+        target: &std::path::Path,
+        source_scope: &std::path::Path,
+        recipe: &str,
+    ) -> Result<String, BossclawError> {
+        // 1. Recipe cap (Finding D) — reject, never truncate.
+        if recipe.len() > crate::graph::MAX_RECIPE_LEN {
+            return Err(BossclawError::InvalidInput("recipe too long".into()));
+        }
+        // 2. Canonicalize source_scope (must exist) and target (else its parent — Create).
+        let canon_scope = std::fs::canonicalize(source_scope).map_err(|e| {
+            BossclawError::InvalidInput(format!("mandate source_scope not resolvable: {e}"))
+        })?;
+        let canon_target = canonicalize_target_or_parent(target).ok_or_else(|| {
+            BossclawError::InvalidInput("mandate target path is not resolvable".into())
+        })?;
+        // 3. UX guard: target must be under an active WRITE grant.
+        if !self.is_write_allowed(target)? {
+            return Err(BossclawError::InvalidInput("target not write-granted".into()));
+        }
+        // 4. Finding A — early-reject a target inside any active READ-grant root. This is
+        //    a TIGHT grant-time guard (defense in depth), NOT the unconditional convergence
+        //    proof: the ultimate enforcer is execute-time `O_NOFOLLOW` + canonical-root-
+        //    anchored ingest (a confirmed write follows no symlink, and ingest only adopts
+        //    files whose canonical path is under a read root). Here we reject as early as
+        //    possible so a misconfigured mandate never even reaches propose-time.
+        //    LEAF-TIGHT: resolve an EXISTING target's final component first
+        //    (`std::fs::canonicalize` follows a leaf symlink), so a symlink AT the leaf that
+        //    points INTO a read root is caught — `canon_target` alone joins the raw leaf
+        //    NOFOLLOW and would miss it. A not-yet-existing Create target fails canonicalize
+        //    → fall back to the parent+leaf form (unchanged). The scan stays segment-aware
+        //    (`Path::starts_with` on `Path`s — `/a/b` never matches `/a/bc`), active grants only.
+        let resolved_target = std::fs::canonicalize(target)
+            .ok()
+            .or_else(|| canonicalize_target_or_parent(target))
+            .ok_or_else(|| {
+                BossclawError::InvalidInput("mandate target path is not resolvable".into())
+            })?;
+        for g in self.grants()? {
+            if !g.revoked
+                && resolved_target.starts_with(std::path::Path::new(&g.canonical_root))
+            {
+                return Err(BossclawError::InvalidInput(
+                    "mandate target must be outside every read-grant root".into(),
+                ));
+            }
+        }
+        // 5. Append the ground-truth `mandate_grant` event (Tier-A, model_meta: None).
+        //    The append chokepoint mints the id = the mandate identity (§4.1). Paths are
+        //    stored canonical so all later `starts_with` checks are on real paths.
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::MANDATE_GRANT_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "target": canon_target.to_string_lossy().to_string(),
+                "source_scope": canon_scope.to_string_lossy().to_string(),
+                "recipe": recipe,
+            }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        Ok(id)
+    }
+
+    /// Revoke a mandate by its `mandate_grant_id` (M6c §4.1). Appends a ground-truth
+    /// `mandate_revoke` event referencing the grant id and refreshes the projection.
+    /// **Sticky + fail-closed:** the fold only ever sets `revoked=1` (there is no
+    /// un-revoke), and a revoke of an unknown id is harmlessly ignored by the fold —
+    /// mirroring `write_revoke`. Returns the revoke event id.
+    pub fn revoke_mandate(&self, mandate_grant_id: &str) -> Result<String, BossclawError> {
+        let id = self.append(Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::MANDATE_REVOKE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "mandate_grant_id": mandate_grant_id }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: self.signer_did(), signature: None,
+        })?;
+        self.rebuild_graph()?;
+        // Purge all of this mandate's synthesis-cache rows so the cache cannot outlive the
+        // mandate under a live watcher (Task 7). A revoke of an unknown id is a harmless
+        // no-op DELETE — mirroring the fold, which ignores a revoke with no grant.
+        {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            conn.execute(
+                "DELETE FROM mandate_synthesis_cache WHERE mandate_grant_id = ?1",
+                rusqlite::params![mandate_grant_id],
+            )?;
+        }
+        Ok(id)
+    }
+
+    /// Every ACTIVE (un-revoked) mandate, `ORDER BY granted_at ASC`. Tier-A read; the
+    /// mandate sibling of [`grants`](Self::grants)/[`write_grants`](Self::write_grants).
+    pub fn active_mandates(&self) -> Result<Vec<crate::graph::Mandate>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT mandate_grant_id, target, source_scope, recipe, granted_at, revoked
+             FROM mandates WHERE revoked = 0 ORDER BY granted_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(crate::graph::Mandate {
+            mandate_grant_id: r.get(0)?,
+            target: r.get(1)?,
+            source_scope: r.get(2)?,
+            recipe: r.get(3)?,
+            granted_at: r.get(4)?,
+            revoked: r.get::<_, i64>(5)? != 0,
         }))?;
         let mut out = Vec::new();
         for row in rows { out.push(row?); }
@@ -2410,18 +2900,11 @@ impl EventLog {
 
         // ── Step 2: canonicalize target (Create ⇒ parent) + eligibility ───────────
         // Reuse the SAME parent-canonicalize logic `is_write_allowed` documents:
-        // for Create the target is absent, so we resolve and key off the PARENT.
+        // for Create the target is absent, so we resolve and key off the PARENT
+        // (via the shared [`canonicalize_target_or_parent`] helper, also used by
+        // `add_mandate` so the two agree). Edit/Delete canonicalize the target itself.
         let canonical: Option<std::path::PathBuf> = match p.op {
-            WriteOp::Create => match p.target.parent() {
-                Some(parent) => match std::fs::canonicalize(parent) {
-                    Ok(real_parent) => p
-                        .target
-                        .file_name()
-                        .map(|name| real_parent.join(name)),
-                    Err(_) => None,
-                },
-                None => None,
-            },
+            WriteOp::Create => canonicalize_target_or_parent(&p.target),
             WriteOp::Edit | WriteOp::Delete => std::fs::canonicalize(&p.target).ok(),
         };
         if canonical.is_none() {
@@ -3607,6 +4090,12 @@ impl EventLog {
         let write_grant_events = self.write_grant_events_ordered()?;
         let write_grants = crate::graph::fold_write_grants(&write_grant_events);
 
+        // Fold mandate_grant/mandate_revoke events → current mandates projection (M6c).
+        // SEPARATE event stream + fold from the grants above; keyed on the grant event
+        // id (the mandate identity), with a sticky `revoked` flag.
+        let mandate_events = self.mandate_events_ordered()?;
+        let mandates = crate::graph::fold_mandates(&mandate_events);
+
         // Fold file_ingested/supersede events → current file per path (M5a).
         let file_events = self.file_and_supersede_events_ordered()?;
         let files = crate::graph::fold_files(&file_events);
@@ -3641,6 +4130,7 @@ impl EventLog {
         tx.execute("DELETE FROM pages", [])?;
         tx.execute("DELETE FROM grants", [])?;
         tx.execute("DELETE FROM write_grants", [])?;
+        tx.execute("DELETE FROM mandates", [])?;
         tx.execute("DELETE FROM files", [])?;
         for e in &edges {
             tx.execute(
@@ -3691,6 +4181,21 @@ impl EventLog {
             tx.execute(
                 "INSERT INTO write_grants (canonical_root, granted_at, revoked) VALUES (?1, ?2, ?3)",
                 rusqlite::params![g.canonical_root, g.granted_at, g.revoked as i64],
+            )?;
+        }
+        for m in &mandates {
+            tx.execute(
+                "INSERT INTO mandates
+                   (mandate_grant_id, target, source_scope, recipe, granted_at, revoked)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    m.mandate_grant_id,
+                    m.target,
+                    m.source_scope,
+                    m.recipe,
+                    m.granted_at,
+                    m.revoked as i64
+                ],
             )?;
         }
         for f in &files {
@@ -3780,6 +4285,23 @@ impl EventLog {
         let conn = store.conn();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events WHERE event_type IN ('write_grant', 'write_revoke') ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&row?)?);
+        }
+        Ok(out)
+    }
+
+    /// All `mandate_grant`/`mandate_revoke` events, payload-parsed, in chain (`seq ASC`)
+    /// order (M6c). The mandate sibling of [`write_grant_events_ordered`]: it selects ONLY
+    /// the mandate event types, so a grant/write-grant event can never feed the mandate fold.
+    fn mandate_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type IN ('mandate_grant', 'mandate_revoke') ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
@@ -4334,6 +4856,63 @@ impl EventLog {
         for row in rows {
             let ev: Event = serde_json::from_str(&row?)?;
             if let Some(flag) = ev.content.get(PROPOSALS_ENABLED_KEY).and_then(|v| v.as_bool()) {
+                return Ok(flag); // newest explicit flag wins → sticky
+            }
+        }
+        Ok(true) // flag never set → default open
+    }
+
+    /// Set the M6c mandate-proposer on/off switch by appending a control
+    /// `config` event whose content is `{ "mandates_enabled": <enabled> }`
+    /// (M6c §5.5 / D8). CLONES the [`EventLog::set_evolve_enabled`] mechanism exactly —
+    /// the only writer of [`MANDATES_ENABLED_KEY`], a signed + hash-chained
+    /// control config (so a forged/replayed flip is tamper-evident via
+    /// `verify_chain`). INDEPENDENT of the evolve and proposals switches: this gates
+    /// ONLY the autonomous mandate-driven `write_proposal` synthesis, never the
+    /// curation loop. Carries no model fields, so it never disturbs
+    /// [`EventLog::active_model`].
+    pub fn set_mandates_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(MANDATES_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
+    /// Whether the M6c mandate proposer is enabled (M6c §5.5 / D8 off-switch).
+    ///
+    /// STICKY / fail-closed semantics IDENTICAL to [`EventLog::evolve_enabled`]:
+    /// config events are scanned newest-first and the FIRST one carrying an
+    /// explicit `mandates_enabled` bool wins. Because [`EventLog::set_mandates_enabled`]
+    /// is the only writer of the key, this is exactly "the latest EXPLICIT value":
+    /// once an explicit `false` exists with no LATER explicit `true`, mandates stay
+    /// off — a flag-LESS newer config (e.g. an active-model switch, or a
+    /// `proposals_enabled` flip) does NOT silently re-arm mandates. Default-open
+    /// (`true`) ONLY when the flag was never set at all.
+    pub fn mandates_enabled(&self) -> Result<bool, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let ev: Event = serde_json::from_str(&row?)?;
+            if let Some(flag) = ev.content.get(MANDATES_ENABLED_KEY).and_then(|v| v.as_bool()) {
                 return Ok(flag); // newest explicit flag wins → sticky
             }
         }
@@ -5104,7 +5683,416 @@ impl EventLog {
         //    `summarize_cursor` (F1) independent of the extraction cursor above. ──
         self.summarize_topics(reasoner, &mut report)?;
 
+        // ── 10. M6c mandate phase (§5.1/§5.5/§5.6). A NEW top-level phase, AFTER summarize:
+        //    the brain's standing sync goals are evaluated last, so a mandate synthesizes
+        //    over a graph + dossiers that already reflect THIS tick's curation. Skipped
+        //    wholesale when the INDEPENDENT mandate off-switch is engaged (sticky +
+        //    fail-closed, §5.6); the evolve off-switch already returned earlier. The whole
+        //    phase is `#[cfg(unix)]` — the actuator/gate surface (M6a) is Unix-only.
+        //
+        //    Best-effort isolation mirrors the M6b reconciliation wiring EXACTLY: each
+        //    mandate is wrapped so an `Err` is logged and the loop CONTINUES — a single
+        //    mandate failure NEVER unwinds the committed graph/summarize work nor aborts the
+        //    tick. The off-switch is RE-READ per mandate (security M1, fast-kill): flipping
+        //    it mid-phase stops further proposals within the same tick. The shared
+        //    `report.proposals_emitted` counter bounds M6b + M6c proposals together. ──
+        #[cfg(unix)]
+        {
+            if self.mandates_enabled()? {
+                for m in self.active_mandates()? {
+                    // Re-read the off-switch per mandate so a flip mid-phase fast-kills the
+                    // rest of the tick (sticky + fail-closed). A read error aborts the phase
+                    // (fail-closed) but never unwinds committed work.
+                    if !self.mandates_enabled()? {
+                        break;
+                    }
+                    if let Err(e) = self.run_mandate(&m, reasoner, &mut report) {
+                        log::warn!(
+                            "evolve: mandate {} (target {}) failed (committed work kept): {e}",
+                            m.mandate_grant_id, m.target
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(report)
+    }
+
+    /// M6c mandate phase — gather + cached-or-synth DECISION for ONE mandate `m`
+    /// (spec §5.1/§5.2, findings E/G, Task 9a). Returns a [`MandateAction`]; it appends
+    /// NO event and runs NO write gate (Task 9b turns the action into a gated
+    /// `write_proposal` / `write_rejected` and wires it into `evolve_once`).
+    ///
+    /// Algorithm:
+    /// 1. **Gather** `current_files()` whose canonical path is segment-aware UNDER
+    ///    `m.source_scope` (the same `Path::starts_with` discipline as `is_write_allowed`
+    ///    / `add_mandate`'s read-root scan) AND not equal to `m.target` (the output is
+    ///    never its own source). Over [`crate::graph::MAX_SOURCES_PER_MANDATE`] → `Elide`
+    ///    (directory-bomb guard, finding E). Empty in-scope set → `Elide` (never
+    ///    synthesize from nothing, finding G).
+    /// 2. **sources_hash** = sha256 over the SORTED `(canonical_path, content_hash)` pairs
+    ///    (deterministic — sort before hashing).
+    /// 3. **cached-or-synth**: a cache HIT (`get_synthesis_cache`) reuses its bytes +
+    ///    `source_event_ids_at_synth` with NO LLM call. A miss reads each source's ON-DISK
+    ///    bytes, fences EACH via [`crate::extract::push_fenced_source`]; if the combined
+    ///    fenced length would exceed [`crate::extract::MAX_INPUT_TEXT_BYTES`] → `Elide` (do
+    ///    NOT truncate, finding E). Otherwise it calls the reasoner EXACTLY as
+    ///    `reconcile_confirmed_contradiction` does the rewrite turn (same `complete_json`,
+    ///    same structured schema, parse-failure → the `?`-propagated `Reject`); an empty
+    ///    `synced_content` → `Reject("empty synthesis")` (finding G). On success it caches
+    ///    the bytes + the engine-gathered source ids just read.
+    /// 4. **Compare vs ON-DISK** (`std::fs::read(&m.target)`, NEVER the stale `files`
+    ///    projection hash): equal → `Elide`. Op = `Create` if the target is absent, else
+    ///    `Edit` (M6c never deletes).
+    /// 5. **Lineage (finding B — anti-laundering union)**: the cache/synth source ids ∪
+    ///    the CURRENT in-scope `file_event_id`s, deduped, fed to
+    ///    [`crate::mandate::mandate_lineage`]. EVERY id is engine-gathered; see the
+    ///    invariant comment at the union site.
+    #[cfg(unix)]
+    pub fn mandate_phase_for(
+        &self,
+        m: &crate::graph::Mandate,
+        reasoner: &dyn crate::reason::Reasoner,
+    ) -> Result<MandateAction, BossclawError> {
+        use sha2::{Digest, Sha256};
+
+        // ── 1. Gather in-scope sources: segment-aware UNDER source_scope, target excluded.
+        //    `Path::starts_with` compares whole components, so a string-prefix sibling of
+        //    the scope (e.g. `/a/bc` under `/a/b`) does NOT match — the same discipline as
+        //    `is_write_allowed` / the `add_mandate` read-root scan. ──
+        let scope = std::path::Path::new(&m.source_scope);
+        let target = std::path::Path::new(&m.target);
+        let in_scope: Vec<crate::graph::FileRecord> = self
+            .current_files()?
+            .into_iter()
+            .filter(|rec| {
+                let p = std::path::Path::new(&rec.canonical_path);
+                p.starts_with(scope) && p != target
+            })
+            .collect();
+
+        // Directory-bomb guard (finding E): too many sources → Elide (retryable, no event).
+        if in_scope.len() > crate::graph::MAX_SOURCES_PER_MANDATE {
+            return Ok(MandateAction::Elide);
+        }
+        // Never synthesize from nothing (finding G): empty in-scope set → Elide.
+        if in_scope.is_empty() {
+            return Ok(MandateAction::Elide);
+        }
+
+        // ── 2. sources_hash: sha256 over the SORTED (canonical_path, content_hash) pairs.
+        //    Sort first so the digest is independent of `current_files()` row order
+        //    (it already orders by path, but we sort explicitly to make the determinism
+        //    a property of THIS code, not of the query). A NUL byte separates fields and
+        //    pairs so no concatenation collision can occur. ──
+        let mut pairs: Vec<(&str, &str)> = in_scope
+            .iter()
+            .map(|rec| (rec.canonical_path.as_str(), rec.content_hash.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        let mut hasher = Sha256::new();
+        for (path, content_hash) in &pairs {
+            hasher.update(path.as_bytes());
+            hasher.update([0x00]);
+            hasher.update(content_hash.as_bytes());
+            hasher.update([0x00]);
+        }
+        let sources_hash = hex::encode(hasher.finalize());
+
+        // The CURRENT in-scope source event ids — engine-gathered, used in BOTH the
+        // synth-time cache lineage and the step-5 anti-laundering union.
+        let current_source_ids: Vec<String> =
+            in_scope.iter().map(|rec| rec.file_event_id.clone()).collect();
+
+        // ── 3. cached-or-synth → (expected_bytes, synth_lineage_ids). ──
+        let (expected_bytes, synth_lineage_ids) =
+            match self.get_synthesis_cache(&m.mandate_grant_id, &sources_hash)? {
+                // Cache HIT: reuse the stored bytes + the exact ids read at synth time. NO
+                // LLM call (convergence + cost: the source-state is byte-identical).
+                Some(row) => (row.expected_bytes, row.source_event_ids_at_synth),
+                // Cache MISS: read each source's ON-DISK bytes and fence EACH as untrusted
+                // DATA into one combined block (mirrors how the reconcile rewrite turn fences
+                // the live file body). FAIL CLOSED on any unusable in-scope source — see the
+                // per-source guards below. The hash already pinned the FULL in-scope set, so
+                // synthesizing from fewer sources than that set names would cache PARTIAL
+                // bytes under the full-set `sources_hash`; because a skipped source's
+                // content_hash is unchanged when it becomes readable again, the cache would
+                // return those partial bytes FOREVER → permanent staleness, convergence
+                // silently broken. So we synthesize ONLY when EVERY in-scope source reads
+                // cleanly as UTF-8 — guaranteeing the cached bytes correspond to exactly the
+                // set `sources_hash` names. An unusable source elides (retryable next tick).
+                None => {
+                    let mut fenced = String::new();
+                    for rec in &in_scope {
+                        // Read-Err (e.g. the file vanished after the projection listed it):
+                        // do NOT skip, synthesize, or cache — Elide and retry once every
+                        // in-scope source is readable again (the source-state is unchanged,
+                        // so a later tick recomputes the same `sources_hash`).
+                        let Ok(bytes) = std::fs::read(&rec.canonical_path) else {
+                            return Ok(MandateAction::Elide);
+                        };
+                        // Require valid UTF-8 ON DISK NOW. A lossy view would synthesize from
+                        // replacement chars (also defeating Elide-convergence), so non-UTF-8
+                        // also fails closed → Elide. The fence neutralizes any embedded
+                        // terminator; the reasoner sees DATA, never instructions.
+                        let Ok(text) = String::from_utf8(bytes) else {
+                            return Ok(MandateAction::Elide);
+                        };
+                        crate::extract::push_fenced_source(&mut fenced, &text);
+                    }
+                    // Over-cap input (finding E): do NOT truncate — Elide and surface nothing
+                    // (stays retryable). Truncating would synthesize from a partial view and
+                    // could silently drop a source's content.
+                    if fenced.len() > crate::extract::MAX_INPUT_TEXT_BYTES {
+                        return Ok(MandateAction::Elide);
+                    }
+                    // Synthesize. Mirrors `reconcile_confirmed_contradiction`'s rewrite turn
+                    // EXACTLY: the same `complete_json` trait method, the same structured
+                    // schema, and a parse/transport failure propagates via `?` (→ the caller
+                    // sees the `Err`; Task 9b leaves the mandate retryable). The trusted
+                    // recipe is the frame; the sources are fenced below.
+                    let prompt = crate::mandate::build_recipe_prompt(&m.recipe, &fenced);
+                    let out = reasoner.complete_json(
+                        MANDATE_SYSTEM,
+                        &prompt,
+                        &crate::mandate::recipe_schema(),
+                    )?;
+                    let synced = out.get("synced_content").and_then(|v| v.as_str()).unwrap_or("");
+                    // Empty synthesis is a genuine failure → Reject (finding G: NEVER truncate
+                    // the target to empty). Mirrors the reconcile `empty_rewrite` reject.
+                    if synced.is_empty() {
+                        return Ok(MandateAction::Reject {
+                            reason: "empty synthesis".into(),
+                            sources_hash,
+                        });
+                    }
+                    // Output-size bound (review carry-forward, Minor #3): an over-cap synthesis
+                    // Elides BEFORE it is cached — bounding the synthesis cache row (a runaway
+                    // model output can never bloat the encrypted cache), and, because the phase
+                    // returns Elide, the proposal too. Retryable: the source-state is unchanged,
+                    // so a later tick recomputes the same `sources_hash` (and a model that
+                    // eventually returns in-bound bytes converges). NEVER a Reject — an oversized
+                    // output is a transient model artifact, not a terminal (path,key) failure.
+                    if synced.len() > crate::graph::MAX_SYNCED_CONTENT_BYTES {
+                        return Ok(MandateAction::Elide);
+                    }
+                    let bytes = synced.as_bytes().to_vec();
+                    let expected_hash = hex::encode(Sha256::digest(&bytes));
+                    // Cache the bytes WITH the engine-gathered ids just read (finding B): a
+                    // later hit unions exactly these — never a model-named id.
+                    self.put_synthesis_cache(
+                        &m.mandate_grant_id,
+                        &sources_hash,
+                        &bytes,
+                        &expected_hash,
+                        &current_source_ids,
+                    )?;
+                    (bytes, current_source_ids.clone())
+                }
+            };
+
+        // ── 4. Compare vs the ON-DISK target (NEVER the stale `files` projection hash:
+        //    it is out of date the instant an actuator write lands). Equal → Elide. ──
+        let actual = std::fs::read(target).ok();
+        if actual.as_deref() == Some(expected_bytes.as_slice()) {
+            return Ok(MandateAction::Elide);
+        }
+        // Op is Create iff the target file does not exist yet, else Edit. M6c NEVER deletes.
+        let op = if target.exists() {
+            crate::actuator::WriteOp::Edit
+        } else {
+            crate::actuator::WriteOp::Create
+        };
+
+        // ── 5. Lineage (finding B — the anti-laundering union). ──
+        // SECURITY INVARIANT (Task-5 carry-forward): every id in `union` is an
+        // ENGINE-GATHERED `file_event_id` — `synth_lineage_ids` comes from the cache row
+        // or the `FileRecord`s read in step 1, and `current_source_ids` are the step-1
+        // `FileRecord.file_event_id`s. NONE is ever derived from the model's
+        // `synced_content` or any model output. The model produces only file BYTES; it
+        // never names a source id. Deriving any lineage id from model output would launder
+        // an attacker-chosen id into the gate's trust set — forbidden.
+        let mut union: Vec<String> = synth_lineage_ids;
+        union.extend(current_source_ids);
+        union.sort();
+        union.dedup();
+        let lineage = crate::mandate::mandate_lineage(&m.mandate_grant_id, &union)?;
+
+        Ok(MandateAction::Propose { expected: expected_bytes, lineage, op, sources_hash })
+    }
+
+    /// M6c — act on ONE mandate `m` this tick (§5.1/§5.5/§5.6, Task 9b). Calls
+    /// [`mandate_phase_for`](Self::mandate_phase_for) for the gather + cached-or-synth
+    /// DECISION, then turns the [`MandateAction`] into the SAME recorded outcomes the M6b
+    /// sibling [`reconcile_confirmed_contradiction`](Self::reconcile_confirmed_contradiction)
+    /// produces — a gated `write_proposal` (+ cached bytes) or a `write_rejected`. The
+    /// EXACT mirror of that method's propose/reject/record half, with the M6c producer
+    /// stamp and the source-state `inducing_key`.
+    ///
+    /// Action handling:
+    /// - [`MandateAction::Elide`] → do nothing, emit NO event (stays retryable next tick).
+    /// - [`MandateAction::Reject`] → record a `write_rejected` (a genuine synthesis
+    ///   failure, e.g. empty synthesis) stamped [`M6C_PROPOSER_PRODUCER`]; `count`.
+    /// - [`MandateAction::Propose`] →
+    ///   1. `inducing_key` = `{mandate, target, sources_hash}` — the SHAPE
+    ///      [`is_mandate_proposal_suppressed`](Self::is_mandate_proposal_suppressed)
+    ///      expects (§5.4); `sources_hash` is the one the phase computed (returned in the
+    ///      action so the two sites cannot drift).
+    ///   2. **Idempotency** — a suppressed `(target, key)` skips (emits nothing).
+    ///   3. **Caps** — the GLOBAL per-tick cap ([`MAX_PROPOSALS_PER_TICK`], SHARED with M6b
+    ///      via `report.proposals_emitted`) OR the per-mandate cap
+    ///      ([`MAX_PROPOSALS_PER_MANDATE_PER_TICK`]) ⇒ ELIDE: no event,
+    ///      `report.proposals_elided_cap += 1` (NEVER a `write_rejected` — a cap is retryable).
+    ///   4. **Gate + record** — `propose_write`; a `reject_reason` (e.g. the target left a
+    ///      write-grant: the never-widen check) records a `write_rejected`; otherwise an
+    ///      `append_write_proposal_with` + `put_proposal_bytes`, `proposals_emitted += 1`.
+    ///
+    /// `proposals_emitted` is the SHARED global counter (M6b increments it too), so the
+    /// global cap bounds M6b + M6c proposals TOGETHER in one tick. Best-effort isolation
+    /// is the CALLER's (`evolve_once` wraps each call so an `Err` is logged + the loop
+    /// continues); this method returns `Err` only on a genuine append/IO failure.
+    #[cfg(unix)]
+    fn run_mandate(
+        &self,
+        m: &crate::graph::Mandate,
+        reasoner: &dyn crate::reason::Reasoner,
+        report: &mut EvolveReport,
+    ) -> Result<(), BossclawError> {
+        let (expected, lineage, op, sources_hash) = match self.mandate_phase_for(m, reasoner)? {
+            // In sync / no sources / over an input cap → nothing to do, stays retryable.
+            MandateAction::Elide => return Ok(()),
+            // A genuine synthesis failure (e.g. empty synthesis) → record a terminal
+            // `write_rejected` for the target, stamped with the M6c producer. `target` is
+            // the mandate's canonical target; the inducing_key carries the source-state so a
+            // later DIFFERENT source-state is a fresh (non-suppressed) ask. Best-effort:
+            // a Reject NEVER unwinds committed work (the caller isolates an Err).
+            MandateAction::Reject { reason, sources_hash } => {
+                // The inducing_key carries the REAL source-state digest, so the
+                // `write_rejected` is terminal for exactly this source-state (a later
+                // DIFFERENT source-state is a fresh ask), mirroring M6b's same-key reject.
+                // Lineage cites the mandate id (a genuine, resolvable Tier-B source).
+                let inducing_key = serde_json::json!({
+                    "mandate": m.mandate_grant_id, "target": m.target, "sources_hash": sources_hash,
+                });
+                self.append_write_rejected_with(
+                    Some(&m.target),
+                    &reason,
+                    &inducing_key,
+                    std::slice::from_ref(&m.mandate_grant_id),
+                    crate::graph::M6C_PROPOSER_PRODUCER,
+                )?;
+                report.proposals_rejected += 1;
+                return Ok(());
+            }
+            MandateAction::Propose { expected, lineage, op, sources_hash } => {
+                (expected, lineage, op, sources_hash)
+            }
+        };
+
+        // ── 1. inducing_key = the SOURCE-STATE key (§5.4): {mandate, target, sources_hash}.
+        //    This is the exact shape `is_mandate_proposal_suppressed` matches on; keying on
+        //    `sources_hash` makes a NEW source-state a fresh ask (a prior state's decline
+        //    cannot suppress it) while a decline is sticky for THIS state. ──
+        let inducing_key = serde_json::json!({
+            "mandate": m.mandate_grant_id, "target": m.target, "sources_hash": sources_hash,
+        });
+
+        // ── 2. Idempotency: a suppressed (target, key) — an OPEN proposal, a prior
+        //    write_rejected, or a DECLINED sync for THIS source-state — skips silently. ──
+        if self.is_mandate_proposal_suppressed(&m.target, &inducing_key)? {
+            return Ok(());
+        }
+
+        // ── 3. Caps (ELIDE, never reject — a cap is retryable). Two bounds:
+        //    - the GLOBAL per-tick cap, SHARED with M6b via `report.proposals_emitted`, so
+        //      M6b + M6c proposals together never exceed MAX_PROPOSALS_PER_TICK in one tick;
+        //    - the per-mandate cap. A mandate owns ONE target, so one `run_mandate` emits at
+        //      most one proposal — the per-mandate bound is structural here; the explicit
+        //      guard encodes it (and is future-proof if a mandate ever fans out). ──
+        let already_emitted_for_mandate = 0usize; // one target per run_mandate call
+        if report.proposals_emitted >= crate::extract::MAX_PROPOSALS_PER_TICK
+            || already_emitted_for_mandate >= crate::graph::MAX_PROPOSALS_PER_MANDATE_PER_TICK
+        {
+            report.proposals_elided_cap += 1;
+            return Ok(());
+        }
+
+        // ── 4. Gate + record. Build the proposal with the engine-gathered lineage (mandate
+        //    ∪ source ids) and the synthesized whole-file bytes; the op is the phase's
+        //    Create/Edit decision (M6c never deletes). The hash is the engine's canonical
+        //    content hash (the same `get_proposal_bytes_checked` recomputes). ──
+        let expected_hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&expected))
+        };
+        let gated = self.propose_write(crate::actuator::WriteProposal {
+            target: std::path::PathBuf::from(&m.target),
+            new_content: expected.clone(),
+            op,
+            source_event_ids: lineage.clone(),
+            rationale: m.recipe.clone(),
+        })?;
+
+        // A gate FAILURE is recorded as a `write_rejected` (terminal for this source-state).
+        // TWO distinct failure signals must be honored (the gate separates them):
+        //   - `reject_reason.is_some()` — op×existence, an unresolvable target, or a symlink
+        //     final component; AND
+        //   - `!allowed` — the target is NOT under an active write-grant. This is the
+        //     LOAD-BEARING never-widen check, and the gate signals it via `allowed=false`
+        //     with NO `reject_reason` (a not-granted target is not a malformed proposal, just
+        //     an unauthorized one). Acting only on `reject_reason` would EMIT a proposal for a
+        //     target outside every write-grant — a grant-widening leak. So `!allowed` rejects
+        //     here too (propose-time), and `execute_write_resolving` re-checks it at execute.
+        let gate_reject = gated
+            .verdict
+            .reject_reason
+            .as_deref()
+            .map(str::to_string)
+            .or_else(|| (!gated.verdict.allowed).then(|| "target not under an active write grant".to_string()));
+        if let Some(reason) = gate_reject {
+            self.append_write_rejected_with(
+                Some(&m.target),
+                &reason,
+                &inducing_key,
+                &lineage,
+                crate::graph::M6C_PROPOSER_PRODUCER,
+            )?;
+            report.proposals_rejected += 1;
+            return Ok(());
+        }
+
+        // Record the gated proposal (M6c producer) + its bytes (the side-table cache). The
+        // verdict_summary mirrors M6b's shape so the app surfaces the same fields. The
+        // append chokepoint stamps `origin:"external"` automatically when the lineage cites
+        // an external source — taint is never shed.
+        let op_str = match op {
+            crate::actuator::WriteOp::Create => "create",
+            crate::actuator::WriteOp::Edit => "edit",
+            // M6c never deletes; the phase only ever returns Create/Edit. A Delete here
+            // would be a contract violation, so name it explicitly rather than silently
+            // mislabeling — it cannot occur.
+            crate::actuator::WriteOp::Delete => "delete",
+        };
+        let verdict_summary = serde_json::json!({
+            "requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint),
+            "allowed": gated.verdict.allowed,
+        });
+        let pid = self.append_write_proposal_with(
+            &m.target,
+            op_str,
+            &expected_hash,
+            expected.len() as u64,
+            &m.recipe,
+            &inducing_key,
+            &verdict_summary,
+            &lineage,
+            crate::graph::M6C_PROPOSER_PRODUCER,
+        )?;
+        self.put_proposal_bytes(&pid, &expected, &expected_hash)?;
+        report.proposals_emitted += 1;
+        Ok(())
     }
 
     /// M6b reconciliation for ONE confirmed contradiction `r` (resolved entity ids),

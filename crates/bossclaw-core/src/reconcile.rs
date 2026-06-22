@@ -55,21 +55,14 @@ fn sanitize_engine_fact(engine_fact: &str) -> String {
     // ranges) via the shared helper, which also caps at its own 200-byte ceiling.
     let control_stripped = crate::summarize::sanitize_ident(engine_fact);
 
-    // Step 2: neutralize embedded fence markers the SAME way push_fenced_source does
-    // (zero-width space breaks the literal match while staying visually intact), so
-    // a label can never forge a `<<<SOURCE_BEGIN>>>`/`<<<SOURCE_END>>>` boundary in
-    // the trusted frame. The guard keeps the common (marker-free) path allocation-
-    // free. If push_fenced_source's neutralization ever changes, the dirty-fact test
-    // (which asserts no real marker survives in the frame) is the tripwire.
-    let neutralized = if control_stripped.contains("<<<SOURCE_END>>>")
-        || control_stripped.contains("<<<SOURCE_BEGIN>>>")
-    {
-        control_stripped
-            .replace("<<<SOURCE_END>>>", "<<<SOURCE_END\u{200B}>>>")
-            .replace("<<<SOURCE_BEGIN>>>", "<<<SOURCE_BEGIN\u{200B}>>>")
-    } else {
-        control_stripped
-    };
+    // Step 2: neutralize embedded fence markers via the single-sourced
+    // [`crate::extract::neutralize_fence_markers`] (the SAME helper push_fenced_source
+    // uses): a zero-width space breaks the literal match while staying visually intact,
+    // so a label can never forge a `<<<SOURCE_BEGIN>>>`/`<<<SOURCE_END>>>` boundary in
+    // the trusted frame. Single-sourcing means the data-side and frame-side policies
+    // cannot drift; the dirty-fact test (which asserts no real marker survives in the
+    // frame) is the tripwire if the shared helper ever changes.
+    let neutralized = crate::extract::neutralize_fence_markers(&control_stripped);
 
     // Step 3: hard length cap on a UTF-8 char boundary so a giant label can't bury
     // the engine's real instruction. LOAD-BEARING, not redundant with Step 1's inner
