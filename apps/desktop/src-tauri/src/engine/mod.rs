@@ -1,10 +1,7 @@
 //! The engine spine (SP1): a single live, encrypted `EventLog` wired into the desktop.
 //! See docs/superpowers/specs/2026-06-22-desktop-engine-spine-design.md.
 
-// TEMP: the engine module is fully built + unit-tested, but no non-test code
-// CONSTRUCTS an EngineHandle until Task 4 wires it into main.rs/AppState — so the
-// bin build sees these symbols as dead. Task 4 (AppState + engine_status) removes
-// this allow once EngineHandle is reachable from `main`.
+// TEMP: teardown/delete go live when Task 5 wires reset_identity; removed there.
 #![allow(dead_code)]
 
 pub mod keystore;

@@ -9,6 +9,7 @@ pub struct AppState {
     pub air_client: Arc<dyn AirClient>,
     pub identity_store: IdentityStore,
     pub inbox: std::sync::Arc<crate::inbox::manager::InboxManager>,
+    pub engine: std::sync::Arc<crate::engine::EngineHandle>,
 }
 
 #[tauri::command]
