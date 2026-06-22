@@ -66,10 +66,15 @@ impl MockReasonerProvider {
         Self { reasoner: Arc::new(bossclaw_core::ScriptedReasoner::new(model_id)) }
     }
 
-    // Used by the scripted-evolve test (SP3 Task 7) to wrap a reasoner with canned turns.
-    #[allow(dead_code)]
-    pub fn from_scripted(s: bossclaw_core::ScriptedReasoner) -> Self {
-        Self { reasoner: Arc::new(s) }
+    /// Wrap ANY `Reasoner` (SP3 Task 7). The engine's `ScriptedReasoner` is SHA-256-keyed on
+    /// the exact `(system, prompt)`, but `evolve_once` computes the recall/neighborhood
+    /// context internally, so reproducing those keys at the desktop level is fragile. The
+    /// evolve tests instead inject a small prompt-agnostic stub that picks a schema-valid
+    /// response by inspecting the `schema` arg (extraction vs adjudication); this wraps it.
+    /// A `ScriptedReasoner` can also be passed here as `Arc<dyn Reasoner>` when exact
+    /// prompt-keying IS desired.
+    pub fn from_reasoner(r: Arc<dyn Reasoner>) -> Self {
+        Self { reasoner: r }
     }
 }
 
