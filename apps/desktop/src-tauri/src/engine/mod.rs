@@ -3,6 +3,7 @@
 
 pub mod embed;
 pub mod keystore;
+pub mod reason;
 
 use crate::engine::keystore::EngineKeystore;
 use crate::secrets::SecretsVault;
@@ -48,7 +49,11 @@ pub enum EngineOpError {
     Open(EngineError),
     Core(String),
     Embedder(String),
-    Busy,
+    /// Reasoner build/transport failure (SP3 evolve loop).
+    #[allow(dead_code)] // constructed by recall/evolve_once (SP3 Tasks 5–7); seam lands first
+    Reasoner(String),
+    /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve").
+    Busy(&'static str),
     Join(String),
 }
 
@@ -58,7 +63,8 @@ impl std::fmt::Display for EngineOpError {
             EngineOpError::Open(e) => write!(f, "{e}"),
             EngineOpError::Core(m) => write!(f, "engine error: {m}"),
             EngineOpError::Embedder(m) => write!(f, "memory model unavailable: {m}"),
-            EngineOpError::Busy => write!(f, "an ingest is already running"),
+            EngineOpError::Reasoner(m) => write!(f, "reasoner unavailable: {m}"),
+            EngineOpError::Busy(op) => write!(f, "an {op} is already running"),
             EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
         }
     }
@@ -192,7 +198,7 @@ impl EngineHandle {
     /// in-flight guard (a concurrent call returns `Busy`).
     pub async fn run_ingest(&self, onboarded: bool) -> Result<bossclaw_core::IngestReport, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
-        let _guard = self.ingest_lock.try_lock().map_err(|_| EngineOpError::Busy)?;
+        let _guard = self.ingest_lock.try_lock().map_err(|_| EngineOpError::Busy("ingest"))?;
         let provider = self.embedder_provider.clone();
         let report = tokio::task::spawn_blocking(move || -> Result<bossclaw_core::IngestReport, EngineOpError> {
             let embedder = provider.embedder()?; // lazy, cached — built BEFORE the walk
