@@ -31,6 +31,13 @@ thiserror = "1.0"
 urlencoding = "2.1"
 uuid = { version = "1", features = ["v4"] }
 
+# Memory/actuator engine (SP1): bossclaw-core is Unix-only until M7 — it pulls bundled-SQLCipher
+# (needs a system OpenSSL on Windows) + rustix, so the desktop excludes the engine on Windows via
+# `#[cfg(unix)]`. `zeroize` is used only by the engine keystore, so it rides in the same section.
+[target.'cfg(unix)'.dependencies]
+bossclaw-core = { path = "../../../crates/bossclaw-core" }
+zeroize = "1"
+
 # Single-instance guard (CF2): exactly one desktop process, so the in-process POLICY_LOCK is the
 # whole-machine lock and two instances can't both reserve the same budget slot. Desktop-only plugin.
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
@@ -41,6 +48,9 @@ keyring = { version = "2.3", features = ["linux-secret-service", "linux-keyutils
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 keyring = "2.3"
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = ["custom-protocol"]

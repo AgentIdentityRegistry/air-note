@@ -89,6 +89,7 @@ dependencies = [
  "air-rs",
  "async-trait",
  "base64 0.22.1",
+ "bossclaw-core",
  "chrono",
  "ed25519-dalek",
  "hex",
@@ -104,11 +105,13 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "unsigned-varint",
  "urlencoding",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
