@@ -3,28 +3,28 @@
 //! behind this same trait with zero rework.
 //! See docs/superpowers/specs/2026-06-23-sp3-recall-evolve-design.md.
 
-// SP3 Task 1 lands this seam ahead of its consumers: `EngineHandle` gains a
-// `reasoner_provider` field + `evolve_once` (Task 3/7) and `main.rs` constructs
-// `OllamaReasonerProvider` + the scheduler (Task 10). Until then these symbols are
-// intentionally not yet wired, mirroring the repo's "Phase 2 will consume them" convention.
-#![allow(dead_code)]
-
 use crate::engine::EngineOpError;
 use bossclaw_core::Reasoner;
 use std::sync::{Arc, Mutex};
 
 /// Single source of truth for the evolve reasoner's Ollama model tag (mirrors
 /// embed::MODEL_ID). Unpinned for SP3 (the user pulls it via `ollama pull`).
+// Used by the Ollama detection probe + scheduler (SP3 Tasks 9–10) and by `reasoner()` below.
+#[allow(dead_code)] // consumed at Task 9 (ollama_probe) / Task 10 (scheduler)
 pub const REASONER_MODEL_ID: &str = "qwen2.5:7b-instruct";
 
 /// Builds (and caches) the reasoner. Called on first evolve, never at startup.
 pub trait ReasonerProvider: Send + Sync {
+    // Called by `EngineHandle::evolve_once` (SP3 Task 7); the seam + impls land first.
+    #[allow(dead_code)]
     fn reasoner(&self) -> Result<Arc<dyn Reasoner>, EngineOpError>;
 }
 
 /// Production provider: yields `bossclaw_core::OllamaReasoner` (loopback-fail-closed)
 /// on first use and caches it for the process lifetime.
 pub struct OllamaReasonerProvider {
+    // Read by `reasoner()`, which `evolve_once` first calls at SP3 Task 7.
+    #[allow(dead_code)]
     cell: Mutex<Option<Arc<dyn Reasoner>>>,
 }
 
@@ -66,6 +66,8 @@ impl MockReasonerProvider {
         Self { reasoner: Arc::new(bossclaw_core::ScriptedReasoner::new(model_id)) }
     }
 
+    // Used by the scripted-evolve test (SP3 Task 7) to wrap a reasoner with canned turns.
+    #[allow(dead_code)]
     pub fn from_scripted(s: bossclaw_core::ScriptedReasoner) -> Self {
         Self { reasoner: Arc::new(s) }
     }

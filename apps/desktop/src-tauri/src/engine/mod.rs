@@ -7,12 +7,13 @@ pub mod reason;
 
 use crate::engine::keystore::EngineKeystore;
 use crate::secrets::SecretsVault;
-use bossclaw_core::EventLog;
+use bossclaw_core::{Embedder, EventLog};
 use serde::Serialize;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::task::spawn_blocking;
 
 /// Errors from opening / accessing the engine. Mapped to `EngineState` for the UI.
 #[derive(Debug)]
@@ -50,7 +51,7 @@ pub enum EngineOpError {
     Core(String),
     Embedder(String),
     /// Reasoner build/transport failure (SP3 evolve loop).
-    #[allow(dead_code)] // constructed by recall/evolve_once (SP3 Tasks 5–7); seam lands first
+    #[allow(dead_code)] // constructed by evolve_once (SP3 Task 7); the seam + Display land first
     Reasoner(String),
     /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve").
     Busy(&'static str),
@@ -88,6 +89,26 @@ pub struct EngineStatus {
     pub chain_ok: bool,
 }
 
+/// A recall `Hit` paired with its hydrated snippet text (`recall.rs::Hit` carries no text).
+/// The command layer maps this to `HitDto`; the snippet is best-effort (missing → empty).
+#[derive(Debug)]
+pub struct HitWithText {
+    pub hit: bossclaw_core::Hit,
+    pub text: String,
+}
+
+/// Session-scoped evolve telemetry (the engine's own `EvolveStatus` stubs these fields to
+/// `None/0/None`, so SP3 owns the real values). Reset on app restart; persistence is M7.
+// Written by `record_tick` + read by `evolve_status`/`EvolveStatusDto` (SP3 Tasks 7–8);
+// declared here with the recall-core plumbing so the field set lands once.
+#[allow(dead_code)]
+#[derive(Default, Clone)]
+pub struct EvolveTelemetry {
+    pub last_tick_ms: Option<u128>,
+    pub error_count: usize,
+    pub last_error: Option<String>,
+}
+
 /// The single chokepoint for engine access. Holds one lazily-opened `Arc<EventLog>`
 /// behind an async mutex; `get_or_open` serializes first-open and gates on onboarding.
 pub struct EngineHandle {
@@ -95,7 +116,21 @@ pub struct EngineHandle {
     keystore: EngineKeystore,
     db_path: PathBuf,
     embedder_provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    /// Read by `evolve_once` (SP3 Task 7); set here with the rest of the recall-core plumbing.
+    #[allow(dead_code)]
+    reasoner_provider: Arc<dyn crate::engine::reason::ReasonerProvider>,
     ingest_lock: Mutex<()>,
+    /// Serializes manual + scheduled evolve ticks (`try_lock` → `Busy("evolve")`).
+    /// Consumed by `evolve_once` (SP3 Task 7).
+    #[allow(dead_code)]
+    evolve_lock: Mutex<()>,
+    /// `true` once the in-memory recall index reflects persisted vectors this session.
+    /// Set ONLY after a successful rebuild (a failure stays retryable). See `ensure_indexed`.
+    indexed: Mutex<bool>,
+    /// The evolve status read path (a `std::sync::Mutex`, poison-recovered on read).
+    /// Written by `record_tick` + read by `evolve_status` (SP3 Task 7).
+    #[allow(dead_code)]
+    evolve_tel: std::sync::Mutex<EvolveTelemetry>,
 }
 
 impl EngineHandle {
@@ -103,13 +138,18 @@ impl EngineHandle {
         vault: Arc<dyn SecretsVault>,
         data_dir: PathBuf,
         embedder_provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+        reasoner_provider: Arc<dyn crate::engine::reason::ReasonerProvider>,
     ) -> Self {
         Self {
             cell: Mutex::new(None),
             keystore: EngineKeystore::new(vault),
             db_path: data_dir.join("brain.db"),
             embedder_provider,
+            reasoner_provider,
             ingest_lock: Mutex::new(()),
+            evolve_lock: Mutex::new(()),
+            indexed: Mutex::new(false),
+            evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
         }
     }
 
@@ -129,7 +169,13 @@ impl EngineHandle {
         let db_path = self.db_path.clone();
         let log = tokio::task::spawn_blocking(move || {
             let keys = keystore.load_or_mint()?;
+            // Open bare, then force the three autonomy switches off. Any open/prime failure
+            // maps to the existing open-failure path (KeystoreDbMismatch) — no new variant.
             EventLog::open(&db_path, &keys.dek, keys.signing_key)
+                .and_then(|log| {
+                    Self::prime_switches(&log)?;
+                    Ok(log)
+                })
                 .map(Arc::new)
                 .map_err(|e| EngineError::KeystoreDbMismatch(e.to_string()))
         })
@@ -217,7 +263,80 @@ impl EngineHandle {
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        // `ingest_all` rebuilds the in-memory index internally, so the index now reflects
+        // persisted vectors — mark it current to skip a redundant first-recall rebuild.
+        *self.indexed.lock().await = true;
         Ok(report)
+    }
+
+    /// Force the three autonomy switches OFF (the engine defaults them ON when never set).
+    /// Each setter is sticky, so this writes at most once per flag and is idempotent across
+    /// opens. Runs inside `get_or_open`'s first-open closure; failure reuses the open path.
+    fn prime_switches(log: &EventLog) -> Result<(), bossclaw_core::BossclawError> {
+        if log.evolve_enabled()? {
+            log.set_evolve_enabled(false)?;
+        }
+        if log.proposals_enabled()? {
+            log.set_proposals_enabled(false)?;
+        }
+        if log.mandates_enabled()? {
+            log.set_mandates_enabled(false)?;
+        }
+        Ok(())
+    }
+
+    /// Build the in-memory recall index from persisted vectors the first time it's needed.
+    /// The flag is set ONLY after a successful rebuild, so a rebuild error leaves it `false`
+    /// and the next call retries (no silent-empty-recall trap). The `tokio::Mutex<bool>`
+    /// serializes concurrent first-recalls (no double rebuild) and makes "set true only on
+    /// success" race-free. Returns the (cached) embedder for the caller.
+    async fn ensure_indexed(&self, log: &Arc<EventLog>) -> Result<Arc<dyn Embedder>, EngineOpError> {
+        let embedder = self.embedder_provider.embedder()?;
+        let mut done = self.indexed.lock().await;
+        if !*done {
+            let (log2, emb2) = (log.clone(), embedder.clone());
+            spawn_blocking(move || -> Result<(), EngineOpError> {
+                log2.rebuild_indexes(&*emb2).map_err(|e| EngineOpError::Core(e.to_string()))?;
+                log2.rebuild_graph().map_err(|e| EngineOpError::Core(e.to_string()))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))??;
+            *done = true;
+        }
+        Ok(embedder)
+    }
+
+    /// Hybrid recall over persisted memory (semantic + keyword), with best-effort snippet
+    /// hydration. Gated → `ensure_indexed` → `spawn_blocking(log.recall)`. A missing snippet
+    /// becomes an empty string (never errors): `event_by_id` is best-effort per hit.
+    pub async fn recall(
+        &self,
+        onboarded: bool,
+        query: String,
+        k: usize,
+    ) -> Result<Vec<HitWithText>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let embedder = self.ensure_indexed(&log).await?;
+        spawn_blocking(move || -> Result<Vec<HitWithText>, EngineOpError> {
+            let hits = log
+                .recall(&*embedder, &query, k, &bossclaw_core::RecallOptions::default())
+                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(hits
+                .into_iter()
+                .map(|h| {
+                    let text = log
+                        .event_by_id(&h.event_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|e| e.content.get("text").and_then(|t| t.as_str()).map(str::to_owned))
+                        .unwrap_or_default();
+                    HitWithText { hit: h, text }
+                })
+                .collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
     /// Every current ingested file (one per path). Gated.
@@ -270,6 +389,22 @@ mod tests {
         fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
     }
 
+    /// A fresh `TestVault` + tempdir (the dir guard must outlive the handle). Mirrors the
+    /// inline setup the SP2 tests use; centralised here for the SP3 recall/evolve tests.
+    fn test_vault_and_dir() -> (Arc<TestVault>, tempfile::TempDir) {
+        (TestVault::new(), tempfile::tempdir().unwrap())
+    }
+
+    /// A handle wired with the mock embedder + mock reasoner (the common SP3 test shape).
+    fn new_test_handle(vault: Arc<TestVault>, dir: &tempfile::TempDir) -> EngineHandle {
+        EngineHandle::new(
+            vault,
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(8)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        )
+    }
+
     #[test]
     fn mock_embedder_provider_yields_a_working_embedder() {
         use crate::engine::embed::{EmbedderProvider, MockEmbedderProvider};
@@ -284,7 +419,7 @@ mod tests {
     async fn not_onboarded_does_not_open_or_mint() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
+        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)), std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")));
         let st = h.status(false).await;
         assert!(matches!(st.state, EngineState::NotOnboarded));
         // No keys minted, no DB created.
@@ -296,10 +431,12 @@ mod tests {
     async fn onboarded_opens_fresh_brain_and_memoizes() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
+        let h = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)), std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")));
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
-        assert_eq!(st.event_count, 0);
+        // First open primes the three autonomy switches OFF (SP3 `prime_switches`), so a
+        // fresh brain holds exactly those 3 sticky `config` events — not zero.
+        assert_eq!(st.event_count, 3);
         assert!(st.chain_ok);
         // Second call reuses the same instance (Arc ptr identical).
         let a = h.get_or_open(true).await.unwrap();
@@ -312,11 +449,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
         // Open once to create the DB under the real minted DEK.
-        let h1 = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
+        let h1 = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)), std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")));
         h1.get_or_open(true).await.unwrap();
         // Now corrupt the stored DEK and open with a FRESH handle (empty cell).
         vault.set("air-agent.engine.dek", &hex::encode([0u8; 32])).unwrap();
-        let h2 = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
+        let h2 = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)), std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")));
         let st = h2.status(true).await;
         assert!(matches!(st.state, EngineState::KeystoreDbMismatch));
     }
@@ -325,7 +462,7 @@ mod tests {
     async fn teardown_removes_keys_db_and_resets_cell() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
+        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)), std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")));
         h.get_or_open(true).await.unwrap();
         assert!(dir.path().join("brain.db").exists());
         h.teardown().await.unwrap();
@@ -343,6 +480,7 @@ mod tests {
         let h = EngineHandle::new(
             vault, app_dir.path().to_path_buf(),
             std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+            std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
         );
 
         h.add_grant(true, src_dir.path().to_path_buf()).await.unwrap();
@@ -371,6 +509,7 @@ mod tests {
         let h = EngineHandle::new(
             vault, app_dir.path().to_path_buf(),
             std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+            std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
         );
         h.add_grant(true, src_dir.path().to_path_buf()).await.unwrap();
 
@@ -385,5 +524,49 @@ mod tests {
         let again = h.run_ingest(true).await.unwrap();
         assert_eq!(again.ingested, 0);
         assert_eq!(again.deduped, 2);
+    }
+
+    // ---- SP3: recall core (Tasks 3/4/5/6) ----
+
+    /// Task 3: the handle constructs with BOTH providers, and the recall gate is intact
+    /// (not onboarded → `Open(NotOnboarded)`), proving the new field is wired without bypass.
+    #[tokio::test]
+    async fn handle_constructs_with_both_providers() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let err = handle.recall(false, "q".into(), 3).await.unwrap_err();
+        assert!(matches!(err, EngineOpError::Open(EngineError::NotOnboarded)));
+    }
+
+    /// Task 4: the first open forces all THREE autonomy switches off (the engine defaults
+    /// them on), and priming is idempotent across re-opens (no duplicate config events).
+    #[tokio::test]
+    async fn first_open_forces_all_autonomy_switches_off() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.expect("opens");
+        assert!(!log.evolve_enabled().unwrap(), "evolve off");
+        assert!(!log.proposals_enabled().unwrap(), "proposals off");
+        assert!(!log.mandates_enabled().unwrap(), "mandates off");
+        // Idempotent: a second open (forced via clearing the cell) writes no new config events.
+        let n1 = log.count().unwrap();
+        drop(log);
+        *handle.cell.lock().await = None;
+        let log2 = handle.get_or_open(true).await.expect("re-opens");
+        assert_eq!(log2.count().unwrap(), n1, "no duplicate config events on re-open");
+    }
+
+    /// Tasks 5 + 6: `run_ingest` marks the index current, then `recall` round-trips through
+    /// `ensure_indexed` and hydrates the ingested snippet text.
+    #[tokio::test]
+    async fn ensure_indexed_builds_once_then_recall_finds_ingested_text() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), "ferris the crab loves rust").unwrap();
+        handle.add_grant(true, src.path().to_path_buf()).await.unwrap();
+        handle.run_ingest(true).await.unwrap(); // sets indexed=true after its rebuild
+        let hits = handle.recall(true, "ferris crab".into(), 5).await.unwrap();
+        assert!(hits.iter().any(|h| h.text.contains("ferris")), "recall finds the ingested text");
     }
 }
