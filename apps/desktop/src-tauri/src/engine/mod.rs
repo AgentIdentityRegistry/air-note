@@ -161,6 +161,39 @@ impl EngineHandle {
         }
     }
 
+    /// Grant read-access to `path` (canonicalized + appended by the engine). Gated.
+    #[allow(dead_code)] // wired in Task 6
+    pub async fn add_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.add_grant(&path).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Revoke a previously-granted folder. Gated.
+    #[allow(dead_code)] // wired in Task 6
+    pub async fn revoke_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.revoke_grant(&path).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Every grant (active + revoked); the UI filters to active. Gated.
+    #[allow(dead_code)] // wired in Task 6
+    pub async fn list_grants(&self, onboarded: bool) -> Result<Vec<bossclaw_core::Grant>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.grants().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Identity-reset teardown: delete both engine slots, drop the memoized log (reset the
     /// cell to `None`), then delete brain.db.
     pub async fn teardown(&self) -> Result<(), EngineError> {
@@ -264,5 +297,29 @@ mod tests {
         assert!(!dir.path().join("brain.db").exists());
         // Cell is empty again: a not-onboarded call after teardown stays NotOnboarded.
         assert!(matches!(h.status(false).await.state, EngineState::NotOnboarded));
+    }
+
+    #[tokio::test]
+    async fn grant_then_list_then_revoke() {
+        let app_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let vault = TestVault::new();
+        let h = EngineHandle::new(
+            vault, app_dir.path().to_path_buf(),
+            std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+        );
+
+        h.add_grant(true, src_dir.path().to_path_buf()).await.unwrap();
+        let grants = h.list_grants(true).await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].revoked);
+
+        h.revoke_grant(true, src_dir.path().to_path_buf()).await.unwrap();
+        let grants = h.list_grants(true).await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].revoked);
+
+        // Gate: not-onboarded refuses.
+        assert!(matches!(h.add_grant(false, src_dir.path().to_path_buf()).await, Err(EngineOpError::Open(EngineError::NotOnboarded))));
     }
 }
