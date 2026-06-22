@@ -35,7 +35,7 @@ uuid = { version = "1", features = ["v4"] }
 # (needs a system OpenSSL on Windows) + rustix, so the desktop excludes the engine on Windows via
 # `#[cfg(unix)]`. `zeroize` is used only by the engine keystore, so it rides in the same section.
 [target.'cfg(unix)'.dependencies]
-bossclaw-core = { path = "../../../crates/bossclaw-core" }
+bossclaw-core = { path = "../../../crates/bossclaw-core", features = ["ollama"] }
 zeroize = "1"
 
 # Single-instance guard (CF2): exactly one desktop process, so the in-process POLICY_LOCK is the
