@@ -141,6 +141,26 @@ pub struct WriteVerdict {
     pub reject_reason: Option<String>,
 }
 
+impl WriteVerdict {
+    /// The single reason this verdict is a propose-time gate reject, or `None` if it
+    /// cleared the gate. Folds the TWO fail signals every write proposer must honor:
+    /// - `reject_reason.is_some()` — a malformed proposal (empty sources, an unresolvable
+    ///   target, an op×existence mismatch, or a symlink final component); OR
+    /// - `!allowed` — the target is NOT under an active write-grant, which the gate
+    ///   signals via `allowed == false` with NO `reject_reason` (an unauthorized
+    ///   target is not a malformed one). The never-widen check is load-bearing, so a
+    ///   not-granted target MUST reject at propose too (execute re-checks regardless).
+    ///
+    /// Single-sourced like [`OpExistence::reject_reason`] so the M6b reconciler and
+    /// the M6c mandate proposer cannot drift on what counts as a gate reject. Borrows
+    /// `self` (the not-granted reason is a `&'static str`) — no allocation.
+    pub fn gate_reject_reason(&self) -> Option<&str> {
+        self.reject_reason
+            .as_deref()
+            .or_else(|| (!self.allowed).then_some("target not under an active write grant"))
+    }
+}
+
 /// A proposal paired with its computed verdict — the output of the gate and the
 /// input to execute (T4). Carrying both together keeps the gated bytes, the base
 /// hash+identity, and the taint verdict bound to the exact proposal they describe.
@@ -639,6 +659,44 @@ mod tests {
         // Edit/Delete of an existing (non-symlink) target is fine.
         assert_eq!(classify_op_existence(WriteOp::Edit, true, false), OpExistence::Ok);
         assert_eq!(classify_op_existence(WriteOp::Delete, true, false), OpExistence::Ok);
+    }
+
+    /// A minimal verdict for exercising `gate_reject_reason` — only `reject_reason`
+    /// and `allowed` matter to that method; the rest are inert placeholders.
+    fn verdict(reject_reason: Option<&str>, allowed: bool) -> WriteVerdict {
+        WriteVerdict {
+            target_canonical: None,
+            allowed,
+            taint: Taint::Clean,
+            provenance: vec![],
+            diff_flags: DiffFlags::default(),
+            base_content_hash: None,
+            base_identity: None,
+            requires_loud_modal: false,
+            reject_reason: reject_reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn gate_reject_reason_folds_reject_reason_and_not_allowed() {
+        // A malformed proposal (reject_reason set) rejects with that reason.
+        assert_eq!(
+            verdict(Some("empty sources"), true).gate_reject_reason(),
+            Some("empty sources")
+        );
+        // A not-granted target carries `allowed == false` with NO reject_reason — the
+        // never-widen signal the gate expresses through `allowed` alone.
+        assert_eq!(
+            verdict(None, false).gate_reject_reason(),
+            Some("target not under an active write grant")
+        );
+        // When BOTH fire, the specific `reject_reason` wins (it precedes the !allowed arm).
+        assert_eq!(
+            verdict(Some("create target already exists"), false).gate_reject_reason(),
+            Some("create target already exists")
+        );
+        // A clean, granted verdict clears the gate.
+        assert_eq!(verdict(None, true).gate_reject_reason(), None);
     }
 
     #[test]
