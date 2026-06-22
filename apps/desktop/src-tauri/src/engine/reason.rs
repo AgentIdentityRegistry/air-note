@@ -14,16 +14,13 @@ pub const REASONER_MODEL_ID: &str = "qwen2.5:7b-instruct";
 
 /// Builds (and caches) the reasoner. Called on first evolve, never at startup.
 pub trait ReasonerProvider: Send + Sync {
-    // Called by `EngineHandle::evolve_once` (SP3 Task 7); the seam + impls land first.
-    #[allow(dead_code)]
+    /// Called by `EngineHandle::evolve_once` to drive the loop.
     fn reasoner(&self) -> Result<Arc<dyn Reasoner>, EngineOpError>;
 }
 
 /// Production provider: yields `bossclaw_core::OllamaReasoner` (loopback-fail-closed)
 /// on first use and caches it for the process lifetime.
 pub struct OllamaReasonerProvider {
-    // Read by `reasoner()`, which `evolve_once` first calls at SP3 Task 7.
-    #[allow(dead_code)]
     cell: Mutex<Option<Arc<dyn Reasoner>>>,
 }
 
