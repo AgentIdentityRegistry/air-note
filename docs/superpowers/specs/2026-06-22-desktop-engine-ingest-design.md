@@ -243,7 +243,7 @@ Pure helpers (the `IngestReportDto` → summary string; sorting/grouping the fil
 - **Frontend `vitest`**: the `IngestReportDto` → summary-string formatter; file-list helpers; the active-grant filter.
 - **One `#[ignore]`-gated real-model integration test** (env-var-pointed model dir, mirroring `bossclaw-core/tests/recall.rs`) exercising `ResourceModel2Vec` → `Model2Vec::from_pretrained` → `ingest_all` end-to-end with real vectors.
 - **Manual launch:** onboard → Add folder → Ingest → see summary + file list → Revoke → re-Ingest.
-- **Gates:** `cargo build/test/clippy -p air_agent_desktop` + `cargo test -p bossclaw-core` green; `npm run typecheck --workspace @air-agent/desktop` + `vitest` green; **`cargo deny check` passes** (the network-ban guard); `cargo audit` against the accepted baseline. Native-only ⇒ no Python/jail in the test path.
+- **Gates:** `cargo build/test/clippy -p air_agent_desktop` + `cargo test -p bossclaw-core` green; `npm run typecheck --workspace @air-agent/desktop` + `vitest` green; the **engine network-free guard** (`cargo tree -p bossclaw-core -e normal` shows no `hf-hub`/`ureq`/`reqwest` in the default graph). Native-only ⇒ no Python/jail in the test path.
 
 ## New constants / resources / commands / engine touch
 
