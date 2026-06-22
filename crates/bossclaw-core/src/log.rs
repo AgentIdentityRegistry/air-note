@@ -1792,6 +1792,36 @@ impl EventLog {
         Ok(ReembedStats { reembedded, gc_removed, elapsed_ms })
     }
 
+    /// Record the active embedding model as a signed `config` event so
+    /// [`active_model`](Self::active_model) becomes truthful. Mirrors the config
+    /// write inside [`reembed_migration`](Self::reembed_migration) but signed by
+    /// this log's own DID (not the migration DID) and without the re-embed/GC —
+    /// callers that have just embedded under `model_id` use this to stamp the
+    /// model at vector-birth. Reuses the existing `schema_version` if a config
+    /// already exists. Returns the event id.
+    pub fn set_active_model(&self, model_id: &str, dim: u32) -> Result<String, BossclawError> {
+        let schema_version = self
+            .active_model()?
+            .map(|m| m.schema_version)
+            .unwrap_or(SCHEMA_VERSION);
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "active_model_id": model_id,
+                "dim": dim,
+                "schema_version": schema_version,
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
     /// Append a signed Tier-B `link` event connecting `src` —`relation`→ `dst`.
     ///
     /// `valid_time` (optional, RFC 3339) is the world-clock start; absent means
@@ -6542,6 +6572,24 @@ mod tests {
     fn open_log(dir: &Path) -> EventLog {
         let key = SigningKey::from_bytes(&KEY_BYTES);
         EventLog::open(&dir.join("m.db"), &DEK, key).unwrap()
+    }
+
+    #[test]
+    fn set_active_model_writes_discoverable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path()); // the existing test helper in this module (log.rs:6542)
+        assert!(log.active_model().unwrap().is_none());
+
+        log.set_active_model("minishlab/potion-base-8M", 256).unwrap();
+
+        let m = log.active_model().unwrap().expect("config now present");
+        assert_eq!(m.active_model_id, "minishlab/potion-base-8M");
+        assert_eq!(m.dim, 256);
+        assert_eq!(m.schema_version, SCHEMA_VERSION);
+
+        // Idempotent re-set with the same model keeps it discoverable.
+        log.set_active_model("minishlab/potion-base-8M", 256).unwrap();
+        assert_eq!(log.active_model().unwrap().unwrap().active_model_id, "minishlab/potion-base-8M");
     }
 
     /// F2 security gate (parent §5.11): the private `append_graph_event` defaults
