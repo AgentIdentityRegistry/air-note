@@ -1,6 +1,7 @@
 //! The engine spine (SP1): a single live, encrypted `EventLog` wired into the desktop.
 //! See docs/superpowers/specs/2026-06-22-desktop-engine-spine-design.md.
 
+pub mod embed;
 pub mod keystore;
 
 use crate::engine::keystore::EngineKeystore;
@@ -39,6 +40,32 @@ impl fmt::Display for EngineError {
     }
 }
 
+/// Errors from the SP2 operational commands (grant/ingest/list). Wraps the
+/// SP1 open/gate path so SP1's `EngineError`/`map_err_state`/`EngineState`
+/// stay a status-only concern (untouched).
+#[allow(dead_code)] // wired in Task 6 (commands map this to String)
+#[derive(Debug)]
+pub enum EngineOpError {
+    Open(EngineError),
+    Core(String),
+    Embedder(String),
+    Busy,
+    Join(String),
+}
+
+#[allow(dead_code)] // wired in Task 6
+impl std::fmt::Display for EngineOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineOpError::Open(e) => write!(f, "{e}"),
+            EngineOpError::Core(m) => write!(f, "engine error: {m}"),
+            EngineOpError::Embedder(m) => write!(f, "memory model unavailable: {m}"),
+            EngineOpError::Busy => write!(f, "an ingest is already running"),
+            EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
+        }
+    }
+}
+
 /// The coarse engine state surfaced to the UI (distinguishes setup states from faults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,14 +90,24 @@ pub struct EngineHandle {
     cell: Mutex<Option<Arc<EventLog>>>,
     keystore: EngineKeystore,
     db_path: PathBuf,
+    #[allow(dead_code)] // wired in Task 6 (ingest reads the provider + in-flight lock)
+    embedder_provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    #[allow(dead_code)] // wired in Task 6
+    ingest_lock: Mutex<()>,
 }
 
 impl EngineHandle {
-    pub fn new(vault: Arc<dyn SecretsVault>, data_dir: PathBuf) -> Self {
+    pub fn new(
+        vault: Arc<dyn SecretsVault>,
+        data_dir: PathBuf,
+        embedder_provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    ) -> Self {
         Self {
             cell: Mutex::new(None),
             keystore: EngineKeystore::new(vault),
             db_path: data_dir.join("brain.db"),
+            embedder_provider,
+            ingest_lock: Mutex::new(()),
         }
     }
 
@@ -151,6 +188,7 @@ fn map_err_state(e: &EngineError) -> EngineState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::embed;
     use crate::secrets::SecretsVault;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -163,11 +201,21 @@ mod tests {
         fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
     }
 
+    #[test]
+    fn mock_embedder_provider_yields_a_working_embedder() {
+        use crate::engine::embed::{EmbedderProvider, MockEmbedderProvider};
+        let p = MockEmbedderProvider::new(8);
+        let e = p.embedder().expect("mock embedder builds");
+        let v = e.embed(&["hello".to_string()]).unwrap();
+        assert_eq!(v[0].len(), 8);
+        assert_eq!(e.model_id(), "mock-v1");
+    }
+
     #[tokio::test]
     async fn not_onboarded_does_not_open_or_mint() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf());
+        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         let st = h.status(false).await;
         assert!(matches!(st.state, EngineState::NotOnboarded));
         // No keys minted, no DB created.
@@ -179,7 +227,7 @@ mod tests {
     async fn onboarded_opens_fresh_brain_and_memoizes() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault, dir.path().to_path_buf());
+        let h = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
         assert_eq!(st.event_count, 0);
@@ -195,11 +243,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
         // Open once to create the DB under the real minted DEK.
-        let h1 = EngineHandle::new(vault.clone(), dir.path().to_path_buf());
+        let h1 = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         h1.get_or_open(true).await.unwrap();
         // Now corrupt the stored DEK and open with a FRESH handle (empty cell).
         vault.set("air-agent.engine.dek", &hex::encode([0u8; 32])).unwrap();
-        let h2 = EngineHandle::new(vault, dir.path().to_path_buf());
+        let h2 = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         let st = h2.status(true).await;
         assert!(matches!(st.state, EngineState::KeystoreDbMismatch));
     }
@@ -208,7 +256,7 @@ mod tests {
     async fn teardown_removes_keys_db_and_resets_cell() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf());
+        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         h.get_or_open(true).await.unwrap();
         assert!(dir.path().join("brain.db").exists());
         h.teardown().await.unwrap();

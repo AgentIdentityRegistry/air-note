@@ -63,7 +63,12 @@ fn main() {
             #[cfg(not(unix))]
             let identity_store = IdentityStore::new(vault, data_dir);
             #[cfg(unix)]
-            let engine = std::sync::Arc::new(crate::engine::EngineHandle::new(vault, data_dir));
+            let engine = {
+                let resource_dir = app.path().resource_dir().expect("resource dir");
+                let model_dir = resource_dir.join("models/potion-base-8M");
+                let provider = std::sync::Arc::new(crate::engine::embed::ResourceModel2Vec::new(model_dir));
+                std::sync::Arc::new(crate::engine::EngineHandle::new(vault, data_dir, provider))
+            };
 
             // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
             // Settings UI will offer a friendlier toggle in a later task.
