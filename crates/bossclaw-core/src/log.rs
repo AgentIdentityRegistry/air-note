@@ -6034,26 +6034,14 @@ impl EventLog {
             rationale: m.recipe.clone(),
         })?;
 
-        // A gate FAILURE is recorded as a `write_rejected` (terminal for this source-state).
-        // TWO distinct failure signals must be honored (the gate separates them):
-        //   - `reject_reason.is_some()` — op×existence, an unresolvable target, or a symlink
-        //     final component; AND
-        //   - `!allowed` — the target is NOT under an active write-grant. This is the
-        //     LOAD-BEARING never-widen check, and the gate signals it via `allowed=false`
-        //     with NO `reject_reason` (a not-granted target is not a malformed proposal, just
-        //     an unauthorized one). Acting only on `reject_reason` would EMIT a proposal for a
-        //     target outside every write-grant — a grant-widening leak. So `!allowed` rejects
-        //     here too (propose-time), and `execute_write_resolving` re-checks it at execute.
-        let gate_reject = gated
-            .verdict
-            .reject_reason
-            .as_deref()
-            .map(str::to_string)
-            .or_else(|| (!gated.verdict.allowed).then(|| "target not under an active write grant".to_string()));
-        if let Some(reason) = gate_reject {
+        // A gate FAILURE → `write_rejected` (terminal for this source-state).
+        // `gate_reject_reason()` folds BOTH signals — a `reject_reason` OR `!allowed`
+        // (the load-bearing never-widen check; `execute_write_resolving` re-checks at
+        // execute). Single-sourced on `WriteVerdict` so M6b/M6c cannot drift.
+        if let Some(reason) = gated.verdict.gate_reject_reason() {
             self.append_write_rejected_with(
                 Some(&m.target),
-                &reason,
+                reason,
                 &inducing_key,
                 &lineage,
                 crate::graph::M6C_PROPOSER_PRODUCER,
@@ -6223,33 +6211,16 @@ impl EventLog {
                 rationale: engine_fact.clone(),
             })?;
 
-            // i. A gate FAILURE → write_rejected. TWO distinct signals must be honored,
-            //    symmetric with M6c's `run_mandate` (the gate separates them):
-            //      - `reject_reason.is_some()` — op×existence, an unresolvable target, or a
-            //        symlink final component; AND
-            //      - `!allowed` — the target is NOT under an active write-grant, which the
-            //        gate signals via `allowed=false` with NO `reject_reason` (a not-granted
-            //        target is unauthorized, not malformed). Acting only on `reject_reason`
-            //        would EMIT a proposal for a target outside every write-grant — a
-            //        grant-widening leak. M6b's targets are reconcilable (tracked +
-            //        read-granted via `is_reconcilable_target`), so they are USUALLY
-            //        write-granted too and this branch is rarely hit — but the write-grant
-            //        is INDEPENDENT and revocable, and `execute_write_resolving` re-checks at
-            //        execute, so propose-time must reject `!allowed` too (the never-widen
-            //        check is load-bearing at both seams).
-            let gate_reject = gated
-                .verdict
-                .reject_reason
-                .as_deref()
-                .map(str::to_string)
-                .or_else(|| {
-                    (!gated.verdict.allowed)
-                        .then(|| "target not under an active write grant".to_string())
-                });
-            if let Some(reason) = gate_reject {
+            // i. A gate FAILURE → write_rejected. `gate_reject_reason()` folds BOTH
+            //    signals (a `reject_reason` OR `!allowed`, the never-widen check) —
+            //    single-sourced on `WriteVerdict`, symmetric with M6c's `run_mandate`.
+            //    M6b's targets are reconcilable (tracked + read-granted), so `!allowed`
+            //    is rare here, but the write-grant is independent + revocable and execute
+            //    re-checks; this rejects THIS target and `continue`s to the next.
+            if let Some(reason) = gated.verdict.gate_reject_reason() {
                 self.append_write_rejected(
                     Some(&rec.canonical_path),
-                    &reason,
+                    reason,
                     &inducing_key,
                     &lineage,
                 )?;
