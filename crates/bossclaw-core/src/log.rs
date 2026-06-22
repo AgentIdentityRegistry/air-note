@@ -6223,11 +6223,33 @@ impl EventLog {
                 rationale: engine_fact.clone(),
             })?;
 
-            // i. A gate reject_reason is a genuine gate failure → write_rejected.
-            if let Some(reason) = gated.verdict.reject_reason.as_deref() {
+            // i. A gate FAILURE → write_rejected. TWO distinct signals must be honored,
+            //    symmetric with M6c's `run_mandate` (the gate separates them):
+            //      - `reject_reason.is_some()` — op×existence, an unresolvable target, or a
+            //        symlink final component; AND
+            //      - `!allowed` — the target is NOT under an active write-grant, which the
+            //        gate signals via `allowed=false` with NO `reject_reason` (a not-granted
+            //        target is unauthorized, not malformed). Acting only on `reject_reason`
+            //        would EMIT a proposal for a target outside every write-grant — a
+            //        grant-widening leak. M6b's targets are reconcilable (tracked +
+            //        read-granted via `is_reconcilable_target`), so they are USUALLY
+            //        write-granted too and this branch is rarely hit — but the write-grant
+            //        is INDEPENDENT and revocable, and `execute_write_resolving` re-checks at
+            //        execute, so propose-time must reject `!allowed` too (the never-widen
+            //        check is load-bearing at both seams).
+            let gate_reject = gated
+                .verdict
+                .reject_reason
+                .as_deref()
+                .map(str::to_string)
+                .or_else(|| {
+                    (!gated.verdict.allowed)
+                        .then(|| "target not under an active write grant".to_string())
+                });
+            if let Some(reason) = gate_reject {
                 self.append_write_rejected(
                     Some(&rec.canonical_path),
-                    reason,
+                    &reason,
                     &inducing_key,
                     &lineage,
                 )?;

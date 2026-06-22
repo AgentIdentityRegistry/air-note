@@ -559,6 +559,17 @@ fn proposals_targeting(log: &bossclaw_core::EventLog, canonical: &str) -> usize 
         .count()
 }
 
+/// Count `file_written` events. The proposer NEVER writes (it only proposes), so a
+/// reconcile-only tick must leave this at zero. Mirrors the `proposals_targeting`
+/// count idiom (and `rejected_count` in `tests/mandate.rs`).
+fn file_written_count(log: &bossclaw_core::EventLog) -> usize {
+    log.stream_all()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == bossclaw_core::graph::FILE_WRITTEN_EVENT_TYPE)
+        .count()
+}
+
 /// END-TO-END: a `.md` asserts "Alice works at Acme"; a memory corrects it to Globex.
 /// One `evolve_once` (a) confirms the contradiction (`invalidate`) AND (b) synthesizes
 /// a corrected rewrite, recording exactly one `write_proposal` whose target is the
@@ -641,6 +652,87 @@ fn evolve_once_emits_reconciliation_proposal_for_file_backed_contradiction() {
         prop.content["origin"],
         serde_json::json!("external"),
         "the assembled-flow proposal must be taint-stamped (engine lineage includes the ingested file)"
+    );
+    log.verify_chain().unwrap();
+}
+
+/// NEVER-WIDEN SYMMETRY (mirrors M6c `proof1a_cannot_widen_grant_rejected_at_propose`):
+/// a confirmed file-backed contradiction whose reconcilable target is NOT under an active
+/// write-grant is rejected AT PROPOSE. The gate signals this via `allowed == false` with
+/// NO `reject_reason`; M6b must treat `!allowed` as a gate-reject too — otherwise it would
+/// EMIT a `write_proposal` for a target outside every write-grant (a grant-widening leak).
+/// The committed `invalidate` still stands; only the proposal is refused (a `write_rejected`
+/// is recorded), and nothing is written.
+#[test]
+fn reconcile_target_outside_write_grant_rejected_at_propose() {
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let emb = MockEmbedder::new(64);
+
+    // ── Tick 1: the FILE establishes "Alice works_at Acme" (same setup as the happy path). ──
+    let (_file_id, file_src) =
+        ingest_md_full(&log, &emb, &dir, "notes.md", b"Alice works at Acme.\n");
+    let canonical = std::fs::canonicalize(dir.join("notes.md"))
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let r1 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        &file_src,
+        &[vec![]],
+        &[],
+        works_at_pass_a("Alice", "Acme", &file_src),
+    ));
+    let rep1 = log.evolve_once(&emb, &r1).unwrap();
+    assert!(rep1.links_emitted >= 1, "the file established the works_at edge");
+    log.rebuild_graph().unwrap();
+
+    // ── Tick 2: a memory corrects the employer → a confirmed contradiction whose retired
+    //    edge traces to the still-current ingested file (a reconcilable target). ──
+    let corr = "Correction: Alice works at Globex, not Acme.";
+    let _mem_id = seed_memory_full(&log, &emb, corr);
+    let nbh = vec!["Alice -works_at-> Acme".to_string()];
+    let r2 = DispatchReasoner::new(add_both_passes(
+        ScriptedReasoner::new("m6b-test"),
+        corr,
+        &[vec![], vec![file_src.clone()]],
+        &nbh,
+        correction_pass_a("Alice", "Acme", "Globex", corr),
+    ));
+
+    // ── Revoke the target dir's write-grant BEFORE evolve. The file stays ingested (the READ
+    //    grant is untouched) and the contradiction still confirms, but the reconcilable target
+    //    is now outside every active write-grant → the gate returns allowed=false with NO
+    //    reject_reason. (Mirrors M6c proof1a's `revoke_write_grant(&out)`.) ──
+    log.revoke_write_grant(&dir).unwrap();
+
+    let rep2 = log.evolve_once(&emb, &r2).unwrap();
+
+    // The contradiction is still confirmed — we exercised the real reconcile path, not a no-op.
+    assert!(
+        rep2.invalidates_emitted >= 1,
+        "the contradiction is still confirmed (the committed invalidate stands)"
+    );
+    // The never-widen gate fires at PROPOSE: no proposal emitted, a write_rejected recorded.
+    assert_eq!(
+        rep2.proposals_emitted, 0,
+        "a target outside any write-grant must NOT be proposed"
+    );
+    assert!(
+        rep2.proposals_rejected >= 1,
+        "the never-widen gate records a write_rejected at propose"
+    );
+    assert_eq!(
+        proposals_targeting(&log, &canonical),
+        0,
+        "no write_proposal leaked for the un-granted target"
+    );
+
+    // No file was written (the proposer never writes; the in-place target is byte-unchanged).
+    assert_eq!(file_written_count(&log), 0, "no file_written event is produced");
+    assert_eq!(
+        std::fs::read(dir.join("notes.md")).unwrap(),
+        b"Alice works at Acme.\n".to_vec(),
+        "the on-disk target is byte-unchanged"
     );
     log.verify_chain().unwrap();
 }
