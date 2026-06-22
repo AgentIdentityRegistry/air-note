@@ -89,6 +89,7 @@ dependencies = [
  "air-rs",
  "async-trait",
  "base64 0.22.1",
+ "bossclaw-core",
  "chrono",
  "ed25519-dalek",
  "hex",
@@ -109,6 +110,7 @@ dependencies = [
  "unsigned-varint",
  "urlencoding",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

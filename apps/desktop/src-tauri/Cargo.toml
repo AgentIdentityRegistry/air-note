@@ -11,6 +11,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 air-rs = { path = "../../../crates/air-rs" }
+bossclaw-core = { path = "../../../crates/bossclaw-core" }
+zeroize = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
