@@ -1774,17 +1774,23 @@ fn recall_intra_result_reinforcement_boosts_neighbor_of_a_non_top_hit() {
     for t in seed_texts {
         ids.push(log.append(mk_memory_event(t)).unwrap());
     }
-    // Neighbour (one-arm): appended, but its VECTOR is withheld — it is added to the
-    // keyword index ONLY, so it is keyword-surfaced (deterministic presence) yet can
-    // never out-rank a two-arm seed.
-    let neighbor_text = "rustacean memory engine ferris crab nz1 nz2 nz3";
-    let neighbor = log.append(mk_memory_event(neighbor_text)).unwrap();
 
-    // Vector index: seeds only (rederive then rebuild covers the seed events; the
-    // neighbour's vector is then NOT what carries it — we index it via keyword).
+    // Build BOTH indexes from the SEEDS ONLY. The neighbour is appended *after* this
+    // point precisely so its vector can never enter the HNSW: `rederive_pending`
+    // embeds every pending event and `rebuild_indexes` builds the vector index from
+    // ALL stored vectors, so appending the neighbour first would silently make it a
+    // TWO-arm hit. A two-arm neighbour can be reordered past a seed by the HNSW's
+    // OS-seeded deeper-rank jitter (index.rs §"Cross-session rank determinism"),
+    // knocking that seed out of the top-`GRAPH_REINFORCE_TOPK` reinforcement set and
+    // killing the boost — the macos-latest non-determinism this ordering removes.
     log.rederive_pending(&embedder).unwrap();
     log.rebuild_indexes(&embedder).unwrap();
-    // Keyword arm for the neighbour (one-arm presence by construction).
+
+    // Neighbour (one-arm): appended after the index build and given keyword-only
+    // presence. Its VECTOR is withheld, so it is keyword-surfaced (deterministic
+    // presence) yet can never out-rank a two-arm seed.
+    let neighbor_text = "rustacean memory engine ferris crab nz1 nz2 nz3";
+    let neighbor = log.append(mk_memory_event(neighbor_text)).unwrap();
     log.keyword_add(&neighbor, neighbor_text).unwrap();
 
     let k = ids.len() + 1;
@@ -1793,7 +1799,17 @@ fn recall_intra_result_reinforcement_boosts_neighbor_of_a_non_top_hit() {
     log.link(&ids[1], "relates_to", &neighbor, None, &[ids[1].clone()]).unwrap();
     log.rebuild_graph().unwrap();
     let hits = log.recall(&embedder, query, k, &RecallOptions::default()).unwrap();
-    let s_nb = find_hit(&hits, &neighbor).expect("neighbor present").score;
+    let nb_hit = find_hit(&hits, &neighbor).expect("neighbor present");
+    // Determinism precondition: the neighbour is keyword-only (one-arm). If it ever
+    // regained a vector it could displace a seed under ANN jitter and reintroduce the
+    // flake, so assert the precondition rather than leaving it implicit.
+    assert!(
+        nb_hit.sources.contains(&RecallSource::Keyword)
+            && !nb_hit.sources.contains(&RecallSource::Vector),
+        "neighbour must be keyword-only (one-arm), got sources={:?}",
+        nb_hit.sources
+    );
+    let s_nb = nb_hit.score;
 
     // Retire the edge → the neighbour loses the reinforcement boost (baseline).
     log.invalidate(&ids[1], "relates_to", &neighbor, None, &[ids[1].clone()]).unwrap();
