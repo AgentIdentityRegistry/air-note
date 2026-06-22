@@ -107,6 +107,12 @@ jobs:
         run: cargo test -p bossclaw-core
       - name: Clippy bossclaw-core (default features)
         run: cargo clippy -p bossclaw-core --all-targets -- -D warnings
+      - name: Engine network-free guard (embedder runs un-sandboxed only if its graph has no HTTP client)
+        run: |
+          if cargo tree -p bossclaw-core -e normal --prefix none | grep -qE '^(hf-hub|ureq|reqwest)( |$)'; then
+            echo "FORBIDDEN: a network crate is in the default bossclaw-core graph"; exit 1
+          fi
+          echo "engine graph is network-free"
 
   # M5b sandboxed-parser jail proofs. Builds the pinned markitdown venv (pip-audit
   # + 0.1.6 drift guard run inside build-venv.sh), then runs the gated jail tests.
