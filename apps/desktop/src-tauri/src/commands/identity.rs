@@ -102,7 +102,7 @@ pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
 // The engine half of reset is Unix-only, so this test (which exercises it) is too.
 #[cfg(all(test, unix))]
 mod tests {
-    use crate::engine::{EngineHandle, EngineState};
+    use crate::engine::{embed, EngineHandle, EngineState};
     use crate::secrets::SecretsVault;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -119,7 +119,7 @@ mod tests {
     async fn reset_tears_down_the_engine() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let engine = Arc::new(EngineHandle::new(vault.clone(), dir.path().to_path_buf()));
+        let engine = Arc::new(EngineHandle::new(vault.clone(), dir.path().to_path_buf(), Arc::new(embed::MockEmbedderProvider::new(8))));
         engine.get_or_open(true).await.unwrap();
         // Simulate the engine half of reset_identity:
         engine.teardown().await.unwrap();

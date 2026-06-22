@@ -2,6 +2,7 @@ import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import { resetIdentity } from "../api/tauri";
 import { useIdentity } from "../state/identity";
+import { SourcesPanel } from "../sources/SourcesPanel";
 
 export function AirSettings() {
   const { refresh } = useIdentity();
@@ -20,6 +21,8 @@ export function AirSettings() {
         AIR endpoint is configured via the <code>AIR_AGENT_USE_REAL_AIR</code>{" "}
         environment variable at launch. (Settings UI for this comes in v1.1.)
       </p>
+
+      <SourcesPanel />
 
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #eee" }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Danger zone</div>

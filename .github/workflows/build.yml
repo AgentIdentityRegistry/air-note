@@ -77,7 +77,17 @@ jobs:
         working-directory: apps/desktop/src-tauri
         run: cargo test
 
-      - name: Build Tauri app
+      # macOS builds only the `.app` bundle. The default `tauri build` honours the
+      # config's `bundle.targets: "all"`, which on macOS also runs bundle_dmg.sh — a
+      # headless hdiutil/AppleScript step that flakes on the GitHub runner with no
+      # code change. CI only needs to prove the app compiles and bundles its
+      # resources (the bundled model dir lives in the `.app`), so skip the DMG here;
+      # `targets: "all"` stays intact for real release packaging.
+      - name: Build Tauri app (macOS — skip the flaky DMG, build the .app only)
+        if: matrix.platform == 'macos-latest'
+        run: npm run build --workspace @air-agent/desktop -- --bundles app
+      - name: Build Tauri app (Linux/Windows)
+        if: matrix.platform != 'macos-latest'
         run: npm run build --workspace @air-agent/desktop
 
   # bossclaw-core engine — its own job (the desktop crate does NOT depend on it,
@@ -107,6 +117,12 @@ jobs:
         run: cargo test -p bossclaw-core
       - name: Clippy bossclaw-core (default features)
         run: cargo clippy -p bossclaw-core --all-targets -- -D warnings
+      - name: Engine network-free guard (embedder runs un-sandboxed only if its graph has no HTTP client)
+        run: |
+          if cargo tree -p bossclaw-core -e normal --prefix none | grep -qE '^(hf-hub|ureq|reqwest)( |$)'; then
+            echo "FORBIDDEN: a network crate is in the default bossclaw-core graph"; exit 1
+          fi
+          echo "engine graph is network-free"
 
   # M5b sandboxed-parser jail proofs. Builds the pinned markitdown venv (pip-audit
   # + 0.1.6 drift guard run inside build-venv.sh), then runs the gated jail tests.

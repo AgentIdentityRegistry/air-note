@@ -63,7 +63,12 @@ fn main() {
             #[cfg(not(unix))]
             let identity_store = IdentityStore::new(vault, data_dir);
             #[cfg(unix)]
-            let engine = std::sync::Arc::new(crate::engine::EngineHandle::new(vault, data_dir));
+            let engine = {
+                let resource_dir = app.path().resource_dir().expect("resource dir");
+                let model_dir = resource_dir.join("models/potion-base-8M");
+                let provider = std::sync::Arc::new(crate::engine::embed::ResourceModel2Vec::new(model_dir));
+                std::sync::Arc::new(crate::engine::EngineHandle::new(vault, data_dir, provider))
+            };
 
             // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
             // Settings UI will offer a friendlier toggle in a later task.
@@ -114,6 +119,18 @@ fn main() {
             reset_identity,
             #[cfg(unix)]
             commands::engine::engine_status,
+            #[cfg(unix)]
+            commands::engine::engine_add_grant,
+            #[cfg(unix)]
+            commands::engine::engine_revoke_grant,
+            #[cfg(unix)]
+            commands::engine::engine_list_grants,
+            #[cfg(unix)]
+            commands::engine::engine_run_ingest,
+            #[cfg(unix)]
+            commands::engine::engine_list_files,
+            #[cfg(unix)]
+            commands::engine::engine_pick_folder,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

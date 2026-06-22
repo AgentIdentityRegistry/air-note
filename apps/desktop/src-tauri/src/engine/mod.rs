@@ -1,6 +1,7 @@
 //! The engine spine (SP1): a single live, encrypted `EventLog` wired into the desktop.
 //! See docs/superpowers/specs/2026-06-22-desktop-engine-spine-design.md.
 
+pub mod embed;
 pub mod keystore;
 
 use crate::engine::keystore::EngineKeystore;
@@ -39,6 +40,30 @@ impl fmt::Display for EngineError {
     }
 }
 
+/// Errors from the SP2 operational commands (grant/ingest/list). Wraps the
+/// SP1 open/gate path so SP1's `EngineError`/`map_err_state`/`EngineState`
+/// stay a status-only concern (untouched).
+#[derive(Debug)]
+pub enum EngineOpError {
+    Open(EngineError),
+    Core(String),
+    Embedder(String),
+    Busy,
+    Join(String),
+}
+
+impl std::fmt::Display for EngineOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineOpError::Open(e) => write!(f, "{e}"),
+            EngineOpError::Core(m) => write!(f, "engine error: {m}"),
+            EngineOpError::Embedder(m) => write!(f, "memory model unavailable: {m}"),
+            EngineOpError::Busy => write!(f, "an ingest is already running"),
+            EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
+        }
+    }
+}
+
 /// The coarse engine state surfaced to the UI (distinguishes setup states from faults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,14 +88,22 @@ pub struct EngineHandle {
     cell: Mutex<Option<Arc<EventLog>>>,
     keystore: EngineKeystore,
     db_path: PathBuf,
+    embedder_provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    ingest_lock: Mutex<()>,
 }
 
 impl EngineHandle {
-    pub fn new(vault: Arc<dyn SecretsVault>, data_dir: PathBuf) -> Self {
+    pub fn new(
+        vault: Arc<dyn SecretsVault>,
+        data_dir: PathBuf,
+        embedder_provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    ) -> Self {
         Self {
             cell: Mutex::new(None),
             keystore: EngineKeystore::new(vault),
             db_path: data_dir.join("brain.db"),
+            embedder_provider,
+            ingest_lock: Mutex::new(()),
         }
     }
 
@@ -124,6 +157,73 @@ impl EngineHandle {
         }
     }
 
+    /// Grant read-access to `path` (canonicalized + appended by the engine). Gated.
+    pub async fn add_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.add_grant(&path).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Revoke a previously-granted folder. Gated.
+    pub async fn revoke_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.revoke_grant(&path).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Every grant (active + revoked); the UI filters to active. Gated.
+    pub async fn list_grants(&self, onboarded: bool) -> Result<Vec<bossclaw_core::Grant>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.grants().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Ingest every active granted folder (native text only), then record the
+    /// active model once (so SP3 recall can discover it). Gated; serialized by an
+    /// in-flight guard (a concurrent call returns `Busy`).
+    pub async fn run_ingest(&self, onboarded: bool) -> Result<bossclaw_core::IngestReport, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let _guard = self.ingest_lock.try_lock().map_err(|_| EngineOpError::Busy)?;
+        let provider = self.embedder_provider.clone();
+        let report = tokio::task::spawn_blocking(move || -> Result<bossclaw_core::IngestReport, EngineOpError> {
+            let embedder = provider.embedder()?; // lazy, cached — built BEFORE the walk
+            let router = bossclaw_core::ingest::ParserRouter::native_only();
+            let report = log.ingest_all(&router, &*embedder).map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // Record the active model at vector-birth (idempotent: only when absent or changed).
+            let needs = match log.active_model().map_err(|e| EngineOpError::Core(e.to_string()))? {
+                Some(m) => m.active_model_id != embedder.model_id(),
+                None => true,
+            };
+            if needs {
+                log.set_active_model(embedder.model_id(), embedder.dim() as u32)
+                    .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            }
+            Ok(report)
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        Ok(report)
+    }
+
+    /// Every current ingested file (one per path). Gated.
+    pub async fn list_files(&self, onboarded: bool) -> Result<Vec<bossclaw_core::graph::FileRecord>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.current_files().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Identity-reset teardown: delete both engine slots, drop the memoized log (reset the
     /// cell to `None`), then delete brain.db.
     pub async fn teardown(&self) -> Result<(), EngineError> {
@@ -151,6 +251,7 @@ fn map_err_state(e: &EngineError) -> EngineState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::embed;
     use crate::secrets::SecretsVault;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -163,11 +264,21 @@ mod tests {
         fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
     }
 
+    #[test]
+    fn mock_embedder_provider_yields_a_working_embedder() {
+        use crate::engine::embed::{EmbedderProvider, MockEmbedderProvider};
+        let p = MockEmbedderProvider::new(8);
+        let e = p.embedder().expect("mock embedder builds");
+        let v = e.embed(&["hello".to_string()]).unwrap();
+        assert_eq!(v[0].len(), 8);
+        assert_eq!(e.model_id(), "mock-v1");
+    }
+
     #[tokio::test]
     async fn not_onboarded_does_not_open_or_mint() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf());
+        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         let st = h.status(false).await;
         assert!(matches!(st.state, EngineState::NotOnboarded));
         // No keys minted, no DB created.
@@ -179,7 +290,7 @@ mod tests {
     async fn onboarded_opens_fresh_brain_and_memoizes() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault, dir.path().to_path_buf());
+        let h = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
         assert_eq!(st.event_count, 0);
@@ -195,11 +306,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
         // Open once to create the DB under the real minted DEK.
-        let h1 = EngineHandle::new(vault.clone(), dir.path().to_path_buf());
+        let h1 = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         h1.get_or_open(true).await.unwrap();
         // Now corrupt the stored DEK and open with a FRESH handle (empty cell).
         vault.set("air-agent.engine.dek", &hex::encode([0u8; 32])).unwrap();
-        let h2 = EngineHandle::new(vault, dir.path().to_path_buf());
+        let h2 = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         let st = h2.status(true).await;
         assert!(matches!(st.state, EngineState::KeystoreDbMismatch));
     }
@@ -208,7 +319,7 @@ mod tests {
     async fn teardown_removes_keys_db_and_resets_cell() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf());
+        let h = EngineHandle::new(vault.clone(), dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)));
         h.get_or_open(true).await.unwrap();
         assert!(dir.path().join("brain.db").exists());
         h.teardown().await.unwrap();
@@ -216,5 +327,57 @@ mod tests {
         assert!(!dir.path().join("brain.db").exists());
         // Cell is empty again: a not-onboarded call after teardown stays NotOnboarded.
         assert!(matches!(h.status(false).await.state, EngineState::NotOnboarded));
+    }
+
+    #[tokio::test]
+    async fn grant_then_list_then_revoke() {
+        let app_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let vault = TestVault::new();
+        let h = EngineHandle::new(
+            vault, app_dir.path().to_path_buf(),
+            std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+        );
+
+        h.add_grant(true, src_dir.path().to_path_buf()).await.unwrap();
+        let grants = h.list_grants(true).await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].revoked);
+
+        h.revoke_grant(true, src_dir.path().to_path_buf()).await.unwrap();
+        let grants = h.list_grants(true).await.unwrap();
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].revoked);
+
+        // Gate: not-onboarded refuses.
+        assert!(matches!(h.add_grant(false, src_dir.path().to_path_buf()).await, Err(EngineOpError::Open(EngineError::NotOnboarded))));
+    }
+
+    #[tokio::test]
+    async fn ingest_indexes_files_and_records_model() {
+        use std::fs;
+        let app_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), "the quick brown fox").unwrap();
+        fs::write(src_dir.path().join("b.md"), "# notes\nhello world").unwrap();
+
+        let vault = TestVault::new();
+        let h = EngineHandle::new(
+            vault, app_dir.path().to_path_buf(),
+            std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+        );
+        h.add_grant(true, src_dir.path().to_path_buf()).await.unwrap();
+
+        let report = h.run_ingest(true).await.unwrap();
+        assert_eq!(report.ingested, 2);
+        assert_eq!(report.failed.len(), 0);
+
+        let files = h.list_files(true).await.unwrap();
+        assert_eq!(files.len(), 2);
+
+        // Re-ingest is a no-op: everything deduped, model already recorded.
+        let again = h.run_ingest(true).await.unwrap();
+        assert_eq!(again.ingested, 0);
+        assert_eq!(again.deduped, 2);
     }
 }
