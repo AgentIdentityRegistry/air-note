@@ -85,5 +85,38 @@ pub async fn create_identity(
 
 #[tauri::command]
 pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
-    state.identity_store.clear()
+    // Clear identity first, then tear the engine down so a re-onboard starts on a clean
+    // brain (otherwise the OLD identity's memories silently re-attach — see spec Rev 2).
+    state.identity_store.clear()?;
+    state.engine.teardown().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::{EngineHandle, EngineState};
+    use crate::secrets::SecretsVault;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct TestVault { store: Mutex<HashMap<String, String>> }
+    impl TestVault { fn new() -> Arc<Self> { Arc::new(Self { store: Mutex::new(HashMap::new()) }) } }
+    impl SecretsVault for TestVault {
+        fn set(&self, k: &str, v: &str) -> Result<(), String> { self.store.lock().unwrap().insert(k.into(), v.into()); Ok(()) }
+        fn get(&self, k: &str) -> Result<Option<String>, String> { Ok(self.store.lock().unwrap().get(k).cloned()) }
+        fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
+    }
+
+    #[tokio::test]
+    async fn reset_tears_down_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = TestVault::new();
+        let engine = Arc::new(EngineHandle::new(vault.clone(), dir.path().to_path_buf()));
+        engine.get_or_open(true).await.unwrap();
+        // Simulate the engine half of reset_identity:
+        engine.teardown().await.unwrap();
+        assert!(vault.get("air-agent.engine.dek").unwrap().is_none());
+        assert!(!dir.path().join("brain.db").exists());
+        assert!(matches!(engine.status(false).await.state, EngineState::NotOnboarded));
+    }
 }

@@ -1,9 +1,6 @@
 //! The engine spine (SP1): a single live, encrypted `EventLog` wired into the desktop.
 //! See docs/superpowers/specs/2026-06-22-desktop-engine-spine-design.md.
 
-// TEMP: teardown/delete go live when Task 5 wires reset_identity; removed there.
-#![allow(dead_code)]
-
 pub mod keystore;
 
 use crate::engine::keystore::EngineKeystore;
@@ -24,8 +21,6 @@ pub enum EngineError {
     KeystoreInconsistent,
     /// The DB could not be opened with the stored DEK (wrong key or unopenable).
     KeystoreDbMismatch(String),
-    /// The DB opened but its hash chain failed verification (tamper/truncation).
-    ChainFailed,
     /// A keychain or other I/O error.
     Vault(String),
     /// A background task failed to join.
@@ -38,7 +33,6 @@ impl fmt::Display for EngineError {
             EngineError::NotOnboarded => write!(f, "not onboarded"),
             EngineError::KeystoreInconsistent => write!(f, "engine keystore inconsistent"),
             EngineError::KeystoreDbMismatch(e) => write!(f, "engine keystore/DB mismatch: {e}"),
-            EngineError::ChainFailed => write!(f, "engine chain verification failed"),
             EngineError::Vault(e) => write!(f, "engine keychain error: {e}"),
             EngineError::Join(e) => write!(f, "engine task error: {e}"),
         }
@@ -148,7 +142,6 @@ fn map_err_state(e: &EngineError) -> EngineState {
     match e {
         EngineError::NotOnboarded => EngineState::NotOnboarded,
         EngineError::KeystoreInconsistent => EngineState::KeystoreInconsistent,
-        EngineError::ChainFailed => EngineState::ChainFailed,
         EngineError::KeystoreDbMismatch(_) | EngineError::Vault(_) | EngineError::Join(_) => {
             EngineState::KeystoreDbMismatch
         }
