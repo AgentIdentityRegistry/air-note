@@ -122,9 +122,11 @@ mod tests {
     use super::*;
     #[test]
     fn ingest_report_maps_to_dto() {
-        let mut r = bossclaw_core::IngestReport::default();
-        r.ingested = 2;
-        r.skipped.push((std::path::PathBuf::from("/x/a.bin"), "not valid UTF-8".into()));
+        let r = bossclaw_core::IngestReport {
+            ingested: 2,
+            skipped: vec![(std::path::PathBuf::from("/x/a.bin"), "not valid UTF-8".into())],
+            ..Default::default()
+        };
         let dto = IngestReportDto::from(r);
         assert_eq!(dto.ingested, 2);
         assert_eq!(dto.skipped.len(), 1);
