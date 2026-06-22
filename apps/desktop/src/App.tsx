@@ -9,6 +9,7 @@ import { GenerateAndRegister } from "./onboarding/GenerateAndRegister";
 import { Done } from "./onboarding/Done";
 import { IdentityPanel } from "./identity/IdentityPanel";
 import { InboxPanel } from "./inbox/InboxPanel";
+import { MemoryPanel } from "./memory/MemoryPanel";
 import { AirSettings } from "./settings/AirSettings";
 import { Button } from "./components/Button";
 
@@ -26,7 +27,7 @@ export default function App() {
   );
 }
 
-type View = "identity" | "inbox" | "settings";
+type View = "identity" | "inbox" | "memory" | "settings";
 
 function Shell() {
   const { identity, loading } = useIdentity();
@@ -42,9 +43,10 @@ function Shell() {
       <nav style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <Button variant={view === "identity" ? "primary" : "secondary"} onClick={() => setView("identity")}>Identity</Button>
         <InboxNavButton active={view === "inbox"} onClick={() => setView("inbox")} />
+        <Button variant={view === "memory" ? "primary" : "secondary"} onClick={() => setView("memory")}>Memory</Button>
         <Button variant={view === "settings" ? "primary" : "secondary"} onClick={() => setView("settings")}>Settings</Button>
       </nav>
-      {view === "identity" ? <IdentityPanel /> : view === "inbox" ? <InboxPanel /> : <AirSettings />}
+      {view === "identity" ? <IdentityPanel /> : view === "inbox" ? <InboxPanel /> : view === "memory" ? <MemoryPanel /> : <AirSettings />}
     </div>
   );
 }
