@@ -188,7 +188,7 @@ export function MemoryPanel() {
           >
             {status?.enabled ? "Turn evolve off" : "Turn evolve on"}
           </Button>
-          <Button variant="primary" onClick={onEvolveNow} disabled={evolving || !ollamaReady}>
+          <Button variant="primary" onClick={onEvolveNow} disabled={evolving || !ollamaReady || !status?.enabled}>
             {evolving ? "Evolving…" : "Evolve now"}
           </Button>
         </div>
