@@ -2,6 +2,9 @@
 
 mod air;
 mod commands;
+// Engine spine is Unix-only until M7: `bossclaw-core` (bundled-SQLCipher + rustix) doesn't build
+// on Windows yet, so the desktop ships without the engine there. M7 un-gates it.
+#[cfg(unix)]
 mod engine;
 mod file_access;
 mod inbox;
@@ -53,7 +56,13 @@ fn main() {
             let data_dir = app.path().app_data_dir().expect("app data dir");
             let _ = air::migrate_identity_metadata(&data_dir, vault::LEGACY_IDENTITY_SERVICE);
 
+            // On Windows there is no engine, so `vault`/`data_dir` are not cloned (cloning then
+            // dropping the clones would warn as unused) — move them straight into IdentityStore.
+            #[cfg(unix)]
             let identity_store = IdentityStore::new(vault.clone(), data_dir.clone());
+            #[cfg(not(unix))]
+            let identity_store = IdentityStore::new(vault, data_dir);
+            #[cfg(unix)]
             let engine = std::sync::Arc::new(crate::engine::EngineHandle::new(vault, data_dir));
 
             // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
@@ -69,6 +78,7 @@ fn main() {
                 air_client,
                 identity_store,
                 inbox: std::sync::Arc::new(crate::inbox::manager::InboxManager::new()),
+                #[cfg(unix)]
                 engine,
             });
             Ok(())
@@ -102,6 +112,7 @@ fn main() {
             get_trust_score,
             create_identity,
             reset_identity,
+            #[cfg(unix)]
             commands::engine::engine_status,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,

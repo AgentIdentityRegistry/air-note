@@ -11,8 +11,6 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 air-rs = { path = "../../../crates/air-rs" }
-bossclaw-core = { path = "../../../crates/bossclaw-core" }
-zeroize = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
@@ -32,6 +30,13 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "1.0"
 urlencoding = "2.1"
 uuid = { version = "1", features = ["v4"] }
+
+# Memory/actuator engine (SP1): bossclaw-core is Unix-only until M7 — it pulls bundled-SQLCipher
+# (needs a system OpenSSL on Windows) + rustix, so the desktop excludes the engine on Windows via
+# `#[cfg(unix)]`. `zeroize` is used only by the engine keystore, so it rides in the same section.
+[target.'cfg(unix)'.dependencies]
+bossclaw-core = { path = "../../../crates/bossclaw-core" }
+zeroize = "1"
 
 # Single-instance guard (CF2): exactly one desktop process, so the in-process POLICY_LOCK is the
 # whole-machine lock and two instances can't both reserve the same budget slot. Desktop-only plugin.

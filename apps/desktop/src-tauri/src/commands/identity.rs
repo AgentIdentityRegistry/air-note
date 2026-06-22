@@ -9,6 +9,8 @@ pub struct AppState {
     pub air_client: Arc<dyn AirClient>,
     pub identity_store: IdentityStore,
     pub inbox: std::sync::Arc<crate::inbox::manager::InboxManager>,
+    // Engine spine is Unix-only until M7 (bossclaw-core doesn't build on Windows yet).
+    #[cfg(unix)]
     pub engine: std::sync::Arc<crate::engine::EngineHandle>,
 }
 
@@ -91,11 +93,14 @@ pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
     // prompts a retry that completes the rest, and a half-done reset never leaves a brain
     // reachable by a NEW identity (the onboarding gate + fresh-key mint prevent that).
     state.identity_store.clear()?;
+    // On Windows there is no engine, so reset only clears the identity slots above.
+    #[cfg(unix)]
     state.engine.teardown().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-#[cfg(test)]
+// The engine half of reset is Unix-only, so this test (which exercises it) is too.
+#[cfg(all(test, unix))]
 mod tests {
     use crate::engine::{EngineHandle, EngineState};
     use crate::secrets::SecretsVault;

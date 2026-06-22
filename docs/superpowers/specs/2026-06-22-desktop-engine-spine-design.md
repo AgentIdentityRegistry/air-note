@@ -23,6 +23,7 @@ On first engine use after onboarding, open a single live `bossclaw_core::EventLo
 ## Non-goals (explicitly deferred)
 
 - File ingest / read-grants → SP2. The evolve loop / scheduler → SP3. Recall (semantic search index) → opened by SP3; the spine opens the **bare** log. Write-proposal listing/diff/confirm UI → SP4. Mandate add/revoke/list → SP5. Multi-device / portable-brain export (incl. key backup) → out of scope for the whole milestone.
+- **Windows support → deferred to M7.** Engine integration is **Unix-only until M7** — `bossclaw-core` (bundled-SQLCipher + rustix) doesn't build on Windows yet, so the desktop excludes the engine on Windows via `#[cfg(unix)]` (the `bossclaw-core`/`zeroize` deps are in a `[target.'cfg(unix)'.dependencies]` block, and `mod engine`, the `AppState.engine` field, the engine construction, the `engine_status` handler entry, and the reset teardown are all `#[cfg(unix)]`-gated). On Windows the desktop builds without the engine; identity + messaging are unaffected, and reset only clears identity. M7 (bossclaw-core Windows support) un-gates it.
 
 ## Architecture
 
