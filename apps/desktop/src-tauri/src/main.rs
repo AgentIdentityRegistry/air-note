@@ -2,6 +2,7 @@
 
 mod air;
 mod commands;
+mod engine;
 mod file_access;
 mod inbox;
 mod llm_stream;
