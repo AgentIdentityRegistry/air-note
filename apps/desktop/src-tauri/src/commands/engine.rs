@@ -4,7 +4,6 @@ use serde::Serialize;
 use tauri::State;
 
 #[derive(Serialize)]
-#[allow(dead_code)] // wired in Task 6
 pub struct GrantDto {
     pub canonical_root: String,
     pub granted_at: String,
@@ -17,7 +16,6 @@ impl From<bossclaw_core::Grant> for GrantDto {
 }
 
 #[derive(Serialize)]
-#[allow(dead_code)] // wired in Task 6
 pub struct FileRecordDto {
     pub canonical_path: String,
     pub file_event_id: String,
@@ -36,14 +34,12 @@ impl From<bossclaw_core::graph::FileRecord> for FileRecordDto {
 }
 
 #[derive(Serialize)]
-#[allow(dead_code)] // wired in Task 6
 pub struct SkipDto {
     pub path: String,
     pub reason: String,
 }
 
 #[derive(Serialize)]
-#[allow(dead_code)] // wired in Task 6
 pub struct IngestReportDto {
     pub ingested: usize,
     pub superseded: usize,
@@ -74,6 +70,51 @@ impl From<bossclaw_core::IngestReport> for IngestReportDto {
 pub async fn engine_status(state: State<'_, AppState>) -> Result<EngineStatus, String> {
     let onboarded = state.identity_store.is_onboarded();
     Ok(state.engine.status(onboarded).await)
+}
+
+#[tauri::command]
+pub async fn engine_add_grant(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.add_grant(onboarded, std::path::PathBuf::from(path)).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn engine_revoke_grant(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.revoke_grant(onboarded, std::path::PathBuf::from(path)).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn engine_list_grants(state: State<'_, AppState>) -> Result<Vec<GrantDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let grants = state.engine.list_grants(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(grants.into_iter().map(GrantDto::from).collect())
+}
+
+#[tauri::command]
+pub async fn engine_run_ingest(state: State<'_, AppState>) -> Result<IngestReportDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let report = state.engine.run_ingest(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(IngestReportDto::from(report))
+}
+
+#[tauri::command]
+pub async fn engine_list_files(state: State<'_, AppState>) -> Result<Vec<FileRecordDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let files = state.engine.list_files(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(files.into_iter().map(FileRecordDto::from).collect())
+}
+
+#[tauri::command]
+pub async fn engine_pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
+    // A cancelled dialog yields None; a dropped sender (window closed) also -> None.
+    let picked = rx.await.ok().flatten();
+    Ok(picked.and_then(|p| p.into_path().ok()).map(|pb| pb.to_string_lossy().into_owned()))
 }
 
 #[cfg(test)]

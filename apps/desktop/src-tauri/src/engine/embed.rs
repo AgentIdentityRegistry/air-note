@@ -10,18 +10,15 @@ use std::sync::{Arc, Mutex};
 /// The single source of truth for the active embedding model id. Both this
 /// crate's ingest (SP2) and the future recall-open (SP3) construct `Model2Vec`
 /// with THIS id, so the vectors SP2 writes and the index SP3 rebuilds match.
-#[allow(dead_code)] // wired in Task 6 (ingest constructs Model2Vec with this id)
 pub const MODEL_ID: &str = "minishlab/potion-base-8M";
 
 /// Builds (and caches) the embedder. Called on first ingest, never at startup.
 pub trait EmbedderProvider: Send + Sync {
-    #[allow(dead_code)] // wired in Task 6 (ingest calls this on first run)
     fn embedder(&self) -> Result<Arc<dyn Embedder>, EngineOpError>;
 }
 
 /// Production provider: loads `Model2Vec` from the bundled model directory on
 /// first use and caches it for the process lifetime.
-#[allow(dead_code)] // wired in Task 6 (held by EngineHandle, exercised by ingest)
 pub struct ResourceModel2Vec {
     model_dir: PathBuf,
     cell: Mutex<Option<Arc<dyn Embedder>>>,

@@ -119,6 +119,18 @@ fn main() {
             reset_identity,
             #[cfg(unix)]
             commands::engine::engine_status,
+            #[cfg(unix)]
+            commands::engine::engine_add_grant,
+            #[cfg(unix)]
+            commands::engine::engine_revoke_grant,
+            #[cfg(unix)]
+            commands::engine::engine_list_grants,
+            #[cfg(unix)]
+            commands::engine::engine_run_ingest,
+            #[cfg(unix)]
+            commands::engine::engine_list_files,
+            #[cfg(unix)]
+            commands::engine::engine_pick_folder,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

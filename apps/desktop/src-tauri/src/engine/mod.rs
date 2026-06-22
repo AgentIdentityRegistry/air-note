@@ -43,7 +43,6 @@ impl fmt::Display for EngineError {
 /// Errors from the SP2 operational commands (grant/ingest/list). Wraps the
 /// SP1 open/gate path so SP1's `EngineError`/`map_err_state`/`EngineState`
 /// stay a status-only concern (untouched).
-#[allow(dead_code)] // wired in Task 6 (commands map this to String)
 #[derive(Debug)]
 pub enum EngineOpError {
     Open(EngineError),
@@ -53,7 +52,6 @@ pub enum EngineOpError {
     Join(String),
 }
 
-#[allow(dead_code)] // wired in Task 6
 impl std::fmt::Display for EngineOpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -90,9 +88,7 @@ pub struct EngineHandle {
     cell: Mutex<Option<Arc<EventLog>>>,
     keystore: EngineKeystore,
     db_path: PathBuf,
-    #[allow(dead_code)] // wired in Task 6 (ingest reads the provider + in-flight lock)
     embedder_provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
-    #[allow(dead_code)] // wired in Task 6
     ingest_lock: Mutex<()>,
 }
 
@@ -162,7 +158,6 @@ impl EngineHandle {
     }
 
     /// Grant read-access to `path` (canonicalized + appended by the engine). Gated.
-    #[allow(dead_code)] // wired in Task 6
     pub async fn add_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         tokio::task::spawn_blocking(move || {
@@ -173,7 +168,6 @@ impl EngineHandle {
     }
 
     /// Revoke a previously-granted folder. Gated.
-    #[allow(dead_code)] // wired in Task 6
     pub async fn revoke_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         tokio::task::spawn_blocking(move || {
@@ -184,7 +178,6 @@ impl EngineHandle {
     }
 
     /// Every grant (active + revoked); the UI filters to active. Gated.
-    #[allow(dead_code)] // wired in Task 6
     pub async fn list_grants(&self, onboarded: bool) -> Result<Vec<bossclaw_core::Grant>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         tokio::task::spawn_blocking(move || {
@@ -197,7 +190,6 @@ impl EngineHandle {
     /// Ingest every active granted folder (native text only), then record the
     /// active model once (so SP3 recall can discover it). Gated; serialized by an
     /// in-flight guard (a concurrent call returns `Busy`).
-    #[allow(dead_code)] // wired in Task 6
     pub async fn run_ingest(&self, onboarded: bool) -> Result<bossclaw_core::IngestReport, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         let _guard = self.ingest_lock.try_lock().map_err(|_| EngineOpError::Busy)?;
@@ -223,7 +215,6 @@ impl EngineHandle {
     }
 
     /// Every current ingested file (one per path). Gated.
-    #[allow(dead_code)] // wired in Task 6
     pub async fn list_files(&self, onboarded: bool) -> Result<Vec<bossclaw_core::graph::FileRecord>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         tokio::task::spawn_blocking(move || {
