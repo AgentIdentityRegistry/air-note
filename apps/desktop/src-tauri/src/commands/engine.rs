@@ -165,6 +165,93 @@ pub async fn engine_recall(
         .map_err(|e| e.to_string())
 }
 
+/// The evolve loop's status for the webview: the engine's live `{enabled, queue_depth}`
+/// merged with the handle's session telemetry `{last_tick_ms, error_count, last_error}`
+/// (the engine stubs those three to `None/0/None`, so telemetry WINS for them).
+#[derive(Serialize)]
+pub struct EvolveStatusDto {
+    pub enabled: bool,
+    pub queue_depth: usize,
+    pub last_tick_ms: Option<u128>,
+    pub error_count: usize,
+    pub last_error: Option<String>,
+}
+impl EvolveStatusDto {
+    /// Merge the engine status with the handle telemetry: `enabled`/`queue_depth` come from
+    /// the engine; `last_tick_ms`/`error_count`/`last_error` come from telemetry (which holds
+    /// the real values the engine only stubs).
+    pub fn from_parts(s: &bossclaw_core::EvolveStatus, t: &crate::engine::EvolveTelemetry) -> Self {
+        EvolveStatusDto {
+            enabled: s.enabled,
+            queue_depth: s.queue_depth,
+            last_tick_ms: t.last_tick_ms,
+            error_count: t.error_count,
+            last_error: t.last_error.clone(),
+        }
+    }
+}
+
+/// What one evolve tick did (the subset the Memory tab renders). Mirrors the TS twin.
+#[derive(Serialize)]
+pub struct EvolveReportDto {
+    pub entities_minted: usize,
+    pub links_emitted: usize,
+    pub invalidates_emitted: usize,
+    pub pages_emitted: usize,
+    pub memories_processed: usize,
+}
+impl From<bossclaw_core::EvolveReport> for EvolveReportDto {
+    fn from(r: bossclaw_core::EvolveReport) -> Self {
+        EvolveReportDto {
+            entities_minted: r.entities_minted,
+            links_emitted: r.links_emitted,
+            invalidates_emitted: r.invalidates_emitted,
+            pages_emitted: r.pages_emitted,
+            memories_processed: r.memories_processed,
+        }
+    }
+}
+
+/// The evolve loop's status. NEVER errors: if the engine isn't open yet (or any op error),
+/// report a disabled/empty status — payload-encoded exactly like `engine_status`, so a
+/// status poll from the Memory tab can never throw.
+#[tauri::command]
+pub async fn engine_evolve_status(state: State<'_, AppState>) -> Result<EvolveStatusDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    match state.engine.evolve_status(onboarded).await {
+        Ok((s, t)) => Ok(EvolveStatusDto::from_parts(&s, &t)),
+        Err(_) => Ok(EvolveStatusDto {
+            enabled: false,
+            queue_depth: 0,
+            last_tick_ms: None,
+            error_count: 0,
+            last_error: None,
+        }),
+    }
+}
+
+/// Flip the sticky evolve off-switch (the Memory tab toggle).
+#[tauri::command]
+pub async fn engine_set_evolve_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_evolve_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
+}
+
+/// Run one evolve tick now ("Evolve now"). Returns the tick report.
+#[tauri::command]
+pub async fn engine_evolve_now(state: State<'_, AppState>) -> Result<EvolveReportDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state
+        .engine
+        .evolve_once(onboarded)
+        .await
+        .map(EvolveReportDto::from)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +283,47 @@ mod tests {
         assert_eq!(dto.skipped.len(), 1);
         assert_eq!(dto.skipped[0].path, "/x/a.bin");
         assert_eq!(dto.skipped[0].reason, "not valid UTF-8");
+    }
+
+    #[test]
+    fn evolve_status_dto_merges_engine_and_telemetry() {
+        // The engine's EvolveStatus stubs last_tick_ms/error_count/last_error; the handle's
+        // telemetry holds the real values and MUST win. enabled + queue_depth come from the engine.
+        let st = bossclaw_core::EvolveStatus {
+            queue_depth: 4,
+            last_tick_ms: None,
+            error_count: 0,
+            last_error: None,
+            enabled: true,
+        };
+        let tel = crate::engine::EvolveTelemetry {
+            last_tick_ms: Some(120),
+            error_count: 2,
+            last_error: Some("boom".into()),
+        };
+        let dto = EvolveStatusDto::from_parts(&st, &tel);
+        assert_eq!(dto.queue_depth, 4);
+        assert!(dto.enabled);
+        assert_eq!(dto.last_tick_ms, Some(120), "telemetry wins over the engine stub");
+        assert_eq!(dto.error_count, 2);
+        assert_eq!(dto.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn evolve_report_maps_to_dto() {
+        let r = bossclaw_core::EvolveReport {
+            entities_minted: 3,
+            links_emitted: 2,
+            invalidates_emitted: 1,
+            pages_emitted: 4,
+            memories_processed: 5,
+            ..Default::default()
+        };
+        let dto = EvolveReportDto::from(r);
+        assert_eq!(dto.entities_minted, 3);
+        assert_eq!(dto.links_emitted, 2);
+        assert_eq!(dto.invalidates_emitted, 1);
+        assert_eq!(dto.pages_emitted, 4);
+        assert_eq!(dto.memories_processed, 5);
     }
 }

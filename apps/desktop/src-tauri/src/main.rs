@@ -143,6 +143,12 @@ fn main() {
             commands::engine::engine_pick_folder,
             #[cfg(unix)]
             commands::engine::engine_recall,
+            #[cfg(unix)]
+            commands::engine::engine_evolve_status,
+            #[cfg(unix)]
+            commands::engine::engine_set_evolve_enabled,
+            #[cfg(unix)]
+            commands::engine::engine_evolve_now,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,
