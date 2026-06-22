@@ -79,6 +79,12 @@ fn main() {
                     reasoner_provider,
                 ))
             };
+            // Start the background evolve driver (OFF by default — it gates on the sticky
+            // `evolve_enabled` off-switch + a present local Ollama + a non-empty queue each
+            // wake). Spawned via `tauri::async_runtime::spawn` inside the scheduler; the
+            // handle + identity store are cheaply cloned for it.
+            #[cfg(unix)]
+            crate::engine::scheduler::spawn(engine.clone(), identity_store.clone());
 
             // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
             // Settings UI will offer a friendlier toggle in a later task.
@@ -149,6 +155,8 @@ fn main() {
             commands::engine::engine_set_evolve_enabled,
             #[cfg(unix)]
             commands::engine::engine_evolve_now,
+            #[cfg(unix)]
+            commands::engine::engine_ollama_status,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

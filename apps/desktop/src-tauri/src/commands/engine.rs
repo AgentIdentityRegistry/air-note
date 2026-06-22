@@ -252,6 +252,31 @@ pub async fn engine_evolve_now(state: State<'_, AppState>) -> Result<EvolveRepor
         .map_err(|e| e.to_string())
 }
 
+/// Whether the LOCAL Ollama is reachable and the evolve model is pulled, plus the model tag
+/// the Memory tab shows in its "install Ollama and `ollama pull …`" hint. `model_tag` is
+/// always `REASONER_MODEL_ID` (the single source of truth), independent of the probe result.
+#[derive(Serialize)]
+pub struct OllamaStatusDto {
+    pub reachable: bool,
+    pub model_present: bool,
+    pub model_tag: String,
+}
+
+/// Probe the local Ollama for the evolve loop. NEVER errors (payload-encoded exactly like
+/// `engine_status`): the probe maps any connect/timeout/parse failure to `reachable:false`,
+/// so the Memory tab can poll this without a throw. No `AppState` / no onboarding gate — the
+/// probe touches a fixed loopback host, never the engine.
+#[tauri::command]
+pub async fn engine_ollama_status() -> Result<OllamaStatusDto, String> {
+    let model_tag = crate::engine::reason::REASONER_MODEL_ID;
+    let status = crate::engine::ollama_probe::probe(model_tag).await;
+    Ok(OllamaStatusDto {
+        reachable: status.reachable,
+        model_present: status.model_present,
+        model_tag: model_tag.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
