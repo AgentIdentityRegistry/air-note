@@ -44,6 +44,9 @@ keyring = { version = "2.3", features = ["linux-secret-service", "linux-keyutils
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 keyring = "2.3"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
