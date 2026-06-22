@@ -64,6 +64,36 @@ impl From<bossclaw_core::IngestReport> for IngestReportDto {
     }
 }
 
+/// A recall hit for the webview: the engine's `Hit` plus the hydrated snippet text.
+/// `sources` is snake_case (`"vector"` / `"keyword"`) to match the TS `RecallSource` union.
+#[derive(Serialize)]
+pub struct HitDto {
+    pub event_id: String,
+    pub score: f32,
+    pub kind: String,
+    pub sources: Vec<String>,
+    pub text: String,
+}
+impl From<crate::engine::HitWithText> for HitDto {
+    fn from(h: crate::engine::HitWithText) -> Self {
+        HitDto {
+            event_id: h.hit.event_id,
+            score: h.hit.score,
+            kind: h.hit.kind,
+            text: h.text,
+            sources: h
+                .hit
+                .sources
+                .iter()
+                .map(|s| match s {
+                    bossclaw_core::RecallSource::Vector => "vector".to_string(),
+                    bossclaw_core::RecallSource::Keyword => "keyword".to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Reports the brain's status: opens-or-gets the engine (gated on onboarding), verifies
 /// its chain, and counts entries. Never errors — failures are encoded in `status.state`.
 #[tauri::command]
@@ -117,9 +147,43 @@ pub async fn engine_pick_folder(app: tauri::AppHandle) -> Result<Option<String>,
     Ok(picked.and_then(|p| p.into_path().ok()).map(|pb| pb.to_string_lossy().into_owned()))
 }
 
+/// Hybrid recall over the user's memory. `k` is clamped server-side to a sane range so a
+/// webview bug can't request an unbounded result set.
+#[tauri::command]
+pub async fn engine_recall(
+    query: String,
+    k: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<HitDto>, String> {
+    let k = k.clamp(1, 50);
+    let onboarded = state.identity_store.is_onboarded();
+    state
+        .engine
+        .recall(onboarded, query, k)
+        .await
+        .map(|v| v.into_iter().map(HitDto::from).collect())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hit_dto_maps_sources_to_snake_case() {
+        let h = bossclaw_core::Hit {
+            event_id: "e1".into(),
+            score: 0.5,
+            sources: vec![bossclaw_core::RecallSource::Vector, bossclaw_core::RecallSource::Keyword],
+            kind: "memory".into(),
+        };
+        let dto = HitDto::from(crate::engine::HitWithText { hit: h, text: "hello".into() });
+        assert_eq!(dto.sources, vec!["vector".to_string(), "keyword".to_string()]);
+        assert_eq!(dto.text, "hello");
+        assert_eq!(dto.kind, "memory");
+        assert_eq!(dto.event_id, "e1");
+        assert_eq!(dto.score, 0.5);
+    }
+
     #[test]
     fn ingest_report_maps_to_dto() {
         let r = bossclaw_core::IngestReport {

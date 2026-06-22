@@ -10,6 +10,8 @@ export type IngestReportDto = {
   skipped: SkipDto[];
   failed: SkipDto[];
 };
+export type RecallSource = "vector" | "keyword";
+export type HitDto = { event_id: string; score: number; kind: string; sources: RecallSource[]; text: string };
 
 /** Opens the native folder picker; resolves to the chosen path, or null if the user cancels. */
 export const pickFolder = (): Promise<string | null> => invoke<string | null>("engine_pick_folder");
@@ -18,3 +20,5 @@ export const revokeGrant = (path: string): Promise<void> => invoke<void>("engine
 export const listGrants = (): Promise<GrantDto[]> => invoke<GrantDto[]>("engine_list_grants");
 export const runIngest = (): Promise<IngestReportDto> => invoke<IngestReportDto>("engine_run_ingest");
 export const listFiles = (): Promise<FileRecordDto[]> => invoke<FileRecordDto[]>("engine_list_files");
+export const recall = (query: string, k: number): Promise<HitDto[]> =>
+  invoke<HitDto[]>("engine_recall", { query, k });
