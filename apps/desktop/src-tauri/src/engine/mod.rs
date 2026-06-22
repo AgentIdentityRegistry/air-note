@@ -194,6 +194,45 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Ingest every active granted folder (native text only), then record the
+    /// active model once (so SP3 recall can discover it). Gated; serialized by an
+    /// in-flight guard (a concurrent call returns `Busy`).
+    #[allow(dead_code)] // wired in Task 6
+    pub async fn run_ingest(&self, onboarded: bool) -> Result<bossclaw_core::IngestReport, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let _guard = self.ingest_lock.try_lock().map_err(|_| EngineOpError::Busy)?;
+        let provider = self.embedder_provider.clone();
+        let report = tokio::task::spawn_blocking(move || -> Result<bossclaw_core::IngestReport, EngineOpError> {
+            let embedder = provider.embedder()?; // lazy, cached — built BEFORE the walk
+            let router = bossclaw_core::ingest::ParserRouter::native_only();
+            let report = log.ingest_all(&router, &*embedder).map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // Record the active model at vector-birth (idempotent: only when absent or changed).
+            let needs = match log.active_model().map_err(|e| EngineOpError::Core(e.to_string()))? {
+                Some(m) => m.active_model_id != embedder.model_id(),
+                None => true,
+            };
+            if needs {
+                log.set_active_model(embedder.model_id(), embedder.dim() as u32)
+                    .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            }
+            Ok(report)
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        Ok(report)
+    }
+
+    /// Every current ingested file (one per path). Gated.
+    #[allow(dead_code)] // wired in Task 6
+    pub async fn list_files(&self, onboarded: bool) -> Result<Vec<bossclaw_core::graph::FileRecord>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.current_files().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Identity-reset teardown: delete both engine slots, drop the memoized log (reset the
     /// cell to `None`), then delete brain.db.
     pub async fn teardown(&self) -> Result<(), EngineError> {
@@ -321,5 +360,33 @@ mod tests {
 
         // Gate: not-onboarded refuses.
         assert!(matches!(h.add_grant(false, src_dir.path().to_path_buf()).await, Err(EngineOpError::Open(EngineError::NotOnboarded))));
+    }
+
+    #[tokio::test]
+    async fn ingest_indexes_files_and_records_model() {
+        use std::fs;
+        let app_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), "the quick brown fox").unwrap();
+        fs::write(src_dir.path().join("b.md"), "# notes\nhello world").unwrap();
+
+        let vault = TestVault::new();
+        let h = EngineHandle::new(
+            vault, app_dir.path().to_path_buf(),
+            std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+        );
+        h.add_grant(true, src_dir.path().to_path_buf()).await.unwrap();
+
+        let report = h.run_ingest(true).await.unwrap();
+        assert_eq!(report.ingested, 2);
+        assert_eq!(report.failed.len(), 0);
+
+        let files = h.list_files(true).await.unwrap();
+        assert_eq!(files.len(), 2);
+
+        // Re-ingest is a no-op: everything deduped, model already recorded.
+        let again = h.run_ingest(true).await.unwrap();
+        assert_eq!(again.ingested, 0);
+        assert_eq!(again.deduped, 2);
     }
 }
