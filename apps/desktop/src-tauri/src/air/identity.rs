@@ -15,6 +15,10 @@ pub struct IdentityMetadata {
 ///   - Private key bytes → SecretsVault under key "air-agent.agent.signing_key"
 ///   - Agent secret (returned by AIR) → SecretsVault under "air-agent.agent.air_secret"
 ///   - Public metadata → JSON at <app_data_dir>/identity.json
+///
+/// `Clone` is cheap (both fields are `Arc`/`PathBuf`); the SP3 evolve scheduler holds a
+/// clone for its onboarding read across the spawn boundary.
+#[derive(Clone)]
 pub struct IdentityStore {
     vault: Arc<dyn SecretsVault>,
     data_dir: PathBuf,
