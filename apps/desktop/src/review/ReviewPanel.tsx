@@ -222,9 +222,9 @@ export function ReviewPanel() {
 
       {confirmFor ? (
         <Card>
-          <div style={{ fontWeight: 600, color: "#b00" }}>This change looks risky</div>
+          <div style={{ fontWeight: 600, color: "#b00" }}>Confirm this edit</div>
           <p style={{ fontSize: 13, color: "#444" }}>
-            The new content matches a secret- or value-shaped pattern. Confirm you’ve read the diff before applying.
+            This rewrites a file your agent learned from. Review the before/after, then confirm you’ve read it.
           </p>
           <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13 }}>
             <input type="checkbox" checked={reviewed} onChange={(e) => setReviewed(e.target.checked)} />

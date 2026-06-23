@@ -653,6 +653,15 @@ impl EngineHandle {
                 _ => {} // base matches live → proceed.
             }
 
+            // Map the proposal's OWN op back to a `WriteOp` (fail-closed on an unknown string —
+            // NEVER default to Edit). SP4's M6b only emits "edit", so this is behavior-identical
+            // today; mapping it keeps a future Create/Delete proposal from being mis-gated as Edit.
+            let op = match p.op.as_str() {
+                "edit" => bossclaw_core::actuator::WriteOp::Edit,
+                "create" => bossclaw_core::actuator::WriteOp::Create,
+                "delete" => bossclaw_core::actuator::WriteOp::Delete,
+                other => return Err(EngineOpError::Core(format!("unknown proposal op: {other}"))),
+            };
             // Verified bytes (fail closed if the side-table row is missing/tampered).
             let bytes = log.get_proposal_bytes_checked(&p.id, &p.new_content_hash)
                 .map_err(|e| EngineOpError::Core(e.to_string()))?;
@@ -661,7 +670,7 @@ impl EngineHandle {
             let gated = log.propose_write(bossclaw_core::actuator::WriteProposal {
                 target: std::path::PathBuf::from(&p.target),
                 new_content: bytes,
-                op: bossclaw_core::actuator::WriteOp::Edit,
+                op,
                 source_event_ids: p.source_event_ids.clone(),
                 rationale: p.rationale.clone(),
             }).map_err(|e| EngineOpError::Core(e.to_string()))?;
