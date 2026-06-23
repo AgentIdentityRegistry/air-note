@@ -280,6 +280,23 @@ pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> 
     Ok(PreviewDto::from(preview))
 }
 
+#[derive(Serialize)]
+pub struct ApplyResultDto {
+    pub file_written_id: String,
+}
+impl From<crate::engine::ApplyResult> for ApplyResultDto {
+    fn from(r: crate::engine::ApplyResult) -> Self {
+        Self { file_written_id: r.file_written_id }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_apply_proposal(id: String, acknowledged_loud: bool, state: State<'_, AppState>) -> Result<ApplyResultDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let result = state.engine.apply_proposal(onboarded, id, acknowledged_loud).await.map_err(|e| e.to_string())?;
+    Ok(ApplyResultDto::from(result))
+}
+
 /// The evolve loop's status. NEVER errors: if the engine isn't open yet (or any op error),
 /// report a disabled/empty status — payload-encoded exactly like `engine_status`, so a
 /// status poll from the Memory tab can never throw.

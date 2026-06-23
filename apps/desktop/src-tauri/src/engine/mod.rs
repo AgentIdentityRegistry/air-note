@@ -62,6 +62,15 @@ pub enum EngineOpError {
     Reasoner(String),
     /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve").
     Busy(&'static str),
+    /// The on-disk file changed since the proposal was drafted; the re-gate at confirm
+    /// fails closed. Carries the reason. Nothing is written.
+    Stale(String),
+    /// The folder's write-grant was revoked between propose and apply; re-gate fails closed.
+    Revoked(String),
+    /// The FRESH re-gate verdict is loud (secret-/value-shaped or Delete) but the caller did not
+    /// pass `acknowledged_loud == true`. The op refuses to write — the UI must show the
+    /// "I've reviewed this" confirm and retry with the ack. Carries the reason.
+    NeedsLoudConfirm(String),
     Join(String),
 }
 
@@ -73,6 +82,9 @@ impl std::fmt::Display for EngineOpError {
             EngineOpError::Embedder(m) => write!(f, "memory model unavailable: {m}"),
             EngineOpError::Reasoner(m) => write!(f, "reasoner unavailable: {m}"),
             EngineOpError::Busy(op) => write!(f, "an {op} is already running"),
+            EngineOpError::Stale(m) => write!(f, "the file changed since this was suggested: {m}"),
+            EngineOpError::Revoked(m) => write!(f, "edits aren't allowed in this folder anymore: {m}"),
+            EngineOpError::NeedsLoudConfirm(m) => write!(f, "this change needs an explicit review confirmation: {m}"),
             EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
         }
     }
@@ -597,6 +609,87 @@ impl EngineHandle {
     }
 }
 
+/// The outcome of a successful apply: the audit `file_written` id (also the handle for Undo).
+#[derive(Debug, Clone)]
+pub struct ApplyResult {
+    pub file_written_id: String,
+}
+
+impl EngineHandle {
+    /// Approve + apply one proposal (Lock 2). The anti-clobber check is the EXPLICIT base-hash
+    /// compare: read the live target, sha256 it, and if the proposal's recorded
+    /// `base_content_hash` differs → fail closed as `Stale` BEFORE proposing or executing (a fresh
+    /// re-propose re-bases on live bytes and could not see the drift). Only then does it fetch the
+    /// verified bytes, re-gate with a FRESH `propose_write` against the LIVE file + current
+    /// write-grant (this still guards the micro-TOCTOU window + grant revocation). The loud-confirm
+    /// is decided from the FRESH verdict (NOT the stale propose-time flag): if it is loud and
+    /// `acknowledged_loud == false` the op REFUSES (`NeedsLoudConfirm`) — never a silent write.
+    /// Only then does it execute (atomic temp+rename, durable undo, signed `file_written`). Nothing
+    /// is written on any failure. Gated.
+    pub async fn apply_proposal(&self, onboarded: bool, id: String, acknowledged_loud: bool) -> Result<ApplyResult, EngineOpError> {
+        use sha2::{Digest, Sha256};
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let pending = log.pending_proposals().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            let p = pending.into_iter().find(|p| p.id == id)
+                .ok_or_else(|| EngineOpError::Stale("proposal not found or already resolved".to_string()))?;
+
+            // ── ANTI-CLOBBER: compare the live file to the proposal's propose-time fingerprint. ──
+            // This is the TRUE staleness detector (a fresh propose_write below re-bases on the live
+            // file and cannot detect that it changed). Edit-only proposals always carry a base.
+            let live_bytes = std::fs::read(&p.target)
+                .map_err(|e| EngineOpError::Stale(format!("could not read target: {e}")))?;
+            let live_hash = hex::encode(Sha256::digest(&live_bytes));
+            match &p.base_content_hash {
+                Some(base) if *base != live_hash => {
+                    return Err(EngineOpError::Stale(format!(
+                        "the file changed since this was suggested (base {base} != live {live_hash})"
+                    )));
+                }
+                None => {
+                    // No recorded base (e.g. a legacy/minimal proposal) → cannot prove freshness.
+                    return Err(EngineOpError::Stale("proposal has no base fingerprint to verify against".to_string()));
+                }
+                _ => {} // base matches live → proceed.
+            }
+
+            // Verified bytes (fail closed if the side-table row is missing/tampered).
+            let bytes = log.get_proposal_bytes_checked(&p.id, &p.new_content_hash)
+                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // FRESH gate against the current disk + grant (never trust the stored verdict). Guards
+            // the micro-TOCTOU window between the hash check above and the rename, + grant revoke.
+            let gated = log.propose_write(bossclaw_core::actuator::WriteProposal {
+                target: std::path::PathBuf::from(&p.target),
+                new_content: bytes,
+                op: bossclaw_core::actuator::WriteOp::Edit,
+                source_event_ids: p.source_event_ids.clone(),
+                rationale: p.rationale.clone(),
+            }).map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // reject_reason set ⇒ symlink/op-mismatch/unresolvable; !allowed ⇒ grant revoked.
+            if let Some(reason) = gated.verdict.reject_reason.as_deref() {
+                return Err(EngineOpError::Stale(reason.to_string()));
+            }
+            if !gated.verdict.allowed {
+                return Err(EngineOpError::Revoked("target not under an active write grant".to_string()));
+            }
+            // LOUD-CONFIRM on the FRESH verdict (G1/IMP-1a): a loud write requires the explicit ack.
+            // This is the authoritative gate — the propose-time flag was only a UI hint.
+            if gated.verdict.requires_loud_modal && !acknowledged_loud {
+                return Err(EngineOpError::NeedsLoudConfirm(
+                    "secret-/value-shaped or delete change — confirm review before applying".to_string(),
+                ));
+            }
+            // execute is atomic temp+rename: it never partially writes, so a failure here also
+            // leaves the file untouched. (Defensive: any execute error surfaces as Core.)
+            let fw_id = log.execute_write_resolving(gated, &p.id)
+                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(ApplyResult { file_written_id: fw_id })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+}
+
 /// Truncate `s` in place to at most `max` bytes WITHOUT splitting a UTF-8 char (plain
 /// `String::truncate` panics on a non-char-boundary). Walks back to the nearest boundary at
 /// or below `max`. Used to cap `last_error` before it flows to the webview DTO.
@@ -1065,6 +1158,133 @@ mod tests {
         drop(log);
         let preview2 = handle.proposal_preview(true, pid2).await.unwrap();
         assert!(preview2.requires_loud_modal, "garbled verdict_summary previews fail-loud");
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_writes_file_and_resolves_then_stale_fails_closed() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+
+        // ---- happy path ----
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("notes.md");
+        let original = b"Alice works at Acme.\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path);
+        let new_bytes = b"Alice works at Globex.\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let gated = log.propose_write(WriteProposal {
+            target: path.clone(), new_content: new_bytes.clone(), op: WriteOp::Edit,
+            source_event_ids: vec![file_id.clone()], rationale: "fix".to_string(),
+        }).unwrap();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "fix", &key, &vs, std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // An Edit to a TRACKED file is loud by construction: propose_write's engine-anchored taint
+        // (actuator step 4, security-critical) sets taint=Untrusted for any currently-ingested
+        // target, so the FRESH re-gate's requires_loud_modal is always true here. The authoritative
+        // loud gate therefore needs the explicit ack to apply — exactly what the loud test asserts.
+        let result = handle.apply_proposal(true, pid.clone(), true).await.unwrap();
+        assert!(!result.file_written_id.is_empty(), "an apply returns the file_written id");
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the file gained the corrected bytes");
+        // the proposal is no longer pending (resolved by the file_written).
+        assert!(handle.list_proposals(true).await.unwrap().iter().all(|p| p.id != pid));
+        // G4: the emitted file_written carries resolves_proposal == pid (the resolution mechanism).
+        let log = handle.get_or_open(true).await.unwrap();
+        let fw = log.event_by_id(&result.file_written_id).unwrap().unwrap();
+        assert_eq!(fw.event_type, "file_written");
+        assert_eq!(fw.content["resolves_proposal"], serde_json::json!(pid),
+            "the file_written resolves the exact proposal id");
+        drop(log);
+
+        // ---- stale path: mutate the file AFTER a fresh propose, assert apply fails closed ----
+        let (vault2, dir2) = test_vault_and_dir();
+        let handle2 = new_test_handle(vault2, &dir2);
+        let log2 = handle2.get_or_open(true).await.unwrap();
+        let folder2 = tempfile::tempdir().unwrap();
+        log2.add_grant(folder2.path()).unwrap();
+        log2.add_write_grant(folder2.path()).unwrap();
+        let path2 = folder2.path().join("notes.md");
+        let orig2 = b"Alice works at Acme.\n".to_vec();
+        std::fs::write(&path2, &orig2).unwrap();
+        let fid2 = bossclaw_ingest_one(&log2, &path2);
+        let new2 = b"Alice works at Globex.\n".to_vec();
+        let hash2 = hex::encode(Sha256::digest(&new2));
+        let canon2 = std::fs::canonicalize(&path2).unwrap().to_string_lossy().to_string();
+        let k2 = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let g2 = log2.propose_write(WriteProposal { target: path2.clone(), new_content: new2.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![fid2.clone()], rationale: "fix".to_string() }).unwrap();
+        // The proposal records its base fingerprint = sha256("Alice works at Acme.") at propose.
+        let vs2 = serde_json::json!({"requires_loud_modal": g2.verdict.requires_loud_modal,
+            "taint": format!("{:?}", g2.verdict.taint), "allowed": g2.verdict.allowed,
+            "base_content_hash": g2.verdict.base_content_hash});
+        assert_eq!(g2.verdict.base_content_hash.as_deref(), Some(hex::encode(Sha256::digest(&orig2)).as_str()),
+            "the gate fingerprinted the original on-disk bytes");
+        let pid2 = log2.append_write_proposal(&canon2, "edit", &hash2, new2.len() as u64, "fix",
+            &k2, &vs2, std::slice::from_ref(&fid2)).unwrap();
+        log2.put_proposal_bytes(&pid2, &new2, &hash2).unwrap();
+        drop(log2);
+
+        // Someone edits the file out from under the proposal (live bytes no longer match base).
+        std::fs::write(&path2, b"Alice retired.\n").unwrap();
+
+        let stale = handle2.apply_proposal(true, pid2.clone(), false).await;
+        assert!(matches!(stale, Err(EngineOpError::Stale(_))), "a changed file fails closed as Stale: {stale:?}");
+        assert_eq!(std::fs::read(&path2).unwrap(), b"Alice retired.\n".to_vec(),
+            "the file is untouched when the apply fails closed (no propose, no execute)");
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_loud_needs_ack_then_applies() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("secrets.md");
+        let original = b"placeholder\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path);
+        // A >=32-char unbroken alphanumeric run trips the secret-shaped diff flag → loud.
+        let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![file_id.clone()], rationale: "fix".to_string() }).unwrap();
+        assert!(gated.verdict.requires_loud_modal, "secret-shaped content forces the loud modal");
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "fix", &key, &vs, std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // acknowledged_loud=false → refuses, file unchanged.
+        let needs = handle.apply_proposal(true, pid.clone(), false).await;
+        assert!(matches!(needs, Err(EngineOpError::NeedsLoudConfirm(_))),
+            "a loud write without ack is refused: {needs:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "no write happened without the ack");
+
+        // acknowledged_loud=true → applies.
+        handle.apply_proposal(true, pid, true).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the ack lets the loud write through");
     }
 
     /// Task 7 (mint): with the stub returning one entity for the extraction schema, an
