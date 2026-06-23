@@ -6277,6 +6277,15 @@ impl EventLog {
                 continue; // already proposed against this file this contradiction
             }
 
+            // SP4 change-(a): be smart — check the write-grant FIRST. An ingested-but-not-
+            // -writable target is SKIPPED (no LLM, no propose, no write_rejected) so the
+            // folder stays clean and re-enabling it later starts fresh. We use
+            // `is_write_allowed` (not `gate_reject_reason`, which folds `!allowed` into the
+            // genuine-reject set) so the pure no-grant case never records terminal dead state.
+            if !self.is_write_allowed(std::path::Path::new(&rec.canonical_path))? {
+                continue;
+            }
+
             // a. inducing_key = the RESOLVED contradiction (entity ids).
             let inducing_key = serde_json::json!({
                 "src": r.src, "relation": r.relation, "dst": r.dst,
@@ -6350,13 +6359,11 @@ impl EventLog {
                 rationale: engine_fact.clone(),
             })?;
 
-            // i. A gate FAILURE → write_rejected. `gate_reject_reason()` folds BOTH
-            //    signals (a `reject_reason` OR `!allowed`, the never-widen check) —
-            //    single-sourced on `WriteVerdict`, symmetric with M6c's `run_mandate`.
-            //    M6b's targets are reconcilable (tracked + read-granted), so `!allowed`
-            //    is rare here, but the write-grant is independent + revocable and execute
-            //    re-checks; this rejects THIS target and `continue`s to the next.
-            if let Some(reason) = gated.verdict.gate_reject_reason() {
+            // i. A GENUINE gate failure (symlink/taint/op×existence) → write_rejected.
+            //    `reject_reason` (NOT `gate_reject_reason`) is the genuine-reject signal:
+            //    a bare `!allowed` (grant revoked between the hoisted check above and here)
+            //    is skipped, never recorded as terminal dead state.
+            if let Some(reason) = gated.verdict.reject_reason.as_deref() {
                 self.append_write_rejected(
                     Some(&rec.canonical_path),
                     reason,
@@ -6366,12 +6373,20 @@ impl EventLog {
                 report.proposals_rejected += 1;
                 continue;
             }
+            if !gated.verdict.allowed {
+                // Grant vanished mid-tick — skip (retryable), do not reject.
+                continue;
+            }
 
-            // j. Record the gated proposal + its bytes (the worklist side table).
+            // j. Record the gated proposal + its bytes (the worklist side table). The
+            //    verdict_summary also carries the base fingerprint (`base_content_hash`) so the
+            //    desktop apply can fail closed if the file diverged since this propose
+            //    (a fresh re-propose at apply re-bases on LIVE bytes and cannot see the drift).
             let verdict_summary = serde_json::json!({
                 "requires_loud_modal": gated.verdict.requires_loud_modal,
                 "taint": format!("{:?}", gated.verdict.taint),
                 "allowed": gated.verdict.allowed,
+                "base_content_hash": gated.verdict.base_content_hash,
             });
             let pid = self.append_write_proposal(
                 &rec.canonical_path,

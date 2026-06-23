@@ -690,85 +690,76 @@ fn evolve_once_emits_reconciliation_proposal_for_file_backed_contradiction() {
     log.verify_chain().unwrap();
 }
 
-/// NEVER-WIDEN SYMMETRY (mirrors M6c `proof1a_cannot_widen_grant_rejected_at_propose`):
-/// a confirmed file-backed contradiction whose reconcilable target is NOT under an active
-/// write-grant is rejected AT PROPOSE. The gate signals this via `allowed == false` with
-/// NO `reject_reason`; M6b must treat `!allowed` as a gate-reject too — otherwise it would
-/// EMIT a `write_proposal` for a target outside every write-grant (a grant-widening leak).
-/// The committed `invalidate` still stands; only the proposal is refused (a `write_rejected`
-/// is recorded), and nothing is written.
+/// SP4 change-(a) — SKIP, don't reject, a reconcilable target outside an active write-grant.
+/// A confirmed file-backed contradiction whose target's folder is not write-granted is SKIPPED
+/// at the TOP of the per-target loop: no LLM rewrite, no `propose_write`, no `write_rejected`.
+/// Skipping (vs the old terminal reject) keeps the folder clean so re-granting write and
+/// re-running surfaces a proposal — a reject would have permanently dead-stated the (path,key).
+/// The committed `invalidate` still stands either way.
 #[test]
-fn reconcile_target_outside_write_grant_rejected_at_propose() {
+fn reconcile_target_outside_write_grant_skipped_at_propose() {
     let (log, _home, dir) = common::open_log_with_write_grant();
     let emb = MockEmbedder::new(64);
 
-    // ── Tick 1: the FILE establishes "Alice works_at Acme" (same setup as the happy path). ──
+    // ── Tick 1: the FILE establishes "Alice works_at Acme". ──
     let (_file_id, file_src) =
         ingest_md_full(&log, &emb, &dir, "notes.md", b"Alice works at Acme.\n");
     let canonical = std::fs::canonicalize(dir.join("notes.md"))
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+        .unwrap().to_string_lossy().to_string();
     let r1 = DispatchReasoner::new(add_both_passes(
         ScriptedReasoner::new("m6b-test"),
-        &file_src,
-        &[vec![]],
-        &[],
+        &file_src, &[vec![]], &[],
         works_at_pass_a("Alice", "Acme", &file_src),
     ));
     let rep1 = log.evolve_once(&emb, &r1).unwrap();
     assert!(rep1.links_emitted >= 1, "the file established the works_at edge");
     log.rebuild_graph().unwrap();
 
-    // ── Tick 2: a memory corrects the employer → a confirmed contradiction whose retired
-    //    edge traces to the still-current ingested file (a reconcilable target). ──
+    // Resolve Alice/Acme to ids — the reconcile builds `inducing_key` from these resolved
+    // entity ids, so the anti-poison check below must query suppression with the same key.
+    let entities = log.all_entities().unwrap();
+    let alice = entities.iter().find(|e| e.label == "Alice").unwrap().entity_id.clone();
+    let acme = entities.iter().find(|e| e.label == "Acme").unwrap().entity_id.clone();
+
+    // ── Tick 2: a memory corrects the employer → confirmed contradiction. ──
     let corr = "Correction: Alice works at Globex, not Acme.";
     let _mem_id = seed_memory_full(&log, &emb, corr);
     let nbh = vec!["Alice -works_at-> Acme".to_string()];
     let r2 = DispatchReasoner::new(add_both_passes(
         ScriptedReasoner::new("m6b-test"),
-        corr,
-        &[vec![], vec![file_src.clone()]],
-        &nbh,
+        corr, &[vec![], vec![file_src.clone()]], &nbh,
         correction_pass_a("Alice", "Acme", "Globex", corr),
     ));
 
-    // ── Revoke the target dir's write-grant BEFORE evolve. The file stays ingested (the READ
-    //    grant is untouched) and the contradiction still confirms, but the reconcilable target
-    //    is now outside every active write-grant → the gate returns allowed=false with NO
-    //    reject_reason. (Mirrors M6c proof1a's `revoke_write_grant(&out)`.) ──
+    // Revoke the target dir's WRITE grant before evolve (read grant untouched).
     log.revoke_write_grant(&dir).unwrap();
 
     let rep2 = log.evolve_once(&emb, &r2).unwrap();
 
-    // The contradiction is still confirmed — we exercised the real reconcile path, not a no-op.
-    assert!(
-        rep2.invalidates_emitted >= 1,
-        "the contradiction is still confirmed (the committed invalidate stands)"
-    );
-    // The never-widen gate fires at PROPOSE: no proposal emitted, a write_rejected recorded.
-    assert_eq!(
-        rep2.proposals_emitted, 0,
-        "a target outside any write-grant must NOT be proposed"
-    );
-    assert!(
-        rep2.proposals_rejected >= 1,
-        "the never-widen gate records a write_rejected at propose"
-    );
-    assert_eq!(
-        proposals_targeting(&log, &canonical),
-        0,
-        "no write_proposal leaked for the un-granted target"
-    );
-
-    // No file was written (the proposer never writes; the in-place target is byte-unchanged).
+    // SP4 change-(a): an un-writable target is SKIPPED, not rejected — no LLM, no propose,
+    // no write_rejected. The contradiction is still confirmed.
+    assert!(rep2.invalidates_emitted >= 1, "the contradiction is still confirmed");
+    assert_eq!(rep2.proposals_emitted, 0, "no proposal for a non-write-granted folder");
+    assert_eq!(rep2.proposals_rejected, 0, "skipped, NOT rejected — no permanent dead state");
+    assert_eq!(proposals_targeting(&log, &canonical), 0, "no write_proposal leaked");
     assert_eq!(file_written_count(&log), 0, "no file_written event is produced");
     assert_eq!(
         std::fs::read(dir.join("notes.md")).unwrap(),
         b"Alice works at Acme.\n".to_vec(),
-        "the on-disk target is byte-unchanged"
+        "the file on disk is untouched",
     );
-    log.verify_chain().unwrap();
+
+    // Anti-poison: a skip records NO terminal `write_rejected`, so the (target, inducing_key)
+    // is NOT suppressed — the proposal stays retryable on a later tick. (The OLD reject path
+    // WOULD have suppressed it permanently; not poisoning the target is the change-(a) win.)
+    // The contradiction is confirm-once (the invalidate consumes the active edge), so the
+    // way to re-surface a proposal is a fresh contradiction — never a replay of THIS one;
+    // asserting non-suppression captures the durable property directly.
+    let inducing_key = serde_json::json!({ "src": alice, "relation": "works_at", "dst": acme });
+    assert!(
+        !log.is_proposal_suppressed(&canonical, &inducing_key).unwrap(),
+        "skip must not terminally suppress the target+key (no write_rejected recorded)",
+    );
 }
 
 /// A contradiction whose BOTH facts come only from memories (no file in the lineage)
