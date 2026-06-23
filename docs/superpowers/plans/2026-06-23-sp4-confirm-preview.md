@@ -14,17 +14,21 @@
 
 | File | Create/Modify | One responsibility |
 |---|---|---|
-| `crates/bossclaw-core/src/log.rs` | Modify | Add `pending_proposals()` (pub) + `PendingProposal` struct; add `explicitly_set(key)` (pub) predicate; hoist the write-grant skip in `reconcile_confirmed_contradiction`. |
-| `crates/bossclaw-core/tests/reconcile.rs` | Modify | Add `pending_proposals_*` test; add `explicitly_set_*` test; rewrite `reconcile_target_outside_write_grant_rejected_at_propose` to assert SKIP (no proposal, no `write_rejected`) + grant-then-propose follow-on. |
-| `apps/desktop/src-tauri/src/engine/mod.rs` | Modify | Change `prime_switches` to force-off only when not explicitly set (mandates always off); add `ProposalSummary`/`PreviewData`/`ApplyResult` types + ops (`set_folder_writable`, `list_writable`, `set_proposals_enabled`, `list_proposals`, `proposal_preview`, `apply_proposal`, `decline_proposal`, `undo_apply`, `set_folder_writable`-aware file listing); add a typed `Stale`/`Revoked` variant to `EngineOpError`; hermetic tests for each. |
-| `apps/desktop/src-tauri/src/commands/engine.rs` | Modify | Add `ProposalDto`/`PreviewDto`/`ApplyResultDto`, extend `FileRecordDto` with `writable`; add the 8 new `#[tauri::command]`s. |
+| `crates/bossclaw-core/src/log.rs` | Modify | Add `#[cfg(unix)]` `PendingProposal` struct (+ `requires_loud_modal()` helper) + `#[cfg(unix)]` `pending_proposals()` (pub); add typed `ConfigFlag` enum + `explicitly_set(flag)` (pub) predicate; hoist the write-grant skip in `reconcile_confirmed_contradiction` + record `base_content_hash` in the proposal `verdict_summary`. |
+| `crates/bossclaw-core/src/lib.rs` | Modify | Re-export `ConfigFlag` (unconditional, line 61) + `#[cfg(unix)] pub use log::PendingProposal;` (mirrors the gated `MandateAction`). |
+| `crates/bossclaw-core/tests/reconcile.rs` | Modify | Add `pending_proposals_*` test; add `explicitly_set_*` test (typed `ConfigFlag`); rewrite + rename `reconcile_target_outside_write_grant_rejected_at_propose` → `..._skipped_at_propose` (assert SKIP, no `write_rejected`, + grant-then-propose follow-on). |
+| `apps/desktop/src-tauri/src/engine/mod.rs` | Modify | Change `prime_switches` to force-off only when not explicitly set (typed `ConfigFlag`; mandates always off); add `ProposalSummary`/`PreviewData`/`ApplyResult` types + ops (`set_folder_writable`, `list_writable`, `set_proposals_enabled`, `list_proposals`, `proposal_preview`, `apply_proposal(…, acknowledged_loud)`, `decline_proposal`, `undo_apply`); add typed `Stale`/`Revoked`/`NeedsLoudConfirm` variants to `EngineOpError`; hermetic tests for each (incl. loud-confirm + fail-loud). |
+| `apps/desktop/src-tauri/src/commands/engine.rs` | Modify | Add `ProposalDto`/`PreviewDto`/`ApplyResultDto`, extend `FileRecordDto` with `writable`; add the 8 new `#[tauri::command]`s (`engine_apply_proposal` takes `acknowledged_loud`); add a command-layer IPC arg-binding test. |
+| `apps/desktop/src-tauri/Cargo.toml` | Modify | Add `tauri = { version = "2", features = ["test"] }` to `[dev-dependencies]` (for the command-layer IPC test). |
 | `apps/desktop/src-tauri/src/main.rs` | Modify | Register each new command with a per-element `#[cfg(unix)]` line in `generate_handler!`. |
 | `apps/desktop/src/api/engine.ts` | Modify | TS twin types + `invoke<T>` wrappers for every new command; extend `FileRecordDto` with `writable`. |
 | `apps/desktop/src/review/diffView.ts` | Create | Pure: compute inline unified diff lines (old vs new). |
 | `apps/desktop/src/review/diffView.test.ts` | Create | vitest for `diffView`. |
 | `apps/desktop/src/review/proposalView.ts` | Create | Pure: map a `ProposalDto` to a display row. |
 | `apps/desktop/src/review/proposalView.test.ts` | Create | vitest for `proposalView`. |
-| `apps/desktop/src/review/ReviewPanel.tsx` | Create | Review queue + per-proposal card (inline diff, Approve/Decline, loud-confirm modal, Recently-applied Undo strip). |
+| `apps/desktop/src/review/ReviewPanel.tsx` | Create | Review queue + per-proposal card (inline diff, Approve/Decline, op-enforced loud-confirm modal, Recently-applied Undo strip). |
+| `apps/desktop/src/review/applyFlow.ts` | Create | Pure: classify apply errors (loud/stale) + the approve decision the panel uses (so the ack flow is unit-tested). |
+| `apps/desktop/src/review/applyFlow.test.ts` | Create | vitest for `applyFlow` (a loud proposal cannot apply without the ack). |
 | `apps/desktop/src/App.tsx` | Modify | `View += "review"`; `ReviewNavButton` (pending-count badge); body-ternary branch. |
 | `apps/desktop/src/sources/SourcesPanel.tsx` | Modify | Per-folder "Allow edits" toggle + "Allow All" master; evolve-off inline offer. |
 | `apps/desktop/src/sources/writableGrants.ts` | Create | Pure: derive which active grants are write-enabled (from files' `writable`). |
@@ -86,6 +90,8 @@ fn pending_proposals_lists_open_then_excludes_resolved_and_rejected() {
 /// One open (unresolved, non-terminally-rejected) `write_proposal`, projected for callers
 /// outside the crate (e.g. the desktop Review queue). Mirrors the per-proposal fields of
 /// `append_write_proposal_with` (`content`) plus the lineage off `model_meta`.
+/// `#[cfg(unix)]` like the confirm/apply API it feeds (M1).
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingProposal {
     /// The proposal event id (the ULID).
@@ -111,15 +117,28 @@ pub struct PendingProposal {
     pub base_content_hash: Option<String>,
 }
 
+#[cfg(unix)]
+impl PendingProposal {
+    /// Single-sourced fail-loud default for a proposal's loud-modal hint: an absent or garbled
+    /// `verdict_summary["requires_loud_modal"]` defaults to `true` (fail-loud). Used by both
+    /// `ProposalSummary::from_pending` (Task 6) and `proposal_preview` (Task 7) so they cannot drift (m2).
+    pub fn requires_loud_modal(&self) -> bool {
+        self.verdict_summary
+            .get("requires_loud_modal")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+}
+
 impl EventLog {
     /// Every OPEN `write_proposal`: emitted, not yet resolved by a `file_written`/`write_declined`,
     /// and whose `(target, inducing_key)` is not terminally `write_rejected`. Oldest first
-    /// (`events_of_types` returns `seq ASC`). The desktop Review queue source.
+    /// (`events_of_types` returns `seq ASC`). The desktop Review queue source. `#[cfg(unix)]` (M1).
+    #[cfg(unix)]
     pub fn pending_proposals(&self) -> Result<Vec<PendingProposal>, BossclawError> {
         use std::collections::{HashMap, HashSet};
         // proposal id → parsed row, in emission order.
         let mut open: Vec<PendingProposal> = Vec::new();
-        let mut open_index: HashMap<String, usize> = HashMap::new();
         let mut resolved: HashSet<String> = HashSet::new();
         // (target, inducing_key.to_string()) terminally rejected.
         let mut rejected_keys: HashSet<(String, String)> = HashSet::new();
@@ -133,23 +152,24 @@ impl EventLog {
         ])? {
             match ev.event_type.as_str() {
                 t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    // Read ALL fields via borrows of `ev.content` / `ev.model_meta` FIRST, then
+                    // build the struct — never move `ev.model_meta` before reading `ev.content`
+                    // (that would be a move-after-use, E0382).
+                    let id = ev.id.clone();
                     let target = ev.content.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let op = ev.content.get("op").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let new_content_hash = ev.content.get("new_content_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let rationale = ev.content.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let inducing_key = ev.content.get("inducing_key").cloned().unwrap_or(serde_json::Value::Null);
-                    proposal_keys.insert(ev.id.clone(), (target.clone(), inducing_key.to_string()));
-                    open_index.insert(ev.id.clone(), open.len());
+                    let verdict_summary = ev.content.get("verdict_summary").cloned().unwrap_or(serde_json::Value::Null);
+                    let base_content_hash = verdict_summary.get("base_content_hash")
+                        .and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let source_event_ids = ev.model_meta.as_ref()
+                        .map(|m| m.source_event_ids.clone()).unwrap_or_default();
+                    proposal_keys.insert(id.clone(), (target.clone(), inducing_key.to_string()));
                     open.push(PendingProposal {
-                        id: ev.id.clone(),
-                        target,
-                        op: ev.content.get("op").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        new_content_hash: ev.content.get("new_content_hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        rationale: ev.content.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        inducing_key,
-                        source_event_ids: ev.model_meta.map(|m| m.source_event_ids).unwrap_or_default(),
-                        base_content_hash: ev.content.get("verdict_summary")
-                            .and_then(|v| v.get("base_content_hash"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        verdict_summary: ev.content.get("verdict_summary").cloned().unwrap_or(serde_json::Value::Null),
+                        id, target, op, new_content_hash, rationale,
+                        inducing_key, source_event_ids, base_content_hash, verdict_summary,
                     });
                 }
                 t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
@@ -165,7 +185,6 @@ impl EventLog {
             }
         }
 
-        let _ = open_index; // index retained for readability; filtering below is by id/keys.
         Ok(open
             .into_iter()
             .filter(|p| {
@@ -195,11 +214,11 @@ impl EventLog {
 - Modify: `crates/bossclaw-core/src/log.rs`
 - Test: `crates/bossclaw-core/tests/reconcile.rs`
 
-- [ ] Rewrite the existing test `reconcile_target_outside_write_grant_rejected_at_propose` (reconcile.rs:666) to assert the new SKIP behavior, and add a grant-then-propose follow-on. Replace its body (keep its name; the assertions flip) — the setup through `revoke_write_grant` is unchanged from grounding §6d; the assertion tail changes:
+- [ ] Rewrite the existing test (grounding §6d, named `reconcile_target_outside_write_grant_rejected_at_propose`, reconcile.rs:666) to assert the new SKIP behavior, AND **rename it** to `reconcile_target_outside_write_grant_skipped_at_propose` (item 18 — it now asserts a skip, not a reject), adding a grant-then-propose follow-on. The setup through `revoke_write_grant` is unchanged from grounding §6d; the assertion tail flips:
 
 ```rust
 #[test]
-fn reconcile_target_outside_write_grant_rejected_at_propose() {
+fn reconcile_target_outside_write_grant_skipped_at_propose() {
     let (log, _home, dir) = common::open_log_with_write_grant();
     let emb = MockEmbedder::new(64);
 
@@ -259,7 +278,7 @@ fn reconcile_target_outside_write_grant_rejected_at_propose() {
 ```
 
 - [ ] Run it (expect FAIL — current code rejects, so `proposals_rejected == 0` fails):
-  `cargo test -p bossclaw-core --test reconcile reconcile_target_outside_write_grant_rejected_at_propose`
+  `cargo test -p bossclaw-core --test reconcile reconcile_target_outside_write_grant_skipped_at_propose`
   Expected output: assertion failure on `proposals_rejected` (left `1`, right `0`) — the old code records a `write_rejected`.
 
 - [ ] Implement the hoist in `crates/bossclaw-core/src/log.rs` inside `reconcile_confirmed_contradiction` (log.rs:6140-6281). Add the check at the TOP of the per-target loop, right after the `seen_paths` guard (after grounding line 6169, before step `a`). Insert exactly:
@@ -313,7 +332,7 @@ fn reconcile_target_outside_write_grant_rejected_at_propose() {
             });
 ```
 
-- [ ] Run it (expect PASS): `cargo test -p bossclaw-core --test reconcile reconcile_target_outside_write_grant_rejected_at_propose`
+- [ ] Run it (expect PASS): `cargo test -p bossclaw-core --test reconcile reconcile_target_outside_write_grant_skipped_at_propose`
   Expected output: `test result: ok. 1 passed`.
 
 - [ ] Run the full reconcile suite to confirm no regression (the round-trip + suppress tests must stay green):
@@ -339,43 +358,65 @@ fn reconcile_target_outside_write_grant_rejected_at_propose() {
 ```rust
 #[test]
 fn explicitly_set_distinguishes_default_from_user_choice() {
-    use bossclaw_core::graph::CONFIG_EVENT_TYPE;
-    let _ = CONFIG_EVENT_TYPE; // doc reference; the key strings are private to log.rs.
+    use bossclaw_core::ConfigFlag;
     let (log, _home, _dir) = common::open_log_with_write_grant();
 
     // Never set → not explicit (even though the getter defaults to true).
     assert!(log.proposals_enabled().unwrap(), "getter default-open");
-    assert!(!log.explicitly_set("proposals_enabled").unwrap(), "never set → not explicit");
+    assert!(!log.explicitly_set(ConfigFlag::Proposals).unwrap(), "never set → not explicit");
 
-    // Explicit true → explicit.
+    // Explicit set flips false → true.
     log.set_proposals_enabled(true).unwrap();
-    assert!(log.explicitly_set("proposals_enabled").unwrap(), "an explicit flip is detected");
+    assert!(log.explicitly_set(ConfigFlag::Proposals).unwrap(), "an explicit flip is detected");
 
-    // A DIFFERENT flag's flip does not mark this key explicit.
+    // A DIFFERENT flag's flip does not mark Proposals explicit.
     let (log2, _home2, _dir2) = common::open_log_with_write_grant();
     log2.set_evolve_enabled(true).unwrap();
-    assert!(!log2.explicitly_set("proposals_enabled").unwrap(), "another key's event is ignored");
-    assert!(log2.explicitly_set("evolve_enabled").unwrap(), "the flipped key is explicit");
-
-    // An unknown key name is never explicit.
-    assert!(!log2.explicitly_set("nonexistent_key").unwrap());
+    assert!(!log2.explicitly_set(ConfigFlag::Proposals).unwrap(), "another flag's event is ignored");
+    assert!(log2.explicitly_set(ConfigFlag::Evolve).unwrap(), "the flipped flag is explicit");
 }
 ```
 
-- [ ] Run it (expect FAIL — `explicitly_set` does not exist):
+- [ ] Run it (expect FAIL — `ConfigFlag` / `explicitly_set` do not exist):
   `cargo test -p bossclaw-core --test reconcile explicitly_set_distinguishes_default_from_user_choice`
-  Expected output: compile error `no method named explicitly_set found`.
+  Expected output: compile error `cannot find type ConfigFlag` / `no method named explicitly_set found`.
 
-- [ ] Implement `explicitly_set` in `crates/bossclaw-core/src/log.rs`. Place it in the same `impl EventLog` block as the flag getters (near `proposals_enabled`, ~log.rs:4879). It takes the key string (the KEY consts are private to `log.rs`; the desktop caller passes `"proposals_enabled"` etc.) and tests key PRESENCE not value:
+- [ ] Implement a typed `ConfigFlag` enum + `explicitly_set(flag)` in `crates/bossclaw-core/src/log.rs` (M2/MIN-4 — a typed identifier so a KEY-const rename can't silently re-break change-(b); the enum maps to the private `*_KEY` consts, so a rename is compile-checked). Add the enum near the KEY consts (log.rs:166-189) and the method in the same `impl EventLog` block as the flag getters (~log.rs:4879):
 
 ```rust
-    /// Was a config flag ever EXPLICITLY set (regardless of its value)? Scans `config`
-    /// events for a bool under `key`, returning true on the first hit. Distinguishes the
-    /// engine's never-set default-open from a user's explicit choice — the input
-    /// `prime_switches` needs to avoid clobbering a user `true` on every launch (SP4 change-b).
-    /// `key` is one of the module flag-key consts (`"evolve_enabled"` / `"proposals_enabled"` /
-    /// `"mandates_enabled"`); an unknown key never matches → `Ok(false)`.
-    pub fn explicitly_set(&self, key: &str) -> Result<bool, BossclawError> {
+/// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
+/// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
+/// reference a compile-checked variant instead of a stringly-typed key that could drift on a
+/// rename (M2). `#[cfg(unix)]` is unnecessary — config flags exist on all platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFlag {
+    Evolve,
+    Proposals,
+    Mandates,
+}
+
+impl ConfigFlag {
+    /// The private content-key const this flag is stored under.
+    fn key(self) -> &'static str {
+        match self {
+            ConfigFlag::Evolve => EVOLVE_ENABLED_KEY,
+            ConfigFlag::Proposals => PROPOSALS_ENABLED_KEY,
+            ConfigFlag::Mandates => MANDATES_ENABLED_KEY,
+        }
+    }
+}
+```
+
+  And the method:
+
+```rust
+    /// Was a config flag ever EXPLICITLY set (regardless of its value)? Scans `config` events for
+    /// a bool under the flag's key, returning true on the first hit. Distinguishes the engine's
+    /// never-set default-open from a user's explicit choice — the input `prime_switches` needs to
+    /// avoid clobbering a user `true` on every launch (SP4 change-b). A typed `ConfigFlag` (not a
+    /// raw key string) keeps the const single-sourced (M2/MIN-4).
+    pub fn explicitly_set(&self, flag: ConfigFlag) -> Result<bool, BossclawError> {
+        let key = flag.key();
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(
@@ -392,12 +433,14 @@ fn explicitly_set_distinguishes_default_from_user_choice() {
     }
 ```
 
+  Re-export `ConfigFlag` from the crate root in `crates/bossclaw-core/src/lib.rs` — add it to the unconditional line-61 list (config flags are all-platform, unlike the `#[cfg(unix)]` `PendingProposal`): `pub use log::{ActiveModel, ConfigFlag, EventLog, ReembedStats, SynthCacheRow, SCHEMA_VERSION};`.
+
 - [ ] Run it (expect PASS): `cargo test -p bossclaw-core --test reconcile explicitly_set_distinguishes_default_from_user_choice`
   Expected output: `test result: ok. 1 passed`.
 
 - [ ] Commit the engine half:
-  `git add crates/bossclaw-core/src/log.rs crates/bossclaw-core/tests/reconcile.rs`
-  `git commit -m "feat(bossclaw-core): add explicitly_set(key) presence predicate over config events"`
+  `git add crates/bossclaw-core/src/log.rs crates/bossclaw-core/src/lib.rs crates/bossclaw-core/tests/reconcile.rs`
+  `git commit -m "feat(bossclaw-core): typed ConfigFlag + explicitly_set(flag) presence predicate"`
 
 - [ ] Write the failing desktop persistence test in `apps/desktop/src-tauri/src/engine/mod.rs` (tests mod, after `first_open_forces_all_autonomy_switches_off` ~line 676). It sets `proposals_enabled = true`, drops the handle so a fresh `EngineHandle`/`EventLog` re-runs `prime_switches`, and asserts the explicit `true` survives while `mandates_enabled` stays forced off:
 
@@ -439,10 +482,11 @@ fn explicitly_set_distinguishes_default_from_user_choice() {
     /// opens (SP4 change-b). `mandates_enabled` is ALWAYS forced off until SP5, regardless of any
     /// prior setting. Each setter is sticky; runs inside `get_or_open`'s first-open closure.
     fn prime_switches(log: &EventLog) -> Result<(), bossclaw_core::BossclawError> {
-        if !log.explicitly_set("evolve_enabled")? && log.evolve_enabled()? {
+        use bossclaw_core::ConfigFlag;
+        if !log.explicitly_set(ConfigFlag::Evolve)? && log.evolve_enabled()? {
             log.set_evolve_enabled(false)?;
         }
-        if !log.explicitly_set("proposals_enabled")? && log.proposals_enabled()? {
+        if !log.explicitly_set(ConfigFlag::Proposals)? && log.proposals_enabled()? {
             log.set_proposals_enabled(false)?;
         }
         // SP5 not shipped: mandates stay forced OFF even if a prior build set them.
@@ -765,11 +809,10 @@ pub struct ProposalSummary {
 
 impl ProposalSummary {
     fn from_pending(p: bossclaw_core::PendingProposal) -> Self {
-        let requires_loud_modal = p
-            .verdict_summary
-            .get("requires_loud_modal")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true); // fail-loud: an unparseable verdict forces the loud modal.
+        // Single-sourced fail-loud default (m2): `PendingProposal::requires_loud_modal()` returns
+        // true when the verdict is absent/garbled. This is a UI HINT to pre-show the modal; the
+        // authoritative loud-confirm gate is the FRESH re-gate inside `apply_proposal` (Task 8).
+        let requires_loud_modal = p.requires_loud_modal();
         Self {
             id: p.id,
             target: p.target,
@@ -797,9 +840,42 @@ impl ProposalSummary {
     }
 ```
 
-  `bossclaw_core::PendingProposal` must be re-exported from the crate root. Add it to the crate's `pub use` list in `crates/bossclaw-core/src/lib.rs` next to the existing `EventLog` / `EvolveReport` re-exports. (If grounding shows them imported as `bossclaw_core::EvolveReport`, add `pub use log::PendingProposal;` in the same place `pub use log::EventLog;` lives.)
+  `bossclaw_core::PendingProposal` must be re-exported from the crate root, **cfg-gated** (M1) so it mirrors the type's own `#[cfg(unix)]` and the existing gated `MandateAction` re-export. In `crates/bossclaw-core/src/lib.rs`, the unconditional list at line 61 is `pub use log::{ActiveModel, EventLog, ReembedStats, SynthCacheRow, SCHEMA_VERSION};` and line 63 already has `#[cfg(unix)] pub use log::MandateAction;` — add directly beneath it:
+
+```rust
+#[cfg(unix)]
+pub use log::PendingProposal;
+```
+
+  (Do NOT add `PendingProposal` to the unconditional line-61 list — the struct is `#[cfg(unix)]`, so an unconditional re-export would fail to compile on non-unix.)
 
 - [ ] Run it (expect PASS): `cargo test -p air_agent_desktop list_proposals_returns_open_summaries`
+  Expected output: `test result: ok. 1 passed`.
+
+- [ ] Write + run the fail-loud default test (MIN-1) in the same tests mod. A garbled (non-object) `verdict_summary` must project `requires_loud_modal == true` via the single-sourced `PendingProposal::requires_loud_modal()` (m2):
+
+```rust
+    #[tokio::test]
+    async fn garbled_verdict_summary_projects_requires_loud_modal_true() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        // verdict_summary is a STRING, not the expected object → `.get("requires_loud_modal")` is
+        // None → fail-loud default true.
+        let pid = log.append_write_proposal("/tmp/x/notes.md", "edit", "deadbeef", 0, "why",
+            &key, &serde_json::json!("garbled"), std::slice::from_ref(&lineage)).unwrap();
+        drop(log);
+
+        let proposals = handle.list_proposals(true).await.unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert!(proposals[0].id == pid && proposals[0].requires_loud_modal,
+            "an absent/garbled verdict_summary fails loud (requires_loud_modal == true)");
+    }
+```
+
+  Run it (expect FAIL before, PASS after the op exists): `cargo test -p air_agent_desktop garbled_verdict_summary_projects_requires_loud_modal_true`
   Expected output: `test result: ok. 1 passed`.
 
 - [ ] Add `ProposalDto` + command in `apps/desktop/src-tauri/src/commands/engine.rs` (DTO with the `EvolveReportDto` `From` template §1e; command with the read template §1b):
@@ -908,6 +984,17 @@ pub async fn engine_list_proposals(state: State<'_, AppState>) -> Result<Vec<Pro
 
         // Fail-closed: an unknown id errors (no bytes / no proposal).
         assert!(handle.proposal_preview(true, "nonexistent".to_string()).await.is_err());
+
+        // Fail-loud (MIN-1): a proposal whose verdict_summary is garbled previews as loud.
+        let log = handle.get_or_open(true).await.unwrap();
+        let new2 = b"Alice works at Initech.\n".to_vec();
+        let hash2 = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&new2)) };
+        let pid2 = log.append_write_proposal(&canonical, "edit", &hash2, new2.len() as u64,
+            "correction2", &key, &serde_json::json!("garbled"), std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid2, &new2, &hash2).unwrap();
+        drop(log);
+        let preview2 = handle.proposal_preview(true, pid2).await.unwrap();
+        assert!(preview2.requires_loud_modal, "garbled verdict_summary previews fail-loud");
     }
 ```
 
@@ -964,8 +1051,9 @@ impl EngineHandle {
                 .map_err(|e| EngineOpError::Core(format!("could not read target: {e}")))?;
             let folder = std::path::Path::new(&p.target)
                 .parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
-            let requires_loud_modal = p.verdict_summary.get("requires_loud_modal")
-                .and_then(|v| v.as_bool()).unwrap_or(true);
+            // Single-sourced fail-loud default (m2) — read into a local BEFORE the struct moves
+            // `p`'s fields. A UI hint only; the authoritative gate is `apply_proposal` (Task 8).
+            let requires_loud_modal = p.requires_loud_modal();
             let taint = p.verdict_summary.get("taint").and_then(|v| v.as_str()).unwrap_or("Untrusted").to_string();
             Ok(PreviewData {
                 path: p.target,
@@ -1035,13 +1123,20 @@ pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> 
 
 ---
 
-### Task 8: `apply_proposal` op (re-gate, staleness fail-closed) + `ApplyResultDto` + command
+### Task 8: `apply_proposal` op (re-gate, staleness + loud-confirm fail-closed) + `ApplyResultDto` + command
 
 **Files:**
-- Modify: `apps/desktop/src-tauri/src/engine/mod.rs` (`EngineOpError::Stale`/`Revoked` + `ApplyResult` + op)
-- Modify: `apps/desktop/src-tauri/src/commands/engine.rs` (`ApplyResultDto` + command)
+- Modify: `apps/desktop/src-tauri/src/engine/mod.rs` (`EngineOpError::Stale`/`Revoked`/`NeedsLoudConfirm` + `ApplyResult` + op with `acknowledged_loud`)
+- Modify: `apps/desktop/src-tauri/src/commands/engine.rs` (`ApplyResultDto` + command with `acknowledged_loud`)
 - Modify: `apps/desktop/src-tauri/src/main.rs` (register)
-- Test: `apps/desktop/src-tauri/src/engine/mod.rs` (tests mod, incl. stale-file)
+- Test: `apps/desktop/src-tauri/src/engine/mod.rs` (tests mod, incl. stale-file + loud-confirm)
+
+> **Loud-modal is enforced HERE, on the FRESH re-gate verdict (security fix G1/IMP-1a).** The
+> propose-time `requires_loud_modal` on `ProposalDto` is only a UI hint. `apply_proposal` recomputes
+> the verdict against the live file and, if it is loud, REFUSES to write unless the caller passes
+> `acknowledged_loud == true`. The desktop op is the sole write entry point besides undo, so this
+> closes the "React-only enforcement off a stale flag" gap. (Follow-up, deferred: enforce
+> `requires_loud_modal` inside `bossclaw-core` `execute_write_inner` itself — out of scope for SP4.)
 
 - [ ] Write the failing tests in `apps/desktop/src-tauri/src/engine/mod.rs` (tests mod): one happy-path apply that mutates the file + resolves the proposal, and one stale-file fail-closed (mutate the file after propose; assert apply errors AND the file is unchanged). Reuse the `bossclaw_ingest_one` helper from Task 7:
 
@@ -1078,11 +1173,19 @@ pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> 
         log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
         drop(log);
 
-        let result = handle.apply_proposal(true, pid.clone()).await.unwrap();
+        // Not-loud proposal applies with acknowledged_loud=false.
+        let result = handle.apply_proposal(true, pid.clone(), false).await.unwrap();
         assert!(!result.file_written_id.is_empty(), "an apply returns the file_written id");
         assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the file gained the corrected bytes");
         // the proposal is no longer pending (resolved by the file_written).
         assert!(handle.list_proposals(true).await.unwrap().iter().all(|p| p.id != pid));
+        // G4: the emitted file_written carries resolves_proposal == pid (the resolution mechanism).
+        let log = handle.get_or_open(true).await.unwrap();
+        let fw = log.event_by_id(&result.file_written_id).unwrap().unwrap();
+        assert_eq!(fw.event_type, "file_written");
+        assert_eq!(fw.content["resolves_proposal"], serde_json::json!(pid),
+            "the file_written resolves the exact proposal id");
+        drop(log);
 
         // ---- stale path: mutate the file AFTER a fresh propose, assert apply fails closed ----
         let (vault2, dir2) = test_vault_and_dir();
@@ -1115,17 +1218,65 @@ pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> 
         // Someone edits the file out from under the proposal (live bytes no longer match base).
         std::fs::write(&path2, b"Alice retired.\n").unwrap();
 
-        let stale = handle2.apply_proposal(true, pid2.clone()).await;
+        let stale = handle2.apply_proposal(true, pid2.clone(), false).await;
         assert!(matches!(stale, Err(EngineOpError::Stale(_))), "a changed file fails closed as Stale: {stale:?}");
         assert_eq!(std::fs::read(&path2).unwrap(), b"Alice retired.\n".to_vec(),
             "the file is untouched when the apply fails closed (no propose, no execute)");
     }
 ```
 
+- [ ] Write + run the loud-confirm enforcement test (G1/IMP-1a) in the same tests mod. Craft `new_content` containing a high-entropy token (≥32 unbroken ASCII alphanumerics → `propose_write` sets `touches_secret_shaped` ⇒ `requires_loud_modal == true`, per actuator `DiffFlags`). Applying with `acknowledged_loud=false` must return `NeedsLoudConfirm` and leave the file unchanged; with `true` it applies:
+
+```rust
+    #[tokio::test]
+    async fn apply_proposal_loud_needs_ack_then_applies() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("secrets.md");
+        let original = b"placeholder\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path);
+        // A >=32-char unbroken alphanumeric run trips the secret-shaped diff flag → loud.
+        let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![file_id.clone()], rationale: "fix".to_string() }).unwrap();
+        assert!(gated.verdict.requires_loud_modal, "secret-shaped content forces the loud modal");
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "fix", &key, &vs, std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // acknowledged_loud=false → refuses, file unchanged.
+        let needs = handle.apply_proposal(true, pid.clone(), false).await;
+        assert!(matches!(needs, Err(EngineOpError::NeedsLoudConfirm(_))),
+            "a loud write without ack is refused: {needs:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "no write happened without the ack");
+
+        // acknowledged_loud=true → applies.
+        handle.apply_proposal(true, pid, true).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the ack lets the loud write through");
+    }
+```
+
+  Run it (PASS after the op): `cargo test -p air_agent_desktop apply_proposal_loud_needs_ack_then_applies`
+  Expected output: `test result: ok. 1 passed`.
+
 - [ ] Run it (expect FAIL): `cargo test -p air_agent_desktop apply_proposal_writes_file_and_resolves_then_stale_fails_closed`
   Expected output: compile error `no method named apply_proposal` / `no variant ... Stale`.
 
-- [ ] Implement the typed error + the op in `apps/desktop/src-tauri/src/engine/mod.rs`. First add two variants to `EngineOpError` (grounding §2a, lines 50-66) and their `Display` arms:
+- [ ] Implement the typed errors + the op in `apps/desktop/src-tauri/src/engine/mod.rs`. First add three variants to `EngineOpError` (grounding §2a, lines 50-66) and their `Display` arms:
 
 ```rust
     /// The on-disk file changed since the proposal was drafted; the re-gate at confirm
@@ -1133,6 +1284,10 @@ pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> 
     Stale(String),
     /// The folder's write-grant was revoked between propose and apply; re-gate fails closed.
     Revoked(String),
+    /// The FRESH re-gate verdict is loud (secret-/value-shaped or Delete) but the caller did not
+    /// pass `acknowledged_loud == true`. The op refuses to write — the UI must show the
+    /// "I've reviewed this" confirm and retry with the ack. Carries the reason.
+    NeedsLoudConfirm(String),
 ```
 
   Add to `impl Display for EngineOpError` (grounding §2a continues in the engine file; mirror the existing arms):
@@ -1140,6 +1295,7 @@ pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> 
 ```rust
             EngineOpError::Stale(m) => write!(f, "the file changed since this was suggested: {m}"),
             EngineOpError::Revoked(m) => write!(f, "edits aren't allowed in this folder anymore: {m}"),
+            EngineOpError::NeedsLoudConfirm(m) => write!(f, "this change needs an explicit review confirmation: {m}"),
 ```
 
   Then the result type + op (multi-step spawn_blocking template §2i, modeled on the engine round-trip test §6e):
@@ -1157,10 +1313,12 @@ impl EngineHandle {
     /// `base_content_hash` differs → fail closed as `Stale` BEFORE proposing or executing (a fresh
     /// re-propose re-bases on live bytes and could not see the drift). Only then does it fetch the
     /// verified bytes, re-gate with a FRESH `propose_write` against the LIVE file + current
-    /// write-grant (this still guards the micro-TOCTOU window + grant revocation), and execute
-    /// (atomic temp+rename, durable undo, signed `file_written`). Nothing is written on any
-    /// failure. Gated.
-    pub async fn apply_proposal(&self, onboarded: bool, id: String) -> Result<ApplyResult, EngineOpError> {
+    /// write-grant (this still guards the micro-TOCTOU window + grant revocation). The loud-confirm
+    /// is decided from the FRESH verdict (NOT the stale propose-time flag): if it is loud and
+    /// `acknowledged_loud == false` the op REFUSES (`NeedsLoudConfirm`) — never a silent write.
+    /// Only then does it execute (atomic temp+rename, durable undo, signed `file_written`). Nothing
+    /// is written on any failure. Gated.
+    pub async fn apply_proposal(&self, onboarded: bool, id: String, acknowledged_loud: bool) -> Result<ApplyResult, EngineOpError> {
         use sha2::{Digest, Sha256};
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         tokio::task::spawn_blocking(move || {
@@ -1206,6 +1364,13 @@ impl EngineHandle {
             if !gated.verdict.allowed {
                 return Err(EngineOpError::Revoked("target not under an active write grant".to_string()));
             }
+            // LOUD-CONFIRM on the FRESH verdict (G1/IMP-1a): a loud write requires the explicit ack.
+            // This is the authoritative gate — the propose-time flag was only a UI hint.
+            if gated.verdict.requires_loud_modal && !acknowledged_loud {
+                return Err(EngineOpError::NeedsLoudConfirm(
+                    "secret-/value-shaped or delete change — confirm review before applying".to_string(),
+                ));
+            }
             // execute is atomic temp+rename: it never partially writes, so a failure here also
             // leaves the file untouched. (Defensive: any execute error surfaces as Core.)
             let fw_id = log.execute_write_resolving(gated, &p.id)
@@ -1235,12 +1400,14 @@ impl From<crate::engine::ApplyResult> for ApplyResultDto {
 }
 
 #[tauri::command]
-pub async fn engine_apply_proposal(id: String, state: State<'_, AppState>) -> Result<ApplyResultDto, String> {
+pub async fn engine_apply_proposal(id: String, acknowledged_loud: bool, state: State<'_, AppState>) -> Result<ApplyResultDto, String> {
     let onboarded = state.identity_store.is_onboarded();
-    let result = state.engine.apply_proposal(onboarded, id).await.map_err(|e| e.to_string())?;
+    let result = state.engine.apply_proposal(onboarded, id, acknowledged_loud).await.map_err(|e| e.to_string())?;
     Ok(ApplyResultDto::from(result))
 }
 ```
+
+> Idiomatic snake_case Rust param `acknowledged_loud` (MIN-3); the JS twin calls `invoke("engine_apply_proposal", { id, acknowledgedLoud })` and Tauri's documented camelCase↔snake_case arg mapping bridges `acknowledgedLoud` → `acknowledged_loud`. Same convention as `engine_undo_apply`'s `file_written_id` ↔ `fileWrittenId` (Task 10).
 
 - [ ] Register in `apps/desktop/src-tauri/src/main.rs`:
 
@@ -1254,7 +1421,7 @@ pub async fn engine_apply_proposal(id: String, state: State<'_, AppState>) -> Re
 
 - [ ] Commit:
   `git add apps/desktop/src-tauri/src/engine/mod.rs apps/desktop/src-tauri/src/commands/engine.rs apps/desktop/src-tauri/src/main.rs`
-  `git commit -m "feat(desktop): apply_proposal op (re-gate, staleness fail-closed) + command"`
+  `git commit -m "feat(desktop): apply_proposal op (re-gate + base-hash anti-clobber + loud-confirm fail-closed) + command"`
 
 ---
 
@@ -1338,12 +1505,13 @@ pub async fn engine_decline_proposal(id: String, reason: String, state: State<'_
 
 ---
 
-### Task 10: `undo_apply` op + command
+### Task 10: `undo_apply` op + command (+ command-layer arg-binding round-trip test)
 
 **Files:**
 - Modify: `apps/desktop/src-tauri/src/engine/mod.rs` (op)
-- Modify: `apps/desktop/src-tauri/src/commands/engine.rs` (command)
+- Modify: `apps/desktop/src-tauri/src/commands/engine.rs` (command + command-layer test)
 - Modify: `apps/desktop/src-tauri/src/main.rs` (register)
+- Modify: `apps/desktop/src-tauri/Cargo.toml` (add the `tauri` `test` feature to dev-deps for the command test)
 - Test: `apps/desktop/src-tauri/src/engine/mod.rs` (tests mod)
 
 - [ ] Write the failing test in `apps/desktop/src-tauri/src/engine/mod.rs` (tests mod). It reuses the happy-path apply flow, then undoes it and asserts the file is restored. Build it standalone (full setup; mirrors the engine round-trip §6e):
@@ -1376,7 +1544,7 @@ pub async fn engine_decline_proposal(id: String, reason: String, state: State<'_
         log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
         drop(log);
 
-        let applied = handle.apply_proposal(true, pid).await.unwrap();
+        let applied = handle.apply_proposal(true, pid, false).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "applied");
         handle.undo_apply(true, applied.file_written_id.clone()).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), original, "undo restored the original bytes");
@@ -1413,13 +1581,13 @@ pub async fn engine_decline_proposal(id: String, reason: String, state: State<'_
 
 ```rust
 #[tauri::command]
-pub async fn engine_undo_apply(fileWrittenId: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn engine_undo_apply(file_written_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let onboarded = state.identity_store.is_onboarded();
-    state.engine.undo_apply(onboarded, fileWrittenId).await.map_err(|e| e.to_string())
+    state.engine.undo_apply(onboarded, file_written_id).await.map_err(|e| e.to_string())
 }
 ```
 
-  (Tauri maps camelCase JS args to snake-or-camel command params; the TS twin in Task 11 passes `{ fileWrittenId }`. Keep the binding name matching the TS call.)
+  (Idiomatic snake_case Rust param per MIN-3; the TS twin in Task 11 calls `invoke("engine_undo_apply", { fileWrittenId })` and Tauri's documented camelCase↔snake_case arg mapping bridges `fileWrittenId` → `file_written_id`.)
 
 - [ ] Register in `apps/desktop/src-tauri/src/main.rs`:
 
@@ -1428,12 +1596,91 @@ pub async fn engine_undo_apply(fileWrittenId: String, state: State<'_, AppState>
             commands::engine::engine_undo_apply,
 ```
 
+- [ ] Add the `tauri` `test` feature to dev-deps (m4) — enables `tauri::test::mock_builder`. In `apps/desktop/src-tauri/Cargo.toml`, the `[dev-dependencies]` block currently has only `tempfile = "3"`; add:
+
+```toml
+[dev-dependencies]
+tempfile = "3"
+tauri = { version = "2", features = ["test"] }
+```
+
+- [ ] Write + run the command-LAYER round-trip test (m4) in `apps/desktop/src-tauri/src/commands/engine.rs` (test mod, after the DTO tests at line 280+). It builds a real Tauri mock app managing a genuine onboarded `AppState`, then invokes `engine_undo_apply` over IPC with the camelCase `{ fileWrittenId }` body — proving Tauri binds it to the snake_case `file_written_id` param and the op runs (an unknown id surfaces an `Err`, confirming the arg reached `undo_write`). Mirrors the `TestVault` from `commands/identity.rs:110-116`:
+
+```rust
+    use crate::commands::identity::AppState;
+    use crate::secrets::SecretsVault;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tauri::Manager;
+
+    struct CmdTestVault { store: Mutex<HashMap<String, String>> }
+    impl CmdTestVault { fn new() -> Arc<Self> { Arc::new(Self { store: Mutex::new(HashMap::new()) }) } }
+    impl SecretsVault for CmdTestVault {
+        fn set(&self, k: &str, v: &str) -> Result<(), String> { self.store.lock().unwrap().insert(k.into(), v.into()); Ok(()) }
+        fn get(&self, k: &str) -> Result<Option<String>, String> { Ok(self.store.lock().unwrap().get(k).cloned()) }
+        fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
+    }
+
+    #[test]
+    fn engine_undo_apply_binds_camelcase_arg_over_ipc() {
+        use crate::air::identity::{IdentityMetadata, IdentityStore};
+        use crate::air::types::Did;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = CmdTestVault::new();
+        // Make is_onboarded() true: save a signing key + metadata (the engine then opens).
+        // IdentityMetadata has no Default — build it explicitly (Did is a pub-field tuple struct).
+        let identity_store = IdentityStore::new(vault.clone(), dir.path().to_path_buf());
+        identity_store.save_signing_key(&[7u8; 32]).unwrap();
+        identity_store.save_metadata(&IdentityMetadata {
+            did: Did("did:wba:AIR-TEST:cmd".to_string()),
+            name: "Test".to_string(),
+            created_at: "2026-06-23T00:00:00Z".to_string(),
+        }).unwrap();
+        let engine = Arc::new(crate::engine::EngineHandle::new(
+            vault, dir.path().to_path_buf(),
+            Arc::new(crate::engine::embed::MockEmbedderProvider::new(8)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        ));
+        let state = AppState { identity_store, engine };
+
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![engine_undo_apply])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock app");
+        app.manage(state);
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        // Invoke with the camelCase key the TS twin sends.
+        let res = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "engine_undo_apply".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(serde_json::json!({ "fileWrittenId": "no-such-id" })),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        // The arg bound + the op ran: an unknown file_written_id fails (Err), NOT a
+        // "missing required key file_written_id" deserialization error.
+        let err = res.expect_err("unknown id makes undo_write fail");
+        let msg = err.to_string();
+        assert!(!msg.contains("missing required key") && !msg.contains("fileWrittenId"),
+            "the camelCase arg bound to file_written_id (not a deserialize error): {msg}");
+    }
+```
+
+  Run it (expect PASS after the command + feature exist): `cargo test -p air_agent_desktop engine_undo_apply_binds_camelcase_arg_over_ipc`
+  Expected output: `test result: ok. 1 passed`.
+
 - [ ] Build: `cargo build -p air_agent_desktop`
   Expected output: `Finished` with no errors.
 
 - [ ] Commit:
-  `git add apps/desktop/src-tauri/src/engine/mod.rs apps/desktop/src-tauri/src/commands/engine.rs apps/desktop/src-tauri/src/main.rs`
-  `git commit -m "feat(desktop): undo_apply op + command"`
+  `git add apps/desktop/src-tauri/src/engine/mod.rs apps/desktop/src-tauri/src/commands/engine.rs apps/desktop/src-tauri/src/main.rs apps/desktop/src-tauri/Cargo.toml`
+  `git commit -m "feat(desktop): undo_apply op + command + command-layer IPC arg-binding test"`
 
 ---
 
@@ -1480,8 +1727,8 @@ export const setProposalsEnabled = (enabled: boolean): Promise<void> =>
 export const listProposals = (): Promise<ProposalDto[]> => invoke<ProposalDto[]>("engine_list_proposals");
 export const proposalPreview = (id: string): Promise<PreviewDto> =>
   invoke<PreviewDto>("engine_proposal_preview", { id });
-export const applyProposal = (id: string): Promise<ApplyResultDto> =>
-  invoke<ApplyResultDto>("engine_apply_proposal", { id });
+export const applyProposal = (id: string, acknowledgedLoud: boolean): Promise<ApplyResultDto> =>
+  invoke<ApplyResultDto>("engine_apply_proposal", { id, acknowledgedLoud });
 export const declineProposal = (id: string, reason: string): Promise<void> =>
   invoke<void>("engine_decline_proposal", { id, reason });
 export const undoApply = (fileWrittenId: string): Promise<void> =>
@@ -1678,6 +1925,7 @@ export function toProposalRow(p: ProposalDto): ProposalRow {
 **Files:**
 - Modify: `apps/desktop/src/App.tsx`
 - Create: `apps/desktop/src/review/ReviewPanel.tsx`
+- Create: `apps/desktop/src/review/applyFlow.ts`, `apps/desktop/src/review/applyFlow.test.ts` (pure loud-confirm decision helper + vitest, so the ack flow is unit-tested)
 
 - [ ] Add the `"review"` view + a `ReviewNavButton` with a pending-count badge + the body-ternary branch in `apps/desktop/src/App.tsx` (grounding §3). Edit the `View` type (line 30):
 
@@ -1685,7 +1933,7 @@ export function toProposalRow(p: ProposalDto): ProposalRow {
 type View = "identity" | "inbox" | "memory" | "review" | "settings";
 ```
 
-  Add the panel import near the other panel imports (e.g. after the MemoryPanel import, §3 note):
+  Add the panel import near the other panel imports (e.g. after the MemoryPanel import, §3 note). `useIdentity` is the existing hook `Shell()` already uses (grounding §3b):
 
 ```tsx
 import { ReviewPanel } from "./review/ReviewPanel";
@@ -1702,22 +1950,25 @@ import { listProposals } from "./api/engine";
       {view === "identity" ? <IdentityPanel /> : view === "inbox" ? <InboxPanel /> : view === "memory" ? <MemoryPanel /> : view === "review" ? <ReviewPanel /> : <AirSettings />}
 ```
 
-  Add `ReviewNavButton` after `InboxNavButton` (grounding §3c). It polls the pending count so the badge is live; failures hide the badge (count 0):
+  Add `ReviewNavButton` after `InboxNavButton` (grounding §3c). M4 fix: it does NOT poll pre-onboarding (the engine returns `NotOnboarded` and would spam) — it gates on `useIdentity().identity`, fetches the count once when identity appears, and only runs the 5 s interval while the Review tab is `active`. Failures silently hide the badge (count 0):
 
 ```tsx
 function ReviewNavButton({ active, onClick }: { active: boolean; onClick: () => void }) {
+  const { identity } = useIdentity();
   const [count, setCount] = useState(0);
   useEffect(() => {
+    if (!identity) { setCount(0); return; } // no engine before onboarding → don't poll.
     let alive = true;
     const refresh = () => {
       listProposals()
         .then((ps) => { if (alive) setCount(ps.length); })
         .catch(() => { if (alive) setCount(0); });
     };
-    refresh();
-    const id = setInterval(refresh, 5000);
-    return () => { alive = false; clearInterval(id); };
-  }, []);
+    refresh(); // one-shot whenever identity present (keeps the badge fresh on tab switch).
+    // Only the active tab pays the 5 s poll; inactive tabs rely on the one-shot above.
+    const id = active ? setInterval(refresh, 5000) : undefined;
+    return () => { alive = false; if (id) clearInterval(id); };
+  }, [identity, active]);
   return (
     <Button variant={active ? "primary" : "secondary"} onClick={onClick}>
       Review{count > 0 ? ` (${count})` : ""}
@@ -1726,9 +1977,9 @@ function ReviewNavButton({ active, onClick }: { active: boolean; onClick: () => 
 }
 ```
 
-  Ensure `useEffect`/`useState` are imported at the top of `App.tsx` (the file already uses `useState`; add `useEffect` if absent).
+  Ensure `useEffect`/`useState` are imported at the top of `App.tsx` (the file already uses `useState`; add `useEffect` if absent). `useIdentity` is already imported (used by `Shell`).
 
-- [ ] Create `apps/desktop/src/review/ReviewPanel.tsx` using the INLINE-style `Button`/`Card` family (grounding §4a/§4d — MemoryPanel/SourcesPanel pattern; NOT the `ui/` kit, NOT `ChangeCard.tsx`). It lists proposals, opens a per-proposal preview with inline diff, Approve (loud-confirm modal gated on `requires_loud_modal` with an "I've reviewed this" checkbox) / Decline, and a "Recently applied" Undo strip. Handlers use the `setBusy/try/catch/finally` pattern (§4d note):
+- [ ] Create `apps/desktop/src/review/ReviewPanel.tsx` using the INLINE-style `Button`/`Card` family (grounding §4a/§4d — MemoryPanel/SourcesPanel pattern; NOT the `ui/` kit, NOT `ChangeCard.tsx`). It lists proposals, opens a per-proposal preview with inline diff, Approve / Decline, and a "Recently applied" Undo strip. The loud-confirm modal is shown either when the propose-time `requires_loud_modal` HINT is set OR when the `apply_proposal` op bounces back `NeedsLoudConfirm` (the op is authoritative — item 2); the modal's "Apply anyway" retries with `acknowledged_loud = true`. Handlers use the `setBusy/try/catch/finally` pattern (§4d note):
 
 ```tsx
 import { useEffect, useState } from "react";
@@ -1787,11 +2038,19 @@ export function ReviewPanel() {
     }
   };
 
-  const doApply = async (id: string, fileName: string) => {
+  // The engine op is authoritative for the loud-confirm (item 2 / G1): we call
+  // applyProposal(id, acknowledged). When the FRESH re-gate is loud and we passed false, the op
+  // returns a `NeedsLoudConfirm` error string → open the modal and retry with true. A `Stale`
+  // error means the file changed under us → clear + reload the preview (MIN-2) so the next render
+  // shows the new baseline, not the stale diff.
+  const isNeedsLoudConfirm = (msg: string) => msg.includes("needs an explicit review confirmation");
+  const isStale = (msg: string) => msg.includes("changed since this was suggested");
+
+  const doApply = async (id: string, fileName: string, acknowledged: boolean) => {
     setBusy(true);
     setError(null);
     try {
-      const r = await applyProposal(id);
+      const r = await applyProposal(id, acknowledged);
       setApplied((prev) => [{ fileWrittenId: r.file_written_id, fileName }, ...prev]);
       setOpenId(null);
       setPreview(null);
@@ -1799,18 +2058,33 @@ export function ReviewPanel() {
       setReviewed(false);
       await refresh();
     } catch (e) {
-      setError(String(e));
+      const msg = String(e);
+      if (!acknowledged && isNeedsLoudConfirm(msg)) {
+        // Authoritative loud gate fired — surface the "I've reviewed this" modal, no error text.
+        setConfirmFor(id);
+        setReviewed(false);
+      } else if (isStale(msg)) {
+        setError("The file changed since this was suggested — reloading the diff.");
+        setConfirmFor(null);
+        setReviewed(false);
+        if (openId === id) { setPreview(null); void onOpen(id); } // MIN-2: reload the baseline.
+        await refresh();
+      } else {
+        setError(msg);
+      }
     } finally {
       setBusy(false);
     }
   };
 
-  const onApprove = (id: string, requiresLoud: boolean, fileName: string) => {
-    if (requiresLoud) {
+  // Pre-show the modal if the propose-time HINT is loud; otherwise try the op (which still
+  // re-checks loud on the fresh verdict and will bounce back NeedsLoudConfirm if needed).
+  const onApprove = (id: string, requiresLoudHint: boolean, fileName: string) => {
+    if (requiresLoudHint) {
       setConfirmFor(id);
       setReviewed(false);
     } else {
-      void doApply(id, fileName);
+      void doApply(id, fileName, false);
     }
   };
 
@@ -1861,6 +2135,10 @@ export function ReviewPanel() {
           <p style={{ color: "#666" }}>
             No changes to review. When the brain learns something that contradicts a file in an
             edit-enabled folder (and evolve is on), proposed rewrites appear here.
+          </p>
+          <p style={{ color: "#888", fontSize: 12 }}>
+            Note: only contradictions learned <em>after</em> you enable a folder for edits are
+            proposed — corrections learned earlier won’t be re-applied retroactively.
           </p>
         </Card>
       ) : (
@@ -1936,7 +2214,7 @@ export function ReviewPanel() {
               disabled={!reviewed || busy}
               onClick={() => {
                 const target = proposals.find((p) => p.id === confirmFor);
-                if (target) void doApply(confirmFor, toProposalRow(target).fileName);
+                if (target) void doApply(confirmFor, toProposalRow(target).fileName, true);
               }}
             >
               Apply anyway
@@ -1970,13 +2248,100 @@ export function ReviewPanel() {
   `npm run typecheck`
   Expected output: no errors.
 
+- [ ] Write + run the `applyFlow` unit test (item 2 — proves the panel CANNOT reach a successful apply for a loud proposal without the ack). Create `apps/desktop/src/review/applyFlow.test.ts`:
+
+```ts
+import { describe, it, expect, vi } from "vitest";
+import { runApprove, classifyApplyError } from "./applyFlow";
+
+describe("classifyApplyError", () => {
+  it("detects NeedsLoudConfirm and Stale from the engine message text", () => {
+    expect(classifyApplyError("this change needs an explicit review confirmation: ...")).toBe("loud");
+    expect(classifyApplyError("the file changed since this was suggested: ...")).toBe("stale");
+    expect(classifyApplyError("some other error")).toBe("other");
+  });
+});
+
+describe("runApprove", () => {
+  it("a loud proposal cannot apply without the ack: first call bounces, second (acked) succeeds", async () => {
+    // Mock op: rejects NeedsLoudConfirm when acknowledged=false, succeeds when true.
+    const op = vi.fn(async (_id: string, acknowledged: boolean) => {
+      if (!acknowledged) throw new Error("this change needs an explicit review confirmation: x");
+      return { file_written_id: "fw1" };
+    });
+    // First attempt without ack → returns { needsLoud: true }, op called once with false, no write.
+    const first = await runApprove(op, "p1", false);
+    expect(first).toEqual({ needsLoud: true });
+    expect(op).toHaveBeenCalledTimes(1);
+    expect(op).toHaveBeenLastCalledWith("p1", false);
+    // Second attempt WITH ack → applied.
+    const second = await runApprove(op, "p1", true);
+    expect(second).toEqual({ applied: "fw1" });
+    expect(op).toHaveBeenLastCalledWith("p1", true);
+  });
+
+  it("a non-loud proposal applies on the first call", async () => {
+    const op = vi.fn(async (_id: string, _ack: boolean) => ({ file_written_id: "fw2" }));
+    expect(await runApprove(op, "p2", false)).toEqual({ applied: "fw2" });
+  });
+});
+```
+
+- [ ] Run it (expect FAIL): `npm run test --workspace @air-agent/desktop -- src/review/applyFlow.test.ts`
+  Expected output: vitest fails to resolve `./applyFlow`.
+
+- [ ] Implement `apps/desktop/src/review/applyFlow.ts` (pure: the loud/stale classification + the approve decision the panel uses, so it is unit-testable away from React):
+
+```ts
+import type { ApplyResultDto } from "../api/engine";
+
+/** Classify an engine apply error by its message text (the typed errors stringify distinctly). */
+export type ApplyErrorKind = "loud" | "stale" | "other";
+export function classifyApplyError(message: string): ApplyErrorKind {
+  if (message.includes("needs an explicit review confirmation")) return "loud";
+  if (message.includes("changed since this was suggested")) return "stale";
+  return "other";
+}
+
+/** The outcome of one approve attempt. */
+export type ApproveOutcome =
+  | { applied: string }   // file_written id
+  | { needsLoud: true }   // the op refused — caller must show the modal + retry with ack=true
+  | { stale: true }       // the file changed — caller reloads the preview
+  | { error: string };
+
+/** Run an approve through the apply op. `op(id, acknowledged)` is `applyProposal`. The op is the
+ *  authoritative loud gate: without the ack a loud proposal throws NeedsLoudConfirm → `needsLoud`. */
+export async function runApprove(
+  op: (id: string, acknowledged: boolean) => Promise<ApplyResultDto>,
+  id: string,
+  acknowledged: boolean,
+): Promise<ApproveOutcome> {
+  try {
+    const r = await op(id, acknowledged);
+    return { applied: r.file_written_id };
+  } catch (e) {
+    const msg = String(e instanceof Error ? e.message : e);
+    const kind = classifyApplyError(msg);
+    if (kind === "loud" && !acknowledged) return { needsLoud: true };
+    if (kind === "stale") return { stale: true };
+    return { error: msg };
+  }
+}
+```
+
+  > The `ReviewPanel`'s `doApply` (above) inlines the same classification for brevity; if you prefer zero duplication, have `doApply` call `runApprove(applyProposal, id, acknowledged)` and switch on the outcome. Either way the unit test pins the invariant: **no `applied` result for a loud proposal unless `acknowledged === true`.**
+
+- [ ] Run it (expect PASS): `npm run test --workspace @air-agent/desktop -- src/review/applyFlow.test.ts`
+  Expected output: `3 passed`.
+
 - [ ] Run the full desktop vitest suite to confirm helpers + existing tests are green:
   `npm run test --workspace @air-agent/desktop`
-  Expected output: all test files pass (incl. `diffView`, `proposalView`, `recallView`, etc.).
+  Expected output: all test files pass (incl. `diffView`, `proposalView`, `applyFlow`, `recallView`, etc.).
 
 - [ ] Commit:
-  `git add apps/desktop/src/App.tsx apps/desktop/src/review/ReviewPanel.tsx`
-  `git commit -m "feat(desktop): Review destination — nav badge + ReviewPanel (diff, approve/decline, undo)"`
+  `git add apps/desktop/src/App.tsx apps/desktop/src/review/ReviewPanel.tsx apps/desktop/src/review/applyFlow.ts apps/desktop/src/review/applyFlow.test.ts`
+  `git commit -m "feat(desktop): Review destination — nav badge + ReviewPanel (diff, op-enforced loud-confirm, undo)"`
 
 ---
 
@@ -2084,42 +2449,82 @@ import { writableRoots, allWritable } from "./writableGrants";
   };
 ```
 
-  Add handlers after `onRevoke` (grounding §5 ~line 74). Enabling a folder for edits is the first-folder-enable trigger that turns proposals on under the hood, and offers to turn evolve on if it's off:
+  **A1 — `active` binding (definitive):** move the single existing `const active = activeGrants(grants);` line (grounding §5 line 71) to sit **immediately after the state declarations**, before the handlers that reference it. Do NOT add a second `active` binding anywhere — there is exactly one, and it is in scope for both the handlers below and the render JSX.
+
+  Add handlers after `onRevoke` (grounding §5 ~line 74). Enabling a folder for edits is the first-folder-enable trigger that turns proposals on under the hood. Both mutators use the standard busy/error pattern (M5): they `setBusy(true)`, clear the error, run, `setError` on failure, and `setBusy(false)` in `finally`; `onAllowAll` collects per-folder failures (continue-and-report) and only flips proposals on after the loop. A shared `busy` already exists in the panel (grounding §5 declares `const [busy, setBusy]`); reuse it so the toggle buttons disable while a mutation is in flight:
 
 ```tsx
   const onToggleWritable = async (root: string, on: boolean) => {
-    await setFolderWritable(root, on);
-    if (on) await setProposalsEnabled(true); // Lock-1 enablement, under the hood.
-    await refresh();
+    setBusy(true);
+    setEditError(null);
+    try {
+      await setFolderWritable(root, on);
+      if (on) await setProposalsEnabled(true); // Lock-1 enablement, under the hood.
+      await refresh();
+    } catch (e) {
+      setEditError(String(e));
+    } finally {
+      setBusy(false);
+    }
   };
   const onAllowAll = async (on: boolean) => {
-    for (const g of active) {
-      await setFolderWritable(g.canonical_root, on);
+    setBusy(true);
+    setEditError(null);
+    const failures: string[] = [];
+    try {
+      for (const g of active) {
+        try {
+          await setFolderWritable(g.canonical_root, on);
+        } catch (e) {
+          failures.push(`${g.canonical_root}: ${String(e)}`); // continue-and-report.
+        }
+      }
+      if (on && failures.length < active.length) await setProposalsEnabled(true);
+      if (failures.length > 0) setEditError(`Some folders failed: ${failures.join("; ")}`);
+      await refresh();
+    } finally {
+      setBusy(false);
     }
-    if (on) await setProposalsEnabled(true);
-    await refresh();
   };
   const onEnableEvolve = async () => {
-    await setEvolveEnabled(true);
-    await refresh();
+    setBusy(true);
+    setEditError(null);
+    try {
+      await setEvolveEnabled(true);
+      await refresh();
+    } catch (e) {
+      setEditError(String(e));
+    } finally {
+      setBusy(false);
+    }
   };
 ```
 
-  (`active` is computed below the handlers in grounding; move the `const active = activeGrants(grants);` line above these handlers, or reference `activeGrants(grants)` inline in `onAllowAll`. To keep it simple, compute `const active = activeGrants(grants);` at the top of the component body right after the state declarations.)
+  Add an `editError` state next to the others (M5 — a dedicated error line for the edit toggles, separate from `ingestError`):
 
-  Compute the writable derivation in the render body (after `const active = activeGrants(grants);`):
+```tsx
+  const [editError, setEditError] = useState<string | null>(null);
+```
+
+  Compute the writable derivation in the render body (after the relocated `const active = activeGrants(grants);`):
 
 ```tsx
   const writable = writableRoots(files);
   const everyWritable = allWritable(active.map((g) => g.canonical_root), writable);
 ```
 
-  Add the "Allow All" master in the header action area (grounding §5 lines 64-69, beside the existing Add/Ingest buttons):
+  Add the "Allow All" master in the header action area (grounding §5 lines 64-69, beside the existing Add/Ingest buttons), disabled while busy (M5):
 
 ```tsx
-        <Button variant="secondary" onClick={() => void onAllowAll(!everyWritable)} disabled={active.length === 0}>
+        <Button variant="secondary" onClick={() => void onAllowAll(!everyWritable)} disabled={busy || active.length === 0}>
           {everyWritable ? "Disallow all edits" : "Allow all edits"}
         </Button>
+```
+
+  Surface the edit-toggle error (M5), beside the existing ingest error line:
+
+```tsx
+      {editError ? <p style={{ fontSize: 13, color: "#b00" }}>{editError}</p> : null}
 ```
 
   Extend each grant row (grounding §5 lines 76-81) to show + toggle "Allow edits" beside "Revoke":
@@ -2130,22 +2535,33 @@ import { writableRoots, allWritable } from "./writableGrants";
           return (
             <li key={g.canonical_root} style={{ marginBottom: 4 }}>
               <code>{g.canonical_root}</code>{" "}
-              <button onClick={() => void onToggleWritable(g.canonical_root, !editable)} style={{ marginLeft: 8 }}>
+              <button disabled={busy} onClick={() => void onToggleWritable(g.canonical_root, !editable)} style={{ marginLeft: 8 }}>
                 {editable ? "Disallow edits" : "Allow edits"}
               </button>
-              <button onClick={() => onRevoke(g.canonical_root)} style={{ marginLeft: 8 }}>Revoke</button>
+              <button disabled={busy} onClick={() => onRevoke(g.canonical_root)} style={{ marginLeft: 8 }}>Revoke</button>
             </li>
           );
         })}
 ```
 
-  Add the evolve-off offer below the grant list (shown only when at least one folder is editable but evolve is off):
+  Add the evolve-off offer below the grant list. **G2 fix:** the trigger is `writable.size > 0 && evolveOn === false` — it must show whenever ANY folder is editable but evolve is off, including when the user enables their ONLY folder (where `everyWritable` is true, so the old `everyWritable === false` clause wrongly hid it):
 
 ```tsx
-      {everyWritable === false && writable.size > 0 && evolveOn === false ? (
+      {writable.size > 0 && evolveOn === false ? (
         <p style={{ fontSize: 13, color: "#b00" }}>
           Edits are enabled, but the learning loop is off, so no changes will be proposed.{" "}
-          <button onClick={() => void onEnableEvolve()}>Turn learning on</button>
+          <button disabled={busy} onClick={() => void onEnableEvolve()}>Turn learning on</button>
+        </p>
+      ) : null}
+```
+
+  Add the M3 one-time "retroactive" note, shown whenever at least one folder is editable (so a user who just enabled a folder learns that prior contradictions won't be re-applied):
+
+```tsx
+      {writable.size > 0 ? (
+        <p style={{ fontSize: 12, color: "#888" }}>
+          Heads up: corrections the brain learned <em>before</em> you enabled a folder won’t be
+          re-applied retroactively — only new contradictions are proposed.
         </p>
       ) : null}
 ```
@@ -2198,8 +2614,9 @@ import { writableRoots, allWritable } from "./writableGrants";
   - [ ] With Ollama up + evolve on, seed a contradiction (ingest a file, then a memory that corrects it) and run evolve until a proposal appears; confirm the Review nav badge shows a count.
   - [ ] Review → open the proposal → confirm the inline before/after diff renders → Approve → confirm the file on disk changed → use "Recently applied" → Undo → confirm the file is restored.
   - [ ] Decline a different proposal → confirm it leaves the queue and never returns.
-  - [ ] Stale-file path: after a proposal exists, edit the target file by hand, then Approve → confirm the apply fails closed with a "the file changed since this was suggested" message and the file is left as the manual edit.
-  - [ ] Risky path: if a proposal touches secret/value-shaped content, confirm Approve shows the loud "I've reviewed this" modal before applying.
+  - [ ] Stale-file path: after a proposal exists, edit the target file by hand, then Approve → confirm the apply fails closed with a "the file changed since this was suggested" message, the file is left as the manual edit, and the diff reloads to the new baseline (MIN-2).
+  - [ ] Risky path: if a proposal touches secret/value-shaped content, confirm Approve shows the loud "I've reviewed this" modal AND that the write only lands after the ack — the engine `apply_proposal` returns `NeedsLoudConfirm` and refuses the first (un-acked) attempt (item 2 / G1).
+  - [ ] EXPECTED behavior (not a bug): a contradiction the brain learned BEFORE a folder was enabled for edits is NOT re-proposed when you later enable that folder (retroactive proposals are out of scope for SP4; the `invalidate` was already consumed). Confirm the Settings note + Review empty-state hint communicate this.
 
 - [ ] Commit (checklist completion / any doc note only — no source changes expected here):
   `git add docs/superpowers/plans/2026-06-23-sp4-confirm-preview.md`
@@ -2215,7 +2632,7 @@ import { writableRoots, allWritable } from "./writableGrants";
 - **Inline unified diff** (`diffView.ts`, Task 11; rendered in `ReviewPanel`, Task 12).
 - **Allow-All master** (Task 13).
 - **Decline = final** (`decline_write_proposal`, Task 9; terminal `write_declined`).
-- **Loud confirm for `requires_loud_modal`** (Task 12 modal with "I've reviewed this").
+- **Loud confirm for `requires_loud_modal`, engine-enforced** (Task 8: `apply_proposal(id, acknowledged_loud)` recomputes loud on the FRESH verdict and returns `NeedsLoudConfirm` without the ack; Task 12 modal with "I've reviewed this" supplies it). The propose-time flag is only a UI hint.
 - **Mandates stay OFF** (Task 3: `prime_switches` always forces `mandates_enabled` off).
 - **Base-fingerprint anti-clobber + re-gate at confirm, staleness fail-closed** (Task 8: compare the proposal's stored `base_content_hash` to the live file hash and fail closed as `Stale` BEFORE the fresh `propose_write` — the fresh propose re-bases on live bytes and cannot detect drift; then re-gate for the TOCTOU window + grant revoke; typed `Stale`/`Revoked`; file untouched on failure). Base persisted at emit in `verdict_summary` (Task 2) and projected on `PendingProposal` (Task 1).
 - **Local-only, atomic + undo + audit** (Task 8/Task 10: `execute_write_resolving` temp+rename + signed `file_written`; `undo_write`).

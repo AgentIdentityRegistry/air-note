@@ -21,7 +21,7 @@ After the user **enables a folder for edits** (and the evolve loop is on), when 
 - sees pending changes in a dedicated **Review** destination (with a count badge),
 - opens one to read a plain-English **"Why"** + an **inline before/after diff**,
 - **Approves** (applied atomically, with undo + an audit record) or **Declines** (final),
-- gets an **extra confirm** for risky edits (secret-looking content) and an **Undo** for anything already applied.
+- gets an **extra confirm** for risky edits (secret-looking content) and an **Undo** for anything applied **this session** (the "Recently applied" strip; persistent cross-session undo is deferred — see Known limitations).
 
 **Two locks, always:** (1) the folder is enabled for edits, **and** (2) the user approves that specific change. Either missing → nothing is written. Off by default.
 
@@ -97,7 +97,7 @@ On **Approve(id)**:
 2. **Anti-clobber check (the true staleness detector):** read the live target, sha256 it, and compare to the recorded `base_content_hash`. If they differ (or no base is recorded) → **fail closed with `Stale`, before proposing or executing**: "the file changed since this was suggested — I'll take another look." *This must precede the fresh propose:* a fresh `propose_write` re-bases on the **live** file, so it can never tell that the file drifted since the proposal was drafted — without this explicit compare an interim user edit would be silently clobbered.
 3. `get_proposal_bytes_checked(id, new_content_hash)` → bytes (**fail-closed** if the side-table row is missing/tampered).
 4. **Fresh** `propose_write(WriteProposal { target, new_content: bytes, op: Edit, source_event_ids: lineage, rationale })` — re-gates against the current file **and** the write-grant; still guards the micro-TOCTOU window between the hash check and the rename, symlink/op-mismatch, and grant revocation. If `verdict.reject_reason.is_some()` → `Stale`; if `!verdict.allowed` → `Revoked`. **Do not apply.**
-5. If `verdict.requires_loud_modal` → show the loud confirm before step 6.
+5. **Loud-confirm on the FRESH verdict (engine-enforced).** The desktop `apply_proposal(id, acknowledged_loud)` op evaluates the **freshly re-gated** `verdict.requires_loud_modal` (NOT the stale propose-time flag, which is only a UI hint on `ProposalDto`). If it is loud and the caller did not pass `acknowledged_loud == true`, the op returns `NeedsLoudConfirm` and **refuses to write** — the UI then shows the "I've reviewed this" modal and retries with the ack. Enforcement lives at the op (the sole write entry point besides undo), never only in React. *Follow-up (deferred): also enforce `requires_loud_modal` inside `bossclaw-core` `execute_write_inner` itself — out of scope for SP4.*
 6. `execute_write_resolving(gated, &id)` → atomic temp+rename, appends `file_written` (`resolves_proposal == id`), durably captures undo `pre_bytes`.
 
 **Decline(id)** → `decline_write_proposal(id, reason)` (terminal `write_declined`, resolves the proposal). **Undo** → `undo_write(file_written_id)` (re-gated, hash-verified restore).
@@ -116,7 +116,7 @@ On **Approve(id)**:
 | File changed on disk since proposal | the propose-time `base_content_hash` ≠ the live file's hash → apply fails closed as `Stale` BEFORE any propose/execute → "stale, I'll re-look"; nothing written |
 | Write-grant revoked between propose and apply | re-gate fails closed → "edits no longer allowed here" |
 | Proposal bytes GC'd / tampered | `get_proposal_bytes_checked` fails closed → "couldn't verify the change" |
-| `requires_loud_modal` (secret-shaped) | apply blocked behind the "I've reviewed this" confirm |
+| `requires_loud_modal` (secret-shaped) | the `apply_proposal` op recomputes loud on the FRESH verdict and returns `NeedsLoudConfirm` unless `acknowledged_loud == true` → write refused until the "I've reviewed this" confirm; never a React-only check |
 | Decline | terminal `write_declined`; that exact fix never returns |
 | Undo after the file changed again | `undo_write` re-gates + hash-checks → fails closed if diverged |
 | Concurrent apply / evolve tick | engine `rename_lock` / `evolve_lock` serialize; no double write |
@@ -125,18 +125,22 @@ On **Approve(id)**:
 
 - **Two locks, both required.** Folder write-grant **and** per-change approval; either missing → no write. Engine **independently re-enforces** the write-grant at `execute_write` (not just at the UI).
 - **Base-fingerprint anti-clobber + re-gate at confirm.** Apply first compares the proposal's stored propose-time `base_content_hash` to the live file's current hash and fails closed (`Stale`) if they diverge — this is what actually catches an interim edit, since a fresh `propose_write` re-bases on live bytes and cannot. Apply never trusts the stored verdict; it then rebuilds the gate against the live file (TOCTOU window, symlink, grant revocation) → staleness/revocation fail closed. Either lock failing → nothing written.
+- **Loud-confirm is engine-enforced on the fresh verdict.** The desktop `apply_proposal(id, acknowledged_loud)` op recomputes `requires_loud_modal` from the fresh re-gate and refuses to write (`NeedsLoudConfirm`) without an explicit `acknowledged_loud == true`. The propose-time flag is only a UI hint; enforcement is at the op, not in React. (Deferred follow-up: push the same check into `bossclaw-core` `execute_write_inner` so even non-desktop callers are covered — not built in SP4.)
 - **Mandates stay OFF.** `mandates_enabled` forced off; the M6c emitter never runs → no autonomous mandate writes in SP4 (that's SP5).
 - **Atomic + undoable + audited.** Every apply is temp+rename atomic, captures durable undo `pre_bytes` before mutating, and appends a signed `file_written` event (`verify_chain`-able).
+- **Chain verification is advisory in SP4 (DELIBERATE, reviewed residual — IMP-1b).** Config-flag persistence (and all event integrity) trusts the SQLCipher/DEK encryption boundary, not a per-write chain check. `verify_chain` runs only in `status()`, and a detected `ChainFailed` surfaces in the UI but does **not** block writes. This is accepted for SP4: the threat (an attacker who can forge a valid-looking re-encrypted `config` event) already implies DEK compromise. **Security follow-up (deferred, NOT built here): gate `get_or_open`'s first-open on `verify_chain` and fail closed on `ChainFailed`** so a tampered log cannot be opened for writing at all.
 - **Local only.** No new network surface; reasoner stays loopback-only (SP3); embedder network-free (two-graph guard stays green). No new secrets / keychain reads.
 - **Taint preserved.** Proposals stay taint-stamped `external`; reasoner output is parsed as data, never authority (engine D2/D8 rules unchanged).
 - **Least work (engine change a).** The brain never drafts for folders it can't write to → smaller surface, no permanent dead state.
 
 ## Known limitations (named, accepted for SP4)
 
-- **Retroactive proposals** not offered for folders enabled *after* a contradiction was processed (the `invalidate` is consumed).
+- **Retroactive proposals** not offered for folders enabled *after* a contradiction was processed (the `invalidate` is consumed). This silent loss is surfaced to the user (not just buried here): Settings → Folders shows a one-time note when a folder is enabled, the Review empty-state repeats it, and the manual-QA checklist marks it EXPECTED behavior.
+- **Undo is session-scoped in SP4.** The "Recently applied" strip + Undo cover changes **applied in the current app session** (React state). A change applied in a prior session is not listed (though the engine retains the `file_written` + undo `pre_bytes`). Follow-up (deferred): a persistent Undo that enumerates recent `file_written` events across sessions.
 - **Per-item review only** (no bulk-approve).
-- **`prime_switches` persistence fix (engine change b) is the main technical risk** — must distinguish never-set defaults from explicit user choices; gets dedicated security-review attention.
-- **N+1 preview reads** (one `event_by_id` / `fs::read` per opened proposal) — fine for the queue sizes SP4 targets.
+- **`prime_switches` persistence fix (engine change b) is the main technical risk** — must distinguish never-set defaults from explicit user choices; gets dedicated security-review attention. (Resolved with a typed `ConfigFlag` predicate so a key rename can't silently re-break it.)
+- **`pending_proposals()` re-folds the actuator event stream `O(events)` per call**, and `engine_proposal_preview` / `engine_apply_proposal` each call it and then `.find(id)` (an N-fold scan per action). Fine for the queue sizes SP4 targets; the future optimization is the projection table the engine already anticipates (mirrors the other folded projections).
+- **N+1 preview reads** (one `fs::read` per opened proposal) — fine for the queue sizes SP4 targets.
 - **Windows** deferred (Unix-gated), matching SP1–SP3.
 
 ## Testing
