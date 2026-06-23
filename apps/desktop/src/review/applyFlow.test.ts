@@ -28,7 +28,7 @@ describe("runApprove", () => {
   });
 
   it("a non-loud proposal applies on the first call", async () => {
-    const op = vi.fn(async (_id: string, _ack: boolean) => ({ file_written_id: "fw2" }));
+    const op = vi.fn(async () => ({ file_written_id: "fw2" }));
     expect(await runApprove(op, "p2", false)).toEqual({ applied: "fw2" });
   });
 });

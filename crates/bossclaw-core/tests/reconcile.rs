@@ -775,6 +775,11 @@ fn explicitly_set_distinguishes_default_from_user_choice() {
     log.set_proposals_enabled(true).unwrap();
     assert!(log.explicitly_set(ConfigFlag::Proposals).unwrap(), "an explicit flip is detected");
 
+    // Value-independence: an explicit FALSE is ALSO "set" (the contract is about the act of
+    // setting, not the value — this is what lets prime_switches avoid clobbering a user's choice).
+    log.set_proposals_enabled(false).unwrap();
+    assert!(log.explicitly_set(ConfigFlag::Proposals).unwrap(), "an explicit false is still 'explicitly set'");
+
     // A DIFFERENT flag's flip does not mark Proposals explicit.
     let (log2, _home2, _dir2) = common::open_log_with_write_grant();
     log2.set_evolve_enabled(true).unwrap();

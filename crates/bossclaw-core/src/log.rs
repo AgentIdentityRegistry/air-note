@@ -5028,7 +5028,7 @@ impl EventLog {
 
     /// Was a config flag ever EXPLICITLY set (regardless of its value)? Scans `config` events for
     /// a bool under the flag's key, returning true on the first hit. Distinguishes the engine's
-    /// never-set default-open from a user's explicit choice — the input `prime_switches` needs to
+    /// never-set default-open from a user's explicit choice — the desktop `prime_switches` needs to
     /// avoid clobbering a user `true` on every launch (SP4 change-b). A typed `ConfigFlag` (not a
     /// raw key string) keeps the const single-sourced (M2/MIN-4).
     pub fn explicitly_set(&self, flag: ConfigFlag) -> Result<bool, BossclawError> {

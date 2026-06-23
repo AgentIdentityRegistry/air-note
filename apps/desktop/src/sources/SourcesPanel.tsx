@@ -89,16 +89,20 @@ export function SourcesPanel() {
     setEditError(null);
     const failures: string[] = [];
     try {
-      for (const g of active) {
-        try {
-          await setFolderWritable(g.canonical_root, on);
-        } catch (e) {
-          failures.push(`${g.canonical_root}: ${String(e)}`); // continue-and-report.
+      try {
+        for (const g of active) {
+          try {
+            await setFolderWritable(g.canonical_root, on);
+          } catch (e) {
+            failures.push(`${g.canonical_root}: ${String(e)}`); // continue-and-report.
+          }
         }
+        if (on && failures.length < active.length) await setProposalsEnabled(true);
+        if (failures.length > 0) setEditError(`Some folders failed: ${failures.join("; ")}`);
+        await refresh();
+      } catch (e) {
+        setEditError(String(e)); // an unexpected throw outside the per-folder loop, surfaced like its siblings.
       }
-      if (on && failures.length < active.length) await setProposalsEnabled(true);
-      if (failures.length > 0) setEditError(`Some folders failed: ${failures.join("; ")}`);
-      await refresh();
     } finally {
       setBusy(false);
     }

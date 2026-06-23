@@ -1090,6 +1090,7 @@ mod tests {
         assert_eq!(p.id, pid);
         assert_eq!(p.target, "/tmp/acme/notes.md");
         assert_eq!(p.op, "edit");
+        assert_eq!(p.new_content_hash, "deadbeef");
         assert_eq!(p.rationale, "Alice now works at Globex");
         assert!(!p.requires_loud_modal, "verdict_summary.requires_loud_modal projected");
 
