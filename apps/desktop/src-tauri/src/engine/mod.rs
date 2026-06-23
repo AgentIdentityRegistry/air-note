@@ -230,6 +230,31 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Enable (`on=true` → `add_write_grant`) or disable (`on=false` → `revoke_write_grant`)
+    /// edits for `path`. Lock 1 of two. Gated. The engine canonicalizes + fails closed on a
+    /// missing path; execute re-checks the grant at write time regardless.
+    pub async fn set_folder_writable(&self, onboarded: bool, path: PathBuf, on: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let r = if on { log.add_write_grant(&path) } else { log.revoke_write_grant(&path) };
+            r.map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// The canonical roots of every ACTIVE write-grant (revoked ones excluded). The UI uses
+    /// this to mark folders + files writable. Gated.
+    pub async fn list_writable(&self, onboarded: bool) -> Result<Vec<String>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let grants = log.write_grants().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(grants.into_iter().filter(|g| !g.revoked).map(|g| g.canonical_root).collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Every grant (active + revoked); the UI filters to active. Gated.
     pub async fn list_grants(&self, onboarded: bool) -> Result<Vec<bossclaw_core::Grant>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -927,5 +952,31 @@ mod tests {
         handle.set_evolve_enabled(true, true).await.unwrap();
         let (status1, _t) = handle.evolve_status(true).await.unwrap();
         assert!(status1.enabled, "toggle on takes effect");
+    }
+
+    #[tokio::test]
+    async fn set_folder_writable_toggles_the_write_grant_and_list_writable_reflects_it() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        // A real folder to grant (must exist; add_write_grant canonicalizes + fails closed).
+        let target = tempfile::tempdir().unwrap();
+        let path = target.path().to_path_buf();
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.set_folder_writable(false, path.clone(), true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+
+        // Enable → listed writable.
+        handle.set_folder_writable(true, path.clone(), true).await.unwrap();
+        let writable = handle.list_writable(true).await.unwrap();
+        assert!(writable.contains(&canonical), "enabled root is listed writable");
+
+        // Disable → not listed.
+        handle.set_folder_writable(true, path.clone(), false).await.unwrap();
+        let writable = handle.list_writable(true).await.unwrap();
+        assert!(!writable.contains(&canonical), "revoked root drops from the writable list");
     }
 }

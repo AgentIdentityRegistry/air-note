@@ -21,14 +21,20 @@ pub struct FileRecordDto {
     pub file_event_id: String,
     pub content_hash: String,
     pub grant_root: String,
+    /// True iff this file's `grant_root` is under an active write-grant (Lock 1).
+    pub writable: bool,
 }
-impl From<bossclaw_core::graph::FileRecord> for FileRecordDto {
-    fn from(f: bossclaw_core::graph::FileRecord) -> Self {
+impl FileRecordDto {
+    /// Build from a record + the set of active writable roots (a file is writable iff its
+    /// ingest grant_root is one of them — same root identity the write-grant uses).
+    pub fn from_parts(f: bossclaw_core::graph::FileRecord, writable_roots: &std::collections::HashSet<String>) -> Self {
+        let writable = writable_roots.contains(&f.grant_root);
         Self {
             canonical_path: f.canonical_path,
             file_event_id: f.file_event_id,
             content_hash: f.content_hash,
             grant_root: f.grant_root,
+            writable,
         }
     }
 }
@@ -115,6 +121,12 @@ pub async fn engine_revoke_grant(path: String, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
+pub async fn engine_set_folder_writable(path: String, on: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_folder_writable(onboarded, std::path::PathBuf::from(path), on).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn engine_list_grants(state: State<'_, AppState>) -> Result<Vec<GrantDto>, String> {
     let onboarded = state.identity_store.is_onboarded();
     let grants = state.engine.list_grants(onboarded).await.map_err(|e| e.to_string())?;
@@ -132,7 +144,9 @@ pub async fn engine_run_ingest(state: State<'_, AppState>) -> Result<IngestRepor
 pub async fn engine_list_files(state: State<'_, AppState>) -> Result<Vec<FileRecordDto>, String> {
     let onboarded = state.identity_store.is_onboarded();
     let files = state.engine.list_files(onboarded).await.map_err(|e| e.to_string())?;
-    Ok(files.into_iter().map(FileRecordDto::from).collect())
+    let writable_roots: std::collections::HashSet<String> =
+        state.engine.list_writable(onboarded).await.map_err(|e| e.to_string())?.into_iter().collect();
+    Ok(files.into_iter().map(|f| FileRecordDto::from_parts(f, &writable_roots)).collect())
 }
 
 #[tauri::command]
