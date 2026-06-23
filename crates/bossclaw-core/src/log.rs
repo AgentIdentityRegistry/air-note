@@ -188,6 +188,31 @@ const PROPOSALS_ENABLED_KEY: &str = "proposals_enabled";
 /// ONLY the autonomous mandate-driven `write_proposal` synthesis.
 const MANDATES_ENABLED_KEY: &str = "mandates_enabled";
 
+/// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
+/// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
+/// reference a compile-checked variant instead of a stringly-typed key that could drift on a
+/// rename (M2). `#[cfg(unix)]` is unnecessary — config flags exist on all platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFlag {
+    /// The evolve on/off switch ([`EVOLVE_ENABLED_KEY`]).
+    Evolve,
+    /// The M6b reconciliation-proposer on/off switch ([`PROPOSALS_ENABLED_KEY`]).
+    Proposals,
+    /// The M6c mandate-proposer on/off switch ([`MANDATES_ENABLED_KEY`]).
+    Mandates,
+}
+
+impl ConfigFlag {
+    /// The private content-key const this flag is stored under.
+    fn key(self) -> &'static str {
+        match self {
+            ConfigFlag::Evolve => EVOLVE_ENABLED_KEY,
+            ConfigFlag::Proposals => PROPOSALS_ENABLED_KEY,
+            ConfigFlag::Mandates => MANDATES_ENABLED_KEY,
+        }
+    }
+}
+
 /// The instruction channel (`system`) for the M6b whole-file rewrite reasoner call
 /// (spec §5.5). The data channel is [`crate::reconcile::build_rewrite_prompt`]'s
 /// fenced frame; this system line states the engine's intent so the prompt itself
@@ -332,6 +357,49 @@ fn unpack_post_identity(
             size: s as u64,
         }),
         _ => None,
+    }
+}
+
+/// One open (unresolved, non-terminally-rejected) `write_proposal`, projected for callers
+/// outside the crate (e.g. the desktop Review queue). Mirrors the per-proposal fields of
+/// `append_write_proposal_with` (`content`) plus the lineage off `model_meta`.
+/// `#[cfg(unix)]` like the confirm/apply API it feeds (M1).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingProposal {
+    /// The proposal event id (the ULID).
+    pub id: String,
+    /// Canonical target path (`content["target"]`).
+    pub target: String,
+    /// `"edit"` / `"create"` / `"delete"` (`content["op"]`; the M6b reconciler emits `"edit"`).
+    pub op: String,
+    /// Hex sha256 of the proposed bytes (`content["new_content_hash"]`).
+    pub new_content_hash: String,
+    /// Plain-English "Why" (`content["rationale"]`).
+    pub rationale: String,
+    /// The resolved contradiction `{src, relation, dst}` (`content["inducing_key"]`).
+    pub inducing_key: serde_json::Value,
+    /// Lineage event ids (`model_meta.source_event_ids`); empty if absent.
+    pub source_event_ids: Vec<String>,
+    /// The propose-time verdict summary `{requires_loud_modal, taint, allowed, base_content_hash}`
+    /// (`content["verdict_summary"]`).
+    pub verdict_summary: serde_json::Value,
+    /// Hex sha256 of the target file's bytes AT PROPOSE TIME
+    /// (`content["verdict_summary"]["base_content_hash"]`; `None` for a Create). The anti-clobber
+    /// fingerprint: apply fails closed if the live file no longer hashes to this.
+    pub base_content_hash: Option<String>,
+}
+
+#[cfg(unix)]
+impl PendingProposal {
+    /// Single-sourced fail-loud default for a proposal's loud-modal hint: an absent or garbled
+    /// `verdict_summary["requires_loud_modal"]` defaults to `true` (fail-loud). Used by both
+    /// `ProposalSummary::from_pending` (Task 6) and `proposal_preview` (Task 7) so they cannot drift (m2).
+    pub fn requires_loud_modal(&self) -> bool {
+        self.verdict_summary
+            .get("requires_loud_modal")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
     }
 }
 
@@ -2264,6 +2332,72 @@ impl EventLog {
             }
         }
         Ok(open_ids.iter().any(|id| !resolved.contains(id)))
+    }
+
+    /// Every OPEN `write_proposal`: emitted, not yet resolved by a `file_written`/`write_declined`,
+    /// and whose `(target, inducing_key)` is not terminally `write_rejected`. Oldest first
+    /// (`events_of_types` returns `seq ASC`). The desktop Review queue source. `#[cfg(unix)]` (M1).
+    #[cfg(unix)]
+    pub fn pending_proposals(&self) -> Result<Vec<PendingProposal>, BossclawError> {
+        use std::collections::{HashMap, HashSet};
+        // proposal id → parsed row, in emission order.
+        let mut open: Vec<PendingProposal> = Vec::new();
+        let mut resolved: HashSet<String> = HashSet::new();
+        // (target, inducing_key.to_string()) terminally rejected.
+        let mut rejected_keys: HashSet<(String, String)> = HashSet::new();
+        let mut proposal_keys: HashMap<String, (String, String)> = HashMap::new();
+
+        for ev in self.events_of_types(&[
+            crate::graph::WRITE_PROPOSAL_EVENT_TYPE,
+            crate::graph::WRITE_REJECTED_EVENT_TYPE,
+            crate::graph::WRITE_DECLINED_EVENT_TYPE,
+            crate::graph::FILE_WRITTEN_EVENT_TYPE,
+        ])? {
+            match ev.event_type.as_str() {
+                t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    // Read ALL fields via borrows of `ev.content` / `ev.model_meta` FIRST, then
+                    // build the struct — never move `ev.model_meta` before reading `ev.content`
+                    // (that would be a move-after-use, E0382).
+                    let id = ev.id.clone();
+                    let target = ev.content.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let op = ev.content.get("op").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let new_content_hash = ev.content.get("new_content_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let rationale = ev.content.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let inducing_key = ev.content.get("inducing_key").cloned().unwrap_or(serde_json::Value::Null);
+                    let verdict_summary = ev.content.get("verdict_summary").cloned().unwrap_or(serde_json::Value::Null);
+                    let base_content_hash = verdict_summary.get("base_content_hash")
+                        .and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let source_event_ids = ev.model_meta.as_ref()
+                        .map(|m| m.source_event_ids.clone()).unwrap_or_default();
+                    proposal_keys.insert(id.clone(), (target.clone(), inducing_key.to_string()));
+                    open.push(PendingProposal {
+                        id, target, op, new_content_hash, rationale,
+                        inducing_key, source_event_ids, base_content_hash, verdict_summary,
+                    });
+                }
+                t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
+                    let target = ev.content.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let key = ev.content.get("inducing_key").cloned().unwrap_or(serde_json::Value::Null);
+                    rejected_keys.insert((target, key.to_string()));
+                }
+                _ => {
+                    if let Some(rid) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        resolved.insert(rid.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(open
+            .into_iter()
+            .filter(|p| {
+                !resolved.contains(&p.id)
+                    && match proposal_keys.get(&p.id) {
+                        Some(k) => !rejected_keys.contains(k),
+                        None => true,
+                    }
+            })
+            .collect())
     }
 
     /// M6c mandate idempotency (spec §5.4) — decline-STICKY suppression keyed on the
@@ -4892,6 +5026,28 @@ impl EventLog {
         Ok(true) // flag never set → default open
     }
 
+    /// Was a config flag ever EXPLICITLY set (regardless of its value)? Scans `config` events for
+    /// a bool under the flag's key, returning true on the first hit. Distinguishes the engine's
+    /// never-set default-open from a user's explicit choice — the desktop `prime_switches` needs to
+    /// avoid clobbering a user `true` on every launch (SP4 change-b). A typed `ConfigFlag` (not a
+    /// raw key string) keeps the const single-sourced (M2/MIN-4).
+    pub fn explicitly_set(&self, flag: ConfigFlag) -> Result<bool, BossclawError> {
+        let key = flag.key();
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let ev: Event = serde_json::from_str(&row?)?;
+            if ev.content.get(key).and_then(|v| v.as_bool()).is_some() {
+                return Ok(true); // some config event carries this key as a bool ⇒ explicit
+            }
+        }
+        Ok(false)
+    }
+
     /// Set the M6c mandate-proposer on/off switch by appending a control
     /// `config` event whose content is `{ "mandates_enabled": <enabled> }`
     /// (M6c §5.5 / D8). CLONES the [`EventLog::set_evolve_enabled`] mechanism exactly —
@@ -6168,6 +6324,15 @@ impl EventLog {
                 continue; // already proposed against this file this contradiction
             }
 
+            // SP4 change-(a): be smart — check the write-grant FIRST. An ingested-but-not-
+            // -writable target is SKIPPED (no LLM, no propose, no write_rejected) so the
+            // folder stays clean and re-enabling it later starts fresh. We use
+            // `is_write_allowed` (not `gate_reject_reason`, which folds `!allowed` into the
+            // genuine-reject set) so the pure no-grant case never records terminal dead state.
+            if !self.is_write_allowed(std::path::Path::new(&rec.canonical_path))? {
+                continue;
+            }
+
             // a. inducing_key = the RESOLVED contradiction (entity ids).
             let inducing_key = serde_json::json!({
                 "src": r.src, "relation": r.relation, "dst": r.dst,
@@ -6241,13 +6406,11 @@ impl EventLog {
                 rationale: engine_fact.clone(),
             })?;
 
-            // i. A gate FAILURE → write_rejected. `gate_reject_reason()` folds BOTH
-            //    signals (a `reject_reason` OR `!allowed`, the never-widen check) —
-            //    single-sourced on `WriteVerdict`, symmetric with M6c's `run_mandate`.
-            //    M6b's targets are reconcilable (tracked + read-granted), so `!allowed`
-            //    is rare here, but the write-grant is independent + revocable and execute
-            //    re-checks; this rejects THIS target and `continue`s to the next.
-            if let Some(reason) = gated.verdict.gate_reject_reason() {
+            // i. A GENUINE gate failure (symlink/taint/op×existence) → write_rejected.
+            //    `reject_reason` (NOT `gate_reject_reason`) is the genuine-reject signal:
+            //    a bare `!allowed` (grant revoked between the hoisted check above and here)
+            //    is skipped, never recorded as terminal dead state.
+            if let Some(reason) = gated.verdict.reject_reason.as_deref() {
                 self.append_write_rejected(
                     Some(&rec.canonical_path),
                     reason,
@@ -6257,12 +6420,20 @@ impl EventLog {
                 report.proposals_rejected += 1;
                 continue;
             }
+            if !gated.verdict.allowed {
+                // Grant vanished mid-tick — skip (retryable), do not reject.
+                continue;
+            }
 
-            // j. Record the gated proposal + its bytes (the worklist side table).
+            // j. Record the gated proposal + its bytes (the worklist side table). The
+            //    verdict_summary also carries the base fingerprint (`base_content_hash`) so the
+            //    desktop apply can fail closed if the file diverged since this propose
+            //    (a fresh re-propose at apply re-bases on LIVE bytes and cannot see the drift).
             let verdict_summary = serde_json::json!({
                 "requires_loud_modal": gated.verdict.requires_loud_modal,
                 "taint": format!("{:?}", gated.verdict.taint),
                 "allowed": gated.verdict.allowed,
+                "base_content_hash": gated.verdict.base_content_hash,
             });
             let pid = self.append_write_proposal(
                 &rec.canonical_path,

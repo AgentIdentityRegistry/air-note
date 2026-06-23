@@ -62,6 +62,15 @@ pub enum EngineOpError {
     Reasoner(String),
     /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve").
     Busy(&'static str),
+    /// The on-disk file changed since the proposal was drafted; the re-gate at confirm
+    /// fails closed. Carries the reason. Nothing is written.
+    Stale(String),
+    /// The folder's write-grant was revoked between propose and apply; re-gate fails closed.
+    Revoked(String),
+    /// The FRESH re-gate verdict is loud (secret-/value-shaped or Delete) but the caller did not
+    /// pass `acknowledged_loud == true`. The op refuses to write — the UI must show the
+    /// "I've reviewed this" confirm and retry with the ack. Carries the reason.
+    NeedsLoudConfirm(String),
     Join(String),
 }
 
@@ -73,9 +82,56 @@ impl std::fmt::Display for EngineOpError {
             EngineOpError::Embedder(m) => write!(f, "memory model unavailable: {m}"),
             EngineOpError::Reasoner(m) => write!(f, "reasoner unavailable: {m}"),
             EngineOpError::Busy(op) => write!(f, "an {op} is already running"),
+            EngineOpError::Stale(m) => write!(f, "the file changed since this was suggested: {m}"),
+            EngineOpError::Revoked(m) => write!(f, "edits aren't allowed in this folder anymore: {m}"),
+            EngineOpError::NeedsLoudConfirm(m) => write!(f, "this change needs an explicit review confirmation: {m}"),
             EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
         }
     }
+}
+
+/// A row in the Review queue, projected from one open `PendingProposal`. The
+/// `requires_loud_modal` is lifted out of the propose-time `verdict_summary` for the badge/card.
+#[derive(Debug, Clone)]
+pub struct ProposalSummary {
+    pub id: String,
+    pub target: String,
+    pub op: String,
+    pub new_content_hash: String,
+    pub rationale: String,
+    pub requires_loud_modal: bool,
+}
+
+impl ProposalSummary {
+    fn from_pending(p: bossclaw_core::PendingProposal) -> Self {
+        // Single-sourced fail-loud default (m2): `PendingProposal::requires_loud_modal()` returns
+        // true when the verdict is absent/garbled. This is a UI HINT to pre-show the modal; the
+        // authoritative loud-confirm gate is the FRESH re-gate inside `apply_proposal` (Task 8).
+        let requires_loud_modal = p.requires_loud_modal();
+        Self {
+            id: p.id,
+            target: p.target,
+            op: p.op,
+            new_content_hash: p.new_content_hash,
+            rationale: p.rationale,
+            requires_loud_modal,
+        }
+    }
+}
+
+/// Everything the Review card renders for one proposal: paths, the "Why", op, both text halves,
+/// and the propose-time loud-modal/taint flags. `old_text`/`new_text` are lossy-UTF8 (the engine
+/// only proposes against UTF-8 targets; non-UTF8 is rejected at synthesis).
+#[derive(Debug, Clone)]
+pub struct PreviewData {
+    pub path: String,
+    pub folder: String,
+    pub rationale: String,
+    pub op: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub requires_loud_modal: bool,
+    pub taint: String,
 }
 
 /// The coarse engine state surfaced to the UI (distinguishes setup states from faults).
@@ -230,6 +286,31 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Enable (`on=true` → `add_write_grant`) or disable (`on=false` → `revoke_write_grant`)
+    /// edits for `path`. Lock 1 of two. Gated. The engine canonicalizes + fails closed on a
+    /// missing path; execute re-checks the grant at write time regardless.
+    pub async fn set_folder_writable(&self, onboarded: bool, path: PathBuf, on: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let r = if on { log.add_write_grant(&path) } else { log.revoke_write_grant(&path) };
+            r.map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// The canonical roots of every ACTIVE write-grant (revoked ones excluded). The UI uses
+    /// this to mark folders + files writable. Gated.
+    pub async fn list_writable(&self, onboarded: bool) -> Result<Vec<String>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let grants = log.write_grants().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(grants.into_iter().filter(|g| !g.revoked).map(|g| g.canonical_root).collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Every grant (active + revoked); the UI filters to active. Gated.
     pub async fn list_grants(&self, onboarded: bool) -> Result<Vec<bossclaw_core::Grant>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -270,16 +351,20 @@ impl EngineHandle {
         Ok(report)
     }
 
-    /// Force the three autonomy switches OFF (the engine defaults them ON when never set).
-    /// Each setter is sticky, so this writes at most once per flag and is idempotent across
-    /// opens. Runs inside `get_or_open`'s first-open closure; failure reuses the open path.
+    /// Neutralize the engine's dangerous default-ON autonomy flags at startup, WITHOUT
+    /// clobbering a user's explicit choice. `evolve`/`proposals` are forced off ONLY when the
+    /// user never explicitly set them (`!explicitly_set`), so an explicit on/off persists across
+    /// opens (SP4 change-b). `mandates_enabled` is ALWAYS forced off until SP5, regardless of any
+    /// prior setting. Each setter is sticky; runs inside `get_or_open`'s first-open closure.
     fn prime_switches(log: &EventLog) -> Result<(), bossclaw_core::BossclawError> {
-        if log.evolve_enabled()? {
+        use bossclaw_core::ConfigFlag;
+        if !log.explicitly_set(ConfigFlag::Evolve)? && log.evolve_enabled()? {
             log.set_evolve_enabled(false)?;
         }
-        if log.proposals_enabled()? {
+        if !log.explicitly_set(ConfigFlag::Proposals)? && log.proposals_enabled()? {
             log.set_proposals_enabled(false)?;
         }
+        // SP5 not shipped: mandates stay forced OFF even if a prior build set them.
         if log.mandates_enabled()? {
             log.set_mandates_enabled(false)?;
         }
@@ -444,11 +529,69 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Flip the sticky engine proposals off-switch (Lock-1 enablement; turned on under the hood
+    /// on first folder-enable). Gated.
+    pub async fn set_proposals_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_proposals_enabled(enabled).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Every current ingested file (one per path). Gated.
     pub async fn list_files(&self, onboarded: bool) -> Result<Vec<bossclaw_core::graph::FileRecord>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         tokio::task::spawn_blocking(move || {
             log.current_files().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Every open proposal, projected for the Review queue. Gated.
+    pub async fn list_proposals(&self, onboarded: bool) -> Result<Vec<ProposalSummary>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let pending = log.pending_proposals().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(pending.into_iter().map(ProposalSummary::from_pending).collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Build the before/after preview for one open proposal. Fail-closed: an unknown id, a
+    /// proposal whose bytes are missing/tampered (`get_proposal_bytes_checked`), or an
+    /// unreadable target all return `Err`. Gated.
+    pub async fn proposal_preview(&self, onboarded: bool, id: String) -> Result<PreviewData, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let pending = log.pending_proposals().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            let p = pending.into_iter().find(|p| p.id == id)
+                .ok_or_else(|| EngineOpError::Core("proposal not found or already resolved".to_string()))?;
+            // new bytes — fail closed unless they hash to the signed proposal's recorded hash.
+            let new_bytes = log.get_proposal_bytes_checked(&p.id, &p.new_content_hash)
+                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // old bytes — the current on-disk file (local read; the target is canonical).
+            let old_bytes = std::fs::read(&p.target)
+                .map_err(|e| EngineOpError::Core(format!("could not read target: {e}")))?;
+            let folder = std::path::Path::new(&p.target)
+                .parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+            // Single-sourced fail-loud default (m2) — read into a local BEFORE the struct moves
+            // `p`'s fields. A UI hint only; the authoritative gate is `apply_proposal` (Task 8).
+            let requires_loud_modal = p.requires_loud_modal();
+            let taint = p.verdict_summary.get("taint").and_then(|v| v.as_str()).unwrap_or("Untrusted").to_string();
+            Ok(PreviewData {
+                path: p.target,
+                folder,
+                rationale: p.rationale,
+                op: p.op,
+                old_text: String::from_utf8_lossy(&old_bytes).to_string(),
+                new_text: String::from_utf8_lossy(&new_bytes).to_string(),
+                requires_loud_modal,
+                taint,
+            })
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
@@ -463,6 +606,117 @@ impl EngineHandle {
             std::fs::remove_file(&self.db_path).map_err(|e| EngineError::Vault(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// The outcome of a successful apply: the audit `file_written` id (also the handle for Undo).
+#[derive(Debug, Clone)]
+pub struct ApplyResult {
+    pub file_written_id: String,
+}
+
+impl EngineHandle {
+    /// Approve + apply one proposal (Lock 2). The anti-clobber check is the EXPLICIT base-hash
+    /// compare: read the live target, sha256 it, and if the proposal's recorded
+    /// `base_content_hash` differs → fail closed as `Stale` BEFORE proposing or executing (a fresh
+    /// re-propose re-bases on live bytes and could not see the drift). Only then does it fetch the
+    /// verified bytes, re-gate with a FRESH `propose_write` against the LIVE file + current
+    /// write-grant (this still guards the micro-TOCTOU window + grant revocation). The loud-confirm
+    /// is decided from the FRESH verdict (NOT the stale propose-time flag): if it is loud and
+    /// `acknowledged_loud == false` the op REFUSES (`NeedsLoudConfirm`) — never a silent write.
+    /// Only then does it execute (atomic temp+rename, durable undo, signed `file_written`). Nothing
+    /// is written on any failure. Gated.
+    pub async fn apply_proposal(&self, onboarded: bool, id: String, acknowledged_loud: bool) -> Result<ApplyResult, EngineOpError> {
+        use sha2::{Digest, Sha256};
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let pending = log.pending_proposals().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            let p = pending.into_iter().find(|p| p.id == id)
+                .ok_or_else(|| EngineOpError::Stale("proposal not found or already resolved".to_string()))?;
+
+            // ── ANTI-CLOBBER: compare the live file to the proposal's propose-time fingerprint. ──
+            // This is the TRUE staleness detector (a fresh propose_write below re-bases on the live
+            // file and cannot detect that it changed). Edit-only proposals always carry a base.
+            let live_bytes = std::fs::read(&p.target)
+                .map_err(|e| EngineOpError::Stale(format!("could not read target: {e}")))?;
+            let live_hash = hex::encode(Sha256::digest(&live_bytes));
+            match &p.base_content_hash {
+                Some(base) if *base != live_hash => {
+                    return Err(EngineOpError::Stale(format!(
+                        "the file changed since this was suggested (base {base} != live {live_hash})"
+                    )));
+                }
+                None => {
+                    // No recorded base (e.g. a legacy/minimal proposal) → cannot prove freshness.
+                    return Err(EngineOpError::Stale("proposal has no base fingerprint to verify against".to_string()));
+                }
+                _ => {} // base matches live → proceed.
+            }
+
+            // Map the proposal's OWN op back to a `WriteOp` (fail-closed on an unknown string —
+            // NEVER default to Edit). SP4's M6b only emits "edit", so this is behavior-identical
+            // today; mapping it keeps a future Create/Delete proposal from being mis-gated as Edit.
+            let op = match p.op.as_str() {
+                "edit" => bossclaw_core::actuator::WriteOp::Edit,
+                "create" => bossclaw_core::actuator::WriteOp::Create,
+                "delete" => bossclaw_core::actuator::WriteOp::Delete,
+                other => return Err(EngineOpError::Core(format!("unknown proposal op: {other}"))),
+            };
+            // Verified bytes (fail closed if the side-table row is missing/tampered).
+            let bytes = log.get_proposal_bytes_checked(&p.id, &p.new_content_hash)
+                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // FRESH gate against the current disk + grant (never trust the stored verdict). Guards
+            // the micro-TOCTOU window between the hash check above and the rename, + grant revoke.
+            let gated = log.propose_write(bossclaw_core::actuator::WriteProposal {
+                target: std::path::PathBuf::from(&p.target),
+                new_content: bytes,
+                op,
+                source_event_ids: p.source_event_ids.clone(),
+                rationale: p.rationale.clone(),
+            }).map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // reject_reason set ⇒ symlink/op-mismatch/unresolvable; !allowed ⇒ grant revoked.
+            if let Some(reason) = gated.verdict.reject_reason.as_deref() {
+                return Err(EngineOpError::Stale(reason.to_string()));
+            }
+            if !gated.verdict.allowed {
+                return Err(EngineOpError::Revoked("target not under an active write grant".to_string()));
+            }
+            // LOUD-CONFIRM on the FRESH verdict (G1/IMP-1a): a loud write requires the explicit ack.
+            // This is the authoritative gate — the propose-time flag was only a UI hint.
+            if gated.verdict.requires_loud_modal && !acknowledged_loud {
+                return Err(EngineOpError::NeedsLoudConfirm(
+                    "secret-/value-shaped or delete change — confirm review before applying".to_string(),
+                ));
+            }
+            // execute is atomic temp+rename: it never partially writes, so a failure here also
+            // leaves the file untouched. (Defensive: any execute error surfaces as Core.)
+            let fw_id = log.execute_write_resolving(gated, &p.id)
+                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(ApplyResult { file_written_id: fw_id })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Undo a prior apply — re-gated, hash-verified restore of the pre-write bytes (LIFO per
+    /// target); fails closed if the file diverged since. Gated.
+    pub async fn undo_apply(&self, onboarded: bool, file_written_id: String) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.undo_write(&file_written_id).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Decline a proposal — terminal `write_declined` (resolves it; the fix never returns). Gated.
+    pub async fn decline_proposal(&self, onboarded: bool, id: String, reason: String) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.decline_write_proposal(&id, &reason).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 }
 
@@ -675,6 +929,27 @@ mod tests {
         assert_eq!(log2.count().unwrap(), n1, "no duplicate config events on re-open");
     }
 
+    #[tokio::test]
+    async fn prime_switches_preserves_explicit_proposals_but_forces_mandates_off() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault.clone(), &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        // After first open everything is forced off (never-set defaults).
+        assert!(!log.proposals_enabled().unwrap());
+        assert!(!log.mandates_enabled().unwrap());
+
+        // The user explicitly enables proposals.
+        log.set_proposals_enabled(true).unwrap();
+        assert!(log.proposals_enabled().unwrap());
+        drop(log);
+
+        // Re-open with a FRESH handle (same vault + db_path) → prime_switches runs again.
+        let handle2 = new_test_handle(vault, &dir);
+        let log2 = handle2.get_or_open(true).await.unwrap();
+        assert!(log2.proposals_enabled().unwrap(), "an explicit user true MUST persist across opens");
+        assert!(!log2.mandates_enabled().unwrap(), "mandates stay forced OFF until SP5");
+    }
+
     /// Tasks 5 + 6: `run_ingest` marks the index current, then `recall` round-trips through
     /// `ensure_indexed` and hydrates the ingested snippet text.
     #[tokio::test]
@@ -773,9 +1048,274 @@ mod tests {
         log.append(ev).unwrap();
     }
 
+    /// Seed one `memory` event and return its id (a lineage source for a Tier-B `write_proposal`).
+    fn seed_one_memory_id(log: &EventLog, text: &str) -> String {
+        log.append(bossclaw_core::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: "memory".to_string(),
+            content: serde_json::json!({ "text": text }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        }).unwrap()
+    }
+
     /// Count events of a given `event_type` in the log (used to prove zero `write_proposal`s).
     fn count_events_of_type(log: &EventLog, event_type: &str) -> usize {
         log.stream_all().unwrap().into_iter().filter(|e| e.event_type == event_type).count()
+    }
+
+    /// Ingest a single written file under a granted dir and return its `file_ingested` id.
+    /// Desktop-crate equivalent of `tests/common::ingest_one` (which lives in the bossclaw-core
+    /// test crate); built on the public API so the preview/apply tests can store + read bytes.
+    fn bossclaw_ingest_one(log: &EventLog, path: &std::path::Path) -> String {
+        let embedder = bossclaw_core::embed::MockEmbedder::new(8);
+        log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &embedder).unwrap();
+        let canonical = std::fs::canonicalize(path).unwrap().to_string_lossy().to_string();
+        log.current_files().unwrap().into_iter()
+            .find(|r| r.canonical_path == canonical)
+            .map(|r| r.file_event_id)
+            .expect("ingested file id")
+    }
+
+    #[tokio::test]
+    async fn list_proposals_returns_open_summaries() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+
+        // Seed a lineage event so the Tier-B proposal append is valid.
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"entity:a","relation":"works_at","dst":"entity:acme"});
+        let pid = log.append_write_proposal(
+            "/tmp/acme/notes.md", "edit", "deadbeef", 0, "Alice now works at Globex",
+            &key, &serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true}),
+            std::slice::from_ref(&lineage),
+        ).unwrap();
+        drop(log);
+
+        let proposals = handle.list_proposals(true).await.unwrap();
+        assert_eq!(proposals.len(), 1);
+        let p = &proposals[0];
+        assert_eq!(p.id, pid);
+        assert_eq!(p.target, "/tmp/acme/notes.md");
+        assert_eq!(p.op, "edit");
+        assert_eq!(p.new_content_hash, "deadbeef");
+        assert_eq!(p.rationale, "Alice now works at Globex");
+        assert!(!p.requires_loud_modal, "verdict_summary.requires_loud_modal projected");
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.list_proposals(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn garbled_verdict_summary_projects_requires_loud_modal_true() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        // verdict_summary is a STRING, not the expected object → `.get("requires_loud_modal")` is
+        // None → fail-loud default true.
+        let pid = log.append_write_proposal("/tmp/x/notes.md", "edit", "deadbeef", 0, "why",
+            &key, &serde_json::json!("garbled"), std::slice::from_ref(&lineage)).unwrap();
+        drop(log);
+
+        let proposals = handle.list_proposals(true).await.unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert!(proposals[0].id == pid && proposals[0].requires_loud_modal,
+            "an absent/garbled verdict_summary fails loud (requires_loud_modal == true)");
+    }
+
+    #[tokio::test]
+    async fn proposal_preview_returns_old_and_new_text_fail_closed_on_missing_bytes() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+
+        // A real write-granted file with known "old" bytes.
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("notes.md");
+        std::fs::write(&path, b"Alice works at Acme.\n").unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path); // see helper note below
+
+        // Build a real gated proposal for new bytes, then record it + its bytes (the engine
+        // emit path), so preview can read both halves.
+        let new_bytes = b"Alice works at Globex.\n".to_vec();
+        let gated = log.propose_write(WriteProposal {
+            target: path.clone(), new_content: new_bytes.clone(), op: WriteOp::Edit,
+            source_event_ids: vec![file_id.clone()], rationale: "correction".to_string(),
+        }).unwrap();
+        let hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&new_bytes))
+        };
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"entity:a","relation":"works_at","dst":"entity:acme"});
+        let verdict_summary = serde_json::json!({
+            "requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint),
+            "allowed": gated.verdict.allowed,
+        });
+        let pid = log.append_write_proposal(
+            &canonical, "edit", &hash, new_bytes.len() as u64, "correction",
+            &key, &verdict_summary, std::slice::from_ref(&file_id),
+        ).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        let preview = handle.proposal_preview(true, pid.clone()).await.unwrap();
+        assert_eq!(preview.path, canonical);
+        assert_eq!(preview.old_text, "Alice works at Acme.\n");
+        assert_eq!(preview.new_text, "Alice works at Globex.\n");
+        assert_eq!(preview.op, "edit");
+        assert_eq!(preview.rationale, "correction");
+
+        // Fail-closed: an unknown id errors (no bytes / no proposal).
+        assert!(handle.proposal_preview(true, "nonexistent".to_string()).await.is_err());
+
+        // Fail-loud (MIN-1): a proposal whose verdict_summary is garbled previews as loud.
+        let log = handle.get_or_open(true).await.unwrap();
+        let new2 = b"Alice works at Initech.\n".to_vec();
+        let hash2 = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&new2)) };
+        let pid2 = log.append_write_proposal(&canonical, "edit", &hash2, new2.len() as u64,
+            "correction2", &key, &serde_json::json!("garbled"), std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid2, &new2, &hash2).unwrap();
+        drop(log);
+        let preview2 = handle.proposal_preview(true, pid2).await.unwrap();
+        assert!(preview2.requires_loud_modal, "garbled verdict_summary previews fail-loud");
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_writes_file_and_resolves_then_stale_fails_closed() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+
+        // ---- happy path ----
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("notes.md");
+        let original = b"Alice works at Acme.\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path);
+        let new_bytes = b"Alice works at Globex.\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let gated = log.propose_write(WriteProposal {
+            target: path.clone(), new_content: new_bytes.clone(), op: WriteOp::Edit,
+            source_event_ids: vec![file_id.clone()], rationale: "fix".to_string(),
+        }).unwrap();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "fix", &key, &vs, std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // An Edit to a TRACKED file is loud by construction: propose_write's engine-anchored taint
+        // (actuator step 4, security-critical) sets taint=Untrusted for any currently-ingested
+        // target, so the FRESH re-gate's requires_loud_modal is always true here. The authoritative
+        // loud gate therefore needs the explicit ack to apply — exactly what the loud test asserts.
+        let result = handle.apply_proposal(true, pid.clone(), true).await.unwrap();
+        assert!(!result.file_written_id.is_empty(), "an apply returns the file_written id");
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the file gained the corrected bytes");
+        // the proposal is no longer pending (resolved by the file_written).
+        assert!(handle.list_proposals(true).await.unwrap().iter().all(|p| p.id != pid));
+        // G4: the emitted file_written carries resolves_proposal == pid (the resolution mechanism).
+        let log = handle.get_or_open(true).await.unwrap();
+        let fw = log.event_by_id(&result.file_written_id).unwrap().unwrap();
+        assert_eq!(fw.event_type, "file_written");
+        assert_eq!(fw.content["resolves_proposal"], serde_json::json!(pid),
+            "the file_written resolves the exact proposal id");
+        drop(log);
+
+        // ---- stale path: mutate the file AFTER a fresh propose, assert apply fails closed ----
+        let (vault2, dir2) = test_vault_and_dir();
+        let handle2 = new_test_handle(vault2, &dir2);
+        let log2 = handle2.get_or_open(true).await.unwrap();
+        let folder2 = tempfile::tempdir().unwrap();
+        log2.add_grant(folder2.path()).unwrap();
+        log2.add_write_grant(folder2.path()).unwrap();
+        let path2 = folder2.path().join("notes.md");
+        let orig2 = b"Alice works at Acme.\n".to_vec();
+        std::fs::write(&path2, &orig2).unwrap();
+        let fid2 = bossclaw_ingest_one(&log2, &path2);
+        let new2 = b"Alice works at Globex.\n".to_vec();
+        let hash2 = hex::encode(Sha256::digest(&new2));
+        let canon2 = std::fs::canonicalize(&path2).unwrap().to_string_lossy().to_string();
+        let k2 = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let g2 = log2.propose_write(WriteProposal { target: path2.clone(), new_content: new2.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![fid2.clone()], rationale: "fix".to_string() }).unwrap();
+        // The proposal records its base fingerprint = sha256("Alice works at Acme.") at propose.
+        let vs2 = serde_json::json!({"requires_loud_modal": g2.verdict.requires_loud_modal,
+            "taint": format!("{:?}", g2.verdict.taint), "allowed": g2.verdict.allowed,
+            "base_content_hash": g2.verdict.base_content_hash});
+        assert_eq!(g2.verdict.base_content_hash.as_deref(), Some(hex::encode(Sha256::digest(&orig2)).as_str()),
+            "the gate fingerprinted the original on-disk bytes");
+        let pid2 = log2.append_write_proposal(&canon2, "edit", &hash2, new2.len() as u64, "fix",
+            &k2, &vs2, std::slice::from_ref(&fid2)).unwrap();
+        log2.put_proposal_bytes(&pid2, &new2, &hash2).unwrap();
+        drop(log2);
+
+        // Someone edits the file out from under the proposal (live bytes no longer match base).
+        std::fs::write(&path2, b"Alice retired.\n").unwrap();
+
+        let stale = handle2.apply_proposal(true, pid2.clone(), false).await;
+        assert!(matches!(stale, Err(EngineOpError::Stale(_))), "a changed file fails closed as Stale: {stale:?}");
+        assert_eq!(std::fs::read(&path2).unwrap(), b"Alice retired.\n".to_vec(),
+            "the file is untouched when the apply fails closed (no propose, no execute)");
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_loud_needs_ack_then_applies() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("secrets.md");
+        let original = b"placeholder\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path);
+        // A >=32-char unbroken alphanumeric run trips the secret-shaped diff flag → loud.
+        let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![file_id.clone()], rationale: "fix".to_string() }).unwrap();
+        assert!(gated.verdict.requires_loud_modal, "secret-shaped content forces the loud modal");
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "fix", &key, &vs, std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // acknowledged_loud=false → refuses, file unchanged.
+        let needs = handle.apply_proposal(true, pid.clone(), false).await;
+        assert!(matches!(needs, Err(EngineOpError::NeedsLoudConfirm(_))),
+            "a loud write without ack is refused: {needs:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), original, "no write happened without the ack");
+
+        // acknowledged_loud=true → applies.
+        handle.apply_proposal(true, pid, true).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the ack lets the loud write through");
     }
 
     /// Task 7 (mint): with the stub returning one entity for the extraction schema, an
@@ -902,5 +1442,116 @@ mod tests {
         handle.set_evolve_enabled(true, true).await.unwrap();
         let (status1, _t) = handle.evolve_status(true).await.unwrap();
         assert!(status1.enabled, "toggle on takes effect");
+    }
+
+    #[tokio::test]
+    async fn set_folder_writable_toggles_the_write_grant_and_list_writable_reflects_it() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        // A real folder to grant (must exist; add_write_grant canonicalizes + fails closed).
+        let target = tempfile::tempdir().unwrap();
+        let path = target.path().to_path_buf();
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.set_folder_writable(false, path.clone(), true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+
+        // Enable → listed writable.
+        handle.set_folder_writable(true, path.clone(), true).await.unwrap();
+        let writable = handle.list_writable(true).await.unwrap();
+        assert!(writable.contains(&canonical), "enabled root is listed writable");
+
+        // Disable → not listed.
+        handle.set_folder_writable(true, path.clone(), false).await.unwrap();
+        let writable = handle.list_writable(true).await.unwrap();
+        assert!(!writable.contains(&canonical), "revoked root drops from the writable list");
+    }
+
+    #[tokio::test]
+    async fn set_proposals_enabled_toggles_the_engine_flag() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(!log.proposals_enabled().unwrap(), "primed off at first open");
+        drop(log);
+
+        handle.set_proposals_enabled(true, true).await.unwrap();
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(log.proposals_enabled().unwrap(), "the op flips the sticky flag on");
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.set_proposals_enabled(false, true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn decline_proposal_removes_it_from_pending() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let pid = log.append_write_proposal("/tmp/x/notes.md", "edit", "deadbeef", 0, "why",
+            &key, &serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true}),
+            std::slice::from_ref(&lineage)).unwrap();
+        drop(log);
+
+        assert_eq!(handle.list_proposals(true).await.unwrap().len(), 1);
+        handle.decline_proposal(true, pid.clone(), "not now".to_string()).await.unwrap();
+        assert!(handle.list_proposals(true).await.unwrap().is_empty(), "declined → no longer pending");
+
+        assert!(matches!(
+            handle.decline_proposal(false, pid, "x".to_string()).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn undo_apply_restores_the_original_bytes() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("notes.md");
+        let original = b"Alice works at Acme.\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path);
+        let new_bytes = b"Alice works at Globex.\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![file_id.clone()], rationale: "fix".to_string() }).unwrap();
+        // Mirror the happy-path apply flow (apply_proposal_writes_file_and_resolves_then_stale_fails_closed):
+        // the proposal MUST carry base_content_hash in its verdict_summary or Task 8's anti-clobber gate
+        // fails closed with Stale("proposal has no base fingerprint to verify against").
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64, "fix",
+            &key, &vs, std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // An Edit to a TRACKED file is loud by construction (engine-anchored taint=Untrusted), so the
+        // FRESH re-gate requires the explicit ack — pass `true`, like the happy-path apply flow.
+        let applied = handle.apply_proposal(true, pid, true).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "applied");
+        handle.undo_apply(true, applied.file_written_id.clone()).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original, "undo restored the original bytes");
+
+        assert!(matches!(
+            handle.undo_apply(false, applied.file_written_id).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
     }
 }

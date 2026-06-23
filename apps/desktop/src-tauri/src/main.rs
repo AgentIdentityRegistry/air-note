@@ -140,11 +140,27 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_revoke_grant,
             #[cfg(unix)]
+            commands::engine::engine_set_folder_writable,
+            #[cfg(unix)]
+            commands::engine::engine_list_writable,
+            #[cfg(unix)]
+            commands::engine::engine_set_proposals_enabled,
+            #[cfg(unix)]
             commands::engine::engine_list_grants,
             #[cfg(unix)]
             commands::engine::engine_run_ingest,
             #[cfg(unix)]
             commands::engine::engine_list_files,
+            #[cfg(unix)]
+            commands::engine::engine_list_proposals,
+            #[cfg(unix)]
+            commands::engine::engine_proposal_preview,
+            #[cfg(unix)]
+            commands::engine::engine_apply_proposal,
+            #[cfg(unix)]
+            commands::engine::engine_decline_proposal,
+            #[cfg(unix)]
+            commands::engine::engine_undo_apply,
             #[cfg(unix)]
             commands::engine::engine_pick_folder,
             #[cfg(unix)]

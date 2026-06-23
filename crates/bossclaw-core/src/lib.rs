@@ -58,9 +58,11 @@ pub use evolve::{EvolveReport, EvolveStatus};
 pub use fastembed::FastEmbed;
 pub use graph::{AsOf, Edge, Entity, Grant, Mandate, Node, Page, WriteGrant, MAX_RECIPE_LEN};
 pub use index::{HnswIndex, VectorIndex};
-pub use log::{ActiveModel, EventLog, ReembedStats, SynthCacheRow, SCHEMA_VERSION};
+pub use log::{ActiveModel, ConfigFlag, EventLog, ReembedStats, SynthCacheRow, SCHEMA_VERSION};
 #[cfg(unix)]
 pub use log::MandateAction;
+#[cfg(unix)]
+pub use log::PendingProposal;
 #[cfg(unix)]
 pub use watch::MandateWatcher;
 pub use model2vec::Model2Vec;

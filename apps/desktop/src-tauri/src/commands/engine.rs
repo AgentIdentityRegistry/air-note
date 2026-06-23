@@ -21,14 +21,20 @@ pub struct FileRecordDto {
     pub file_event_id: String,
     pub content_hash: String,
     pub grant_root: String,
+    /// True iff this file's `grant_root` is under an active write-grant (Lock 1).
+    pub writable: bool,
 }
-impl From<bossclaw_core::graph::FileRecord> for FileRecordDto {
-    fn from(f: bossclaw_core::graph::FileRecord) -> Self {
+impl FileRecordDto {
+    /// Build from a record + the set of active writable roots (a file is writable iff its
+    /// ingest grant_root is one of them — same root identity the write-grant uses).
+    pub fn from_parts(f: bossclaw_core::graph::FileRecord, writable_roots: &std::collections::HashSet<String>) -> Self {
+        let writable = writable_roots.contains(&f.grant_root);
         Self {
             canonical_path: f.canonical_path,
             file_event_id: f.file_event_id,
             content_hash: f.content_hash,
             grant_root: f.grant_root,
+            writable,
         }
     }
 }
@@ -115,6 +121,18 @@ pub async fn engine_revoke_grant(path: String, state: State<'_, AppState>) -> Re
 }
 
 #[tauri::command]
+pub async fn engine_set_folder_writable(path: String, on: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_folder_writable(onboarded, std::path::PathBuf::from(path), on).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn engine_list_writable(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.list_writable(onboarded).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn engine_list_grants(state: State<'_, AppState>) -> Result<Vec<GrantDto>, String> {
     let onboarded = state.identity_store.is_onboarded();
     let grants = state.engine.list_grants(onboarded).await.map_err(|e| e.to_string())?;
@@ -132,7 +150,9 @@ pub async fn engine_run_ingest(state: State<'_, AppState>) -> Result<IngestRepor
 pub async fn engine_list_files(state: State<'_, AppState>) -> Result<Vec<FileRecordDto>, String> {
     let onboarded = state.identity_store.is_onboarded();
     let files = state.engine.list_files(onboarded).await.map_err(|e| e.to_string())?;
-    Ok(files.into_iter().map(FileRecordDto::from).collect())
+    let writable_roots: std::collections::HashSet<String> =
+        state.engine.list_writable(onboarded).await.map_err(|e| e.to_string())?.into_iter().collect();
+    Ok(files.into_iter().map(|f| FileRecordDto::from_parts(f, &writable_roots)).collect())
 }
 
 #[tauri::command]
@@ -212,6 +232,89 @@ impl From<bossclaw_core::EvolveReport> for EvolveReportDto {
     }
 }
 
+#[derive(Serialize)]
+pub struct ProposalDto {
+    pub id: String,
+    pub target: String,
+    pub op: String,
+    pub new_content_hash: String,
+    pub rationale: String,
+    pub requires_loud_modal: bool,
+}
+impl From<crate::engine::ProposalSummary> for ProposalDto {
+    fn from(p: crate::engine::ProposalSummary) -> Self {
+        Self {
+            id: p.id, target: p.target, op: p.op,
+            new_content_hash: p.new_content_hash, rationale: p.rationale,
+            requires_loud_modal: p.requires_loud_modal,
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_list_proposals(state: State<'_, AppState>) -> Result<Vec<ProposalDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let proposals = state.engine.list_proposals(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(proposals.into_iter().map(ProposalDto::from).collect())
+}
+
+#[derive(Serialize)]
+pub struct PreviewDto {
+    pub path: String,
+    pub folder: String,
+    pub rationale: String,
+    pub op: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub requires_loud_modal: bool,
+    pub taint: String,
+}
+impl From<crate::engine::PreviewData> for PreviewDto {
+    fn from(p: crate::engine::PreviewData) -> Self {
+        Self {
+            path: p.path, folder: p.folder, rationale: p.rationale, op: p.op,
+            old_text: p.old_text, new_text: p.new_text,
+            requires_loud_modal: p.requires_loud_modal, taint: p.taint,
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> Result<PreviewDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let preview = state.engine.proposal_preview(onboarded, id).await.map_err(|e| e.to_string())?;
+    Ok(PreviewDto::from(preview))
+}
+
+#[derive(Serialize)]
+pub struct ApplyResultDto {
+    pub file_written_id: String,
+}
+impl From<crate::engine::ApplyResult> for ApplyResultDto {
+    fn from(r: crate::engine::ApplyResult) -> Self {
+        Self { file_written_id: r.file_written_id }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_apply_proposal(id: String, acknowledged_loud: bool, state: State<'_, AppState>) -> Result<ApplyResultDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let result = state.engine.apply_proposal(onboarded, id, acknowledged_loud).await.map_err(|e| e.to_string())?;
+    Ok(ApplyResultDto::from(result))
+}
+
+#[tauri::command]
+pub async fn engine_decline_proposal(id: String, reason: String, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.decline_proposal(onboarded, id, reason).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn engine_undo_apply(file_written_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.undo_apply(onboarded, file_written_id).await.map_err(|e| e.to_string())
+}
+
 /// The evolve loop's status. NEVER errors: if the engine isn't open yet (or any op error),
 /// report a disabled/empty status — payload-encoded exactly like `engine_status`, so a
 /// status poll from the Memory tab can never throw.
@@ -238,6 +341,13 @@ pub async fn engine_set_evolve_enabled(
 ) -> Result<(), String> {
     let onboarded = state.identity_store.is_onboarded();
     state.engine.set_evolve_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
+}
+
+/// Flip the sticky proposals off-switch (invoked under the hood on first folder-enable).
+#[tauri::command]
+pub async fn engine_set_proposals_enabled(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_proposals_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
 }
 
 /// Run one evolve tick now ("Evolve now"). Returns the tick report.
@@ -350,5 +460,93 @@ mod tests {
         assert_eq!(dto.invalidates_emitted, 1);
         assert_eq!(dto.pages_emitted, 4);
         assert_eq!(dto.memories_processed, 5);
+    }
+
+    use crate::commands::identity::AppState;
+    use crate::secrets::SecretsVault;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tauri::Manager;
+
+    struct CmdTestVault { store: Mutex<HashMap<String, String>> }
+    impl CmdTestVault { fn new() -> Arc<Self> { Arc::new(Self { store: Mutex::new(HashMap::new()) }) } }
+    impl SecretsVault for CmdTestVault {
+        fn set(&self, k: &str, v: &str) -> Result<(), String> { self.store.lock().unwrap().insert(k.into(), v.into()); Ok(()) }
+        fn get(&self, k: &str) -> Result<Option<String>, String> { Ok(self.store.lock().unwrap().get(k).cloned()) }
+        fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
+    }
+
+    #[test]
+    fn engine_undo_apply_binds_camelcase_arg_over_ipc() {
+        use crate::air::identity::{IdentityMetadata, IdentityStore};
+        use crate::air::types::Did;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = CmdTestVault::new();
+        // Make is_onboarded() true: save a signing key + metadata (the engine then opens).
+        // IdentityMetadata has no Default — build it explicitly (Did is a pub-field tuple struct).
+        let identity_store = IdentityStore::new(vault.clone(), dir.path().to_path_buf());
+        identity_store.save_signing_key(&[7u8; 32]).unwrap();
+        identity_store.save_metadata(&IdentityMetadata {
+            did: Did("did:wba:AIR-TEST:cmd".to_string()),
+            name: "Test".to_string(),
+            created_at: "2026-06-23T00:00:00Z".to_string(),
+        }).unwrap();
+        let engine = Arc::new(crate::engine::EngineHandle::new(
+            vault, dir.path().to_path_buf(),
+            Arc::new(crate::engine::embed::MockEmbedderProvider::new(8)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        ));
+        // AppState carries air_client + inbox too (the desktop's real wiring, main.rs); use the
+        // in-repo doubles so the managed state matches the real struct shape.
+        let state = AppState {
+            air_client: Arc::new(crate::air::MockAirClient::new()),
+            identity_store,
+            inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
+            engine,
+        };
+
+        // Grant the `main` window permission to invoke `engine_undo_apply`, so the request ROUTES
+        // PAST Tauri's ACL (authority.rs) instead of being rejected with "engine_undo_apply not
+        // allowed. Plugin not found" BEFORE arg deserialization. Without this, any failure (incl.
+        // the routing one) would vacuously pass a negative assertion — the test must actually reach
+        // `undo_write` to prove the camelCase→snake_case binding. The invoke URL below
+        // (`http://tauri.localhost`) is classified as a Remote origin, so the grant must name that
+        // exact origin (a Local grant would not match — Origin::matches in authority.rs).
+        let origin: tauri::utils::acl::RemoteUrlPattern =
+            "http://tauri.localhost".parse().expect("valid remote url pattern");
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.runtime_authority_mut().__allow_command(
+            "engine_undo_apply".to_string(),
+            tauri::utils::acl::ExecutionContext::Remote { url: origin },
+        );
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![engine_undo_apply])
+            .build(context)
+            .expect("build mock app");
+        app.manage(state);
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        // Invoke with the camelCase key the TS twin sends.
+        let res = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "engine_undo_apply".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(serde_json::json!({ "fileWrittenId": "no-such-id" })),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        // POSITIVE op-ran assertion: the camelCase `fileWrittenId` bound to the snake_case
+        // `file_written_id` param AND `undo_write` actually ran — proven by the fail-closed
+        // SIGNATURE it returns for an unknown id (`undo_write fail-closed: no undo record …`,
+        // bossclaw-core log.rs). That string can ONLY appear past the arg binding + the op; a
+        // routing reject, a missing-key deserialize error, or a wrong key could never produce it.
+        let err = res.expect_err("unknown id makes undo_write fail");
+        let msg = err.to_string();
+        assert!(msg.contains("undo_write fail-closed") && msg.contains("no undo record"),
+            "expected the undo_write fail-closed signature (arg bound + op ran), got: {msg}");
     }
 }
