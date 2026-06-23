@@ -762,6 +762,26 @@ fn reconcile_target_outside_write_grant_skipped_at_propose() {
     );
 }
 
+#[test]
+fn explicitly_set_distinguishes_default_from_user_choice() {
+    use bossclaw_core::ConfigFlag;
+    let (log, _home, _dir) = common::open_log_with_write_grant();
+
+    // Never set → not explicit (even though the getter defaults to true).
+    assert!(log.proposals_enabled().unwrap(), "getter default-open");
+    assert!(!log.explicitly_set(ConfigFlag::Proposals).unwrap(), "never set → not explicit");
+
+    // Explicit set flips false → true.
+    log.set_proposals_enabled(true).unwrap();
+    assert!(log.explicitly_set(ConfigFlag::Proposals).unwrap(), "an explicit flip is detected");
+
+    // A DIFFERENT flag's flip does not mark Proposals explicit.
+    let (log2, _home2, _dir2) = common::open_log_with_write_grant();
+    log2.set_evolve_enabled(true).unwrap();
+    assert!(!log2.explicitly_set(ConfigFlag::Proposals).unwrap(), "another flag's event is ignored");
+    assert!(log2.explicitly_set(ConfigFlag::Evolve).unwrap(), "the flipped flag is explicit");
+}
+
 /// A contradiction whose BOTH facts come only from memories (no file in the lineage)
 /// confirms the `invalidate` but synthesizes NO proposal — there is nothing on disk to
 /// rewrite.

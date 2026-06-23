@@ -188,6 +188,31 @@ const PROPOSALS_ENABLED_KEY: &str = "proposals_enabled";
 /// ONLY the autonomous mandate-driven `write_proposal` synthesis.
 const MANDATES_ENABLED_KEY: &str = "mandates_enabled";
 
+/// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
+/// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
+/// reference a compile-checked variant instead of a stringly-typed key that could drift on a
+/// rename (M2). `#[cfg(unix)]` is unnecessary — config flags exist on all platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFlag {
+    /// The evolve on/off switch ([`EVOLVE_ENABLED_KEY`]).
+    Evolve,
+    /// The M6b reconciliation-proposer on/off switch ([`PROPOSALS_ENABLED_KEY`]).
+    Proposals,
+    /// The M6c mandate-proposer on/off switch ([`MANDATES_ENABLED_KEY`]).
+    Mandates,
+}
+
+impl ConfigFlag {
+    /// The private content-key const this flag is stored under.
+    fn key(self) -> &'static str {
+        match self {
+            ConfigFlag::Evolve => EVOLVE_ENABLED_KEY,
+            ConfigFlag::Proposals => PROPOSALS_ENABLED_KEY,
+            ConfigFlag::Mandates => MANDATES_ENABLED_KEY,
+        }
+    }
+}
+
 /// The instruction channel (`system`) for the M6b whole-file rewrite reasoner call
 /// (spec §5.5). The data channel is [`crate::reconcile::build_rewrite_prompt`]'s
 /// fenced frame; this system line states the engine's intent so the prompt itself
@@ -4999,6 +5024,28 @@ impl EventLog {
             }
         }
         Ok(true) // flag never set → default open
+    }
+
+    /// Was a config flag ever EXPLICITLY set (regardless of its value)? Scans `config` events for
+    /// a bool under the flag's key, returning true on the first hit. Distinguishes the engine's
+    /// never-set default-open from a user's explicit choice — the input `prime_switches` needs to
+    /// avoid clobbering a user `true` on every launch (SP4 change-b). A typed `ConfigFlag` (not a
+    /// raw key string) keeps the const single-sourced (M2/MIN-4).
+    pub fn explicitly_set(&self, flag: ConfigFlag) -> Result<bool, BossclawError> {
+        let key = flag.key();
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let ev: Event = serde_json::from_str(&row?)?;
+            if ev.content.get(key).and_then(|v| v.as_bool()).is_some() {
+                return Ok(true); // some config event carries this key as a bool ⇒ explicit
+            }
+        }
+        Ok(false)
     }
 
     /// Set the M6c mandate-proposer on/off switch by appending a control
