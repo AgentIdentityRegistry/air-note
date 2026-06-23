@@ -119,7 +119,7 @@ mod tests {
     async fn reset_tears_down_the_engine() {
         let dir = tempfile::tempdir().unwrap();
         let vault = TestVault::new();
-        let engine = Arc::new(EngineHandle::new(vault.clone(), dir.path().to_path_buf(), Arc::new(embed::MockEmbedderProvider::new(8))));
+        let engine = Arc::new(EngineHandle::new(vault.clone(), dir.path().to_path_buf(), Arc::new(embed::MockEmbedderProvider::new(8)), Arc::new(crate::engine::reason::MockReasonerProvider::new("m"))));
         engine.get_or_open(true).await.unwrap();
         // Simulate the engine half of reset_identity:
         engine.teardown().await.unwrap();

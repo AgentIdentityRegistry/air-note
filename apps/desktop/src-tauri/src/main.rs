@@ -70,8 +70,21 @@ fn main() {
                 // `<resource_dir>/resources/models/potion-base-8M`, NOT `<resource_dir>/models/...`.
                 let model_dir = resource_dir.join("resources/models/potion-base-8M");
                 let provider = std::sync::Arc::new(crate::engine::embed::ResourceModel2Vec::new(model_dir));
-                std::sync::Arc::new(crate::engine::EngineHandle::new(vault, data_dir, provider))
+                let reasoner_provider =
+                    std::sync::Arc::new(crate::engine::reason::OllamaReasonerProvider::new());
+                std::sync::Arc::new(crate::engine::EngineHandle::new(
+                    vault,
+                    data_dir,
+                    provider,
+                    reasoner_provider,
+                ))
             };
+            // Start the background evolve driver (OFF by default — it gates on the sticky
+            // `evolve_enabled` off-switch + a present local Ollama + a non-empty queue each
+            // wake). Spawned via `tauri::async_runtime::spawn` inside the scheduler; the
+            // handle + identity store are cheaply cloned for it.
+            #[cfg(unix)]
+            crate::engine::scheduler::spawn(engine.clone(), identity_store.clone());
 
             // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
             // Settings UI will offer a friendlier toggle in a later task.
@@ -134,6 +147,16 @@ fn main() {
             commands::engine::engine_list_files,
             #[cfg(unix)]
             commands::engine::engine_pick_folder,
+            #[cfg(unix)]
+            commands::engine::engine_recall,
+            #[cfg(unix)]
+            commands::engine::engine_evolve_status,
+            #[cfg(unix)]
+            commands::engine::engine_set_evolve_enabled,
+            #[cfg(unix)]
+            commands::engine::engine_evolve_now,
+            #[cfg(unix)]
+            commands::engine::engine_ollama_status,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

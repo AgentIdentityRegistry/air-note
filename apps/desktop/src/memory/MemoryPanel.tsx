@@ -1,0 +1,200 @@
+import { useEffect, useRef, useState } from "react";
+import { Card } from "../components/Card";
+import { Button } from "../components/Button";
+import {
+  recall, evolveStatus, setEvolveEnabled, evolveNow, ollamaStatus,
+  type HitDto, type EvolveStatusDto, type OllamaStatusDto,
+} from "../api/engine";
+import { toRow } from "./recallView";
+import { formatEvolve } from "./evolveStatus";
+
+/** How many recall hits to request per search. */
+const RECALL_K = 10;
+/** How often the evolve card refreshes its status while the tab is open. */
+const POLL_MS = 5000;
+
+export function MemoryPanel() {
+  // Search state.
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<HitDto[]>([]);
+  const [searched, setSearched] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+
+  // Evolve state.
+  const [status, setStatus] = useState<EvolveStatusDto | null>(null);
+  const [ollama, setOllama] = useState<OllamaStatusDto | null>(null);
+  const [evolving, setEvolving] = useState(false);
+  const [toggling, setToggling] = useState(false);
+  const [evolveError, setEvolveError] = useState<string | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+
+  const refreshStatus = async () => {
+    try {
+      const [s, o] = await Promise.all([evolveStatus(), ollamaStatus()]);
+      setStatus(s);
+      setOllama(o);
+      setUnavailable(false);
+    } catch {
+      setUnavailable(true);
+    }
+  };
+
+  // Poll on mount and every POLL_MS; clear the timer on unmount.
+  const refreshRef = useRef(refreshStatus);
+  refreshRef.current = refreshStatus;
+  useEffect(() => {
+    void refreshRef.current();
+    const id = setInterval(() => void refreshRef.current(), POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  if (unavailable) {
+    return (
+      <Card>
+        <h2 style={{ margin: 0 }}>Memory</h2>
+        <p style={{ color: "#666" }}>Couldn’t reach the memory engine.</p>
+      </Card>
+    );
+  }
+
+  const onSearch = async () => {
+    const q = query.trim();
+    if (!q) return;
+    setSearching(true);
+    setSearchError(null);
+    try {
+      setHits(await recall(q, RECALL_K));
+      setSearched(true);
+    } catch (e) {
+      setSearchError(String(e));
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const onToggleEvolve = async () => {
+    if (!status) return;
+    setToggling(true);
+    setEvolveError(null);
+    try {
+      await setEvolveEnabled(!status.enabled);
+      await refreshStatus();
+    } catch (e) {
+      setEvolveError(String(e));
+    } finally {
+      setToggling(false);
+    }
+  };
+
+  const onEvolveNow = async () => {
+    setEvolving(true);
+    setEvolveError(null);
+    try {
+      await evolveNow();
+      await refreshStatus();
+    } catch (e) {
+      setEvolveError(String(e));
+    } finally {
+      setEvolving(false);
+    }
+  };
+
+  const ollamaReady = !!ollama?.reachable && !!ollama?.model_present;
+
+  return (
+    <Card>
+      <h2 style={{ margin: 0 }}>Memory</h2>
+      <p style={{ color: "#666", fontSize: 13 }}>
+        Search everything the agent has read and learned. Everything stays on your machine.
+      </p>
+
+      <div style={{ display: "flex", gap: 8, margin: "12px 0" }}>
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") void onSearch(); }}
+          placeholder="Search your memory…"
+          style={{
+            flex: 1, padding: "8px 12px", borderRadius: 6,
+            border: "1px solid #ccc", fontFamily: "inherit", fontSize: 14,
+          }}
+        />
+        <Button variant="primary" onClick={onSearch} disabled={searching || query.trim() === ""}>
+          {searching ? "Searching…" : "Search"}
+        </Button>
+      </div>
+
+      {searchError ? <p style={{ fontSize: 13, color: "#b00" }}>{searchError}</p> : null}
+
+      {searched && hits.length === 0 && !searchError ? (
+        <p style={{ color: "#666", fontSize: 13 }}>Nothing found yet — try a different search.</p>
+      ) : null}
+
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {hits.map((h) => {
+          const row = toRow(h);
+          return (
+            <li key={row.id} style={{ padding: "10px 0", borderBottom: "1px solid #eee" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{
+                  fontSize: 11, fontWeight: 600, color: "#555",
+                  background: "#f0f0f0", borderRadius: 4, padding: "2px 6px",
+                }}>
+                  {row.kindLabel}
+                </span>
+                <span style={{ fontSize: 12, color: "#999" }}>
+                  {row.sourcesLabel}{row.sourcesLabel ? " · " : ""}score {row.score}
+                </span>
+              </div>
+              <div style={{ fontSize: 14, lineHeight: 1.4 }}>{row.text}</div>
+            </li>
+          );
+        })}
+      </ul>
+
+      <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #eee" }}>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>Evolve</div>
+        <p style={{ color: "#666", fontSize: 13 }}>
+          A local model can organize memories into dossiers in the background. Off by default; runs only on your machine.
+        </p>
+
+        <p style={{ fontSize: 13, margin: "8px 0" }}>
+          {status ? formatEvolve(status) : "Loading…"}
+        </p>
+
+        <p style={{ fontSize: 13, color: "#666" }}>
+          Local model:{" "}
+          {ollama == null
+            ? "checking…"
+            : ollamaReady
+            ? `ready (${ollama.model_tag})`
+            : ollama.reachable
+            ? `Ollama running, but ${ollama.model_tag} not installed`
+            : "Ollama not detected"}
+        </p>
+
+        {!ollamaReady && ollama != null ? (
+          <p style={{ fontSize: 13, color: "#666" }}>
+            To enable, install Ollama and run <code>ollama pull qwen2.5:7b-instruct</code>.
+          </p>
+        ) : null}
+
+        <div style={{ display: "flex", gap: 8, margin: "8px 0" }}>
+          <Button
+            variant="secondary"
+            onClick={onToggleEvolve}
+            disabled={!status || toggling || !ollamaReady}
+          >
+            {status?.enabled ? "Turn evolve off" : "Turn evolve on"}
+          </Button>
+          <Button variant="primary" onClick={onEvolveNow} disabled={evolving || !ollamaReady || !status?.enabled}>
+            {evolving ? "Evolving…" : "Evolve now"}
+          </Button>
+        </div>
+
+        {evolveError ? <p style={{ fontSize: 13, color: "#b00" }}>{evolveError}</p> : null}
+      </div>
+    </Card>
+  );
+}

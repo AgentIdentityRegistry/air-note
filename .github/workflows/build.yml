@@ -117,12 +117,20 @@ jobs:
         run: cargo test -p bossclaw-core
       - name: Clippy bossclaw-core (default features)
         run: cargo clippy -p bossclaw-core --all-targets -- -D warnings
-      - name: Engine network-free guard (embedder runs un-sandboxed only if its graph has no HTTP client)
+      - name: Clippy bossclaw-core (ollama feature)
+        run: cargo clippy -p bossclaw-core --features ollama --all-targets -- -D warnings
+      - name: Engine network-posture guard (two-graph)
         run: |
+          # Default graph stays FULLY network-free (the embedder path — model2vec, no hf-hub).
           if cargo tree -p bossclaw-core -e normal --prefix none | grep -qE '^(hf-hub|ureq|reqwest)( |$)'; then
-            echo "FORBIDDEN: a network crate is in the default bossclaw-core graph"; exit 1
+            echo "FORBIDDEN: a network crate is in the DEFAULT bossclaw-core graph"; exit 1
           fi
-          echo "engine graph is network-free"
+          # ollama graph (the shipped desktop config): ureq (the loopback LLM client) is the
+          # ONLY permitted network crate; hf-hub/reqwest must never appear (embedder stays pure).
+          if cargo tree -p bossclaw-core -e normal --features ollama --prefix none | grep -qE '^(hf-hub|reqwest)( |$)'; then
+            echo "FORBIDDEN: hf-hub/reqwest in the ollama bossclaw-core graph"; exit 1
+          fi
+          echo "network posture OK: default=zero-client, ollama=ureq-only"
 
   # M5b sandboxed-parser jail proofs. Builds the pinned markitdown venv (pip-audit
   # + 0.1.6 drift guard run inside build-venv.sh), then runs the gated jail tests.
