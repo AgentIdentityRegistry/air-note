@@ -152,6 +152,8 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_list_proposals,
             #[cfg(unix)]
+            commands::engine::engine_proposal_preview,
+            #[cfg(unix)]
             commands::engine::engine_pick_folder,
             #[cfg(unix)]
             commands::engine::engine_recall,

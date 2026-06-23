@@ -252,6 +252,34 @@ pub async fn engine_list_proposals(state: State<'_, AppState>) -> Result<Vec<Pro
     Ok(proposals.into_iter().map(ProposalDto::from).collect())
 }
 
+#[derive(Serialize)]
+pub struct PreviewDto {
+    pub path: String,
+    pub folder: String,
+    pub rationale: String,
+    pub op: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub requires_loud_modal: bool,
+    pub taint: String,
+}
+impl From<crate::engine::PreviewData> for PreviewDto {
+    fn from(p: crate::engine::PreviewData) -> Self {
+        Self {
+            path: p.path, folder: p.folder, rationale: p.rationale, op: p.op,
+            old_text: p.old_text, new_text: p.new_text,
+            requires_loud_modal: p.requires_loud_modal, taint: p.taint,
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_proposal_preview(id: String, state: State<'_, AppState>) -> Result<PreviewDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let preview = state.engine.proposal_preview(onboarded, id).await.map_err(|e| e.to_string())?;
+    Ok(PreviewDto::from(preview))
+}
+
 /// The evolve loop's status. NEVER errors: if the engine isn't open yet (or any op error),
 /// report a disabled/empty status — payload-encoded exactly like `engine_status`, so a
 /// status poll from the Memory tab can never throw.

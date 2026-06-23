@@ -107,6 +107,21 @@ impl ProposalSummary {
     }
 }
 
+/// Everything the Review card renders for one proposal: paths, the "Why", op, both text halves,
+/// and the propose-time loud-modal/taint flags. `old_text`/`new_text` are lossy-UTF8 (the engine
+/// only proposes against UTF-8 targets; non-UTF8 is rejected at synthesis).
+#[derive(Debug, Clone)]
+pub struct PreviewData {
+    pub path: String,
+    pub folder: String,
+    pub rationale: String,
+    pub op: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub requires_loud_modal: bool,
+    pub taint: String,
+}
+
 /// The coarse engine state surfaced to the UI (distinguishes setup states from faults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -534,6 +549,42 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Build the before/after preview for one open proposal. Fail-closed: an unknown id, a
+    /// proposal whose bytes are missing/tampered (`get_proposal_bytes_checked`), or an
+    /// unreadable target all return `Err`. Gated.
+    pub async fn proposal_preview(&self, onboarded: bool, id: String) -> Result<PreviewData, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let pending = log.pending_proposals().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            let p = pending.into_iter().find(|p| p.id == id)
+                .ok_or_else(|| EngineOpError::Core("proposal not found or already resolved".to_string()))?;
+            // new bytes — fail closed unless they hash to the signed proposal's recorded hash.
+            let new_bytes = log.get_proposal_bytes_checked(&p.id, &p.new_content_hash)
+                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+            // old bytes — the current on-disk file (local read; the target is canonical).
+            let old_bytes = std::fs::read(&p.target)
+                .map_err(|e| EngineOpError::Core(format!("could not read target: {e}")))?;
+            let folder = std::path::Path::new(&p.target)
+                .parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+            // Single-sourced fail-loud default (m2) — read into a local BEFORE the struct moves
+            // `p`'s fields. A UI hint only; the authoritative gate is `apply_proposal` (Task 8).
+            let requires_loud_modal = p.requires_loud_modal();
+            let taint = p.verdict_summary.get("taint").and_then(|v| v.as_str()).unwrap_or("Untrusted").to_string();
+            Ok(PreviewData {
+                path: p.target,
+                folder,
+                rationale: p.rationale,
+                op: p.op,
+                old_text: String::from_utf8_lossy(&old_bytes).to_string(),
+                new_text: String::from_utf8_lossy(&new_bytes).to_string(),
+                requires_loud_modal,
+                taint,
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Identity-reset teardown: delete both engine slots, drop the memoized log (reset the
     /// cell to `None`), then delete brain.db.
     pub async fn teardown(&self) -> Result<(), EngineError> {
@@ -890,6 +941,19 @@ mod tests {
         log.stream_all().unwrap().into_iter().filter(|e| e.event_type == event_type).count()
     }
 
+    /// Ingest a single written file under a granted dir and return its `file_ingested` id.
+    /// Desktop-crate equivalent of `tests/common::ingest_one` (which lives in the bossclaw-core
+    /// test crate); built on the public API so the preview/apply tests can store + read bytes.
+    fn bossclaw_ingest_one(log: &EventLog, path: &std::path::Path) -> String {
+        let embedder = bossclaw_core::embed::MockEmbedder::new(8);
+        log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &embedder).unwrap();
+        let canonical = std::fs::canonicalize(path).unwrap().to_string_lossy().to_string();
+        log.current_files().unwrap().into_iter()
+            .find(|r| r.canonical_path == canonical)
+            .map(|r| r.file_event_id)
+            .expect("ingested file id")
+    }
+
     #[tokio::test]
     async fn list_proposals_returns_open_summaries() {
         let (vault, dir) = test_vault_and_dir();
@@ -939,6 +1003,68 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert!(proposals[0].id == pid && proposals[0].requires_loud_modal,
             "an absent/garbled verdict_summary fails loud (requires_loud_modal == true)");
+    }
+
+    #[tokio::test]
+    async fn proposal_preview_returns_old_and_new_text_fail_closed_on_missing_bytes() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+
+        // A real write-granted file with known "old" bytes.
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("notes.md");
+        std::fs::write(&path, b"Alice works at Acme.\n").unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path); // see helper note below
+
+        // Build a real gated proposal for new bytes, then record it + its bytes (the engine
+        // emit path), so preview can read both halves.
+        let new_bytes = b"Alice works at Globex.\n".to_vec();
+        let gated = log.propose_write(WriteProposal {
+            target: path.clone(), new_content: new_bytes.clone(), op: WriteOp::Edit,
+            source_event_ids: vec![file_id.clone()], rationale: "correction".to_string(),
+        }).unwrap();
+        let hash = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&new_bytes))
+        };
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"entity:a","relation":"works_at","dst":"entity:acme"});
+        let verdict_summary = serde_json::json!({
+            "requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint),
+            "allowed": gated.verdict.allowed,
+        });
+        let pid = log.append_write_proposal(
+            &canonical, "edit", &hash, new_bytes.len() as u64, "correction",
+            &key, &verdict_summary, std::slice::from_ref(&file_id),
+        ).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        let preview = handle.proposal_preview(true, pid.clone()).await.unwrap();
+        assert_eq!(preview.path, canonical);
+        assert_eq!(preview.old_text, "Alice works at Acme.\n");
+        assert_eq!(preview.new_text, "Alice works at Globex.\n");
+        assert_eq!(preview.op, "edit");
+        assert_eq!(preview.rationale, "correction");
+
+        // Fail-closed: an unknown id errors (no bytes / no proposal).
+        assert!(handle.proposal_preview(true, "nonexistent".to_string()).await.is_err());
+
+        // Fail-loud (MIN-1): a proposal whose verdict_summary is garbled previews as loud.
+        let log = handle.get_or_open(true).await.unwrap();
+        let new2 = b"Alice works at Initech.\n".to_vec();
+        let hash2 = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&new2)) };
+        let pid2 = log.append_write_proposal(&canonical, "edit", &hash2, new2.len() as u64,
+            "correction2", &key, &serde_json::json!("garbled"), std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid2, &new2, &hash2).unwrap();
+        drop(log);
+        let preview2 = handle.proposal_preview(true, pid2).await.unwrap();
+        assert!(preview2.requires_loud_modal, "garbled verdict_summary previews fail-loud");
     }
 
     /// Task 7 (mint): with the stub returning one entity for the extraction schema, an
