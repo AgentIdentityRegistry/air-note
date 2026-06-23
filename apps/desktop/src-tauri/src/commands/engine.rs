@@ -297,6 +297,12 @@ pub async fn engine_apply_proposal(id: String, acknowledged_loud: bool, state: S
     Ok(ApplyResultDto::from(result))
 }
 
+#[tauri::command]
+pub async fn engine_decline_proposal(id: String, reason: String, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.decline_proposal(onboarded, id, reason).await.map_err(|e| e.to_string())
+}
+
 /// The evolve loop's status. NEVER errors: if the engine isn't open yet (or any op error),
 /// report a disabled/empty status — payload-encoded exactly like `engine_status`, so a
 /// status poll from the Memory tab can never throw.

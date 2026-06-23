@@ -688,6 +688,16 @@ impl EngineHandle {
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
+
+    /// Decline a proposal — terminal `write_declined` (resolves it; the fix never returns). Gated.
+    pub async fn decline_proposal(&self, onboarded: bool, id: String, reason: String) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.decline_write_proposal(&id, &reason).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
 }
 
 /// Truncate `s` in place to at most `max` bytes WITHOUT splitting a UTF-8 char (plain
@@ -1454,6 +1464,28 @@ mod tests {
         // Not onboarded → gate.
         assert!(matches!(
             handle.set_proposals_enabled(false, true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn decline_proposal_removes_it_from_pending() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let pid = log.append_write_proposal("/tmp/x/notes.md", "edit", "deadbeef", 0, "why",
+            &key, &serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true}),
+            std::slice::from_ref(&lineage)).unwrap();
+        drop(log);
+
+        assert_eq!(handle.list_proposals(true).await.unwrap().len(), 1);
+        handle.decline_proposal(true, pid.clone(), "not now".to_string()).await.unwrap();
+        assert!(handle.list_proposals(true).await.unwrap().is_empty(), "declined → no longer pending");
+
+        assert!(matches!(
+            handle.decline_proposal(false, pid, "x".to_string()).await,
             Err(EngineOpError::Open(EngineError::NotOnboarded))
         ));
     }
