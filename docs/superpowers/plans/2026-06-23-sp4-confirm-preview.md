@@ -236,6 +236,12 @@ fn reconcile_target_outside_write_grant_skipped_at_propose() {
     assert!(rep1.links_emitted >= 1, "the file established the works_at edge");
     log.rebuild_graph().unwrap();
 
+    // Resolve Alice/Acme to ids — the reconcile builds `inducing_key` from these resolved
+    // entity ids, so the anti-poison check below must query suppression with the same key.
+    let entities = log.all_entities().unwrap();
+    let alice = entities.iter().find(|e| e.label == "Alice").unwrap().entity_id.clone();
+    let acme = entities.iter().find(|e| e.label == "Acme").unwrap().entity_id.clone();
+
     // ── Tick 2: a memory corrects the employer → confirmed contradiction. ──
     let corr = "Correction: Alice works at Globex, not Acme.";
     let _mem_id = seed_memory_full(&log, &emb, corr);
@@ -264,16 +270,17 @@ fn reconcile_target_outside_write_grant_skipped_at_propose() {
         "the file on disk is untouched",
     );
 
-    // ── Follow-on: re-granting write then re-running surfaces a proposal. ──
-    log.add_write_grant(&dir).unwrap();
-    let r3 = DispatchReasoner::new(add_both_passes(
-        ScriptedReasoner::new("m6b-test"),
-        corr, &[vec![], vec![file_src.clone()]], &nbh,
-        correction_pass_a("Alice", "Acme", "Globex", corr),
-    ));
-    let rep3 = log.evolve_once(&emb, &r3).unwrap();
-    assert_eq!(rep3.proposals_emitted, 1, "granting write then re-running surfaces a proposal");
-    assert_eq!(proposals_targeting(&log, &canonical), 1, "exactly one write_proposal now exists");
+    // Anti-poison: a skip records NO terminal `write_rejected`, so the (target, inducing_key)
+    // is NOT suppressed — the proposal stays retryable on a later tick. (The OLD reject path
+    // WOULD have suppressed it permanently; not poisoning the target is the change-(a) win.)
+    // The contradiction is confirm-once (the invalidate consumes the active edge), so the way
+    // to re-surface a proposal is a FRESH contradiction — never a replay of THIS one (which
+    // cannot re-confirm); asserting non-suppression captures the durable property directly.
+    let inducing_key = serde_json::json!({ "src": alice, "relation": "works_at", "dst": acme });
+    assert!(
+        !log.is_proposal_suppressed(&canonical, &inducing_key).unwrap(),
+        "skip must not terminally suppress the target+key (no write_rejected recorded)",
+    );
 }
 ```
 
