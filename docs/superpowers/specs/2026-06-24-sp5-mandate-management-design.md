@@ -1,85 +1,83 @@
 # Desktop Engine — Mandate Management (SP5) — Design
 
-**Status:** **Draft** (2026-06-24) — brainstormed interactively with Peter; **pending the independent critic + security review** (same gate SP1–SP4 used). Sub-project **5 of 5 — the final one** in the "engine-in-the-desktop" milestone.
+**Status:** **Draft v2** (2026-06-24) — brainstormed interactively with Peter; **independent critic + security review of v1 complete** (both SHIP-WITH-FIXES, 0 Critical / 0 High). **This v2 folds in every must-fix AND adopts a deliberate scope increase ("Option B") that the review forced into the open.** Sub-project **5 of 5 — the final one**.
 
-**⚠️ Only one tiny `bossclaw-core` change — but SP5 introduces the first AUTONOMOUS writes.** Unlike SP4's three surgical engine edits, SP5 needs just **one (possibly two)** additive, read-only engine change(s) (§Engine change). The whole mandate machinery (data model, M6c proposer, even an unused watcher) is **already built and merged** in `bossclaw-core`. The reason SP5 still gets a full security review is behavioral, not surface-area: for the first time the app **writes files without a per-change human confirm** (auto-apply). That is the thing to review.
+**⚠️ SP5 is NOT thin. It changes the security core (the taint model) and introduces the app's first AUTONOMOUS writes.** v1 assumed "auto-apply clean / queue risky" worked out of the box. The security review proved it was **dead code**: every ingested file is stamped `external` (`ingest.rs:617`, single-sourced), so every mandate rewrite is `Untrusted` → always loud → *everything* routed to Review → zero autonomy. To deliver the hands-off feature Peter chose, v2 adds a **scoped taint-trust rule** (a mandate's *own* authorized sources stop tainting *that mandate's* target) plus the **engine-level loud-gate hardening** both reviewers recommended. Four engine changes, two of them security-critical (§Engine changes c, d). **This v2 must clear its own focused security review before any code.**
 
 ## Context — the parent milestone
 
 - **SP1 spine** (merged): one live, encrypted `EventLog` behind the `EngineHandle` chokepoint.
 - **SP2 ingest** (merged): folder read-grants, ingest, persisted `model2vec` vectors.
 - **SP3 recall + evolve** (merged, PR #45): Memory tab, hybrid recall, a local-Ollama evolve loop — OFF by default.
-- **SP4 confirm/preview** (merged, PR #46 `93aa8c3`): the Review destination — proposal queue, before/after diff, Approve/Decline, engine-enforced loud confirm, Undo; `prime_switches` persistence via a typed `ConfigFlag`/`explicitly_set`; the **T-I1 op-mapping** (`apply_proposal` maps the proposal's own `op` so a future Create/Delete isn't mis-gated as Edit).
+- **SP4 confirm/preview** (merged, PR #46 `93aa8c3`): the Review destination — proposal queue, before/after diff, Approve/Decline, **engine-enforced loud confirm at the desktop apply op**, Undo; `prime_switches` persistence via a typed `ConfigFlag`/`explicitly_set`; the **T-I1 op-mapping** (`apply_proposal` maps the proposal's own `op` so a Create/Delete isn't mis-gated as Edit).
 
 The 5 sub-projects: **1 spine ✅ → 2 ingest ✅ → 3 recall + evolve ✅ → 4 confirm/preview ✅ → 5 mandate management (this doc, final).**
 
-SP5 is the capstone that lets the brain pursue **standing goals**: the M6c mandate proposer finally runs, and the user can grant / list / revoke mandates and flip a global on/off switch. The brain's resulting rewrites are **auto-applied when clean** and **routed to SP4's Review queue when risky**.
-
 ## Goal
 
-A **mandate** is a standing, user-granted goal: *"keep file `target` in sync with the sources under `source_scope`, following `recipe`."* After the user turns mandates on and grants one, the brain — on each ~5-min evolve tick — checks whether `target` still matches what `recipe` + the on-disk sources imply. If not, it proposes a whole-file rewrite. The app then:
+A **mandate** is a standing, user-granted goal: *"keep file `target` in sync with the sources under `source_scope`, following `recipe`."* The grant is the user's **standing consent** and a **trust declaration** for those specific sources. After the user turns mandates on and grants one, the brain — on each ~5-min evolve tick — checks whether `target` still matches what `recipe` + the on-disk sources imply. If not, it proposes a whole-file rewrite, and the app:
 
-- **auto-applies** the rewrite when it's **clean** (the engine's fresh re-gate verdict is *not* loud — all sources trusted/local, content not secret-shaped) — no per-change confirm,
-- **parks it in the SP4 Review queue** when it's **risky** (any untrusted/external taint, or secret-shaped `diff_flags`) — a human approves before any write,
+- **auto-applies** the rewrite when it's **clean** — i.e. every cited source is **authorized by an active mandate for that target** (in-scope) **and** the content is **not secret-shaped** (no `diff_flags`) — with no per-change confirm;
+- **parks it in the SP4 Review queue** when it's **risky** — secret-shaped content, a source **outside** the mandate's authorized scope, an unresolvable source, or any other reason the fresh re-gate verdict is loud;
 - records **every** auto-applied write in a **persistent Mandate-activity list** with **Undo**.
 
 The user can **create / list / revoke** mandates and flip a global **Mandates on/off** switch. **Off by default.**
 
-**The autonomy model — the SP5 decision that matters most:** the **mandate grant *is* the standing consent**. Reactive edits (M6b) stay per-change reviewed (that's SP4, unchanged); standing mandates (M6c) auto-apply when clean. "Clean vs. risky" reuses the engine's existing `requires_loud_modal` verdict — no new judgment is invented.
+**Why this needs an engine change (the v1→v2 correction).** Without a trust rule, "clean" is unreachable: a mandate syncs *from* ingested files, and **every** ingested file is `external` → `Untrusted` → loud (this is the *same* fact that makes SP4 always-loud). v2's taint-trust rule (§Engine change c) is precisely the missing "clean" path: a write to a mandate's target, derived only from that mandate's *authorized in-scope* sources, is **not** tainted by those sources — so it can be clean and auto-apply. Everything the taint model protected before stays protected (out-of-scope sources, secret-shaped content, the engine-anchored target floor, M6b reconcile writes).
 
-## Decisions (resolved in brainstorming)
+## Decisions (resolved in brainstorming + the v1 review)
 
-1. **Auto-apply clean / queue risky.** A mandate rewrite whose **fresh re-gate verdict is not loud** is applied automatically (no per-change confirm). A **loud** verdict (`Untrusted`/external taint, or secret-shaped `diff_flags`) is left in the SP4 Review queue for the user. Rationale: the grant is the standing consent; the engine's taint verdict is the auto-apply gate; the one genuinely dangerous case (untrusted-data-derived writes) always keeps a human. Mandates are Create/Edit only (never Delete — engine design D7), so the Delete loud-trigger never applies.
-2. **Polled detection (~5 min); reuse the existing evolve scheduler.** The M6c phase already runs *inside* `evolve_once` (gated by `mandates_enabled`), and the SP3 scheduler already calls `evolve_once` on a timer — so once mandates are on and one exists, M6c is driven **for free**. The engine's `watch.rs` live OS watcher stays **unwired** (clean fast-follow). Trade-off: up to ~5-min latency, accepted.
-3. **Approach A — app-driven auto-apply.** The engine emits mandate proposals into the queue exactly as today; the **desktop scheduler**, right after each evolve tick, auto-applies the **clean** mandate proposals (reusing SP4's `apply_proposal` path *without* the confirm) and leaves **risky** ones queued. The engine keeps its "**never auto-write on its own**" guarantee — the auto-apply *policy and action* live in the app; the engine still only emits proposals and fails safe (a proposal sits in the queue forever absent a caller). *(Approach B — engine writes clean files directly, sealing the rule inside the core — and Approach C — engine stamps an auto-apply flag — were considered and deferred; see §Future hooks.)*
-4. **Persistent Mandate-activity list + Undo (IN scope).** Auto-apply has no pre-confirm, so the user needs a visible *"here's what I changed"* trail. Built cheaply on the event log: list the auto-applied writes (**M6c-attributed `file_written` events** — the attribution mechanism is finalized in the plan and may need the thin engine read-helper of §Engine change (b)), newest-first, each with **Undo** (reuses SP4's `undo_write`). **Survives restarts** — delivers part of SP4's deferred cross-session undo, scoped to exactly where it matters (autonomous writes).
-5. **Global Mandates on/off switch, off by default**, with an explicit "on" that **persists across launches** (the `prime_switches` symmetry fix — §Desktop backend 1).
-6. **Mandate creation honors the engine's grant-time guards.** The "New mandate" form surfaces the engine's rejections (recipe ≤ `MAX_RECIPE_LEN` 2048; target must be under an active **write**-grant; target must **not** be under any active **read**-grant root — the load-bearing self-loop guard) instead of failing silently.
+1. **Auto-apply clean / queue risky.** Clean ⇒ apply automatically (no per-change confirm). Risky ⇒ park in the SP4 Review queue. "Clean vs risky" = the engine's fresh re-gate `requires_loud_modal`, now made *reachable* by Decision 7.
+2. **Polled detection (~5 min); reuse the existing evolve scheduler.** The M6c phase already runs inside `evolve_once` (gated by `mandates_enabled`), and the SP3 scheduler already calls it on a timer. The engine's `watch.rs` live OS watcher stays **unwired** (clean fast-follow). Latency note: a clean rewrite lands within ~5 min in the best case; under the shared `MAX_PROPOSALS_PER_TICK` cap with several mandates + active M6b, a given mandate can take multiple ticks (§Known limitations).
+3. **Approach A — app-driven auto-apply.** The engine emits mandate proposals into the queue; the **desktop scheduler**, right after each evolve tick, auto-applies the **clean** ones (reusing SP4's `apply_proposal(id, acknowledged_loud=false)` path) and leaves **risky** ones queued. The auto-apply *action* lives in the app; the engine never auto-writes on its own.
+4. **Persistent Mandate-activity list + Undo (IN scope, MANDATORY).** Auto-apply has no pre-confirm, so the user needs a guaranteed "here's what I changed" trail. Built on the event log via a small engine attribution helper (§Engine change b) — applied writes are stamped with the actuator producer, not the proposer, so attribution *requires a join*; this is not optional.
+5. **Global Mandates on/off switch, off by default**, with an explicit "on" that **persists across launches** (the `prime_switches` symmetry fix).
+6. **Mandate creation honors the engine's grant-time guards** (recipe ≤ `MAX_RECIPE_LEN` 2048; ≤ `MAX_SOURCES_PER_MANDATE` 256; target under an active **write**-grant; target **not** under any active **read**-grant root — the self-loop guard). The form surfaces rejections clearly.
+7. **(NEW — the v2 centerpiece) A mandate's authorized sources don't taint that mandate's target.** In `propose_write`, an external cited source does **not** escalate taint **iff** an active mandate `m` has `m.target == this proposal's target` **and** the source's ingested path is under `m.source_scope`. Out-of-scope or unresolvable sources still taint (fail-closed over the set); `diff_flags` (secret-shaped) still force loud; the Step-4 engine-anchored target taint is unchanged (and moot for mandates — the self-loop guard keeps the target un-ingested). Re-gate-safe (the same `propose_write` runs at propose and at apply) and scoped (mandate targets ∩ M6b-reconcile targets = ∅).
+8. **(NEW — review hardening) Enforce `requires_loud_modal` inside `bossclaw-core` `execute_write_inner`.** Thread an `acknowledged_loud` flag through the execute path and fail closed if a loud write lacks the ack — so the human-in-the-loop guarantee is an **engine invariant** for *every* caller (desktop, the autonomous sweep, future cloud), not a desktop-layer convention an autonomous actor could satisfy with a bool.
 
 ## Non-goals (explicitly deferred)
 
-- **Live OS watcher (`watch.rs`) → fast-follow.** True instant detection; SP5 is polled. The engine watcher is built+tested but has no desktop caller.
-- **Engine-sealed auto-apply (Approach B) → future hardening.** SP5's auto-apply policy is app-side; the engine still fails safe (queues) for any non-desktop caller.
-- **Per-mandate trust setting (Approach C from the tainted-path question) → deferred.** SP5 uses one global clean/risky rule.
-- **Per-flag "looks like a secret" warning** (needs `diff_flags` in `PreviewDto`) → still deferred (carried from SP4). **Safe note:** secret-shaped content already sets `requires_loud_modal` at the engine level, so it **auto-queues for review** — the dangerous case is covered without the per-flag UI.
-- **Engine-enforced `requires_loud_modal` inside `bossclaw-core` `execute_write_inner`** → still deferred (carried from SP4). SP5's auto-apply gate is the desktop apply op's fresh re-gate. (Flagged below — it matters more now that writes are autonomous.)
-- **Managed-section sync, multi-root `source_scope`, timed mandate expiry, Windows** → engine non-goals (all new Rust is `#[cfg(unix)]`-gated, matching SP1–SP4).
-- **Mandate editing** → revoke + re-create (no in-place edit). **Bulk mandate ops** → later.
-- **`pending_proposals()` projection-table optimization** → perf, deferred (now also scanned each sweep; fine for SP5 queue sizes).
+- **Live OS watcher (`watch.rs`) → fast-follow.** SP5 is polled.
+- **Per-mandate trust *tier* / multiple trust levels** → SP5 has one rule: a mandate trusts its own declared `source_scope`.
+- **Per-flag "looks like a secret" *warning* UI** (needs `diff_flags` in `PreviewDto`) → deferred; but the *protection* is live — secret-shaped content forces loud → queues, so a mandate never auto-writes a secret.
+- **Managed-section sync, multi-root `source_scope`, timed mandate expiry, Windows** → engine non-goals (all new Rust is `#[cfg(unix)]`-gated).
+- **Mandate editing** → revoke + re-create. **Bulk mandate ops** → later.
+- **`pending_proposals()` projection-table optimization** → perf, deferred (§Known limitations).
+- **First-open `verify_chain` fail-closed gate** → still deferred (carried from SP4; ruled acceptable — see §Security invariants).
 
-## Autonomy / permission model
+## Autonomy / permission / trust model
 
-- **Mandate grant = standing consent.** Granting a mandate is the user's one-time, explicit authorization for the brain to keep that one file in sync. No per-change confirm for the clean path — that is the whole point of a "standing chore."
-- **The taint verdict is the auto-apply gate.** Auto-apply fires **only** when the fresh re-gate `verdict.requires_loud_modal == false`. `requires_loud_modal = Untrusted || Delete || diff_flags` (engine); for mandates (Create/Edit) that reduces to **untrusted/external taint OR secret-shaped content → loud → Review**; everything else → auto-apply.
-- **Two locks still hold for the file itself.** (1) the folder is write-granted (engine re-enforced at `execute_write`, not just UI), and (2) for the *risky* path, per-change human approval. For the *clean* path, lock 2 is satisfied once, at grant time.
-- **Producer filter preserves SP4's contract.** The auto-apply sweep applies **only** `m6c-mandate-proposer` proposals. M6b reconcile edits are **never** auto-applied — SP4's "you approve every edit" promise is untouched.
-- **Off by default; explicit + sticky.** `mandates_enabled` is forced off until the user flips it; then it persists (switch-fix). The M6c phase re-reads the flag per mandate (fast-kill).
+- **The mandate grant is BOTH standing consent AND a source-trust declaration.** By granting "keep `target` synced from `source_scope`," the user authorizes (a) the brain to write `target` without re-asking, and (b) `source_scope`'s contents as trusted *inputs for that target*. The signed `mandate_grant` event is the trust root (mandates are **user-created only** — `engine_add_mandate`; the reasoner returns data bytes, never events, so it cannot mint a grant).
+- **What stays gated even for a mandate (the residual protections):**
+  - **Secret-shaped content** → `diff_flags` → loud → Review (never auto-written).
+  - **Out-of-scope / unresolvable sources** → still taint → loud → Review (the trust rule only clears *in-scope, resolvable* sources; it never `filter_map`s the set).
+  - **The engine-anchored target floor (Step 4)** is untouched — and the self-loop guard means a mandate target is never an ingested file, so a mandate can't launder taint through its own output.
+  - **Both write-locks** still hold: the folder write-grant (engine-re-enforced at `execute_write`) and, for the risky path, per-change human approval.
+- **Accepted residual of Option B (eyes-open).** A mandate auto-applies content derived from its in-scope sources. If the user points a mandate at a folder containing an **attacker-authored file**, non-secret malicious content from that file can be synced into the target **without review**. This is the deliberate cost of "trust your own watched folders," bounded by: the user's explicit per-mandate grant; the write-grant containment; the secret-shaped gate; and the activity-list + Undo audit trail. **Flagged for the v2 security review.**
+- **Off by default; explicit + sticky; re-read per item.** `mandates_enabled` forced off until flipped, then persists; the M6c phase re-reads it per mandate.
 
-## Engine change (`bossclaw-core`) — one–two, surgical, additive
+## Engine changes (`bossclaw-core`) — four (a, b additive · c, d security-critical)
 
-> Line numbers are grounding references against current `main` (verified 2026-06-24); the implementation plan re-verifies exact locations.
+> Line numbers are grounding references against `main` (verified 2026-06-24, HEAD `e6e6991`); the plan re-verifies exact locations.
 
-**(a) Surface the proposal's producer in `pending_proposals()`.**
-Today `PendingProposal` (`crates/bossclaw-core/src/log.rs:369`, built by `pending_proposals()` at `log.rs:2341`) carries no producer, so the desktop cannot tell an **M6c mandate** proposal from an **M6b reconcile** one. Add a `producer: String` field, read from the `write_proposal` event's `model_meta.model_id` (M6c stamps `M6C_PROPOSER_PRODUCER = "m6c-mandate-proposer"`, `graph.rs:98`). Additive, read-only — no new event, no behavior change to existing folds.
-- **Why:** the auto-apply sweep must apply **only** mandate proposals; auto-applying an M6b reconcile proposal would break SP4's contract.
-- **Test:** a proposal emitted by M6c surfaces `producer == "m6c-mandate-proposer"`; an M6b one surfaces its reconcile producer.
+**(a) Surface the proposal's producer in `pending_proposals()`.** `PendingProposal` (`log.rs:369`, built by `pending_proposals()` at `log.rs:2341`) gains a `producer: String` read from the `write_proposal` event's `model_meta.model_id` (M6c stamps `M6C_PROPOSER_PRODUCER = "m6c-mandate-proposer"`, `graph.rs:98`). Additive, read-only. **Fail-closed contract:** the sweep auto-applies **iff** `producer == M6C_PROPOSER_PRODUCER`; any other value, *including empty/unknown*, is left for manual review. (Note: the producer filter is a **contract/UX boundary, not the security gate** — even a mislabeled proposal still faces the taint/loud gate at apply.)
 
-**(b) (If needed) a thin read-helper to attribute resolved `file_written` events to their proposer** — the Mandate-activity list (Decision 4) shows *applied* (closed) M6c writes, which `pending_proposals()` (open only) does **not** cover. The plan confirms whether existing event queries suffice (join `file_written.resolves_proposal` → the originating `write_proposal`'s producer) or a small additive read-helper is warranted. Read-only either way; no new events.
+**(b) Mandate-write attribution helper — `mandate_writes()` (MANDATORY, not "if needed").** Applied writes are stamped `model_meta.model_id = ACTUATOR_PRODUCER` ("m6a-actuator", `log.rs:3675`) regardless of proposer; the only discriminator on a `file_written` is `content.resolves_proposal` → the proposal id, and resolved proposals are **not** in `pending_proposals()` (open-only). So attributing an applied write to a mandate **requires a join**. Add a `#[cfg(unix)]` `mandate_writes() -> Vec<MandateWriteRecord>` folding `file_written` ∪ `write_proposal`, keeping `file_written`s whose resolved proposal's producer is `M6C_PROPOSER_PRODUCER`, returning `{ file_written_id, target, written_at, undone }`. **`undone`** = an existing later `file_written` carries `undo_of == this.file_written_id` (an Undo is itself a `file_written` with `undo_of`, no `resolves_proposal`, so it's excluded from the join and flips the original's flag). Ambiguous join (proposal GC'd / producer unreadable) → **omit** (fail-closed display).
+
+**(c) (SECURITY-CRITICAL) Mandate-authorized sources don't taint that mandate's target.** In `propose_write` (the source-taint escalation currently at `log.rs:3048-3062`), when a cited source resolves to an `is_external` event, before escalating to `Untrusted` consult the active mandates: if some active mandate `m` has canonical `m.target` == this proposal's **canonical** target **and** the source's ingested `canonical_path` is under `m.source_scope` — **segment-aware** containment, matching the `add_mandate` self-loop guard (`log.rs:2839`) so `/notes-evil` never matches `/notes` — the source is **authorized** and does **not** escalate taint. Unauthorized external sources, and unresolvable sources, still taint (fail-closed over the set is preserved for everything not explicitly authorized). **Ordering note:** the authorization test needs the canonical target (computed in Step 2), so the in-scope-source taint decision is finalized once the target is canonicalized — the plan picks the exact arrangement (e.g. record candidate external sources in Step 1, resolve which were mandate-authorized after Step 2). Nothing else in `propose_write` changes: Step 4 (target anchor), Step 6 (`requires_loud_modal = Untrusted || Delete || diff_flags.any()`), and the base/identity capture are untouched.
+- **Soundness:** the trust is a pure function of (the signed active mandates, the proposal target, the cited sources' paths) — reproduced identically at propose **and** at the apply-time re-gate, so there is no stored-flag trust. Revoking the mandate makes its in-flight proposals fall back to tainted → loud → queued.
+- **Scoping (the key safety argument):** a mandate `target` is, by the `add_mandate` self-loop guard, **outside every read-grant** (`log.rs:2839`); an M6b reconcile `target` is an **ingested** file (inside a read-grant). The two sets are disjoint, so this rule can **never** clear taint for an M6b reconcile (or any non-mandate) write. **Tested explicitly** (§Testing).
+
+**(d) (SECURITY-CRITICAL) Enforce the loud-gate inside `execute_write_inner`.** Thread `acknowledged_loud: bool` through `execute_write` / `execute_write_resolving` → `execute_write_inner`; immediately after the Step-1a verdict checks (`log.rs:3281-3286`), fail closed if `verdict.requires_loud_modal && !acknowledged_loud`. This makes "a loud write needs an explicit ack" an engine invariant for every caller. The desktop `apply_proposal` threads the user's ack through; the autonomous sweep always passes `acknowledged_loud=false`, so a loud mandate proposal can never auto-write — it is refused → stays queued. (Closes the SP4-deferred residual; both reviewers rated it should-close now that writes are autonomous.)
 
 *Everything else reuses engine APIs that already exist:* `add_mandate` (`log.rs:2800`), `revoke_mandate`, `active_mandates` (`log.rs:2896`), `set_mandates_enabled` (`log.rs:5060`), `mandates_enabled`, `explicitly_set` (`log.rs:5034`), `ConfigFlag::Mandates`, the M6c phase inside `evolve_once`, and the `Mandate` model (`graph.rs:497`) with its `mandate_grant`/`mandate_revoke` events.
 
-## Desktop backend (`apps/desktop/src-tauri`) — the bulk
+## Desktop backend (`apps/desktop/src-tauri`)
 
-**1. Switch-fix — `prime_switches` respects an explicit mandate choice.**
-`apps/desktop/src-tauri/src/engine/mod.rs:359` currently force-OFFs mandates **unconditionally** (`:368–369`), unlike evolve (`:361`) and proposals (`:364`) which are gated behind `!log.explicitly_set(…)?`. Add the same guard:
-```rust
-if !log.explicitly_set(ConfigFlag::Mandates)? && log.mandates_enabled()? {
-    log.set_mandates_enabled(false)?;
-}
-```
-Now a user's explicit "on" persists across launches. One-line symmetry change. **Flip** the existing test `prime_switches_preserves_explicit_proposals_but_forces_mandates_off` (`engine/mod.rs:933`) → `…_preserves_explicit_mandates` (assert an explicit on survives a re-open).
+**1. Switch-fix — `prime_switches` respects an explicit mandate choice.** `engine/mod.rs:359` force-OFFs mandates **unconditionally** (`:368–369`), unlike evolve (`:361`) and proposals (`:364`). Add the same `!log.explicitly_set(ConfigFlag::Mandates)?` guard. **Flip** the existing test `prime_switches_preserves_explicit_proposals_but_forces_mandates_off` (`engine/mod.rs:933`) → assert **both** explicit proposals-on **and** mandates-on survive a re-open (don't drop the proposals coverage).
 
-**2. On/off op + command.** `EngineHandle::set_mandates_enabled(on)` + `engine_set_mandates_enabled` command, registered `#[cfg(unix)]` in `main.rs` (mirror `engine_set_proposals_enabled`). Sticky, funnels through `get_or_open → spawn_blocking → EngineOpError` like every SP2–SP4 op.
+**2. On/off op + command.** `EngineHandle::set_mandates_enabled(on)` + `engine_set_mandates_enabled`, registered `#[cfg(unix)]` in `main.rs` (mirror `engine_set_proposals_enabled`). Sticky; funnels through `get_or_open → spawn_blocking → EngineOpError`.
 
 **3. Mandate CRUD ops + commands + DTOs.**
 ```
@@ -87,98 +85,102 @@ engine_add_mandate(target, source_scope, recipe) -> MandateDto   // surfaces gra
 engine_revoke_mandate(mandate_grant_id)          -> ()
 engine_list_mandates()                           -> Vec<MandateDto>
 ```
-`MandateDto { mandate_grant_id, target, source_scope, recipe, granted_at, revoked }` (`#[derive(Serialize)]` + `From<Mandate>`, `graph.rs:497`). Hand-mirrored TS twins in `api/engine.ts`. `add_mandate`'s engine guards (recipe length; target write-granted; target not under a read-grant root — the self-loop guard) map to typed `EngineOpError`s the form renders.
+`MandateDto { mandate_grant_id, target, source_scope, recipe, granted_at, revoked }` (`From<Mandate>`, `graph.rs:497`; the six fields map 1:1). TS twins in `api/engine.ts`.
 
-**4. New-file (Create) apply fix.** `apply_proposal` (`engine/mod.rs:629`) reads the live target and, at `match &p.base_content_hash` (`:643`), fails closed (`Stale`) when there's no base hash — so a **Create** proposal (target absent) is rejected *before* the T-I1 op-mapping (`:660–661`) ever runs. Special-case `op == "create"`: **skip the live-file fingerprint**; the Create anti-clobber invariant is instead *"the target must still be absent"* (re-check absence immediately before the write). Edit path unchanged (mandates never Delete). *(This is the single code-level gap the Explore pass surfaced; without it, no mandate Create could ever apply.)*
+**4. New-file (Create) apply fix.** `apply_proposal` (`engine/mod.rs:629`) fails closed at `match &p.base_content_hash` (`:643`) when there's no base hash — so a **Create** (target absent) is rejected before the T-I1 op-mapping. Fix: special-case `op == "create"` to **skip the base-hash fail-closed arm** and map `"create"` → `WriteOp::Create` (already present at `:661`). **Do NOT add a desktop absence pre-check** — the engine's Create path is already atomic-no-clobber at the syscall (`RENAME_NOREPLACE` on Linux; macOS `statat`+`renameat`, see §Known limitations), which is the *real* anti-clobber; a desktop "check-then-write" would be strictly weaker (TOCTOU). The Create's safety = the engine's atomic no-clobber create.
 
-**5. Auto-apply sweep (the heart of SP5).** In the scheduler (`apps/desktop/src-tauri/src/engine/scheduler.rs`), immediately after `evolve_once` returns, run a sweep: `list pending proposals`; for each whose `producer == "m6c-mandate-proposer"`, call `apply_proposal(id, acknowledged_loud = false)` and branch on the result:
-- **clean** → applies (atomic write, `file_written` recorded, undo `pre_bytes` captured);
-- **`NeedsLoudConfirm`** (risky) → swallow; the proposal stays open → surfaces in the SP4 Review queue;
-- **`Stale` / `Revoked`** → swallow; skip (re-proposed next tick).
+**5. Auto-apply sweep (the heart of SP5).** In `engine/scheduler.rs`, immediately after `evolve_once` returns, sweep: list pending proposals (already oldest-first, `log.rs` `seq ASC`); for each whose `producer == M6C_PROPOSER_PRODUCER`, up to a **hard cap `MANDATE_AUTOAPPLY_PER_SWEEP = 8`** (mirrors `MAX_PROPOSALS_PER_TICK`), call `apply_proposal(id, acknowledged_loud=false)`:
+- **clean** → applies (atomic write, `file_written` + undo `pre_bytes`);
+- **`NeedsLoudConfirm`** (risky) → swallow; stays open → surfaces in SP4 Review;
+- **`Stale` / `Revoked` / "already resolved"** → swallow; skip.
 
-The sweep **never** touches M6b reconcile proposals (producer filter) — SP4 unchanged. It respects a per-sweep cap (mirrors the engine's `MAX_PROPOSALS_PER_TICK` spirit) and re-reads `mandates_enabled` so flipping the switch off fast-stops it. Surface `producer` through `ProposalSummary` → `ProposalDto` so the UI can label "from mandate" (from engine change a).
+Re-read `mandates_enabled` **per item** (fast-kill). Excess beyond the cap is retried next tick (accepted ~5-min-per-excess latency — stated in the failure matrix). **Cost note (honest):** `apply_proposal` re-folds `pending_proposals()` internally (`engine/mod.rs:633`), so a K-item sweep does 1+K O(events) folds; bounded by the cap; the projection-table optimization is the future fix. Surface `producer` through `ProposalSummary`/`ProposalDto` for the UI label.
 
-## Desktop frontend (`apps/desktop/src`) — the screens
+## Desktop frontend (`apps/desktop/src`)
 
-- **Mandates destination** — `src/mandates/MandatesPanel.tsx` + pure render/validation helpers with sibling `vitest` tests (mirrors `src/review/*`):
-  - the global **Mandates on/off** toggle (off by default);
-  - a **"New mandate"** form: target-file picker, source-folder picker, recipe textarea, with inline validation + clear display of engine rejections (must be write-granted; can't sit inside an ingested/read folder; recipe length);
-  - an **active-mandate list** (target · sources · recipe · granted_at) each with **Revoke**;
-  - the **Mandate-activity list** — auto-applied (M6c-attributed) `file_written` events, newest-first, each with **Undo**.
-- `App.tsx` `View += "mandates"` + a nav entry, written **layout-agnostic** (a destination, like SP4's Review), so the deferred app-shell redesign repositions it with zero rework.
-- **Risky** mandate proposals reuse the **SP4 Review queue unchanged** (optionally labeled "from mandate" via the surfaced producer) — no new review UI.
+- **Mandates destination** — `src/mandates/MandatesPanel.tsx` + pure helpers + vitest (mirrors `src/review/*`): global on/off toggle (off by default); a **"New mandate"** form (target-file picker, source-folder picker, recipe textarea) with inline validation + engine-rejection display; an **active-mandate list** (target · sources · recipe · granted_at) each with **Revoke**; the **Mandate-activity list** — `mandate_writes()` rows, newest-first, with **Undo** (disabled/relabeled when `undone`).
+- `App.tsx` `View += "mandates"` + a nav entry (layout-agnostic destination, like SP4's Review).
+- **Risky** mandate proposals reuse the **SP4 Review queue** (labeled "from mandate" via the surfaced producer, so the user understands why a non-contradiction rewrite appeared).
 
 ## Data flow
 
-`user grants mandate (target + source_scope + recipe) → signed mandate_grant → [every ~5 min] evolve tick → (mandates_enabled) M6c phase: recipe-compare target vs on-disk sources → write_proposal (clean | tainted) → scheduler auto-apply sweep:` **clean** `→ apply_proposal(false) → execute_write_resolving → file_written (+undo)`; **risky** `→ NeedsLoudConfirm → stays queued → SP4 Review → user Approve/Decline`. The Mandate-activity list reads the M6c-attributed `file_written` events; **Undo** → `undo_write`. Mandates off / none granted → M6c phase no-ops.
+`user grants mandate (target + source_scope + recipe) → signed mandate_grant → [~5 min] evolve tick → (mandates_enabled) M6c phase: recipe-compare target vs in-scope sources → write_proposal → scheduler sweep → apply_proposal(false) → propose_write re-gate {Step-1 trust rule clears in-scope sources; diff_flags / out-of-scope still loud} →` **clean** `→ execute_write_resolving (loud-gate engine-checked, ack=false ok) → file_written (+undo)`; **loud** `→ NeedsLoudConfirm → stays queued → SP4 Review → user Approve (ack=true) / Decline`. Mandate-activity reads `mandate_writes()`; **Undo** → `undo_write`. Revoke / mandates-off → next re-gate taints (no active grant) → loud → queued; M6c phase no-ops when off.
 
 ## Failure / partial-state matrix
 
 | Scenario | Result |
 |---|---|
 | Mandates off / none granted | M6c phase no-ops; no proposals |
-| Bad grant (recipe > 2048 / target not write-granted / target under a read-grant root) | engine rejects → "New mandate" form shows *why*; no mandate created |
-| Clean mandate rewrite | auto-applied silently; appears in Mandate-activity with Undo |
-| Risky (tainted / secret-shaped) mandate rewrite | sweep gets `NeedsLoudConfirm` → parked in SP4 Review; **nothing auto-written** |
-| Any M6b reconcile proposal | producer filter excludes it from the sweep → still needs manual approval (SP4 unchanged) |
-| Target changed on disk since the proposal | base-hash anti-clobber → `Stale` → skipped; re-proposed next tick; never clobbered |
-| Create proposal but target reappeared | Create anti-clobber ("still absent") fails → skipped; never overwrites |
-| Write-grant revoked between propose and sweep | fresh re-gate → `Revoked` → skipped |
+| Bad grant (recipe > 2048 / > 256 sources / target not write-granted / target under a read-grant root) | engine rejects → "New mandate" form shows *why*; no mandate created |
+| Clean rewrite (all sources in-scope+authorized, not secret-shaped) | **auto-applied** silently; appears in Mandate-activity with Undo |
+| Secret-shaped rewrite | `diff_flags` → loud → `NeedsLoudConfirm` → parked in Review; **never auto-written** |
+| Source outside the mandate's `source_scope`, or unresolvable | still tainted → loud → parked in Review |
+| Mandate revoked between propose and sweep | re-gate finds no active grant → source re-taints → loud → parked (or `Revoked` if the write-grant also went) |
+| Any M6b reconcile proposal | producer filter excludes it from the sweep; trust rule can't apply (target is ingested, not a mandate target) → still human-approved (SP4 unchanged) |
+| Target changed on disk since the proposal | base-hash anti-clobber → `Stale` → skipped; re-proposed next tick |
+| Create proposal, target reappeared | engine atomic no-clobber create fails closed → skipped; never overwrites |
+| Write-grant revoked between propose and apply | re-gate → `Revoked` → skipped |
 | Mandates flipped off mid-sweep | per-item `mandates_enabled` re-read → stops fast |
-| Relaunch with an explicit mandates-on | `prime_switches` preserves it (switch-fix); M6c resumes |
+| > 8 eligible clean proposals in one tick | first 8 applied (oldest-first); remainder retried next tick (~5-min-per-excess) |
+| Ollama down | no tick runs → no sweep; a clean proposal queued from a prior tick waits until Ollama returns (accepted coupling) |
+| Concurrent apply (sweep vs SP4 UI) on the same clean proposal | engine resolve-check + `rename_lock` serialize; the loser gets `Stale`/"already resolved" and is skipped — no double write |
+| Relaunch with explicit mandates-on | `prime_switches` preserves it; M6c resumes |
 
 ## Security invariants
 
-- **Grant is consent; taint verdict is the gate.** Auto-apply happens **only** when the fresh re-gate verdict is **not loud**. Any untrusted/external taint or secret-shaped `diff_flags` → `requires_loud_modal` → **not** auto-applied → parked in Review. The confused-deputy case (untrusted data flowing into a trusted file) always keeps a human.
-- **Engine still never auto-writes on its own.** The auto-apply *action* is the **desktop scheduler** calling `apply_proposal`; the engine only emits proposals and fails safe. Approach A keeps the core exactly as safe as SP4.
-- **Producer-filtered sweep preserves SP4.** Only `m6c-mandate-proposer` proposals auto-apply; M6b reconcile edits never do.
-- **Same anti-clobber + re-gate at apply.** The clean path uses the *exact* SP4 apply chain (base-hash anti-clobber → fresh `propose_write` re-gate → T-I1 op-mapping → atomic temp+rename → durable undo `pre_bytes` → signed `file_written`). For **Create**, anti-clobber = *"target still absent."*
-- **Two locks still hold for the file.** Folder write-grant (engine-re-enforced at `execute_write`) + (risky path) human approval. A mandate target must be write-granted **and** outside every read-grant root (`add_mandate` self-loop guard) — so a mandate can never rewrite a file it is also ingesting.
-- **Off by default; explicit + sticky; re-read per item.** `mandates_enabled` forced off until flipped, then persists; the M6c phase re-reads it per mandate.
-- **Local only.** No new network surface (reuses SP3's loopback reasoner + network-free embedder; the **two-graph network guard** stays green). No new secrets / keychain reads.
-- **Carried residual (from SP4, NOT closed here) — flagged for review.** Loud-confirm is enforced at the **desktop** apply op, not yet inside `bossclaw-core execute_write_inner`; first-open `verify_chain` is still advisory. These matter **more** now that writes are autonomous (a wider confused-deputy surface). The recommended next hardening is pushing the loud-gate into the engine (Approach B territory) — deferred, but explicitly on the table for the security reviewer.
+- **The trust rule is scoped, signed, and re-gate-safe (Engine change c).** In-scope authorized sources stop tainting *only* a mandate's own target; everything else (out-of-scope/unresolvable sources, secret-shaped content, the Step-4 target floor) still taints. The trust root is the signed `mandate_grant` (user-created only). M6b-reconcile and mandate targets are disjoint by the self-loop guard, so the rule provably never clears taint for a non-mandate write — **with a test that asserts it.**
+- **The loud-gate is now an engine invariant (Engine change d).** `execute_write_inner` refuses any `requires_loud_modal` write without `acknowledged_loud`. No caller — desktop, the autonomous sweep, or a future one — can write a loud proposal without the ack. The sweep hardcodes `acknowledged_loud=false`, so it can only ever auto-apply genuinely-clean writes.
+- **Engine still never auto-writes on its own.** The auto-apply *action* is the desktop scheduler; the engine emits proposals and fails safe.
+- **Same anti-clobber + fresh re-gate at apply.** The clean path uses the exact SP4 apply chain (base-hash anti-clobber → fresh `propose_write` re-gate → T-I1 op-mapping → atomic temp+rename → durable undo → signed `file_written`). For Create, anti-clobber = the engine's atomic no-clobber create.
+- **Accepted residual of Option B (eyes-open, flagged for review):** a poisoned in-scope source file can drive a non-secret malicious auto-write into the target. Bounded by the explicit grant, write-grant containment, the secret-shaped gate, and the activity+Undo trail. This is the deliberate price of autonomy.
+- **`verify_chain` stays advisory (carried from SP4 — ruled ACCEPTABLE).** Its threat (forging a valid re-encrypted event — e.g. a fake `mandate_grant`) already implies DEK/SQLCipher compromise, which autonomy does not widen. The eventual hardening (gate `get_or_open` on `verify_chain`) remains a deferred, non-blocking follow-up.
+- **Local only.** No new network surface (loopback reasoner + network-free embedder; the two-graph network guard stays green). No new secrets / keychain reads. `cargo audit` both crates at implementation time (no new deps introduced by this design).
 
 ## Known limitations (named, accepted for SP5)
 
-- **Polled, not instant** — up to ~5-min lag before a source change is noticed (watcher deferred).
-- **Auto-apply policy is app-side** (Approach A), not engine-sealed; the engine fails safe (queues) for any non-desktop caller.
-- **No per-mandate trust** — one global clean/risky rule.
-- **Mandate editing = revoke + re-create** (no in-place edit); **no bulk ops**.
-- **`pending_proposals()` re-folds the actuator stream `O(events)` per call** — now also scanned each sweep; fine for SP5 queue sizes; the projection-table is the future fix.
-- **Windows deferred** (Unix-gated), matching SP1–SP4.
+- **Polled, not instant**; best-case ~5-min latency, more under cap contention (Decision 2).
+- **macOS Create no-clobber is `statat`+`renameat`, not `O_EXCL`-atomic** (`actuator.rs` macOS branch) — a local racer could lose-then-overwrite a file **inside the user's own write-granted folder**. Contained by canonicalize + write-grant + `O_NOFOLLOW` (cannot escape the grant or follow a planted symlink); Linux uses kernel-atomic `RENAME_NOREPLACE`. Narrow, accepted.
+- **Auto-apply policy is app-side** (Approach A); the engine fails safe (queues) for any non-desktop caller. (Engine change d still enforces the loud-gate for all callers.)
+- **One trust rule, not a tier**; **mandate editing = revoke + re-create**; **no bulk ops**.
+- **`pending_proposals()` re-folds `O(events)` per call** and the sweep does 1+K folds (capped at 8) — projection-table is the future fix.
+- **Windows deferred** (Unix-gated).
 
 ## Testing
 
-- **Engine (`bossclaw-core`):** `pending_proposals()` surfaces `producer` correctly for an M6c vs. an M6b proposal.
-- **Desktop backend** (`#[cfg(unix)]` `EngineHandle` tests with `MockVault` + `MockEmbedderProvider` + `ScriptedReasoner`):
-  - **switch-fix:** set mandates on → reopen with a fresh handle → assert still on (the flipped `…_preserves_explicit_mandates` test); the engine `tests/mandate.rs` sticky-default test still holds.
-  - **Create-apply:** a Create proposal applies (file written); refused if the target reappeared.
-  - **auto-apply sweep — the three that matter:** ① clean mandate proposal → auto-applied; ② risky (tainted) mandate proposal → stays queued, never auto-written; ③ **an M6b reconcile proposal → NEVER auto-applied.** Built with SP4's hard-won Tauri ACL discipline (real `__allow_command` grant for a `Remote{http://tauri.localhost}` origin + a **positive** op-ran signature + a **mutation-verify** so the test can't pass vacuously).
-  - **CRUD round-trip:** add → list → revoke; grant-time rejections (recipe length, no write-grant, read-grant self-loop) surface as typed errors.
-  - **Mandate-activity:** lists M6c `file_written` events; Undo restores prior bytes.
-- **Front-end:** `vitest` for New-mandate form validation, the mandate-list view, and the activity-list view (pure helpers, like SP4's `diffView`/`proposalView`).
-- **Gates (all green):** `cargo build/test/clippy -p air_agent_desktop` · `cargo test -p bossclaw-core` · `cargo clippy -p bossclaw-core --features ollama -- -D warnings` · `typecheck` · `vitest` · the **two-graph network guard**.
-- **Manual launch:** turn mandates on → grant a mandate (target in a write-granted folder, sources in a read folder) → trigger an evolve tick → a clean change **auto-applies** + shows in Mandate-activity + Undo restores it; introduce an external/tainted source → that rewrite **parks in Review** → Approve; **Revoke** stops further writes; relaunch → mandates **still on**.
+- **Engine (`bossclaw-core`):**
+  - **(c) trust rule — the load-bearing tests:** a mandate proposal over in-scope authorized sources, non-secret content → `Clean` / `requires_loud_modal == false`; a source **outside** `source_scope` → `Untrusted`/loud; secret-shaped content → loud (via `diff_flags`) even with all-in-scope sources; **after revoke** → loud again. **Scoping proof:** an **M6b reconcile** proposal (target = an ingested file) is **still `Untrusted`/loud** — the trust rule did not leak.
+  - **(d) loud-gate:** `execute_write_inner` refuses a loud write with `acknowledged_loud=false`; permits it with `true`; a clean write needs no ack.
+  - **(a) producer** surfaced in `pending_proposals()` for M6c vs M6b; empty/unknown producer ⇒ not auto-appliable.
+  - **(b) `mandate_writes()`** attributes an M6c write, **excludes** an M6b/manual write, and flips `undone` after an Undo.
+- **Desktop backend** (`#[cfg(unix)]` `EngineHandle` + `MockVault`/`MockEmbedder`/`ScriptedReasoner`):
+  - switch-fix (both flags persist across re-open); Create-apply (applies; refused if target reappeared);
+  - **auto-apply sweep — the three that matter:** ① clean mandate proposal → auto-applied; ② risky (secret-shaped / out-of-scope) → stays queued; ③ an M6b reconcile proposal → **NEVER** auto-applied (producer filter *and* trust-scoping). Built with SP4's Tauri ACL discipline (real `__allow_command` grant for a `Remote{http://tauri.localhost}` origin + a positive op-ran signature + mutation-verify).
+  - CRUD round-trip + grant-time rejections surface as typed errors.
+- **Front-end:** vitest for New-mandate validation, the mandate-list view, and the activity-list view (incl. `undone` disabling Undo).
+- **Gates (all green):** `cargo build/test/clippy -p air_agent_desktop` · `cargo test -p bossclaw-core` · `cargo clippy -p bossclaw-core --features ollama -- -D warnings` · `typecheck` · `vitest` · two-graph network guard · `cargo audit` both crates.
+- **Manual launch:** mandates on → grant a mandate (target in a write-granted folder, sources in a *read* folder) → tick → a clean change **auto-applies** + shows in Mandate-activity + Undo restores; drop a secret-shaped or out-of-scope source → that rewrite **parks in Review** → Approve; **Revoke** stops further writes; relaunch → mandates **still on**.
 
 ## New constants / modules / commands / touch (summary)
 
-- **Engine:** (a) `producer` field on `PendingProposal` + `pending_proposals()` + test; (b) *if needed* a thin read-helper attributing resolved `file_written` events to their proposer (Mandate-activity). **No new events** (reuses `mandate_grant`/`mandate_revoke`/`write_proposal`/`file_written`, all already built).
-- **Desktop backend:** `prime_switches` mandate guard (+ flipped test); `set_mandates_enabled` op+command; `add`/`revoke`/`list_mandates` ops+commands + `MandateDto`; Create-apply fix in `apply_proposal`; scheduler auto-apply sweep; `producer` through `ProposalSummary`/`ProposalDto`; `api/engine.ts` twins.
+- **Engine:** (a) `producer` on `PendingProposal`; (b) `mandate_writes()` + `MandateWriteRecord`; (c) the Step-1 trust exception in `propose_write`; (d) `acknowledged_loud` threaded into `execute_write*`. New const `MANDATE_AUTOAPPLY_PER_SWEEP` may live engine-side or desktop-side (plan decides). **No new events.**
+- **Desktop backend:** `prime_switches` mandate guard (+ flipped test); `set_mandates_enabled` op+command; `add`/`revoke`/`list_mandates` ops+commands + `MandateDto`; Create-apply fix; scheduler auto-apply sweep; `producer` through `ProposalSummary`/`ProposalDto`; `api/engine.ts` twins.
 - **Desktop frontend:** `src/mandates/*` (MandatesPanel + form/list/activity helpers + tests); `App.tsx` `View += "mandates"` + nav; reuse SP4 Review for the risky path.
 
-## Resolved by brainstorming (was open questions)
+## Resolved by brainstorming + review (was open questions)
 
-1. Autonomy → **auto-apply** (mandate grant = standing consent), not per-change review.
-2. Tainted path → **auto-apply clean, queue risky** (the engine's `requires_loud_modal` is the gate).
-3. Detection → **polled ~5 min** (reuse the evolve scheduler); live watcher deferred.
-4. Build approach → **A, app-driven** (engine stays light, keeps its "never auto-write on its own" guarantee).
-5. Audit/undo → **persistent Mandate-activity list + Undo, IN scope** (the price of no pre-confirm).
-6. Create-apply gap → **fix in the desktop apply op** (absence-based anti-clobber for Create).
+1. Autonomy → **auto-apply** (mandate grant = standing consent).
+2. Tainted path → **auto-apply clean, queue risky**; "clean" made reachable by the trust rule (Decision 7).
+3. Detection → **polled ~5 min**; live watcher deferred.
+4. Build approach → **A, app-driven** sweep; engine keeps "never auto-write on its own."
+5. Audit/undo → **persistent Mandate-activity list + Undo, IN scope** (mandatory join helper).
+6. Create-apply gap → **fix in the desktop apply op**; rely on the engine's atomic no-clobber (no desktop pre-check).
+7. **(v1-review correction)** "auto-apply clean" was dead code (all ingested sources are `external`) → adopt the **scoped taint-trust rule (Engine change c)** to make it real.
+8. **(v1-review hardening)** Move the loud-gate into `execute_write_inner` (Engine change d).
 
 ## Future hooks (NOT built here)
 
 - **Live OS watcher** (`watch.rs`) → instant detection.
-- **Engine-sealed auto-apply + loud-gate inside `execute_write_inner`** (Approach B) → the recommended next hardening for autonomous writes.
-- **Per-mandate trust tier** (Approach C), **mandate editing**, **bulk ops**.
+- **Per-mandate trust tiers**, **mandate editing**, **bulk ops**.
+- **First-open `verify_chain` fail-closed gate** (carried deferral).
 - **App-shell redesign** → repositions the Mandates + Review destinations.
 - **M7** → battery/thermal-smart scheduler, persisted index, Windows, signer-DID verification.
