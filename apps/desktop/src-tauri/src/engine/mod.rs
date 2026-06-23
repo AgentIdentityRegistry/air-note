@@ -473,6 +473,17 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Flip the sticky engine proposals off-switch (Lock-1 enablement; turned on under the hood
+    /// on first folder-enable). Gated.
+    pub async fn set_proposals_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_proposals_enabled(enabled).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Every current ingested file (one per path). Gated.
     pub async fn list_files(&self, onboarded: bool) -> Result<Vec<bossclaw_core::graph::FileRecord>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -978,5 +989,24 @@ mod tests {
         handle.set_folder_writable(true, path.clone(), false).await.unwrap();
         let writable = handle.list_writable(true).await.unwrap();
         assert!(!writable.contains(&canonical), "revoked root drops from the writable list");
+    }
+
+    #[tokio::test]
+    async fn set_proposals_enabled_toggles_the_engine_flag() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(!log.proposals_enabled().unwrap(), "primed off at first open");
+        drop(log);
+
+        handle.set_proposals_enabled(true, true).await.unwrap();
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(log.proposals_enabled().unwrap(), "the op flips the sticky flag on");
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.set_proposals_enabled(false, true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
     }
 }

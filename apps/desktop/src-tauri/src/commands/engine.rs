@@ -254,6 +254,13 @@ pub async fn engine_set_evolve_enabled(
     state.engine.set_evolve_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
 }
 
+/// Flip the sticky proposals off-switch (invoked under the hood on first folder-enable).
+#[tauri::command]
+pub async fn engine_set_proposals_enabled(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_proposals_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
+}
+
 /// Run one evolve tick now ("Evolve now"). Returns the tick report.
 #[tauri::command]
 pub async fn engine_evolve_now(state: State<'_, AppState>) -> Result<EvolveReportDto, String> {

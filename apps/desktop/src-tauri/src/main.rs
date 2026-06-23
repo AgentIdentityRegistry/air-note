@@ -142,6 +142,8 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_set_folder_writable,
             #[cfg(unix)]
+            commands::engine::engine_set_proposals_enabled,
+            #[cfg(unix)]
             commands::engine::engine_list_grants,
             #[cfg(unix)]
             commands::engine::engine_run_ingest,
