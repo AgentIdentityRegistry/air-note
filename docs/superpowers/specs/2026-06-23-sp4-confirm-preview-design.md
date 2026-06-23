@@ -89,19 +89,22 @@ Plus: extend the SP2 `FileRecordDto` (or a sibling) with a `writable: bool` flag
 ### EngineHandle ops (the chokepoint)
 Each new op funnels through `get_or_open(onboarded)` → `spawn_blocking(move || log.<core>(…))` → `EngineOpError` mapping, exactly like SP2/SP3 ops. `apply_proposal` relies on the engine's internal `rename_lock` for write serialization (no new desktop lock).
 
-### Apply flow (security-critical) — re-gate at confirm
+### Apply flow (security-critical) — base-fingerprint check + re-gate at confirm
+**Propose-time:** when the M6b reconciler emits a proposal it stores the gate's **`base_content_hash`** (the sha256 of the target's bytes at draft time; `WriteVerdict.base_content_hash`, `Some` for an Edit) inside the proposal's `verdict_summary` JSON — **no new event field or `append_write_proposal` signature**, just one more key in the object it already passes.
+
 On **Approve(id)**:
-1. Load the open proposal; `get_proposal_bytes_checked(id, new_content_hash)` → bytes (**fail-closed** if the side-table row is missing/tampered).
-2. **Fresh** `propose_write(WriteProposal { target, new_content: bytes, op: Edit, source_event_ids: lineage, rationale })` — re-gates against the **current** on-disk file (base hash + identity) **and** the write-grant.
-3. If `verdict.gate_reject_reason().is_some()` → surface the reason and **do not apply**: "the file changed since this was suggested — I'll take another look" (staleness) or "edits aren't allowed in this folder anymore" (grant revoked).
-4. If `verdict.requires_loud_modal` → show the loud confirm before step 5.
-5. `execute_write_resolving(gated, &id)` → atomic temp+rename, appends `file_written` (`resolves_proposal == id`), durably captures undo `pre_bytes`.
+1. Load the open proposal (carrying its recorded `base_content_hash`).
+2. **Anti-clobber check (the true staleness detector):** read the live target, sha256 it, and compare to the recorded `base_content_hash`. If they differ (or no base is recorded) → **fail closed with `Stale`, before proposing or executing**: "the file changed since this was suggested — I'll take another look." *This must precede the fresh propose:* a fresh `propose_write` re-bases on the **live** file, so it can never tell that the file drifted since the proposal was drafted — without this explicit compare an interim user edit would be silently clobbered.
+3. `get_proposal_bytes_checked(id, new_content_hash)` → bytes (**fail-closed** if the side-table row is missing/tampered).
+4. **Fresh** `propose_write(WriteProposal { target, new_content: bytes, op: Edit, source_event_ids: lineage, rationale })` — re-gates against the current file **and** the write-grant; still guards the micro-TOCTOU window between the hash check and the rename, symlink/op-mismatch, and grant revocation. If `verdict.reject_reason.is_some()` → `Stale`; if `!verdict.allowed` → `Revoked`. **Do not apply.**
+5. If `verdict.requires_loud_modal` → show the loud confirm before step 6.
+6. `execute_write_resolving(gated, &id)` → atomic temp+rename, appends `file_written` (`resolves_proposal == id`), durably captures undo `pre_bytes`.
 
 **Decline(id)** → `decline_write_proposal(id, reason)` (terminal `write_declined`, resolves the proposal). **Undo** → `undo_write(file_written_id)` (re-gated, hash-verified restore).
 
 ## Data flow
 
-`evolve tick (enabled folder, write-granted) → reconcile drafts → write_proposal + proposal_bytes → engine_list_proposals → Review queue (badge) → engine_proposal_preview → user Approve → re-gate (fresh propose_write) → [loud confirm if flagged] → execute_write_resolving → file_written (audit) + undo captured`. Decline → `write_declined`. Folders not write-granted → skipped at reconcile (no proposal). 
+`evolve tick (enabled folder, write-granted) → reconcile drafts → write_proposal + proposal_bytes → engine_list_proposals → Review queue (badge) → engine_proposal_preview → user Approve → base-hash anti-clobber check → re-gate (fresh propose_write) → [loud confirm if flagged] → execute_write_resolving → file_written (audit) + undo captured`. Decline → `write_declined`. Folders not write-granted → skipped at reconcile (no proposal). 
 
 ## Failure / partial-state matrix
 
@@ -110,7 +113,7 @@ On **Approve(id)**:
 | Not onboarded → any `engine_*` | `Open(NotOnboarded)`; Review shows "set up your identity first" |
 | Evolve off / Ollama down | no new proposals; Review shows empty + a hint to enable evolve |
 | Folder not editable | reconcile skips it (engine change a) → no proposal; nothing burned |
-| File changed on disk since proposal | re-gate at apply fails closed → "stale, I'll re-look"; nothing written |
+| File changed on disk since proposal | the propose-time `base_content_hash` ≠ the live file's hash → apply fails closed as `Stale` BEFORE any propose/execute → "stale, I'll re-look"; nothing written |
 | Write-grant revoked between propose and apply | re-gate fails closed → "edits no longer allowed here" |
 | Proposal bytes GC'd / tampered | `get_proposal_bytes_checked` fails closed → "couldn't verify the change" |
 | `requires_loud_modal` (secret-shaped) | apply blocked behind the "I've reviewed this" confirm |
@@ -121,7 +124,7 @@ On **Approve(id)**:
 ## Security invariants
 
 - **Two locks, both required.** Folder write-grant **and** per-change approval; either missing → no write. Engine **independently re-enforces** the write-grant at `execute_write` (not just at the UI).
-- **Re-gate at confirm.** Apply never trusts the stored propose-time verdict; it rebuilds the gate against the live file → staleness/revocation fail closed.
+- **Base-fingerprint anti-clobber + re-gate at confirm.** Apply first compares the proposal's stored propose-time `base_content_hash` to the live file's current hash and fails closed (`Stale`) if they diverge — this is what actually catches an interim edit, since a fresh `propose_write` re-bases on live bytes and cannot. Apply never trusts the stored verdict; it then rebuilds the gate against the live file (TOCTOU window, symlink, grant revocation) → staleness/revocation fail closed. Either lock failing → nothing written.
 - **Mandates stay OFF.** `mandates_enabled` forced off; the M6c emitter never runs → no autonomous mandate writes in SP4 (that's SP5).
 - **Atomic + undoable + audited.** Every apply is temp+rename atomic, captures durable undo `pre_bytes` before mutating, and appends a signed `file_written` event (`verify_chain`-able).
 - **Local only.** No new network surface; reasoner stays loopback-only (SP3); embedder network-free (two-graph guard stays green). No new secrets / keychain reads.
