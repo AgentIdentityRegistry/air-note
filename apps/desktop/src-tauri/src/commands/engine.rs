@@ -226,6 +226,32 @@ impl From<bossclaw_core::EvolveReport> for EvolveReportDto {
     }
 }
 
+#[derive(Serialize)]
+pub struct ProposalDto {
+    pub id: String,
+    pub target: String,
+    pub op: String,
+    pub new_content_hash: String,
+    pub rationale: String,
+    pub requires_loud_modal: bool,
+}
+impl From<crate::engine::ProposalSummary> for ProposalDto {
+    fn from(p: crate::engine::ProposalSummary) -> Self {
+        Self {
+            id: p.id, target: p.target, op: p.op,
+            new_content_hash: p.new_content_hash, rationale: p.rationale,
+            requires_loud_modal: p.requires_loud_modal,
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_list_proposals(state: State<'_, AppState>) -> Result<Vec<ProposalDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let proposals = state.engine.list_proposals(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(proposals.into_iter().map(ProposalDto::from).collect())
+}
+
 /// The evolve loop's status. NEVER errors: if the engine isn't open yet (or any op error),
 /// report a disabled/empty status — payload-encoded exactly like `engine_status`, so a
 /// status poll from the Memory tab can never throw.

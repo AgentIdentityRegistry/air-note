@@ -78,6 +78,35 @@ impl std::fmt::Display for EngineOpError {
     }
 }
 
+/// A row in the Review queue, projected from one open `PendingProposal`. The
+/// `requires_loud_modal` is lifted out of the propose-time `verdict_summary` for the badge/card.
+#[derive(Debug, Clone)]
+pub struct ProposalSummary {
+    pub id: String,
+    pub target: String,
+    pub op: String,
+    pub new_content_hash: String,
+    pub rationale: String,
+    pub requires_loud_modal: bool,
+}
+
+impl ProposalSummary {
+    fn from_pending(p: bossclaw_core::PendingProposal) -> Self {
+        // Single-sourced fail-loud default (m2): `PendingProposal::requires_loud_modal()` returns
+        // true when the verdict is absent/garbled. This is a UI HINT to pre-show the modal; the
+        // authoritative loud-confirm gate is the FRESH re-gate inside `apply_proposal` (Task 8).
+        let requires_loud_modal = p.requires_loud_modal();
+        Self {
+            id: p.id,
+            target: p.target,
+            op: p.op,
+            new_content_hash: p.new_content_hash,
+            rationale: p.rationale,
+            requires_loud_modal,
+        }
+    }
+}
+
 /// The coarse engine state surfaced to the UI (distinguishes setup states from faults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -494,6 +523,17 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Every open proposal, projected for the Review queue. Gated.
+    pub async fn list_proposals(&self, onboarded: bool) -> Result<Vec<ProposalSummary>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            let pending = log.pending_proposals().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(pending.into_iter().map(ProposalSummary::from_pending).collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Identity-reset teardown: delete both engine slots, drop the memoized log (reset the
     /// cell to `None`), then delete brain.db.
     pub async fn teardown(&self) -> Result<(), EngineError> {
@@ -834,9 +874,71 @@ mod tests {
         log.append(ev).unwrap();
     }
 
+    /// Seed one `memory` event and return its id (a lineage source for a Tier-B `write_proposal`).
+    fn seed_one_memory_id(log: &EventLog, text: &str) -> String {
+        log.append(bossclaw_core::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: "memory".to_string(),
+            content: serde_json::json!({ "text": text }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        }).unwrap()
+    }
+
     /// Count events of a given `event_type` in the log (used to prove zero `write_proposal`s).
     fn count_events_of_type(log: &EventLog, event_type: &str) -> usize {
         log.stream_all().unwrap().into_iter().filter(|e| e.event_type == event_type).count()
+    }
+
+    #[tokio::test]
+    async fn list_proposals_returns_open_summaries() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+
+        // Seed a lineage event so the Tier-B proposal append is valid.
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"entity:a","relation":"works_at","dst":"entity:acme"});
+        let pid = log.append_write_proposal(
+            "/tmp/acme/notes.md", "edit", "deadbeef", 0, "Alice now works at Globex",
+            &key, &serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true}),
+            std::slice::from_ref(&lineage),
+        ).unwrap();
+        drop(log);
+
+        let proposals = handle.list_proposals(true).await.unwrap();
+        assert_eq!(proposals.len(), 1);
+        let p = &proposals[0];
+        assert_eq!(p.id, pid);
+        assert_eq!(p.target, "/tmp/acme/notes.md");
+        assert_eq!(p.op, "edit");
+        assert_eq!(p.rationale, "Alice now works at Globex");
+        assert!(!p.requires_loud_modal, "verdict_summary.requires_loud_modal projected");
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.list_proposals(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn garbled_verdict_summary_projects_requires_loud_modal_true() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        // verdict_summary is a STRING, not the expected object → `.get("requires_loud_modal")` is
+        // None → fail-loud default true.
+        let pid = log.append_write_proposal("/tmp/x/notes.md", "edit", "deadbeef", 0, "why",
+            &key, &serde_json::json!("garbled"), std::slice::from_ref(&lineage)).unwrap();
+        drop(log);
+
+        let proposals = handle.list_proposals(true).await.unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert!(proposals[0].id == pid && proposals[0].requires_loud_modal,
+            "an absent/garbled verdict_summary fails loud (requires_loud_modal == true)");
     }
 
     /// Task 7 (mint): with the stub returning one entity for the extraction schema, an

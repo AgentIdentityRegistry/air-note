@@ -62,6 +62,8 @@ pub use log::{ActiveModel, ConfigFlag, EventLog, ReembedStats, SynthCacheRow, SC
 #[cfg(unix)]
 pub use log::MandateAction;
 #[cfg(unix)]
+pub use log::PendingProposal;
+#[cfg(unix)]
 pub use watch::MandateWatcher;
 pub use model2vec::Model2Vec;
 #[cfg(feature = "ollama")]
