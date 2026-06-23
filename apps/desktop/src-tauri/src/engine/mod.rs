@@ -689,6 +689,17 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Undo a prior apply — re-gated, hash-verified restore of the pre-write bytes (LIFO per
+    /// target); fails closed if the file diverged since. Gated.
+    pub async fn undo_apply(&self, onboarded: bool, file_written_id: String) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        tokio::task::spawn_blocking(move || {
+            log.undo_write(&file_written_id).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Decline a proposal — terminal `write_declined` (resolves it; the fix never returns). Gated.
     pub async fn decline_proposal(&self, onboarded: bool, id: String, reason: String) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -1486,6 +1497,50 @@ mod tests {
 
         assert!(matches!(
             handle.decline_proposal(false, pid, "x".to_string()).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn undo_apply_restores_the_original_bytes() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("notes.md");
+        let original = b"Alice works at Acme.\n".to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let file_id = bossclaw_ingest_one(&log, &path);
+        let new_bytes = b"Alice works at Globex.\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"works_at","dst":"acme"});
+        let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![file_id.clone()], rationale: "fix".to_string() }).unwrap();
+        // Mirror the happy-path apply flow (apply_proposal_writes_file_and_resolves_then_stale_fails_closed):
+        // the proposal MUST carry base_content_hash in its verdict_summary or Task 8's anti-clobber gate
+        // fails closed with Stale("proposal has no base fingerprint to verify against").
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64, "fix",
+            &key, &vs, std::slice::from_ref(&file_id)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // An Edit to a TRACKED file is loud by construction (engine-anchored taint=Untrusted), so the
+        // FRESH re-gate requires the explicit ack — pass `true`, like the happy-path apply flow.
+        let applied = handle.apply_proposal(true, pid, true).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "applied");
+        handle.undo_apply(true, applied.file_written_id.clone()).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original, "undo restored the original bytes");
+
+        assert!(matches!(
+            handle.undo_apply(false, applied.file_written_id).await,
             Err(EngineOpError::Open(EngineError::NotOnboarded))
         ));
     }
