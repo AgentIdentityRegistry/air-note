@@ -65,6 +65,7 @@ export type ApplyResultDto = { file_written_id: string };
 
 export const setFolderWritable = (path: string, on: boolean): Promise<void> =>
   invoke<void>("engine_set_folder_writable", { path, on });
+export const listWritable = (): Promise<string[]> => invoke<string[]>("engine_list_writable");
 export const setProposalsEnabled = (enabled: boolean): Promise<void> =>
   invoke<void>("engine_set_proposals_enabled", { enabled });
 export const listProposals = (): Promise<ProposalDto[]> => invoke<ProposalDto[]>("engine_list_proposals");

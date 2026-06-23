@@ -127,6 +127,12 @@ pub async fn engine_set_folder_writable(path: String, on: bool, state: State<'_,
 }
 
 #[tauri::command]
+pub async fn engine_list_writable(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.list_writable(onboarded).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn engine_list_grants(state: State<'_, AppState>) -> Result<Vec<GrantDto>, String> {
     let onboarded = state.identity_store.is_onboarded();
     let grants = state.engine.list_grants(onboarded).await.map_err(|e| e.to_string())?;
