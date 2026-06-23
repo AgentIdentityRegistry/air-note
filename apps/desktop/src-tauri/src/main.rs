@@ -65,7 +65,10 @@ fn main() {
             #[cfg(unix)]
             let engine = {
                 let resource_dir = app.path().resource_dir().expect("resource dir");
-                let model_dir = resource_dir.join("models/potion-base-8M");
+                // Tauri preserves the declared `resources/` prefix from bundle.resources
+                // (tauri.conf.json) when copying, so the model lands at
+                // `<resource_dir>/resources/models/potion-base-8M`, NOT `<resource_dir>/models/...`.
+                let model_dir = resource_dir.join("resources/models/potion-base-8M");
                 let provider = std::sync::Arc::new(crate::engine::embed::ResourceModel2Vec::new(model_dir));
                 std::sync::Arc::new(crate::engine::EngineHandle::new(vault, data_dir, provider))
             };
