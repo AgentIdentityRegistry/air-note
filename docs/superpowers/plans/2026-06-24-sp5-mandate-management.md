@@ -16,6 +16,15 @@
 2. **The SP4 op-map already exists.** `apply_proposal` (engine/mod.rs:659-664) already maps `p.op` → `WriteOp` fail-closed. So Task 9 (Create-apply) is NOT "add op-mapping"; it is "reorder the op-map ABOVE the base-hash arm and skip the base-hash fail-closed arm for `op == "create"`", because `propose_write` sets `base_content_hash = None` for a Create (log.rs:3155-3156) and the current `None => Stale` arm (engine/mod.rs:649-652) wrongly rejects every Create.
 3. **`MANDATE_AUTOAPPLY_PER_SWEEP` lives desktop-side** (in `scheduler.rs`, Task 11) — there is no engine const for it, and the sweep is an app-side action per Decision 3 / Approach A.
 4. **The SP4 plan doc does not contain the Tauri ACL `__allow_command` test**; the real discipline is the committed test `engine_undo_apply_binds_camelcase_arg_over_ipc` (commands/engine.rs:479-551). Task 11's sweep tests are EngineHandle-level (no IPC), so they do NOT need `__allow_command`; only a command-LAYER IPC test would. Task 7 adds one command-layer IPC test for `engine_add_mandate` that DOES use the `__allow_command` discipline verbatim.
+5. **Pinned engine-test harness names (`crates/bossclaw-core/tests/common/mod.rs`, verified).** The engine tests below use the REAL helpers — do NOT invent siblings:
+   - `common::open_log_with_write_grant() -> (EventLog, TempDir, PathBuf)` — opens an onboarded log and grants BOTH read+write on a created `home/files` dir (the returned `PathBuf`). This is the base opener; for a scope/dest split, call `add_grant`/`add_write_grant` on additional tempdirs against the returned `log`.
+   - `common::ingest_one(log: &EventLog, path: &Path) -> String` — **2 args, NO embedder** (it constructs its own `MockEmbedder::new(64)` internally). Earlier draft prose that called `ingest_one(&log, &emb, &path)` was wrong and is corrected throughout.
+   - `common::seed_memory(log, text) -> String` — appends a `memory` event, returns its id (there is no `seed_one_memory`/`seed_one_memory_id` in the ENGINE harness).
+   - `common::open_write_grant_and_external_target() -> (EventLog, TempDir, PathBuf)` — opens + ingests a tracked `n.md` target.
+   - `common::append_minimal_proposal` / `common::append_rejected` — the SP4 proposal/rejection factories.
+   - Mock arity: `bossclaw_core::embed::MockEmbedder::new(dim: usize)`. The DESKTOP tests use their OWN local helpers — `seed_one_memory_id(log, text) -> String` (engine/mod.rs:1052) and `bossclaw_ingest_one(log, path) -> String` (engine/mod.rs:1070) — NOT the engine `common::*`; the desktop op tests stay on those.
+6. **`M6B_PROPOSER_PRODUCER = "m6b-reconciler"` is `pub` in graph.rs:91** (T11/T4 use it alongside `M6C_PROPOSER_PRODUCER` at graph.rs:98). Confirmed.
+7. **The desktop crate has NO `log`/`tracing` dependency** (`apps/desktop/src-tauri/Cargo.toml` `[dependencies]` is `air-rs` + `tauri` + serde/tokio/etc.; the engine `bossclaw-core` is a `[target.'cfg(unix)'.dependencies]` dep with `features = ["ollama"]`, so `bossclaw_core::graph::*` resolves in the Unix-gated scheduler op). The only existing desktop diagnostic is `eprintln!` (vault.rs:65,90). So MF5's sweep observability uses **`eprintln!`** in the desktop scheduler — NOT `log::warn!` (which the spec/review referenced because the ENGINE crate has the `log` facade at log.rs:5896). Prescribing `log::warn!` in the desktop crate would require adding a dependency and break the build; `eprintln!` matches the real desktop convention.
 
 ---
 
@@ -47,37 +56,33 @@
 
 **What changes (grounded against the real `propose_write`, log.rs:3021-3193):** Today Step 1 (3045-3063) escalates `taint = Untrusted` the moment a cited source resolves to an `is_external` event. The rule: an external source must NOT escalate iff an active mandate authorizes it for THIS target. Ordering is load-bearing — Step 1 must record external candidates WITHOUT escalating; after Step 2 yields `Some(canonical_target)`, a new step escalates each candidate UNLESS authorized; an unresolvable target escalates ALL candidates (taint, never skip).
 
-- [ ] Add the test-support helpers + the load-bearing tests in `crates/bossclaw-core/tests/reconcile.rs` (append at end of file). These reuse the existing `common::open_log_with_write_grant` harness (returns `(log, home, dir)`) and the `MockEmbedder`. The helper `mandate_proposal_verdict` ingests one source file under a READ-granted scope dir, grants a mandate whose target is in a WRITE-granted dir, and returns the `propose_write` verdict for a rewrite of the target citing that source:
+- [ ] Add the test-support fixture + the load-bearing tests in `crates/bossclaw-core/tests/reconcile.rs` (append at end of file). These use the REAL harness (grounded, discrepancy note 5): `common::open_log_with_write_grant() -> (EventLog, TempDir, PathBuf)` (the returned `PathBuf` is a read+write-granted `dest`) and the **2-arg** `common::ingest_one(log, path)` (it builds its own `MockEmbedder` — do NOT pass one). The fixture grants a mandate whose target is in `dest` and whose `source_scope` is a SEPARATE read-granted `scope` tempdir, then returns the `propose_write` verdict for a rewrite citing the ingested source. It returns the `home`/`scope` TempDirs so the caller keeps them alive:
 
 ```rust
 // ── SP5 (c) trust-rule tests ────────────────────────────────────────────────
-// A self-contained fixture: a READ-granted `scope` dir holding one ingested source
-// file, and a separate WRITE-granted `dest` dir holding the mandate target. The
-// mandate authorizes `scope` as the source for `dest/target.md`. We then build a
-// rewrite proposal for the target citing the ingested source and return the verdict.
+// Fixture: `dest` (read+write-granted by the harness) holds the mandate target; a SEPARATE
+// read-granted `scope` tempdir holds one ingested source file. The mandate authorizes `scope`
+// as the source for `dest/synced.md`. Returns (log, home, dest, scope, gated) — `home`/`scope`
+// kept alive by the caller; `gated` is the verdict for the rewrite citing the ingested source.
 #[cfg(unix)]
 fn trust_fixture(
     source_body: &[u8],
     new_body: &[u8],
-) -> (bossclaw_core::EventLog, tempfile::TempDir, tempfile::TempDir, bossclaw_core::actuator::GatedProposal) {
+) -> (bossclaw_core::EventLog, tempfile::TempDir, std::path::PathBuf, tempfile::TempDir, bossclaw_core::actuator::GatedProposal) {
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let emb = MockEmbedder::new(64);
-    // dest dir (write-granted) holds the mandate target.
-    let dest = tempfile::tempdir().unwrap();
-    let (log, _home) = common::open_log_for_dir(&dest); // read+write grant on `dest`
-    log.add_write_grant(dest.path()).unwrap();
-    let target = dest.path().join("synced.md");
+    // The harness opens an onboarded log + a read+write-granted `dest` files dir.
+    let (log, home, dest) = common::open_log_with_write_grant();
+    let target = dest.join("synced.md");
     std::fs::write(&target, b"stale\n").unwrap();
-    // scope dir (read-granted only) holds the source; ingest it so it is `external`.
+    // A SEPARATE read-granted scope dir holds the source; ingest it so it is `external`.
     let scope = tempfile::tempdir().unwrap();
     log.add_grant(scope.path()).unwrap();
     let src_path = scope.path().join("src.md");
     std::fs::write(&src_path, source_body).unwrap();
-    let src_id = ingest_one(&log, &emb, &src_path);
+    let src_id = common::ingest_one(&log, &src_path);
     // Grant the mandate: target in `dest`, sources under `scope`.
     log.add_mandate(&target, scope.path(), "sync the target from scope").unwrap();
     log.rebuild_graph().unwrap();
-    // Build the rewrite proposal citing the ingested source.
     let gated = log.propose_write(WriteProposal {
         target: target.clone(),
         new_content: new_body.to_vec(),
@@ -85,13 +90,13 @@ fn trust_fixture(
         source_event_ids: vec![src_id],
         rationale: "mandate sync".to_string(),
     }).unwrap();
-    (log, dest, scope, gated)
+    (log, home, dest, scope, gated)
 }
 
 #[cfg(unix)]
 #[test]
 fn mandate_in_scope_clean_source_is_not_loud() {
-    let (_log, _dest, _scope, gated) = trust_fixture(b"clean source text\n", b"clean new text\n");
+    let (_log, _home, _dest, _scope, gated) = trust_fixture(b"clean source text\n", b"clean new text\n");
     assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Clean,
         "an in-scope authorized source must NOT taint the mandate's target");
     assert!(!gated.verdict.requires_loud_modal, "clean + in-scope ⇒ not loud (auto-appliable)");
@@ -101,7 +106,7 @@ fn mandate_in_scope_clean_source_is_not_loud() {
 #[test]
 fn mandate_secret_shaped_content_is_loud_even_in_scope() {
     // All-in-scope, but the NEW content is secret-shaped (>=32-char alnum run) → diff_flags → loud.
-    let (_log, _dest, _scope, gated) = trust_fixture(
+    let (_log, _home, _dest, _scope, gated) = trust_fixture(
         b"clean source\n",
         b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n",
     );
@@ -113,25 +118,18 @@ fn mandate_secret_shaped_content_is_loud_even_in_scope() {
 #[test]
 fn mandate_out_of_scope_source_is_loud() {
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let emb = MockEmbedder::new(64);
-    let dest = tempfile::tempdir().unwrap();
-    let (log, _home) = common::open_log_for_dir(&dest);
-    log.add_write_grant(dest.path()).unwrap();
-    let target = dest.path().join("synced.md");
-    std::fs::write(&target, b"stale\n").unwrap();
-    // scope_a is the mandate's authorized scope; scope_b is a DIFFERENT read-granted dir.
-    let scope_a = tempfile::tempdir().unwrap();
+    let (log, _home, dest, scope_a, _gated) = trust_fixture(b"clean\n", b"new\n");
+    // scope_a is the mandate's authorized scope (from the fixture); scope_b is a DIFFERENT
+    // read-granted dir whose source is OUT of scope.
     let scope_b = tempfile::tempdir().unwrap();
-    log.add_grant(scope_a.path()).unwrap();
     log.add_grant(scope_b.path()).unwrap();
     let outside = scope_b.path().join("evil.md");
     std::fs::write(&outside, b"out of scope source\n").unwrap();
-    let outside_id = ingest_one(&log, &emb, &outside);
-    log.add_mandate(&target, scope_a.path(), "sync from scope_a only").unwrap();
-    log.rebuild_graph().unwrap();
-    // The proposal cites a source OUTSIDE the mandate's scope_a → still tainted → loud.
+    let outside_id = common::ingest_one(&log, &outside);
+    let _ = &scope_a; // the in-scope dir is kept alive; the proposal cites the OUT-of-scope source.
+    let target = dest.join("synced.md");
     let gated = log.propose_write(WriteProposal {
-        target: target.clone(), new_content: b"new\n".to_vec(), op: WriteOp::Edit,
+        target, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
         source_event_ids: vec![outside_id], rationale: "x".to_string(),
     }).unwrap();
     assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Untrusted,
@@ -145,11 +143,8 @@ fn mandate_sibling_scope_prefix_is_loud_segment_aware() {
     // L1: a source under `<scope>-evil` (a sibling sharing a string prefix) must NOT be cleared —
     // containment is segment-aware, so `/p/scope-evil/x` is not "under" `/p/scope`.
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let emb = MockEmbedder::new(64);
-    let dest = tempfile::tempdir().unwrap();
-    let (log, _home) = common::open_log_for_dir(&dest);
-    log.add_write_grant(dest.path()).unwrap();
-    let target = dest.path().join("synced.md");
+    let (log, _home, dest) = common::open_log_with_write_grant();
+    let target = dest.join("synced.md");
     std::fs::write(&target, b"stale\n").unwrap();
     // Build sibling dirs `scope` and `scope-evil` under the SAME parent.
     let parent = tempfile::tempdir().unwrap();
@@ -161,7 +156,7 @@ fn mandate_sibling_scope_prefix_is_loud_segment_aware() {
     log.add_grant(&evil).unwrap();
     let evil_src = evil.join("s.md");
     std::fs::write(&evil_src, b"sibling source\n").unwrap();
-    let evil_id = ingest_one(&log, &emb, &evil_src);
+    let evil_id = common::ingest_one(&log, &evil_src);
     log.add_mandate(&target, &scope, "sync from scope only").unwrap();
     log.rebuild_graph().unwrap();
     let gated = log.propose_write(WriteProposal {
@@ -177,23 +172,19 @@ fn mandate_sibling_scope_prefix_is_loud_segment_aware() {
 #[test]
 fn mandate_after_revoke_is_loud_again() {
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let (log, _dest, scope, gated_before) = trust_fixture(b"clean\n", b"new\n");
+    let (log, _home, _dest, scope, gated_before) = trust_fixture(b"clean\n", b"new\n");
     assert_eq!(gated_before.verdict.taint, bossclaw_core::actuator::Taint::Clean, "clean while granted");
     // Revoke the only active mandate, then re-gate the SAME shape → taints again.
     let m = log.active_mandates().unwrap().into_iter().next().unwrap();
     log.revoke_mandate(&m.mandate_grant_id).unwrap();
     log.rebuild_graph().unwrap();
-    // Re-resolve the source id under `scope` and re-propose.
-    let emb = MockEmbedder::new(64);
-    let src_id = {
-        let canonical = std::fs::canonicalize(scope.path().join("src.md")).unwrap()
-            .to_string_lossy().to_string();
-        // ingest is idempotent on unchanged bytes; fetch the existing file id.
-        let _ = emb;
-        log.current_files().unwrap().into_iter()
-            .find(|r| r.canonical_path == canonical).map(|r| r.file_event_id).unwrap()
-    };
-    let target = std::fs::canonicalize(_dest_path(&gated_before)).unwrap();
+    // Fetch the already-ingested source id from the projection (ingest is idempotent; no re-ingest).
+    let canonical_src = std::fs::canonicalize(scope.path().join("src.md")).unwrap()
+        .to_string_lossy().to_string();
+    let src_id = log.current_files().unwrap().into_iter()
+        .find(|r| r.canonical_path == canonical_src).map(|r| r.file_event_id).unwrap();
+    // Reuse the original target directly off the prior gated proposal (GatedProposal.proposal pub).
+    let target = gated_before.proposal.target.clone();
     let gated_after = log.propose_write(WriteProposal {
         target, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
         source_event_ids: vec![src_id], rationale: "x".to_string(),
@@ -203,12 +194,6 @@ fn mandate_after_revoke_is_loud_again() {
     assert!(gated_after.verdict.requires_loud_modal);
 }
 
-/// Pull the canonical target path back out of a gated proposal (test helper).
-#[cfg(unix)]
-fn _dest_path(g: &bossclaw_core::actuator::GatedProposal) -> std::path::PathBuf {
-    g.proposal.target.clone()
-}
-
 #[cfg(unix)]
 #[test]
 fn mandate_unresolvable_target_taints_all_candidates() {
@@ -216,22 +201,19 @@ fn mandate_unresolvable_target_taints_all_candidates() {
     // (taint, never skip). We force unresolvability by proposing an EDIT to a path that does
     // not exist (Edit canonicalizes the target itself, which then fails → canonical == None).
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let emb = MockEmbedder::new(64);
-    let dest = tempfile::tempdir().unwrap();
-    let (log, _home) = common::open_log_for_dir(&dest);
-    log.add_write_grant(dest.path()).unwrap();
+    let (log, _home, dest) = common::open_log_with_write_grant();
     let scope = tempfile::tempdir().unwrap();
     log.add_grant(scope.path()).unwrap();
     let src = scope.path().join("s.md");
     std::fs::write(&src, b"clean\n").unwrap();
-    let src_id = ingest_one(&log, &emb, &src);
+    let src_id = common::ingest_one(&log, &src);
     // A mandate whose target is a real (write-granted) file, so add_mandate's guards pass…
-    let real_target = dest.path().join("real.md");
+    let real_target = dest.join("real.md");
     std::fs::write(&real_target, b"x\n").unwrap();
     log.add_mandate(&real_target, scope.path(), "r").unwrap();
     log.rebuild_graph().unwrap();
     // …but PROPOSE against a NON-EXISTENT target path (Edit ⇒ canonicalize fails ⇒ None).
-    let missing = dest.path().join("does-not-exist.md");
+    let missing = dest.join("does-not-exist.md");
     let gated = log.propose_write(WriteProposal {
         target: missing, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
         source_event_ids: vec![src_id], rationale: "x".to_string(),
@@ -249,23 +231,20 @@ fn m6b_reconcile_target_stays_loud_trust_rule_did_not_leak() {
     // and a mandate target is OUTSIDE every read root (the add_mandate self-loop guard), so the
     // two sets are disjoint and the rule can never clear an ingested-target write.
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let emb = MockEmbedder::new(64);
-    let dir = tempfile::tempdir().unwrap();
-    let (log, _home) = common::open_log_for_dir(&dir);
-    log.add_write_grant(dir.path()).unwrap(); // make the ingested file writable (M6b can edit it)
+    // The harness `dir` is read+write-granted; an ingested file under it is a valid M6b target.
+    let (log, _home, dir) = common::open_log_with_write_grant();
     let scope = tempfile::tempdir().unwrap();
     log.add_grant(scope.path()).unwrap();
     let src = scope.path().join("s.md");
     std::fs::write(&src, b"clean\n").unwrap();
-    let src_id = ingest_one(&log, &emb, &src);
+    let src_id = common::ingest_one(&log, &src);
     // The TARGET is itself an ingested file under a read root.
-    let ingested_target = dir.path().join("note.md");
+    let ingested_target = dir.join("note.md");
     std::fs::write(&ingested_target, b"old\n").unwrap();
-    let _tgt_id = ingest_one(&log, &emb, &ingested_target);
+    let _tgt_id = common::ingest_one(&log, &ingested_target);
     // A mandate exists for some OTHER target (so active_mandates is non-empty), proving the rule
     // is consulted yet still does not clear THIS ingested-target write.
     let other = tempfile::tempdir().unwrap();
-    let (_log2, _h2) = (&log, ()); // reuse the same log
     log.add_write_grant(other.path()).unwrap();
     let other_target = other.path().join("synced.md");
     std::fs::write(&other_target, b"x\n").unwrap();
@@ -282,19 +261,7 @@ fn m6b_reconcile_target_stays_loud_trust_rule_did_not_leak() {
 }
 ```
 
-  Helper note: these tests reference `common::open_log_for_dir(&dir) -> (EventLog, TempDir-home)` and a crate-test `ingest_one(&log, &emb, &path) -> String`. The reconcile test harness already has an `ingest_one` / `ingest_md_full` helper (used by the SP4 reconcile tests) and `common::open_log_with_write_grant`. If `open_log_for_dir` does not exist under that exact name, add it next to `open_log_with_write_grant` in `tests/common/mod.rs` as a thin wrapper that opens a log with a READ grant on the passed dir:
-
-```rust
-/// Open a fresh log onboarded, with a READ grant already added on `dir` (write grant is the
-/// caller's to add). Mirrors `open_log_with_write_grant` but lets the caller own the dir.
-pub fn open_log_for_dir(dir: &tempfile::TempDir) -> (bossclaw_core::EventLog, tempfile::TempDir) {
-    let (log, home) = open_onboarded_log(); // the existing bare-onboarded opener
-    log.add_grant(dir.path()).unwrap();
-    (log, home)
-}
-```
-
-  (If the bare opener has a different name in `common`, use whatever the SP4 tests call to get an onboarded `EventLog`; the only requirement is an onboarded log you can `add_grant`/`add_write_grant`/`add_mandate` against.)
+  Grounding note (discrepancy 5): these tests call the REAL `common::open_log_with_write_grant()` (returns `(EventLog, TempDir, PathBuf)`, read+write-granted `dest`) and the 2-arg `common::ingest_one(log, path)`. There is NO `open_log_for_dir` and NO 3-arg `ingest_one` — do not add either. `GatedProposal.proposal` is `pub` (actuator.rs:167-173), so `gated_before.proposal.target.clone()` reads the target directly (the broken `_dest_path` helper and the dead `let emb` are gone — MF1).
 
 - [ ] Run them (expect FAIL — the trust rule does not exist, so an in-scope source still taints and `mandate_in_scope_clean_source_is_not_loud` fails on `taint == Clean`):
   `cargo test -p bossclaw-core --test reconcile mandate_`
@@ -424,15 +391,13 @@ EOF
 /// write-granted, ingested file. Returns (log, home-keepalive, dir-keepalive, gated, target).
 #[cfg(unix)]
 fn loud_gated(
-) -> (bossclaw_core::EventLog, tempfile::TempDir, tempfile::TempDir, bossclaw_core::actuator::GatedProposal, std::path::PathBuf) {
+) -> (bossclaw_core::EventLog, tempfile::TempDir, std::path::PathBuf, bossclaw_core::actuator::GatedProposal, std::path::PathBuf) {
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let emb = MockEmbedder::new(64);
-    let dir = tempfile::tempdir().unwrap();
-    let (log, home) = common::open_log_for_dir(&dir);
-    log.add_write_grant(dir.path()).unwrap();
-    let target = dir.path().join("note.md");
+    // `dir` is read+write-granted; `home` is the keepalive TempDir.
+    let (log, home, dir) = common::open_log_with_write_grant();
+    let target = dir.join("note.md");
     std::fs::write(&target, b"placeholder\n").unwrap();
-    let id = ingest_one(&log, &emb, &target); // ingested ⇒ external ⇒ Untrusted too
+    let id = common::ingest_one(&log, &target); // ingested ⇒ external ⇒ Untrusted too
     let gated = log.propose_write(WriteProposal {
         target: target.clone(),
         new_content: b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec(),
@@ -464,13 +429,10 @@ fn execute_write_loud_without_ack_fails_closed_then_permits_with_ack() {
 #[test]
 fn execute_write_resolving_loud_without_ack_fails_closed() {
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let emb = MockEmbedder::new(64);
-    let dir = tempfile::tempdir().unwrap();
-    let (log, _home) = common::open_log_for_dir(&dir);
-    log.add_write_grant(dir.path()).unwrap();
-    let target = dir.path().join("note.md");
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let target = dir.join("note.md");
     std::fs::write(&target, b"placeholder\n").unwrap();
-    let fid = ingest_one(&log, &emb, &target);
+    let fid = common::ingest_one(&log, &target);
     // Record an open proposal so execute_write_resolving has an id to resolve.
     let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
     let hash = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&new_bytes)) };
@@ -637,7 +599,7 @@ fn pending_proposals_surface_producer_for_m6c_vs_m6b() {
     let (log, _home, dir) = common::open_write_grant_and_external_target();
     let path = dir.join("n.md");
     let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
-    let lineage = common::seed_one_memory(&log, "Alice works at Acme"); // returns the memory id
+    let lineage = common::seed_memory(&log, "Alice works at Acme"); // returns the memory id
     let key_a = serde_json::json!({"src":"entity:a","relation":"r","dst":"entity:b"});
     let key_b = serde_json::json!({"src":"entity:c","relation":"r","dst":"entity:d"});
     let vs = serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true});
@@ -654,7 +616,7 @@ fn pending_proposals_surface_producer_for_m6c_vs_m6b() {
 }
 ```
 
-  Helper note: this uses `common::open_write_grant_and_external_target()` and `common::seed_one_memory(&log, text) -> String` from the SP4 reconcile harness (the SP4 `pending_proposals` test used `open_write_grant_and_external_target` + `append_minimal_proposal`). If `seed_one_memory` returns `()` in the harness, add a `seed_one_memory_id` sibling that returns the id (same body, `.unwrap()` returns the append id). The two `append_write_proposal_with` consts (`M6C_PROPOSER_PRODUCER`/`M6B_PROPOSER_PRODUCER`) are `pub` in `graph.rs`.
+  Grounding note (discrepancy 5/6): this uses the REAL `common::open_write_grant_and_external_target() -> (EventLog, TempDir, PathBuf)` and `common::seed_memory(log, text) -> String` (returns the memory id — there is NO `seed_one_memory`/`seed_one_memory_id` in the engine harness, so do not reference one). `append_write_proposal_with` already exists and `M6C_PROPOSER_PRODUCER` (graph.rs:98) / `M6B_PROPOSER_PRODUCER` (graph.rs:91) are `pub`.
 
 - [ ] Run it (expect FAIL — `producer` field does not exist on `PendingProposal`):
   `cargo test -p bossclaw-core --test reconcile pending_proposals_surface_producer_for_m6c_vs_m6b`
@@ -716,7 +678,7 @@ EOF
 - Modify: `crates/bossclaw-core/src/lib.rs` (re-export `MandateWriteRecord`)
 - Test: `crates/bossclaw-core/tests/reconcile.rs`
 
-**What changes (grounded):** Applied writes are stamped `model_meta.model_id = ACTUATOR_PRODUCER` ("m6a-actuator", graph.rs:78) regardless of proposer; the only discriminator on a `file_written` is `content.resolves_proposal` → the proposal id, and resolved proposals are not in `pending_proposals()`. So attributing an applied write to a mandate REQUIRES a join: fold `file_written ∪ write_proposal`, keep each `file_written` whose resolved proposal's `producer == M6C_PROPOSER_PRODUCER`, returning `{file_written_id, target, written_at, undone}`. `undone` = a later `file_written` carries `undo_of == this.file_written_id`. COMPLETENESS (L2): never silently drop an applied M6c write — degrade to target-only attribution rather than omit.
+**What changes (grounded):** Applied writes are stamped `model_meta.model_id = ACTUATOR_PRODUCER` ("m6a-actuator", graph.rs:78) regardless of proposer; the only discriminator on a `file_written` is `content.resolves_proposal` → the proposal id, and resolved proposals are not in `pending_proposals()`. So attributing an applied write to a mandate REQUIRES a join: fold `file_written ∪ write_proposal`, keep each `file_written` whose resolved proposal's `producer == M6C_PROPOSER_PRODUCER`, returning `{file_written_id, target, written_at, undone}`. `undone` = a later `file_written` carries `undo_of == this.file_written_id`. Two invariants (L2 + security L3): **(i) completeness** — the join is TOTAL in practice (an M6c proposal is retained while its `file_written` is live, so every applied M6c write is attributable); **(ii) fail-closed against false attribution** — a row is included only when its resolved proposal is PROVABLY M6c, so an unprovable-producer write is EXCLUDED (claiming a write is a mandate write when it can't be proven is worse than omitting it; by (i) this exclusion is unreachable for a real M6c write).
 
 - [ ] Write the failing test in `crates/bossclaw-core/tests/reconcile.rs` (append after the Task 3 test). It applies one real M6c write and one M6b write through the engine, then asserts `mandate_writes()` attributes only the M6c one, and flips `undone` after an undo. Build the proposals via `append_write_proposal_with` + `execute_write_resolving` so the `file_written` carries `resolves_proposal`:
 
@@ -726,17 +688,15 @@ EOF
 fn mandate_writes_attributes_m6c_excludes_m6b_and_flips_undone() {
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
     use sha2::{Digest, Sha256};
-    let emb = MockEmbedder::new(64);
-    let dir = tempfile::tempdir().unwrap();
-    let (log, _home) = common::open_log_for_dir(&dir);
-    log.add_write_grant(dir.path()).unwrap();
+    // `dir` is a read+write-granted PathBuf (the harness grants both).
+    let (log, _home, dir) = common::open_log_with_write_grant();
 
     // Helper: write `file` with `old`, ingest it, then apply a rewrite to `new` resolving a
     // proposal stamped with `producer`. Returns (file_written_id, canonical_target).
     let apply_via = |file: &str, old: &[u8], new: &[u8], producer: &str| -> (String, String) {
-        let path = dir.path().join(file);
+        let path = dir.join(file);
         std::fs::write(&path, old).unwrap();
-        let fid = ingest_one(&log, &emb, &path);
+        let fid = common::ingest_one(&log, &path);
         let hash = hex::encode(Sha256::digest(new));
         let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
         let key = serde_json::json!({"src":"a","relation":"r","dst":file});
@@ -806,13 +766,18 @@ impl EventLog {
     ///
     /// Attribution requires a JOIN: a `file_written` is stamped `ACTUATOR_PRODUCER`, so the only
     /// link to a mandate is `content.resolves_proposal` → a `write_proposal` whose
-    /// `model_meta.model_id == M6C_PROPOSER_PRODUCER`. COMPLETENESS is load-bearing (SP5 L2):
-    /// because Option B removed the preventive review, a silently-dropped row would be an invisible
-    /// autonomous write with no Undo. So a `file_written` whose `resolves_proposal` points at a
-    /// proposal we cannot find (GC'd) is NOT dropped if its target is recoverable — but in practice
-    /// an M6c proposal is never GC'd while its `file_written` is live, so the join is total here;
-    /// we still fold defensively (an unresolvable producer simply excludes the row, since it cannot
-    /// be PROVEN to be M6c). `#[cfg(unix)]` (mandate surface).
+    /// `model_meta.model_id == M6C_PROPOSER_PRODUCER`. Two invariants govern the join (SP5 L2 +
+    /// security L3):
+    ///   • COMPLETENESS — because Option B removed the preventive review, an applied M6c write that
+    ///     never surfaced (with no Undo offered) would be an invisible autonomous change. In PRACTICE
+    ///     the join is TOTAL: an M6c `write_proposal` is never GC'd while its `file_written` is live
+    ///     (a resolved proposal is retained), so every applied M6c write is attributable here.
+    ///   • FAIL-CLOSED against FALSE attribution — a row is included ONLY when its resolved proposal's
+    ///     producer is PROVABLY `M6C_PROPOSER_PRODUCER`. A `file_written` whose `resolves_proposal`
+    ///     cannot be resolved to a known M6c producer is EXCLUDED (not "degraded to target-only"):
+    ///     claiming an unprovable write is a mandate write would be worse than omitting it, and the
+    ///     completeness invariant means this exclusion is unreachable for a real M6c write anyway.
+    /// `#[cfg(unix)]` (mandate surface).
     #[cfg(unix)]
     pub fn mandate_writes(&self) -> Result<Vec<MandateWriteRecord>, BossclawError> {
         use std::collections::{HashMap, HashSet};
@@ -1036,12 +1001,44 @@ EOF
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
+
+    /// Read the sticky mandates on/off flag (SF5 — the UI toggle's mount-time read, so it reflects
+    /// the persisted state after relaunch rather than defaulting to OFF until clicked). Gated
+    /// `Result` form (a not-onboarded state surfaces via `Open(NotOnboarded)`). The sweep uses the
+    /// infallible `mandates_enabled_or_false` (Task 11) instead.
+    pub async fn mandates_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.mandates_enabled().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
 ```
 
-- [ ] Run it (expect PASS): `cargo test -p air_agent_desktop set_mandates_enabled_toggles_the_engine_flag`
-  Expected output: `test result: ok. 1 passed`.
+  Add a test for the getter alongside the toggle test (tests mod):
 
-- [ ] Add the command in `apps/desktop/src-tauri/src/commands/engine.rs` (after `engine_set_proposals_enabled`), mirroring the bool-setter template:
+```rust
+    #[tokio::test]
+    async fn mandates_enabled_reflects_the_persisted_flag() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        // Off by default at first open.
+        assert!(!handle.mandates_enabled(true).await.unwrap(), "default off");
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        assert!(handle.mandates_enabled(true).await.unwrap(), "the getter reflects the flip");
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.mandates_enabled(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+```
+
+- [ ] Run them (expect PASS): `cargo test -p air_agent_desktop set_mandates_enabled_toggles_the_engine_flag mandates_enabled_reflects_the_persisted_flag`
+  Expected output: `test result: ok.` with both passing.
+
+- [ ] Add the commands in `apps/desktop/src-tauri/src/commands/engine.rs` (after `engine_set_proposals_enabled`), mirroring the bool-setter + bool-reader templates:
 
 ```rust
 /// Flip the sticky mandates off-switch (SP5 global Mandates on/off). Off by default.
@@ -1050,13 +1047,22 @@ pub async fn engine_set_mandates_enabled(enabled: bool, state: State<'_, AppStat
     let onboarded = state.identity_store.is_onboarded();
     state.engine.set_mandates_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
 }
+
+/// Read the sticky mandates flag (SF5 — the UI toggle reads this on mount to reflect persisted state).
+#[tauri::command]
+pub async fn engine_mandates_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.mandates_enabled(onboarded).await.map_err(|e| e.to_string())
+}
 ```
 
-- [ ] Register in `apps/desktop/src-tauri/src/main.rs` (in `generate_handler!`, after `engine_set_proposals_enabled` ~line 144):
+- [ ] Register both in `apps/desktop/src-tauri/src/main.rs` (in `generate_handler!`, after `engine_set_proposals_enabled` ~line 144):
 
 ```rust
             #[cfg(unix)]
             commands::engine::engine_set_mandates_enabled,
+            #[cfg(unix)]
+            commands::engine::engine_mandates_enabled,
 ```
 
 - [ ] Build: `cargo build -p air_agent_desktop`
@@ -1065,7 +1071,10 @@ pub async fn engine_set_mandates_enabled(enabled: bool, state: State<'_, AppStat
 - [ ] Commit:
   `git add apps/desktop/src-tauri/src/engine/mod.rs apps/desktop/src-tauri/src/commands/engine.rs apps/desktop/src-tauri/src/main.rs`
   `git commit -m "$(cat <<'EOF'
-feat(desktop): set_mandates_enabled op + command (SP5 global on/off)
+feat(desktop): set_mandates_enabled + mandates_enabled getter ops + commands (SP5 on/off)
+
+The getter (engine_mandates_enabled) lets the UI toggle read the persisted flag on mount so it
+reflects an explicit on after relaunch instead of defaulting to off until clicked (SF5).
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 EOF
@@ -1569,12 +1578,17 @@ EOF
 
         // The target reappears on disk BEFORE apply (a racer created it).
         std::fs::write(&target2, b"already here\n").unwrap();
-        // Apply must fail closed (the fresh re-gate sees op=Create against an existing target →
-        // reject_reason "create target already exists" → Stale) and NOT overwrite the racer's file.
+        // Apply must fail closed (SF1): the FRESH `propose_write` re-gate runs `classify_op_existence`
+        // and, seeing op=Create against an EXISTING target, sets `reject_reason = "create target
+        // already exists"`; `apply_proposal` maps a `reject_reason` to `EngineOpError::Stale` (the
+        // `gated.verdict.reject_reason.is_some() => Stale` arm), so it fails BEFORE execute — the
+        // syscall atomic no-clobber is the deeper backstop but is not what fires here. Assert the
+        // SPECIFIC Stale variant, and that the racer's file is untouched.
         let refused = handle2.apply_proposal(true, pid2, true).await;
-        assert!(refused.is_err(), "a Create whose target reappeared must be refused: {refused:?}");
+        assert!(matches!(refused, Err(EngineOpError::Stale(_))),
+            "a Create whose target reappeared must fail closed as Stale (re-gate classify_op_existence): {refused:?}");
         assert_eq!(std::fs::read(&target2).unwrap(), b"already here\n".to_vec(),
-            "the racer's file is untouched (engine atomic no-clobber)");
+            "the racer's file is untouched (the apply never reached execute)");
     }
 ```
 
@@ -1624,7 +1638,7 @@ EOF
   Note: `WriteOp` derives `PartialEq` (actuator.rs:20), so `op != WriteOp::Create` compiles. The rest of `apply_proposal` (the `get_proposal_bytes_checked`, the fresh `propose_write` using `op`, the reject/allowed/loud checks, and `execute_write_resolving(gated, &p.id, acknowledged_loud)` from Task 2) is unchanged.
 
 - [ ] Run it (expect PASS): `cargo test -p air_agent_desktop apply_create_proposal_writes_new_file_and_refuses_if_target_reappeared`
-  Expected output: `test result: ok. 1 passed`. The Create now applies; the reappeared-target Create is refused by the engine's atomic no-clobber (its fresh re-gate sees `op=Create` against an existing file → `reject_reason` → `Stale`).
+  Expected output: `test result: ok. 1 passed`. The Create now applies; the reappeared-target Create fails closed as `Stale` because the fresh `propose_write` re-gate's `classify_op_existence` sees `op=Create` against an existing file → `reject_reason "create target already exists"` → mapped to `Stale` (the syscall atomic no-clobber is the deeper backstop, not the arm that fires here).
 
 - [ ] Confirm the SP4 Edit apply tests still pass (the Edit path's base-hash check is unchanged, just wrapped in the `op != Create` guard):
   `cargo test -p air_agent_desktop apply_proposal_writes_file_and_resolves_then_stale_fails_closed apply_proposal_loud_needs_ack_then_applies`
@@ -1949,8 +1963,12 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
         let applied = handle.mandate_autoapply_sweep(true).await.unwrap();
         assert_eq!(applied, 0, "a risky (loud) mandate proposal is NOT auto-applied");
         assert_eq!(std::fs::read(&target).unwrap(), b"old\n".to_vec(), "the file is untouched");
-        assert!(handle.list_proposals(true).await.unwrap().iter().any(|p| p.id == pid),
-            "the risky proposal stays queued for SP4 Review");
+        // SF3: the risky proposal stays queued AND still carries the m6c producer, so the Review
+        // surface can render its "from a mandate" label (the label path survives the sweep).
+        let queued = handle.list_proposals(true).await.unwrap();
+        let row = queued.iter().find(|p| p.id == pid).expect("the risky proposal stays queued for SP4 Review");
+        assert_eq!(row.producer, "m6c-mandate-proposer",
+            "the queued risky proposal keeps its m6c producer (the 'from mandate' label path)");
     }
 
     #[tokio::test]
@@ -1988,14 +2006,70 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
         assert!(handle.list_proposals(true).await.unwrap().iter().any(|p| p.id == pid),
             "the M6b proposal stays queued for human review (SP4 unchanged)");
     }
+
+    // Security L2: the per-item fast-kill. With TWO clean M6c proposals queued but mandates turned
+    // OFF, the sweep's per-item `mandates_enabled_or_false` read gates the FIRST iteration and breaks,
+    // so NOTHING is applied — proving the guard reads the LIVE flag, not a snapshot taken before the
+    // loop. (A true "flip AFTER the first apply, stop the second" assertion would need a production
+    // test-hook between iterations, which is out of scope; gating-with-the-flag-off pins the same
+    // live-read invariant deterministically.)
+    #[tokio::test]
+    async fn sweep_fast_kills_when_mandates_off_even_with_clean_candidates() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        log.add_grant(dest.path()).unwrap();
+        log.add_write_grant(dest.path()).unwrap();
+        log.add_grant(scope.path()).unwrap();
+        let src = scope.path().join("s.md");
+        std::fs::write(&src, b"clean source\n").unwrap();
+        let src_id = bossclaw_ingest_one(&log, &src);
+        // Two distinct mandates+targets, each yielding a CLEAN (in-scope, non-secret) M6c proposal.
+        let mut pids = Vec::new();
+        for name in ["a.md", "b.md"] {
+            let target = dest.path().join(name);
+            std::fs::write(&target, b"old\n").unwrap();
+            log.add_mandate(&target, scope.path(), "sync").unwrap();
+            log.rebuild_graph().unwrap();
+            let new_bytes = format!("clean new {name}\n").into_bytes();
+            let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+                op: WriteOp::Edit, source_event_ids: vec![src_id.clone()], rationale: "sync".to_string() }).unwrap();
+            assert!(!gated.verdict.requires_loud_modal, "fixture proposals must be CLEAN");
+            let hash = hex::encode(Sha256::digest(&new_bytes));
+            let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+            let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+                "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+                "base_content_hash": gated.verdict.base_content_hash});
+            let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new_bytes.len() as u64,
+                "sync", &serde_json::json!({"src":"a","relation":"r","dst":name}), &vs,
+                std::slice::from_ref(&src_id), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+            log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+            pids.push(pid);
+        }
+        drop(log);
+
+        // Mandates OFF (never enabled). The per-item kill-switch read gates the first iteration.
+        let applied = handle.mandate_autoapply_sweep(true).await.unwrap();
+        assert_eq!(applied, 0, "with mandates off the per-item fast-kill applies NOTHING");
+        // Both clean proposals are untouched on disk and still queued.
+        assert_eq!(std::fs::read(dest.path().join("a.md")).unwrap(), b"old\n".to_vec(), "a.md untouched");
+        assert_eq!(std::fs::read(dest.path().join("b.md")).unwrap(), b"old\n".to_vec(), "b.md untouched");
+        let queued = handle.list_proposals(true).await.unwrap();
+        assert!(pids.iter().all(|pid| queued.iter().any(|p| &p.id == pid)),
+            "both clean proposals stay queued when the sweep fast-kills");
+    }
 ```
 
-  > Note on Tauri ACL discipline: these three tests call `mandate_autoapply_sweep` directly on the `EngineHandle` (not over IPC), so they do NOT need `__allow_command` — that discipline is only required for command-LAYER `get_ipc_response` tests (which Task 7 covers for `engine_add_mandate`). Each sweep test here uses a POSITIVE signature (the return count) + a mutation-verify (the file bytes + the queue state) so it cannot pass vacuously.
+  > Note on Tauri ACL discipline: these four tests call `mandate_autoapply_sweep` directly on the `EngineHandle` (not over IPC), so they do NOT need `__allow_command` — that discipline is only required for command-LAYER `get_ipc_response` tests (which Task 7 covers for `engine_add_mandate`). Each sweep test here uses a POSITIVE signature (the return count) + a mutation-verify (the file bytes + the queue state) so it cannot pass vacuously.
 
-- [ ] Run them (expect FAIL): `cargo test -p air_agent_desktop sweep_auto_applies sweep_leaves sweep_never`
+- [ ] Run them (expect FAIL): `cargo test -p air_agent_desktop sweep_auto_applies sweep_leaves sweep_never sweep_fast_kills`
   Expected output: compile error `no method named mandate_autoapply_sweep`.
 
-- [ ] Implement the `mandate_autoapply_sweep` op in `apps/desktop/src-tauri/src/engine/mod.rs` (in `impl EngineHandle`). It lists pending, picks candidates via the pure `scheduler::sweep_candidates`, then per item re-reads `mandates_enabled` (fast-kill) and calls `apply_proposal(id, false)`, swallowing the risky/stale/revoked outcomes. Returns the count applied (for tests + telemetry). `mandates_enabled` is re-read through a small gated read — reuse the existing `mandates_enabled` getter on the log via a `spawn_blocking`-wrapped op already present, or read it inline. Here we read it inline per item via a cheap op:
+- [ ] Implement the `mandate_autoapply_sweep` op in `apps/desktop/src-tauri/src/engine/mod.rs` (in `impl EngineHandle`). It lists pending, picks candidates via the pure `crate::engine::scheduler::sweep_candidates` (MF4: `pub mod scheduler;` at engine/mod.rs:8, and `bossclaw-core` is a `[target.'cfg(unix)'.dependencies]` dep with `features=["ollama"]`, so `bossclaw_core::graph::M6C_PROPOSER_PRODUCER` inside `sweep_candidates` resolves in this Unix-gated context), then per item re-reads `mandates_enabled` (fast-kill) and calls `apply_proposal(id, false)`, swallowing the EXPECTED risky/stale/revoked outcomes but **logging the unexpected** (MF5 / security L1 — the autonomous loop must not ship blind; the desktop crate has no `log`/`tracing` dep, so use `eprintln!`, matching vault.rs:65,90):
 
 ```rust
     /// The SP5 auto-apply sweep: after an evolve tick, auto-apply the CLEAN mandate (M6c)
@@ -2004,7 +2078,9 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
     /// `apply_proposal(id, acknowledged_loud=false)`:
     ///   • CLEAN → applies (the engine loud-gate permits a non-loud write with ack=false);
     ///   • `NeedsLoudConfirm` (risky) → swallowed; stays open → surfaces in Review;
-    ///   • `Stale` / `Revoked` / not-found → swallowed; skipped.
+    ///   • `Stale` / `Revoked` / not-found → swallowed; skipped (retried next tick);
+    ///   • any OTHER error → swallowed BUT logged (`eprintln!`) so one bad proposal cannot abort the
+    ///     sweep yet the autonomous loop is never silent about an unexpected fault.
     /// Re-reads `mandates_enabled` PER ITEM (fast-kill if the user flips it off mid-sweep).
     /// Returns the number applied. Gated. NOTE: each `apply_proposal` re-folds `pending_proposals`
     /// internally, so a K-item sweep is 1+K O(events) folds — bounded by the cap (projection-table
@@ -2024,15 +2100,19 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
             if !self.mandates_enabled_or_false(onboarded).await {
                 break;
             }
+            // Keep a copy of the id for an observability message (apply_proposal consumes it).
+            let id_for_log = id.clone();
             match self.apply_proposal(onboarded, id, false).await {
                 Ok(_) => applied += 1,
                 // A loud (risky) proposal refuses without the ack → leave it queued for Review.
                 Err(EngineOpError::NeedsLoudConfirm(_)) => {}
                 // The file drifted / grant revoked / already resolved → skip; retried next tick.
                 Err(EngineOpError::Stale(_)) | Err(EngineOpError::Revoked(_)) => {}
-                // Any other error (e.g. a transient engine fault) is also swallowed so one bad
-                // proposal cannot abort the whole sweep; the next tick retries.
-                Err(_) => {}
+                // Any OTHER error (a transient/unexpected engine fault) is swallowed so one bad
+                // proposal cannot abort the whole sweep — but it is LOGGED so the autonomous loop
+                // is never silent about an anomaly (MF5 / security L1). Desktop has no log facade,
+                // so eprintln! (matching the existing vault.rs convention).
+                Err(e) => eprintln!("mandate sweep: proposal {id_for_log} apply failed unexpectedly (skipped): {e}"),
             }
         }
         Ok(applied)
@@ -2051,19 +2131,26 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
     }
 ```
 
-- [ ] Run them (expect PASS): `cargo test -p air_agent_desktop sweep_auto_applies sweep_leaves sweep_never`
-  Expected output: `test result: ok.` with all three passing — clean applied (file changed + resolved + in activity list), risky queued (file untouched), M6b never (file untouched).
+- [ ] Run them (expect PASS): `cargo test -p air_agent_desktop sweep_auto_applies sweep_leaves sweep_never sweep_fast_kills`
+  Expected output: `test result: ok.` with all four passing — clean applied (file changed + resolved + in activity list), risky queued (file untouched, m6c producer survives), M6b never (file untouched), fast-kill applies nothing with mandates off (both clean proposals stay queued).
 
-- [ ] Wire the sweep into the scheduler loop in `apps/desktop/src-tauri/src/engine/scheduler.rs` `spawn` (after `evolve_once`, scheduler.rs:68). Replace the `let _ = engine.evolve_once(onboarded).await;` line:
+- [ ] Wire the sweep into the scheduler loop in `apps/desktop/src-tauri/src/engine/scheduler.rs` `spawn` (after `evolve_once`, scheduler.rs:68). Replace the `let _ = engine.evolve_once(onboarded).await;` line. The sweep is **intentionally coupled to the `Run` tick** (it only runs when `decide_tick == Run`, i.e. Ollama up + evolve on): on Ollama-down no tick runs, so a clean proposal queued by a PRIOR tick simply waits until Ollama returns — the same accepted Ollama-down coupling the spec's failure matrix names. The production call site logs a one-line summary (`eprintln!`) when it applied anything or hit an error, so the autonomous loop surfaces telemetry the way `evolve_once` does (MF5 / security L1):
 
 ```rust
                 // Records telemetry inside; a `Busy` (manual tick overlap) is a harmless skip.
                 let _ = engine.evolve_once(onboarded).await;
                 // SP5: right after the tick, auto-apply the CLEAN mandate proposals it produced and
-                // leave risky ones queued. No-ops when mandates are off (the sweep re-reads the
-                // flag per item; with none on it simply finds no M6c candidates). Errors are
-                // swallowed inside the sweep so one bad proposal can't break the cadence.
-                let _ = engine.mandate_autoapply_sweep(onboarded).await;
+                // leave risky ones queued. INTENTIONALLY coupled to the Run tick — on Ollama-down no
+                // tick runs, so an already-queued clean proposal waits until Ollama returns (accepted
+                // coupling, spec failure matrix). No-ops when mandates are off (the sweep re-reads the
+                // flag per item; with none on it finds no M6c candidates). Per-item errors are
+                // swallowed+logged inside the sweep so one bad proposal can't break the cadence; here
+                // we surface a one-line summary so the autonomous loop is observable (MF5 / security L1).
+                match engine.mandate_autoapply_sweep(onboarded).await {
+                    Ok(0) => {} // nothing applied this tick — stay quiet.
+                    Ok(n) => eprintln!("mandate sweep: auto-applied {n} clean mandate write(s)"),
+                    Err(e) => eprintln!("mandate sweep: aborted before applying: {e}"),
+                }
 ```
 
 - [ ] Build + run the scheduler + sweep tests + the full desktop suite to confirm the wiring compiles and nothing regressed:
@@ -2128,6 +2215,7 @@ export type MandateWriteDto = {
 
 export const setMandatesEnabled = (enabled: boolean): Promise<void> =>
   invoke<void>("engine_set_mandates_enabled", { enabled });
+export const mandatesEnabled = (): Promise<boolean> => invoke<boolean>("engine_mandates_enabled");
 export const addMandate = (target: string, sourceScope: string, recipe: string): Promise<MandateDto> =>
   invoke<MandateDto>("engine_add_mandate", { target, sourceScope, recipe });
 export const revokeMandate = (mandateGrantId: string): Promise<void> =>
@@ -2466,7 +2554,8 @@ import { useEffect, useState } from "react";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import {
-  pickFolder, setMandatesEnabled, addMandate, revokeMandate, listMandates, mandateWrites,
+  pickFolder, setMandatesEnabled, mandatesEnabled as readMandatesEnabled, addMandate, revokeMandate,
+  listMandates, mandateWrites, undoApply,
   type MandateDto, type MandateWriteDto,
 } from "../api/engine";
 import { validateMandateForm } from "./mandateForm";
@@ -2490,7 +2579,11 @@ export function MandatesPanel() {
 
   const refresh = async () => {
     try {
-      const [ms, ws] = await Promise.all([listMandates(), mandateWrites()]);
+      // SF5: read the persisted mandates flag too, so the toggle reflects an explicit "on" after
+      // relaunch (write-then-reflect alone would show OFF until clicked). Failures hide the toggle
+      // state as off (the list reads below set `unavailable`).
+      const [on, ms, ws] = await Promise.all([readMandatesEnabled(), listMandates(), mandateWrites()]);
+      setEnabled(on);
       setMandates(ms);
       setWrites(ws);
       setUnavailable(false);
@@ -2510,7 +2603,7 @@ export function MandatesPanel() {
     setError(null);
     try {
       await setMandatesEnabled(on);
-      setEnabled(on);
+      await refresh(); // re-read the persisted flag so the displayed state always matches the engine.
     } catch (e) {
       setError(String(e));
     } finally {
@@ -2569,8 +2662,7 @@ export function MandatesPanel() {
     setBusy(true);
     setError(null);
     try {
-      // Undo reuses the SP4 engine undo (re-gated, hash-verified restore).
-      const { undoApply } = await import("../api/engine");
+      // Undo reuses the SP4 engine undo (re-gated, hash-verified restore) — statically imported.
       await undoApply(fileWrittenId);
       await refresh();
     } catch (e) {
@@ -2774,7 +2866,7 @@ EOF
   - [ ] With Ollama up + evolve on, make the source drift so the recipe implies a **clean** rewrite of the target → wait a tick (~5 min) → confirm the target file **auto-applies** (changes on disk with no per-change confirm) AND appears in **Recent mandate activity** → click **Undo** → confirm the file is restored.
   - [ ] Drop a **secret-shaped** or **out-of-scope** source so the next rewrite is risky → confirm that rewrite **parks in Review** (labeled "from a mandate"), is NOT auto-applied, and Approve there still requires the "I’ve reviewed this" confirm.
   - [ ] **Revoke** the mandate → confirm no further auto-writes happen (a subsequent drift produces nothing, or a queued risky one that you can decline).
-  - [ ] **Relaunch** the app → confirm Mandates is **still on** (the `prime_switches` persistence fix) and the active mandate + activity list survive.
+  - [ ] **Relaunch** the app → confirm the Mandates toggle **shows on** (the engine flag persists via the `prime_switches` fix — Task 5 — AND the panel reads it on mount via `mandatesEnabled()` — SF5/Task 14 — so it is not falsely OFF until clicked) and the active mandate + activity list survive.
   - [ ] EXPECTED (not a bug): an M6b reconcile (contradiction) proposal still requires human approval in Review and is **never** auto-applied — only M6c mandate proposals sweep.
 
 - [ ] Commit (checklist completion / any doc note only — no source changes expected here):
