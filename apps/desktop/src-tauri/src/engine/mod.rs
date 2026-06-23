@@ -270,16 +270,20 @@ impl EngineHandle {
         Ok(report)
     }
 
-    /// Force the three autonomy switches OFF (the engine defaults them ON when never set).
-    /// Each setter is sticky, so this writes at most once per flag and is idempotent across
-    /// opens. Runs inside `get_or_open`'s first-open closure; failure reuses the open path.
+    /// Neutralize the engine's dangerous default-ON autonomy flags at startup, WITHOUT
+    /// clobbering a user's explicit choice. `evolve`/`proposals` are forced off ONLY when the
+    /// user never explicitly set them (`!explicitly_set`), so an explicit on/off persists across
+    /// opens (SP4 change-b). `mandates_enabled` is ALWAYS forced off until SP5, regardless of any
+    /// prior setting. Each setter is sticky; runs inside `get_or_open`'s first-open closure.
     fn prime_switches(log: &EventLog) -> Result<(), bossclaw_core::BossclawError> {
-        if log.evolve_enabled()? {
+        use bossclaw_core::ConfigFlag;
+        if !log.explicitly_set(ConfigFlag::Evolve)? && log.evolve_enabled()? {
             log.set_evolve_enabled(false)?;
         }
-        if log.proposals_enabled()? {
+        if !log.explicitly_set(ConfigFlag::Proposals)? && log.proposals_enabled()? {
             log.set_proposals_enabled(false)?;
         }
+        // SP5 not shipped: mandates stay forced OFF even if a prior build set them.
         if log.mandates_enabled()? {
             log.set_mandates_enabled(false)?;
         }
@@ -673,6 +677,27 @@ mod tests {
         *handle.cell.lock().await = None;
         let log2 = handle.get_or_open(true).await.expect("re-opens");
         assert_eq!(log2.count().unwrap(), n1, "no duplicate config events on re-open");
+    }
+
+    #[tokio::test]
+    async fn prime_switches_preserves_explicit_proposals_but_forces_mandates_off() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault.clone(), &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        // After first open everything is forced off (never-set defaults).
+        assert!(!log.proposals_enabled().unwrap());
+        assert!(!log.mandates_enabled().unwrap());
+
+        // The user explicitly enables proposals.
+        log.set_proposals_enabled(true).unwrap();
+        assert!(log.proposals_enabled().unwrap());
+        drop(log);
+
+        // Re-open with a FRESH handle (same vault + db_path) → prime_switches runs again.
+        let handle2 = new_test_handle(vault, &dir);
+        let log2 = handle2.get_or_open(true).await.unwrap();
+        assert!(log2.proposals_enabled().unwrap(), "an explicit user true MUST persist across opens");
+        assert!(!log2.mandates_enabled().unwrap(), "mandates stay forced OFF until SP5");
     }
 
     /// Tasks 5 + 6: `run_ingest` marks the index current, then `recall` round-trips through
