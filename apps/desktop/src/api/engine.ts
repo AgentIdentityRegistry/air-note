@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type GrantDto = { canonical_root: string; granted_at: string; revoked: boolean };
-export type FileRecordDto = { canonical_path: string; file_event_id: string; content_hash: string; grant_root: string };
+export type FileRecordDto = { canonical_path: string; file_event_id: string; content_hash: string; grant_root: string; writable: boolean };
 export type SkipDto = { path: string; reason: string };
 export type IngestReportDto = {
   ingested: number;
@@ -42,3 +42,37 @@ export const setEvolveEnabled = (enabled: boolean): Promise<void> =>
   invoke<void>("engine_set_evolve_enabled", { enabled });
 export const evolveNow = (): Promise<EvolveReportDto> => invoke<EvolveReportDto>("engine_evolve_now");
 export const ollamaStatus = (): Promise<OllamaStatusDto> => invoke<OllamaStatusDto>("engine_ollama_status");
+
+export type ProposalDto = {
+  id: string;
+  target: string;
+  op: string;
+  new_content_hash: string;
+  rationale: string;
+  requires_loud_modal: boolean;
+};
+export type PreviewDto = {
+  path: string;
+  folder: string;
+  rationale: string;
+  op: string;
+  old_text: string;
+  new_text: string;
+  requires_loud_modal: boolean;
+  taint: string;
+};
+export type ApplyResultDto = { file_written_id: string };
+
+export const setFolderWritable = (path: string, on: boolean): Promise<void> =>
+  invoke<void>("engine_set_folder_writable", { path, on });
+export const setProposalsEnabled = (enabled: boolean): Promise<void> =>
+  invoke<void>("engine_set_proposals_enabled", { enabled });
+export const listProposals = (): Promise<ProposalDto[]> => invoke<ProposalDto[]>("engine_list_proposals");
+export const proposalPreview = (id: string): Promise<PreviewDto> =>
+  invoke<PreviewDto>("engine_proposal_preview", { id });
+export const applyProposal = (id: string, acknowledgedLoud: boolean): Promise<ApplyResultDto> =>
+  invoke<ApplyResultDto>("engine_apply_proposal", { id, acknowledgedLoud });
+export const declineProposal = (id: string, reason: string): Promise<void> =>
+  invoke<void>("engine_decline_proposal", { id, reason });
+export const undoApply = (fileWrittenId: string): Promise<void> =>
+  invoke<void>("engine_undo_apply", { fileWrittenId });
