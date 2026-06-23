@@ -295,6 +295,40 @@ fn pending_projection_open_close_and_suppress() {
     assert!(log.is_proposal_suppressed(&canonical, &key).unwrap(), "a write_rejected suppresses re-attempts");
 }
 
+#[test]
+fn pending_proposals_lists_open_then_excludes_resolved_and_rejected() {
+    let (log, _home, dir) = common::open_write_grant_and_external_target();
+    let path = dir.join("n.md");
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let key = serde_json::json!({"src":"entity:a","relation":"rel","dst":"entity:b"});
+
+    assert!(log.pending_proposals().unwrap().is_empty(), "nothing yet → no open proposals");
+
+    let pid = common::append_minimal_proposal(&log, &canonical, &key);
+    let open = log.pending_proposals().unwrap();
+    assert_eq!(open.len(), 1, "one OPEN proposal is listed");
+    let row = &open[0];
+    assert_eq!(row.id, pid);
+    assert_eq!(row.target, canonical);
+    assert_eq!(row.op, "edit");
+    assert_eq!(row.new_content_hash, "deadbeef");
+    assert_eq!(row.rationale, "rationale");
+    assert_eq!(row.inducing_key, key);
+    assert!(!row.source_event_ids.is_empty(), "lineage carried from model_meta");
+    // `append_minimal_proposal` passes an empty verdict_summary `{}`, so there is no base hash;
+    // the real emit path (Task 2) records it. Absence ⇒ None (apply then re-reads + re-gates).
+    assert_eq!(row.base_content_hash, None, "minimal proposal carries no base fingerprint");
+
+    log.decline_write_proposal(&pid, "not now").unwrap();
+    assert!(log.pending_proposals().unwrap().is_empty(), "declined → no longer open");
+
+    // A write_rejected on a DIFFERENT (path,key) must not resurface the declined one,
+    // and a rejected proposal is never listed as open.
+    let key2 = serde_json::json!({"src":"entity:c","relation":"rel","dst":"entity:d"});
+    common::append_rejected(&log, &canonical, &key2, "stale_target");
+    assert!(log.pending_proposals().unwrap().is_empty(), "rejected (path,key) is not open");
+}
+
 /// Suppression is SCOPED: an OPEN proposal (or a write_rejected) for one (path,key)
 /// must NOT suppress a DIFFERENT key or a different path — else valid proposals are
 /// silently dropped.

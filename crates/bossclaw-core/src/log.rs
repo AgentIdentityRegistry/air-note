@@ -335,6 +335,49 @@ fn unpack_post_identity(
     }
 }
 
+/// One open (unresolved, non-terminally-rejected) `write_proposal`, projected for callers
+/// outside the crate (e.g. the desktop Review queue). Mirrors the per-proposal fields of
+/// `append_write_proposal_with` (`content`) plus the lineage off `model_meta`.
+/// `#[cfg(unix)]` like the confirm/apply API it feeds (M1).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingProposal {
+    /// The proposal event id (the ULID).
+    pub id: String,
+    /// Canonical target path (`content["target"]`).
+    pub target: String,
+    /// `"edit"` / `"create"` / `"delete"` (`content["op"]`; the M6b reconciler emits `"edit"`).
+    pub op: String,
+    /// Hex sha256 of the proposed bytes (`content["new_content_hash"]`).
+    pub new_content_hash: String,
+    /// Plain-English "Why" (`content["rationale"]`).
+    pub rationale: String,
+    /// The resolved contradiction `{src, relation, dst}` (`content["inducing_key"]`).
+    pub inducing_key: serde_json::Value,
+    /// Lineage event ids (`model_meta.source_event_ids`); empty if absent.
+    pub source_event_ids: Vec<String>,
+    /// The propose-time verdict summary `{requires_loud_modal, taint, allowed, base_content_hash}`
+    /// (`content["verdict_summary"]`).
+    pub verdict_summary: serde_json::Value,
+    /// Hex sha256 of the target file's bytes AT PROPOSE TIME
+    /// (`content["verdict_summary"]["base_content_hash"]`; `None` for a Create). The anti-clobber
+    /// fingerprint: apply fails closed if the live file no longer hashes to this.
+    pub base_content_hash: Option<String>,
+}
+
+#[cfg(unix)]
+impl PendingProposal {
+    /// Single-sourced fail-loud default for a proposal's loud-modal hint: an absent or garbled
+    /// `verdict_summary["requires_loud_modal"]` defaults to `true` (fail-loud). Used by both
+    /// `ProposalSummary::from_pending` (Task 6) and `proposal_preview` (Task 7) so they cannot drift (m2).
+    pub fn requires_loud_modal(&self) -> bool {
+        self.verdict_summary
+            .get("requires_loud_modal")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+}
+
 impl EventLog {
     /// Open (creating if needed) an event log at `path`, encrypted with `dek`,
     /// signing with `key`.
@@ -2264,6 +2307,72 @@ impl EventLog {
             }
         }
         Ok(open_ids.iter().any(|id| !resolved.contains(id)))
+    }
+
+    /// Every OPEN `write_proposal`: emitted, not yet resolved by a `file_written`/`write_declined`,
+    /// and whose `(target, inducing_key)` is not terminally `write_rejected`. Oldest first
+    /// (`events_of_types` returns `seq ASC`). The desktop Review queue source. `#[cfg(unix)]` (M1).
+    #[cfg(unix)]
+    pub fn pending_proposals(&self) -> Result<Vec<PendingProposal>, BossclawError> {
+        use std::collections::{HashMap, HashSet};
+        // proposal id → parsed row, in emission order.
+        let mut open: Vec<PendingProposal> = Vec::new();
+        let mut resolved: HashSet<String> = HashSet::new();
+        // (target, inducing_key.to_string()) terminally rejected.
+        let mut rejected_keys: HashSet<(String, String)> = HashSet::new();
+        let mut proposal_keys: HashMap<String, (String, String)> = HashMap::new();
+
+        for ev in self.events_of_types(&[
+            crate::graph::WRITE_PROPOSAL_EVENT_TYPE,
+            crate::graph::WRITE_REJECTED_EVENT_TYPE,
+            crate::graph::WRITE_DECLINED_EVENT_TYPE,
+            crate::graph::FILE_WRITTEN_EVENT_TYPE,
+        ])? {
+            match ev.event_type.as_str() {
+                t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    // Read ALL fields via borrows of `ev.content` / `ev.model_meta` FIRST, then
+                    // build the struct — never move `ev.model_meta` before reading `ev.content`
+                    // (that would be a move-after-use, E0382).
+                    let id = ev.id.clone();
+                    let target = ev.content.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let op = ev.content.get("op").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let new_content_hash = ev.content.get("new_content_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let rationale = ev.content.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let inducing_key = ev.content.get("inducing_key").cloned().unwrap_or(serde_json::Value::Null);
+                    let verdict_summary = ev.content.get("verdict_summary").cloned().unwrap_or(serde_json::Value::Null);
+                    let base_content_hash = verdict_summary.get("base_content_hash")
+                        .and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let source_event_ids = ev.model_meta.as_ref()
+                        .map(|m| m.source_event_ids.clone()).unwrap_or_default();
+                    proposal_keys.insert(id.clone(), (target.clone(), inducing_key.to_string()));
+                    open.push(PendingProposal {
+                        id, target, op, new_content_hash, rationale,
+                        inducing_key, source_event_ids, base_content_hash, verdict_summary,
+                    });
+                }
+                t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
+                    let target = ev.content.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let key = ev.content.get("inducing_key").cloned().unwrap_or(serde_json::Value::Null);
+                    rejected_keys.insert((target, key.to_string()));
+                }
+                _ => {
+                    if let Some(rid) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        resolved.insert(rid.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(open
+            .into_iter()
+            .filter(|p| {
+                !resolved.contains(&p.id)
+                    && match proposal_keys.get(&p.id) {
+                        Some(k) => !rejected_keys.contains(k),
+                        None => true,
+                    }
+            })
+            .collect())
     }
 
     /// M6c mandate idempotency (spec §5.4) — decline-STICKY suppression keyed on the
