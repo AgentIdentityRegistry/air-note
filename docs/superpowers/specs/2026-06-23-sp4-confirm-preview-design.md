@@ -21,7 +21,7 @@ After the user **enables a folder for edits** (and the evolve loop is on), when 
 - sees pending changes in a dedicated **Review** destination (with a count badge),
 - opens one to read a plain-English **"Why"** + an **inline before/after diff**,
 - **Approves** (applied atomically, with undo + an audit record) or **Declines** (final),
-- gets an **extra confirm** for risky edits (secret-looking content) and an **Undo** for anything applied **this session** (the "Recently applied" strip; persistent cross-session undo is deferred — see Known limitations).
+- approves each change behind an **"I've reviewed this" confirm** — *every* edit gets it (the brain only rewrites files it ingested, which the engine treats as `Untrusted` ⇒ always "loud") — and gets an **Undo** for anything applied **this session** (the "Recently applied" strip; persistent cross-session undo is deferred — see Known limitations).
 
 **Two locks, always:** (1) the folder is enabled for edits, **and** (2) the user approves that specific change. Either missing → nothing is written. Off by default.
 
@@ -32,7 +32,7 @@ After the user **enables a folder for edits** (and the evolve loop is on), when 
 3. **Review card** = file + folder + enabled status · "Why" · **inline unified diff** · Approve / Decline · undo note.
 4. **Enabling** = a per-folder "Allow edits" toggle **+ an "Allow All" master**, in Settings → Folders, beside the existing "Read" grant. New folders start read-only (no silent escalation). "Allow All" off = revoke everywhere.
 5. **Decline = final** (matches the engine's terminal `write_declined`).
-6. **Risky edits** (secret-shaped content) get a loud confirm ("I've reviewed this"); **Undo** lives in a "Recently applied" strip in the Review destination.
+6. **Every edit requires the "I've reviewed this" confirm.** *(Build-time revision of the original "normal edits are one-click" assumption.)* The brain only rewrites **ingested** files, which the engine stamps `Untrusted`, so `requires_loud_modal` is always set ⇒ the confirm is **universal**, not just for secret-shaped edits. *(A per-flag extra warning specifically for secret-/value-shaped content is a deferred follow-up — the preview DTO doesn't yet carry `diff_flags`; the SP4 confirm is one honest universal message.)* The confirm is **engine-enforced** at the apply op (§Apply flow step 5). Softening some edits to one-click would require a 4th `bossclaw-core` change (deferred — option "🅱"); SP4 accepts always-loud (option "🅰", no engine change). **Undo** lives in a "Recently applied" strip in the Review destination.
 
 ## Non-goals (explicitly deferred)
 
@@ -116,7 +116,7 @@ On **Approve(id)**:
 | File changed on disk since proposal | the propose-time `base_content_hash` ≠ the live file's hash → apply fails closed as `Stale` BEFORE any propose/execute → "stale, I'll re-look"; nothing written |
 | Write-grant revoked between propose and apply | re-gate fails closed → "edits no longer allowed here" |
 | Proposal bytes GC'd / tampered | `get_proposal_bytes_checked` fails closed → "couldn't verify the change" |
-| `requires_loud_modal` (secret-shaped) | the `apply_proposal` op recomputes loud on the FRESH verdict and returns `NeedsLoudConfirm` unless `acknowledged_loud == true` → write refused until the "I've reviewed this" confirm; never a React-only check |
+| `requires_loud_modal` (always set for ingested edits — they're `Untrusted`) | the `apply_proposal` op recomputes loud on the FRESH verdict and returns `NeedsLoudConfirm` unless `acknowledged_loud == true` → write refused until the "I've reviewed this" confirm; never a React-only check |
 | Decline | terminal `write_declined`; that exact fix never returns |
 | Undo after the file changed again | `undo_write` re-gates + hash-checks → fails closed if diverged |
 | Concurrent apply / evolve tick | engine `rename_lock` / `evolve_lock` serialize; no double write |
@@ -166,7 +166,7 @@ On **Approve(id)**:
 3. Diff → **inline unified**.
 4. Enable UX → per-folder toggle **+ Allow-All**; new folders read-only; evolve-off → offer to enable.
 5. Decline → **final**.
-6. Risky edits → **loud confirm**; undo via "Recently applied".
+6. Edit confirm → **every edit is loud** (ingested files are `Untrusted`); one honest universal confirm (a per-flag secret-shaped warning is deferred). *(Build revision of the brainstorm "one-click for normal" — accepted as 🅰, no engine change.)* Undo via "Recently applied".
 7. Engine change → **accepted** (SP4 is not desktop-only); 3 surgical edits, full security review.
 8. App-shell sidebar + search → **deferred to its own sub-project**.
 
