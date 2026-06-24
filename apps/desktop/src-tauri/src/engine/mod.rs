@@ -352,10 +352,10 @@ impl EngineHandle {
     }
 
     /// Neutralize the engine's dangerous default-ON autonomy flags at startup, WITHOUT
-    /// clobbering a user's explicit choice. `evolve`/`proposals` are forced off ONLY when the
-    /// user never explicitly set them (`!explicitly_set`), so an explicit on/off persists across
-    /// opens (SP4 change-b). `mandates_enabled` is ALWAYS forced off until SP5, regardless of any
-    /// prior setting. Each setter is sticky; runs inside `get_or_open`'s first-open closure.
+    /// clobbering a user's explicit choice. `evolve`/`proposals`/`mandates` are forced off ONLY
+    /// when the user never explicitly set them (`!explicitly_set`), so an explicit on/off persists
+    /// across opens (SP4 change-b for evolve/proposals; SP5 for mandates). Each setter is sticky;
+    /// runs inside `get_or_open`'s first-open closure.
     fn prime_switches(log: &EventLog) -> Result<(), bossclaw_core::BossclawError> {
         use bossclaw_core::ConfigFlag;
         if !log.explicitly_set(ConfigFlag::Evolve)? && log.evolve_enabled()? {
@@ -364,8 +364,10 @@ impl EngineHandle {
         if !log.explicitly_set(ConfigFlag::Proposals)? && log.proposals_enabled()? {
             log.set_proposals_enabled(false)?;
         }
-        // SP5 not shipped: mandates stay forced OFF even if a prior build set them.
-        if log.mandates_enabled()? {
+        // SP5 ships mandates: persist an explicit user choice (force off ONLY when never set),
+        // exactly like evolve/proposals above. A fresh install still primes off (default-open,
+        // never-set ⇒ explicitly_set is false ⇒ force off).
+        if !log.explicitly_set(ConfigFlag::Mandates)? && log.mandates_enabled()? {
             log.set_mandates_enabled(false)?;
         }
         Ok(())
@@ -933,7 +935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prime_switches_preserves_explicit_proposals_but_forces_mandates_off() {
+    async fn prime_switches_preserves_explicit_proposals_and_mandates() {
         let (vault, dir) = test_vault_and_dir();
         let handle = new_test_handle(vault.clone(), &dir);
         let log = handle.get_or_open(true).await.unwrap();
@@ -941,16 +943,18 @@ mod tests {
         assert!(!log.proposals_enabled().unwrap());
         assert!(!log.mandates_enabled().unwrap());
 
-        // The user explicitly enables proposals.
+        // The user explicitly enables BOTH proposals and mandates.
         log.set_proposals_enabled(true).unwrap();
+        log.set_mandates_enabled(true).unwrap();
         assert!(log.proposals_enabled().unwrap());
+        assert!(log.mandates_enabled().unwrap());
         drop(log);
 
         // Re-open with a FRESH handle (same vault + db_path) → prime_switches runs again.
         let handle2 = new_test_handle(vault, &dir);
         let log2 = handle2.get_or_open(true).await.unwrap();
-        assert!(log2.proposals_enabled().unwrap(), "an explicit user true MUST persist across opens");
-        assert!(!log2.mandates_enabled().unwrap(), "mandates stay forced OFF until SP5");
+        assert!(log2.proposals_enabled().unwrap(), "an explicit proposals true MUST persist across opens");
+        assert!(log2.mandates_enabled().unwrap(), "an explicit mandates true MUST persist across opens (SP5)");
     }
 
     /// Tasks 5 + 6: `run_ingest` marks the index current, then `recall` round-trips through
