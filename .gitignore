@@ -29,6 +29,7 @@ build
 .claude/
 .omc/
 .gstack/
+.superpowers/
 NEXT-SESSION.md
 
 # SP2: the bundled embedding model is fetched (hash-pinned), never committed.
