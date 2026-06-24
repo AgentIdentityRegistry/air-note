@@ -30,6 +30,8 @@ export type OllamaStatusDto = { reachable: boolean; model_present: boolean; mode
 
 /** Opens the native folder picker; resolves to the chosen path, or null if the user cancels. */
 export const pickFolder = (): Promise<string | null> => invoke<string | null>("engine_pick_folder");
+/** Opens the native file picker; resolves to the chosen file path, or null if the user cancels. */
+export const pickFile = (): Promise<string | null> => invoke<string | null>("engine_pick_file");
 export const addGrant = (path: string): Promise<void> => invoke<void>("engine_add_grant", { path });
 export const revokeGrant = (path: string): Promise<void> => invoke<void>("engine_revoke_grant", { path });
 export const listGrants = (): Promise<GrantDto[]> => invoke<GrantDto[]>("engine_list_grants");
