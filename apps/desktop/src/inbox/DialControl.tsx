@@ -20,12 +20,12 @@ export function DialControl({ did }: { did: string }) {
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-      <span style={{ fontSize: 12, color: "#666" }}>AI:</span>
-      <div style={{ display: "inline-flex", border: "1px solid #ccc", borderRadius: 6, overflow: "hidden" }}>
+      <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>AI:</span>
+      <div style={{ display: "inline-flex", border: "1px solid var(--border-soft)", borderRadius: 6, overflow: "hidden" }}>
         {OPTIONS.map((o) => (
           <button key={o} disabled={busy} onClick={() => change(o)}
             style={{ padding: "4px 10px", fontSize: 12, border: "none", cursor: "pointer",
-              background: o === value ? "#2F6BFF" : "white", color: o === value ? "white" : "#0B0F17" }}>
+              background: o === value ? "var(--primary)" : "var(--surface)", color: o === value ? "var(--surface)" : "var(--text-primary)" }}>
             {o}
           </button>
         ))}

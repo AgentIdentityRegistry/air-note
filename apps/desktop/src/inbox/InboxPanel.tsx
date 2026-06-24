@@ -44,18 +44,18 @@ export function InboxPanel() {
       </div>
 
       {adoption?.state === "adopted" && adoption.dormant_did ? (
-        <div style={{ marginTop: 8, fontSize: 12, color: "#666" }}>
+        <div style={{ marginTop: 8, fontSize: 12, color: "var(--text-secondary)" }}>
           This app previously created {short(adoption.dormant_did)}; it is now dormant. Active agent: {short(adoption.did)}.
         </div>
       ) : null}
 
       {!online ? (
-        <div style={{ marginTop: 12, padding: "8px 12px", borderRadius: 8, background: "#FFF3F3", color: "#A75D61", fontSize: 13 }}>
+        <div style={{ marginTop: 12, padding: "8px 12px", borderRadius: 8, background: "color-mix(in srgb, var(--error) 10%, var(--surface))", color: "var(--error)", fontSize: 13 }}>
           daemon offline — reconnecting. History is read-only.
         </div>
       ) : null}
       {archiveError ? (
-        <div style={{ marginTop: 8, padding: "8px 12px", borderRadius: 8, background: "#FFF8EC", color: "#A57C42", fontSize: 13 }}>
+        <div style={{ marginTop: 8, padding: "8px 12px", borderRadius: 8, background: "color-mix(in srgb, var(--warning) 12%, var(--surface))", color: "var(--warning)", fontSize: 13 }}>
           Couldn&apos;t read the local archive — showing the live feed only.
         </div>
       ) : null}
@@ -76,7 +76,7 @@ export function InboxPanel() {
               <Composer key={showNew ? "new" : selected} to={showNew ? null : selected} disabled={!online} onSend={handleSend} />
             </>
           ) : (
-            <div style={{ color: "#666", fontSize: 13, padding: 12 }}>Select a conversation, or start a new message.</div>
+            <div style={{ color: "var(--text-secondary)", fontSize: 13, padding: 12 }}>Select a conversation, or start a new message.</div>
           )}
         </div>
       </div>
