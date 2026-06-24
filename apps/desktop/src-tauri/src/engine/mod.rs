@@ -106,6 +106,9 @@ pub struct ProposalSummary {
     pub new_content_hash: String,
     pub rationale: String,
     pub requires_loud_modal: bool,
+    /// The proposer's producer stamp (`"m6b-reconciler"` / `"m6c-mandate-proposer"`), surfaced so
+    /// the Review UI can label a mandate-driven rewrite "from mandate".
+    pub producer: String,
 }
 
 impl ProposalSummary {
@@ -121,6 +124,7 @@ impl ProposalSummary {
             new_content_hash: p.new_content_hash,
             rationale: p.rationale,
             requires_loud_modal,
+            producer: p.producer,
         }
     }
 }
@@ -1235,6 +1239,23 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert!(proposals[0].id == pid && proposals[0].requires_loud_modal,
             "an absent/garbled verdict_summary fails loud (requires_loud_modal == true)");
+    }
+
+    #[tokio::test]
+    async fn list_proposals_surfaces_producer() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        let vs = serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true});
+        let pid = log.append_write_proposal_with("/tmp/x/n.md", "edit", "deadbeef", 0, "why",
+            &key, &vs, std::slice::from_ref(&lineage), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+        drop(log);
+
+        let proposals = handle.list_proposals(true).await.unwrap();
+        let p = proposals.iter().find(|p| p.id == pid).unwrap();
+        assert_eq!(p.producer, "m6c-mandate-proposer", "the M6c producer is surfaced on the summary");
     }
 
     #[tokio::test]

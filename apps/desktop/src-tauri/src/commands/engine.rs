@@ -240,13 +240,14 @@ pub struct ProposalDto {
     pub new_content_hash: String,
     pub rationale: String,
     pub requires_loud_modal: bool,
+    pub producer: String,
 }
 impl From<crate::engine::ProposalSummary> for ProposalDto {
     fn from(p: crate::engine::ProposalSummary) -> Self {
         Self {
             id: p.id, target: p.target, op: p.op,
             new_content_hash: p.new_content_hash, rationale: p.rationale,
-            requires_loud_modal: p.requires_loud_modal,
+            requires_loud_modal: p.requires_loud_modal, producer: p.producer,
         }
     }
 }
