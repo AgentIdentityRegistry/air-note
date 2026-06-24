@@ -105,6 +105,16 @@ fn validate_display_name(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// The pure validate-+-mutate core of a rename: validates `raw` and, on success, sets only
+/// `meta.name`. No filesystem, no keys. Factored out (instead of inlined in the command) so the
+/// real command and the unit tests exercise the SAME logic — for a security command the invariant
+/// "only `name` changes; `did`/`created_at` are untouched" must be asserted against the actual
+/// path, not a copy that could drift. On error, `meta` is left unmodified.
+fn apply_rename(meta: &mut IdentityMetadata, raw: &str) -> Result<(), String> {
+    meta.name = validate_display_name(raw)?;
+    Ok(())
+}
+
 /// Rename the agent's LOCAL display name only. Loads the current metadata, validates
 /// the new name (trimmed, non-empty, within `MAX_DISPLAY_NAME_LEN`), swaps just the
 /// `name`, and persists. The DID, the keypair, and `created_at` are left untouched —
@@ -120,7 +130,7 @@ pub async fn rename_identity(
         .ok_or_else(|| "No identity yet. Set up your agent first.".to_string())?;
 
     // Change ONLY the display name; did + created_at + the keypair are deliberately preserved.
-    meta.name = validate_display_name(&new_name)?;
+    apply_rename(&mut meta, &new_name)?;
     state.identity_store.save_metadata(&meta)?;
     Ok(meta)
 }
@@ -139,92 +149,64 @@ pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-// Rename touches no keys/engine, so these tests run on every platform.
+// These tests drive the SAME `apply_rename` core the command uses (no mirrored copy), so the
+// security invariant is asserted against the real path. `apply_rename` is the validate-+-mutate
+// step; the surrounding load/save is thin store I/O covered by `air/identity.rs`. Pure → runs on
+// every platform.
 #[cfg(test)]
 mod rename_tests {
     use super::*;
     use crate::air::types::Did;
-    use crate::secrets::SecretsVault;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
-    struct TestVault {
-        store: Mutex<HashMap<String, String>>,
-    }
-    impl TestVault {
-        fn new() -> Arc<Self> {
-            Arc::new(Self { store: Mutex::new(HashMap::new()) })
-        }
-    }
-    impl SecretsVault for TestVault {
-        fn set(&self, k: &str, v: &str) -> Result<(), String> {
-            self.store.lock().unwrap().insert(k.into(), v.into());
-            Ok(())
-        }
-        fn get(&self, k: &str) -> Result<Option<String>, String> {
-            Ok(self.store.lock().unwrap().get(k).cloned())
-        }
-        fn delete(&self, k: &str) -> Result<(), String> {
-            self.store.lock().unwrap().remove(k);
-            Ok(())
-        }
-    }
-
-    fn seeded_store() -> (IdentityStore, IdentityMetadata, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = IdentityStore::new(TestVault::new(), dir.path().to_path_buf());
-        let meta = IdentityMetadata {
+    fn sample_meta() -> IdentityMetadata {
+        IdentityMetadata {
             did: Did("did:wba:example.com:agent".to_string()),
             name: "Old Name".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        store.save_metadata(&meta).unwrap();
-        (store, meta, dir)
-    }
-
-    // Mirrors the command's body against a real store: only `name` changes; did + created_at stay.
-    fn rename(store: &IdentityStore, raw: &str) -> Result<IdentityMetadata, String> {
-        let mut meta = store
-            .load_metadata()?
-            .ok_or_else(|| "No identity yet.".to_string())?;
-        meta.name = validate_display_name(raw)?;
-        store.save_metadata(&meta)?;
-        Ok(meta)
+        }
     }
 
     #[test]
-    fn rename_changes_only_the_name_and_persists() {
-        let (store, original, _dir) = seeded_store();
+    fn apply_rename_changes_only_the_name() {
+        let mut meta = sample_meta();
+        let did_before = meta.did.clone();
+        let created_before = meta.created_at.clone();
 
-        let updated = rename(&store, "  New Name  ").unwrap();
-        assert_eq!(updated.name, "New Name", "name updates (and is trimmed)");
-        assert_eq!(updated.did, original.did, "did unchanged");
-        assert_eq!(updated.created_at, original.created_at, "created_at unchanged");
-
-        // The change is durable: a fresh load sees the new name with did/created_at intact.
-        let reloaded = store.load_metadata().unwrap().unwrap();
-        assert_eq!(reloaded.name, "New Name");
-        assert_eq!(reloaded.did, original.did);
-        assert_eq!(reloaded.created_at, original.created_at);
+        apply_rename(&mut meta, "  New Name  ").unwrap();
+        assert_eq!(meta.name, "New Name", "name updates (and is trimmed)");
+        assert_eq!(meta.did, did_before, "did untouched");
+        assert_eq!(meta.created_at, created_before, "created_at untouched");
     }
 
     #[test]
-    fn empty_or_whitespace_name_is_rejected_and_metadata_unchanged() {
-        let (store, original, _dir) = seeded_store();
+    fn empty_or_whitespace_name_is_rejected_and_meta_unchanged() {
+        for bad in ["", "   "] {
+            let mut meta = sample_meta();
+            let before = meta.clone();
 
-        assert!(rename(&store, "").is_err(), "empty rejected");
-        assert!(rename(&store, "   ").is_err(), "whitespace-only rejected");
-
-        // A rejected rename leaves the stored name as it was.
-        assert_eq!(store.load_metadata().unwrap().unwrap().name, original.name);
+            assert!(apply_rename(&mut meta, bad).is_err(), "{bad:?} rejected");
+            // A rejected rename leaves every field exactly as it was.
+            assert_eq!(meta.name, before.name);
+            assert_eq!(meta.did, before.did);
+            assert_eq!(meta.created_at, before.created_at);
+        }
     }
 
     #[test]
-    fn over_length_name_is_rejected() {
+    fn over_length_name_is_rejected_and_meta_unchanged() {
+        let mut meta = sample_meta();
+        let before = meta.clone();
+
         let long = "x".repeat(MAX_DISPLAY_NAME_LEN + 1);
-        assert!(validate_display_name(&long).is_err());
-        // The boundary is allowed.
-        assert!(validate_display_name(&"x".repeat(MAX_DISPLAY_NAME_LEN)).is_ok());
+        assert!(apply_rename(&mut meta, &long).is_err());
+        assert_eq!(meta.name, before.name, "rejected over-length leaves name intact");
+        assert_eq!(meta.did, before.did);
+        assert_eq!(meta.created_at, before.created_at);
+
+        // The boundary length is accepted.
+        let at_cap = "x".repeat(MAX_DISPLAY_NAME_LEN);
+        apply_rename(&mut meta, &at_cap).unwrap();
+        assert_eq!(meta.name, at_cap);
     }
 }
 
