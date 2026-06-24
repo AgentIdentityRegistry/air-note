@@ -1,7 +1,7 @@
 import type { HitDto } from "../api/engine";
 
 /** Engine event kinds → human labels shown in the results list. */
-const KIND_LABEL: Record<string, string> = {
+export const KIND_LABEL: Record<string, string> = {
   memory: "Memory",
   page: "Dossier",
   file_ingested: "File",
