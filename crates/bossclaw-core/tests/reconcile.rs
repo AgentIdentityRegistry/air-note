@@ -1582,3 +1582,68 @@ fn mandate_writes_attributes_m6c_excludes_m6b_and_flips_undone() {
     assert_eq!(writes2.len(), 1, "the undo does not add an attributed row (it has no resolves_proposal)");
     assert!(writes2[0].undone, "undone flips true after undo_write");
 }
+
+/// RETENTION REGRESSION GUARD for the mandate-activity list.
+///
+/// The activity list (the only place a user sees/undoes an autonomous M6c write) depends on the
+/// `file_written → write_proposal(producer == M6c)` attribution join being TOTAL. The event log is
+/// append-only with NO GC today (no prune/vacuum/compaction, no `DELETE FROM write_proposal`/
+/// `file_written`), so the join is total. This test locks that invariant: it applies an M6c write,
+/// then exercises the engine's existing durability + maintenance ops that COULD theoretically drop
+/// events — reopen the log from disk, then `rebuild_graph()` + `rebuild_indexes(..)` on the reopened
+/// handle — and asserts `mandate_writes()` STILL lists the write. A future retention/GC change that
+/// orphaned a resolved M6c proposal (silently hiding the write from Undo) would fail HERE.
+#[cfg(unix)]
+#[test]
+fn mandate_writes_survive_reopen_and_rebuilds_retention_guard() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    use sha2::{Digest, Sha256};
+    let (log, home, dir) = common::open_log_with_write_grant();
+    let db_path = home.path().join("m.db"); // the path the harness opened (see common::reopen_log_at).
+
+    // Build one M6c-attributed APPLIED write, mirroring the attribution test's harness: write +
+    // ingest a target, propose against the live file, append an M6c-stamped write_proposal that
+    // resolves to those bytes, then apply it (acked — ingested ⇒ Untrusted ⇒ loud; the retention
+    // invariant under test is attribution survival, not the loud-gate).
+    let path = dir.join("mandated.md");
+    std::fs::write(&path, b"old\n").unwrap();
+    let fid = common::ingest_one(&log, &path);
+    let new = b"new\n";
+    let hash = hex::encode(Sha256::digest(new));
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new.to_vec(),
+        op: WriteOp::Edit, source_event_ids: vec![fid.clone()], rationale: "sync".to_string() }).unwrap();
+    let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+        "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+        "base_content_hash": gated.verdict.base_content_hash});
+    let key = serde_json::json!({"src":"a","relation":"r","dst":"mandated.md"});
+    let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new.len() as u64, "sync",
+        &key, &vs, std::slice::from_ref(&fid), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+    log.put_proposal_bytes(&pid, new, &hash).unwrap();
+    let fw = log.execute_write_resolving(gated, &pid, true).unwrap();
+
+    // Baseline: the freshly-applied M6c write is attributed.
+    let before = log.mandate_writes().unwrap();
+    assert_eq!(before.len(), 1, "the applied M6c write is attributed before any maintenance");
+    assert_eq!(before[0].file_written_id, fw);
+    assert_eq!(before[0].target, canonical);
+    assert!(!before[0].undone, "not undone");
+
+    // Drop the in-memory handle so the reopen reads purely from the on-disk store.
+    drop(log);
+    let reopened = common::reopen_log_at(&db_path);
+
+    // Run the maintenance ops that rebuild derived state from the event log. If any of these
+    // dropped the resolved M6c proposal (or its file_written), the attribution join would break.
+    reopened.rebuild_graph().expect("rebuild_graph after reopen");
+    reopened.rebuild_indexes(&common::mock_embedder()).expect("rebuild_indexes after reopen");
+
+    // The attribution join must STILL be total: same write, same target, still not undone.
+    let after = reopened.mandate_writes().unwrap();
+    assert_eq!(after.len(), 1, "M6c write survives reopen + rebuild_graph + rebuild_indexes (join stays total)");
+    assert_eq!(after[0].file_written_id, fw, "same file_written id after reopen + rebuilds");
+    assert_eq!(after[0].target, canonical, "same target after reopen + rebuilds");
+    assert!(!after[0].undone, "still not undone after reopen + rebuilds");
+
+    drop(home); // keep the tempdir alive until here (its drop deletes the store).
+}

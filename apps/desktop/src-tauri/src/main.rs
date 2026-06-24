@@ -176,6 +176,8 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_pick_folder,
             #[cfg(unix)]
+            commands::engine::engine_pick_file,
+            #[cfg(unix)]
             commands::engine::engine_recall,
             #[cfg(unix)]
             commands::engine::engine_evolve_status,

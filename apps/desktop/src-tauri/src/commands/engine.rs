@@ -167,6 +167,20 @@ pub async fn engine_pick_folder(app: tauri::AppHandle) -> Result<Option<String>,
     Ok(picked.and_then(|p| p.into_path().ok()).map(|pb| pb.to_string_lossy().into_owned()))
 }
 
+/// Picks a single file (the mandate TARGET — a file, not a folder). Mirrors
+/// `engine_pick_folder` exactly but calls `pick_file`; a cancelled dialog (or a dropped sender
+/// when the window closes) yields `None`.
+#[tauri::command]
+pub async fn engine_pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_file(move |p| {
+        let _ = tx.send(p);
+    });
+    let picked = rx.await.ok().flatten();
+    Ok(picked.and_then(|p| p.into_path().ok()).map(|pb| pb.to_string_lossy().into_owned()))
+}
+
 /// Hybrid recall over the user's memory. `k` is clamped server-side to a sane range so a
 /// webview bug can't request an unbounded result set.
 #[tauri::command]

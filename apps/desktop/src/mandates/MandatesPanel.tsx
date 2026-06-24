@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import {
-  pickFolder, setMandatesEnabled, mandatesEnabled as readMandatesEnabled, addMandate, revokeMandate,
+  pickFolder, pickFile, setMandatesEnabled, mandatesEnabled as readMandatesEnabled, addMandate, revokeMandate,
   listMandates, mandateWrites, undoApply,
   type MandateDto, type MandateWriteDto,
 } from "../api/engine";
@@ -24,6 +24,13 @@ export function MandatesPanel() {
   const [sourceScope, setSourceScope] = useState("");
   const [recipe, setRecipe] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
+  // Synchronous in-flight guard (mirrors ReviewPanel): `busy` state only updates after a
+  // re-render, so a fast double-click would fire two engine calls before `disabled` takes
+  // effect. This ref flips synchronously, so the second click is a true no-op. It also gates
+  // the poll below — a poll landing mid-mutation could clobber the lists/toggle with
+  // pre-mutation engine state (a stale `setInterval` closure can't read `busy` state, but it
+  // can read this ref).
+  const inFlight = useRef(false);
 
   const refresh = async () => {
     try {
@@ -42,11 +49,17 @@ export function MandatesPanel() {
 
   useEffect(() => {
     void refresh();
-    const id = setInterval(() => void refresh(), POLL_MS);
+    // Skip a poll while a mutation is in flight so it can't clobber the lists/toggle with
+    // pre-mutation engine state (the post-mutation `refresh()` in each handler repaints).
+    const id = setInterval(() => {
+      if (!inFlight.current) void refresh();
+    }, POLL_MS);
     return () => clearInterval(id);
   }, []);
 
   const onToggle = async (on: boolean) => {
+    if (inFlight.current) return; // synchronous double-click guard (see `inFlight`).
+    inFlight.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -55,15 +68,15 @@ export function MandatesPanel() {
     } catch (e) {
       setError(String(e));
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
 
   const onPickTarget = async () => {
-    // The folder picker returns a directory; the user appends the file name in the field. (A
-    // dedicated file picker is a fast-follow; for SP5 the path field is editable.)
-    const dir = await pickFolder();
-    if (dir) setTarget(dir.endsWith("/") ? dir : `${dir}/`);
+    // The target IS a single file, so pick it directly (no folder + hand-typed filename).
+    const file = await pickFile();
+    if (file) setTarget(file);
   };
   const onPickScope = async () => {
     const dir = await pickFolder();
@@ -71,12 +84,14 @@ export function MandatesPanel() {
   };
 
   const onCreate = async () => {
+    if (inFlight.current) return; // synchronous double-click guard (see `inFlight`).
     const form = { target, sourceScope, recipe };
     const v = validateMandateForm(form);
     if (!v.ok) {
       setFormError(v.error);
       return;
     }
+    inFlight.current = true;
     setBusy(true);
     setFormError(null);
     try {
@@ -89,11 +104,14 @@ export function MandatesPanel() {
       // The engine's typed grant rejection stringifies to its bare reason (Rejected Display).
       setFormError(String(e));
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
 
   const onRevoke = async (id: string) => {
+    if (inFlight.current) return; // synchronous double-click guard (see `inFlight`).
+    inFlight.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -102,11 +120,14 @@ export function MandatesPanel() {
     } catch (e) {
       setError(String(e));
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
 
   const onUndo = async (fileWrittenId: string) => {
+    if (inFlight.current) return; // synchronous double-click guard (see `inFlight`).
+    inFlight.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -116,6 +137,7 @@ export function MandatesPanel() {
     } catch (e) {
       setError(String(e));
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
@@ -152,7 +174,7 @@ export function MandatesPanel() {
               onChange={(e) => setTarget(e.target.value)}
               style={{ flex: 1, padding: 6, fontFamily: "inherit", fontSize: 13 }}
             />
-            <Button variant="secondary" disabled={busy} onClick={() => void onPickTarget()}>Pick folder…</Button>
+            <Button variant="secondary" disabled={busy} onClick={() => void onPickTarget()}>Pick file…</Button>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
             <input
