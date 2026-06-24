@@ -142,7 +142,7 @@ export function ReviewPanel() {
     return (
       <Card>
         <h2 style={{ margin: 0 }}>Review</h2>
-        <p style={{ color: "#666" }}>Couldn’t reach the memory engine. Set up your identity first, then enable a folder for edits.</p>
+        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine. Set up your identity first, then enable a folder for edits.</p>
       </Card>
     );
   }
@@ -150,15 +150,15 @@ export function ReviewPanel() {
   return (
     <div>
       <h2 style={{ margin: "0 0 8px" }}>Review</h2>
-      {error ? <p style={{ color: "#b00", fontSize: 13 }}>{error}</p> : null}
+      {error ? <p style={{ color: "var(--error)", fontSize: 13 }}>{error}</p> : null}
 
       {proposals.length === 0 ? (
         <Card>
-          <p style={{ color: "#666" }}>
+          <p style={{ color: "var(--text-secondary)" }}>
             No changes to review. When the brain learns something that contradicts a file in an
             edit-enabled folder (and evolve is on), proposed rewrites appear here.
           </p>
-          <p style={{ color: "#888", fontSize: 12 }}>
+          <p style={{ color: "var(--text-secondary)", fontSize: 12 }}>
             Note: only contradictions learned <em>after</em> you enable a folder for edits are
             proposed — corrections learned earlier won’t be re-applied retroactively.
           </p>
@@ -173,10 +173,10 @@ export function ReviewPanel() {
                 <div>
                   <div style={{ fontWeight: 600 }}>
                     {row.opLabel}: <code>{row.fileName}</code>{" "}
-                    {row.fromMandate ? <span style={{ color: "#06c", fontSize: 12 }}>· from a mandate</span> : null}{" "}
-                    {row.risky ? <span style={{ color: "#b00", fontSize: 12 }}>⚠ needs careful review</span> : null}
+                    {row.fromMandate ? <span style={{ color: "var(--primary)", fontSize: 12 }}>· from a mandate</span> : null}{" "}
+                    {row.risky ? <span style={{ color: "var(--error)", fontSize: 12 }}>⚠ needs careful review</span> : null}
                   </div>
-                  <div style={{ color: "#666", fontSize: 12 }}><code>{row.folder}</code> · enabled ✓</div>
+                  <div style={{ color: "var(--text-secondary)", fontSize: 12 }}><code>{row.folder}</code> · enabled ✓</div>
                   <div style={{ fontSize: 13, marginTop: 4 }}>Why: {row.why}</div>
                 </div>
                 <Button variant="secondary" onClick={() => (isOpen ? setOpenId(null) : void onOpen(p.id))}>
@@ -187,16 +187,16 @@ export function ReviewPanel() {
               {isOpen ? (
                 <div style={{ marginTop: 8 }}>
                   {previewing ? (
-                    <p style={{ color: "#666", fontSize: 13 }}>Loading preview…</p>
+                    <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>Loading preview…</p>
                   ) : preview ? (
                     <>
-                      <pre style={{ background: "#f6f6f6", padding: 8, fontSize: 12, overflowX: "auto", margin: 0 }}>
+                      <pre style={{ background: "var(--surface-soft)", padding: 8, fontSize: 12, overflowX: "auto", margin: 0 }}>
                         {inlineDiff(preview.old_text, preview.new_text).map((line, idx) => (
                           <div
                             key={idx}
                             style={{
-                              color: line.kind === "del" ? "#b00" : line.kind === "add" ? "#070" : "#444",
-                              background: line.kind === "del" ? "#fdecea" : line.kind === "add" ? "#eafaef" : "transparent",
+                              color: line.kind === "del" ? "var(--diff-del-fg)" : line.kind === "add" ? "var(--diff-add-fg)" : "var(--text-secondary)",
+                              background: line.kind === "del" ? "var(--diff-del-bg)" : line.kind === "add" ? "var(--diff-add-bg)" : "transparent",
                             }}
                           >
                             {line.kind === "del" ? "- " : line.kind === "add" ? "+ " : "  "}
@@ -223,8 +223,8 @@ export function ReviewPanel() {
 
       {confirmFor ? (
         <Card>
-          <div style={{ fontWeight: 600, color: "#b00" }}>Confirm this edit</div>
-          <p style={{ fontSize: 13, color: "#444" }}>
+          <div style={{ fontWeight: 600, color: "var(--error)" }}>Confirm this edit</div>
+          <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
             This rewrites a file your agent learned from. Review the before/after, then confirm you’ve read it.
           </p>
           <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13 }}>

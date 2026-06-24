@@ -53,7 +53,7 @@ export function MemoryPanel() {
     return (
       <Card>
         <h2 style={{ margin: 0 }}>Memory</h2>
-        <p style={{ color: "#666" }}>Couldn’t reach the memory engine.</p>
+        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine.</p>
       </Card>
     );
   }
@@ -105,7 +105,7 @@ export function MemoryPanel() {
   return (
     <Card>
       <h2 style={{ margin: 0 }}>Memory</h2>
-      <p style={{ color: "#666", fontSize: 13 }}>
+      <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
         Search everything the agent has read and learned. Everything stays on your machine.
       </p>
 
@@ -117,7 +117,7 @@ export function MemoryPanel() {
           placeholder="Search your memory…"
           style={{
             flex: 1, padding: "8px 12px", borderRadius: 6,
-            border: "1px solid #ccc", fontFamily: "inherit", fontSize: 14,
+            fontFamily: "inherit", fontSize: 14,
           }}
         />
         <Button variant="primary" onClick={onSearch} disabled={searching || query.trim() === ""}>
@@ -125,25 +125,25 @@ export function MemoryPanel() {
         </Button>
       </div>
 
-      {searchError ? <p style={{ fontSize: 13, color: "#b00" }}>{searchError}</p> : null}
+      {searchError ? <p style={{ fontSize: 13, color: "var(--error)" }}>{searchError}</p> : null}
 
       {searched && hits.length === 0 && !searchError ? (
-        <p style={{ color: "#666", fontSize: 13 }}>Nothing found yet — try a different search.</p>
+        <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>Nothing found yet — try a different search.</p>
       ) : null}
 
       <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
         {hits.map((h) => {
           const row = toRow(h);
           return (
-            <li key={row.id} style={{ padding: "10px 0", borderBottom: "1px solid #eee" }}>
+            <li key={row.id} style={{ padding: "10px 0", borderBottom: "1px solid var(--border-soft)" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
                 <span style={{
-                  fontSize: 11, fontWeight: 600, color: "#555",
-                  background: "#f0f0f0", borderRadius: 4, padding: "2px 6px",
+                  fontSize: 11, fontWeight: 600, color: "var(--text-secondary)",
+                  background: "var(--surface-soft)", borderRadius: 4, padding: "2px 6px",
                 }}>
                   {row.kindLabel}
                 </span>
-                <span style={{ fontSize: 12, color: "#999" }}>
+                <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
                   {row.sourcesLabel}{row.sourcesLabel ? " · " : ""}score {row.score}
                 </span>
               </div>
@@ -153,9 +153,9 @@ export function MemoryPanel() {
         })}
       </ul>
 
-      <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #eee" }}>
+      <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Evolve</div>
-        <p style={{ color: "#666", fontSize: 13 }}>
+        <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
           A local model can organize memories into dossiers in the background. Off by default; runs only on your machine.
         </p>
 
@@ -163,7 +163,7 @@ export function MemoryPanel() {
           {status ? formatEvolve(status) : "Loading…"}
         </p>
 
-        <p style={{ fontSize: 13, color: "#666" }}>
+        <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
           Local model:{" "}
           {ollama == null
             ? "checking…"
@@ -175,7 +175,7 @@ export function MemoryPanel() {
         </p>
 
         {!ollamaReady && ollama != null ? (
-          <p style={{ fontSize: 13, color: "#666" }}>
+          <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
             To enable, install Ollama and run <code>ollama pull qwen2.5:7b-instruct</code>.
           </p>
         ) : null}
@@ -193,7 +193,7 @@ export function MemoryPanel() {
           </Button>
         </div>
 
-        {evolveError ? <p style={{ fontSize: 13, color: "#b00" }}>{evolveError}</p> : null}
+        {evolveError ? <p style={{ fontSize: 13, color: "var(--error)" }}>{evolveError}</p> : null}
       </div>
     </Card>
   );

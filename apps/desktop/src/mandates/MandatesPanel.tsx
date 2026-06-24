@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
+import { ToggleSwitch } from "../components/ui/ToggleSwitch";
 import {
   pickFolder, pickFile, setMandatesEnabled, mandatesEnabled as readMandatesEnabled, addMandate, revokeMandate,
   listMandates, mandateWrites, undoApply,
@@ -146,7 +147,7 @@ export function MandatesPanel() {
     return (
       <Card>
         <h2 style={{ margin: 0 }}>Mandates</h2>
-        <p style={{ color: "#666" }}>Couldn’t reach the memory engine. Set up your identity first.</p>
+        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine. Set up your identity first.</p>
       </Card>
     );
   }
@@ -154,14 +155,20 @@ export function MandatesPanel() {
   return (
     <div>
       <h2 style={{ margin: "0 0 8px" }}>Mandates</h2>
-      {error ? <p style={{ color: "#b00", fontSize: 13 }}>{error}</p> : null}
+      {error ? <p style={{ color: "var(--error)", fontSize: 13 }}>{error}</p> : null}
 
       <Card>
-        <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 14 }}>
-          <input type="checkbox" checked={enabled} disabled={busy} onChange={(e) => void onToggle(e.target.checked)} />
-          Mandates {enabled ? "on" : "off"} — when on, the brain keeps each mandate’s target file in
-          sync and auto-applies clean changes (risky ones go to Review).
-        </label>
+        <ToggleSwitch
+          checked={enabled}
+          disabled={busy}
+          onChange={(next) => void onToggle(next)}
+          label={
+            <>
+              Mandates {enabled ? "on" : "off"} — when on, the brain keeps each mandate’s target file in
+              sync and auto-applies clean changes (risky ones go to Review).
+            </>
+          }
+        />
       </Card>
 
       <Card>
@@ -192,7 +199,7 @@ export function MandatesPanel() {
             rows={3}
             style={{ padding: 6, fontFamily: "inherit", fontSize: 13 }}
           />
-          {formError ? <p style={{ color: "#b00", fontSize: 13, margin: 0 }}>{formError}</p> : null}
+          {formError ? <p style={{ color: "var(--error)", fontSize: 13, margin: 0 }}>{formError}</p> : null}
           <div>
             <Button variant="primary" disabled={busy} onClick={() => void onCreate()}>Create mandate</Button>
           </div>
@@ -202,15 +209,15 @@ export function MandatesPanel() {
       <Card>
         <div style={{ fontWeight: 600, marginBottom: 8 }}>Active mandates</div>
         {mandates.length === 0 ? (
-          <p style={{ color: "#666", fontSize: 13 }}>No mandates yet.</p>
+          <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No mandates yet.</p>
         ) : (
           <ul style={{ paddingLeft: 18, fontSize: 13 }}>
             {mandates.map((m) => {
               const row = toMandateRow(m);
               return (
                 <li key={row.id} style={{ marginBottom: 8 }}>
-                  <div><code>{row.targetName}</code> <span style={{ color: "#666" }}>in {row.targetFolder}</span></div>
-                  <div style={{ color: "#666", fontSize: 12 }}>from <code>{row.sourceScope}</code></div>
+                  <div><code>{row.targetName}</code> <span style={{ color: "var(--text-secondary)" }}>in {row.targetFolder}</span></div>
+                  <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>from <code>{row.sourceScope}</code></div>
                   <div style={{ fontSize: 12 }}>Recipe: {row.recipe}</div>
                   <button disabled={busy} onClick={() => void onRevoke(row.id)} style={{ marginTop: 4 }}>Revoke</button>
                 </li>
@@ -223,14 +230,14 @@ export function MandatesPanel() {
       <Card>
         <div style={{ fontWeight: 600, marginBottom: 8 }}>Recent mandate activity</div>
         {writes.length === 0 ? (
-          <p style={{ color: "#666", fontSize: 13 }}>No mandate changes yet.</p>
+          <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No mandate changes yet.</p>
         ) : (
           <ul style={{ paddingLeft: 18, fontSize: 13 }}>
             {[...writes].reverse().map((w) => {
               const row = toActivityRow(w);
               return (
                 <li key={row.fileWrittenId} style={{ marginBottom: 4 }}>
-                  <code>{row.fileName}</code> <span style={{ color: "#666", fontSize: 12 }}>· {row.label}</span>{" "}
+                  <code>{row.fileName}</code> <span style={{ color: "var(--text-secondary)", fontSize: 12 }}>· {row.label}</span>{" "}
                   <button disabled={busy || !row.canUndo} onClick={() => void onUndo(row.fileWrittenId)} style={{ marginLeft: 8 }}>
                     Undo
                   </button>

@@ -7,7 +7,7 @@ export function Welcome() {
   return (
     <Card>
       <h1 style={{ margin: 0 }}>Welcome to AIR Agent</h1>
-      <p style={{ color: "#666", marginTop: 4 }}>
+      <p style={{ color: "var(--text-secondary)", marginTop: 4 }}>
         Your AI agent, with verifiable identity.
       </p>
       <p style={{ marginTop: "1.5rem", lineHeight: 1.5 }}>
@@ -16,7 +16,7 @@ export function Welcome() {
         <a href="https://agentidentityregistry.org" target="_blank" rel="noreferrer">AIR</a> (the
         Agent Identity Registry).
       </p>
-      <p style={{ marginTop: 12, color: "#666", fontSize: 13 }}>
+      <p style={{ marginTop: 12, color: "var(--text-secondary)", fontSize: 13 }}>
         Your agent&apos;s private key stays on this device. We never see it.
       </p>
       <div style={{ marginTop: 24 }}>

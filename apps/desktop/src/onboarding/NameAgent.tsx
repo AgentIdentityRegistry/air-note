@@ -10,7 +10,7 @@ export function NameAgent() {
   return (
     <Card>
       <h1 style={{ margin: 0 }}>Name your agent</h1>
-      <p style={{ color: "#666", marginTop: 4 }}>
+      <p style={{ color: "var(--text-secondary)", marginTop: 4 }}>
         Give it a name. This will be visible to other agents you transact with.
       </p>
       <div style={{ marginTop: 24 }}>
@@ -32,7 +32,7 @@ export function NameAgent() {
           value={state.domain}
           onChange={(e) => dispatch({ type: "set_domain", domain: e.target.value })}
         />
-        <p style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
+        <p style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 4 }}>
           Your did:wba identifier will be derived from this domain.
         </p>
       </div>

@@ -38,7 +38,7 @@ export function SourcesPanel() {
   const active = activeGrants(grants);
 
   if (unavailable) {
-    return <p style={{ color: "#666" }}>Couldn’t reach the memory engine.</p>;
+    return <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine.</p>;
   }
 
   const onAdd = async () => {
@@ -123,9 +123,9 @@ export function SourcesPanel() {
   const everyWritable = allWritable(active.map((g) => g.canonical_root), writable);
 
   return (
-    <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #eee" }}>
+    <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
       <div style={{ fontWeight: 600, marginBottom: 4 }}>Sources</div>
-      <p style={{ color: "#666", fontSize: 13 }}>
+      <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
         Folders the agent may read into its memory. Files are read locally and never leave your machine.
       </p>
 
@@ -140,8 +140,8 @@ export function SourcesPanel() {
       </div>
 
       {summary ? <p style={{ fontSize: 13 }}>{ingestSummary(summary)}</p> : null}
-      {ingestError ? <p style={{ fontSize: 13, color: "#b00" }}>{ingestError}</p> : null}
-      {editError ? <p style={{ fontSize: 13, color: "#b00" }}>{editError}</p> : null}
+      {ingestError ? <p style={{ fontSize: 13, color: "var(--error)" }}>{ingestError}</p> : null}
+      {editError ? <p style={{ fontSize: 13, color: "var(--error)" }}>{editError}</p> : null}
 
       <ul style={{ paddingLeft: 18, fontSize: 13 }}>
         {active.map((g) => {
@@ -149,25 +149,25 @@ export function SourcesPanel() {
           return (
             <li key={g.canonical_root} style={{ marginBottom: 4 }}>
               <code>{g.canonical_root}</code>{" "}
-              <button disabled={busy} onClick={() => void onToggleWritable(g.canonical_root, !editable)} style={{ marginLeft: 8 }}>
+              <button className="secondary-btn" disabled={busy} onClick={() => void onToggleWritable(g.canonical_root, !editable)} style={{ marginLeft: 8 }}>
                 {editable ? "Disallow edits" : "Allow edits"}
               </button>
-              <button disabled={busy} onClick={() => onRevoke(g.canonical_root)} style={{ marginLeft: 8 }}>Revoke</button>
+              <button className="danger-btn" disabled={busy} onClick={() => onRevoke(g.canonical_root)} style={{ marginLeft: 8 }}>Revoke</button>
             </li>
           );
         })}
-        {active.length === 0 ? <li style={{ color: "#666", listStyle: "none" }}>No folders yet.</li> : null}
+        {active.length === 0 ? <li style={{ color: "var(--text-secondary)", listStyle: "none" }}>No folders yet.</li> : null}
       </ul>
 
       {writable.size > 0 && evolveOn === false ? (
-        <p style={{ fontSize: 13, color: "#b00" }}>
+        <p style={{ fontSize: 13, color: "var(--error)" }}>
           Edits are enabled, but the learning loop is off, so no changes will be proposed.{" "}
-          <button disabled={busy} onClick={() => void onEnableEvolve()}>Turn learning on</button>
+          <button className="secondary-btn" disabled={busy} onClick={() => void onEnableEvolve()}>Turn learning on</button>
         </p>
       ) : null}
 
       {writable.size > 0 ? (
-        <p style={{ fontSize: 12, color: "#888" }}>
+        <p style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
           Heads up: corrections the brain learned <em>before</em> you enabled a folder won’t be
           re-applied retroactively — only new contradictions are proposed.
         </p>
