@@ -54,7 +54,6 @@ export function CommandPalette({
     }, DEBOUNCE_MS);
     return () => clearTimeout(id);
     // conversations intentionally read via ref (see conversationsRef above), not a dep.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, state.query, search]);
 
   // Keyboard: arrows move, Enter navigates, Esc closes.
