@@ -3312,6 +3312,15 @@ impl EventLog {
     /// `content["resolves_proposal"]` on the `file_written`. The write itself (re-checks,
     /// base guard, atomic mutate, undo capture, sole-constructor append) is identical;
     /// only the recorded provenance gains the back-reference. Carries no `undo_of`.
+    ///
+    /// SECURITY (SP5): this TRUSTS `confirmed.verdict` without recomputing it. Callers MUST obtain
+    /// `confirmed` from a `propose_write()` run against the CURRENT filesystem + grants +
+    /// active_mandates immediately prior, so `execute_write_inner`'s loud-gate judges a FRESH
+    /// verdict. The desktop `apply_proposal` does exactly this (re-proposes, then passes the user's
+    /// `acknowledged_loud`); the autonomous mandate sweep passes `acknowledged_loud = false` so a
+    /// fresh-loud verdict fails closed. Never pass a stored/aged verdict — a propose-time-clean
+    /// verdict that is now loud (e.g. a mandate revoked between propose and apply) would otherwise
+    /// be applied unchecked.
     #[cfg(unix)]
     pub fn execute_write_resolving(
         &self,
