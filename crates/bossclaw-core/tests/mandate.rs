@@ -777,10 +777,15 @@ fn proof1b_cannot_widen_grant_rejected_at_execute_after_revoke() {
     log.verify_chain().unwrap();
 }
 
-// ── PROOF 2 — cannot shed taint. ────────────────────────────────────────────────────
+// ── PROOF 2 — external PROVENANCE is preserved; an IN-SCOPE mandate yields a Clean verdict. ──
 // A mandate whose source is EXTERNAL (an ingested file, origin:"external") → the emitted
-// `write_proposal` carries that source's `file_ingested` id in `source_event_ids`, is
-// stamped origin:"external", and the gate verdict is Untrusted + requires_loud_modal.
+// `write_proposal` carries that source's `file_ingested` id in `source_event_ids` and is
+// stamped origin:"external" — the provenance taint is NEVER shed from the record.
+// SP5 change (c): because the source is IN the mandate's authorized `source_scope` and the
+// target is the mandate's own target, the gate VERDICT is Clean / not-loud (the user's grant
+// authorizes auto-apply). The complementary "an UNAUTHORIZED external source still taints"
+// security proof lives in tests/reconcile.rs (out-of-scope / sibling / m6b-target / post-revoke
+// all stay Untrusted + loud — the trust rule cannot launder taint for anything unauthorized).
 #[test]
 fn proof2_cannot_shed_taint_external_source_stamps_proposal() {
     let (log, _tmp, src, out) = phase_log();
@@ -798,11 +803,12 @@ fn proof2_cannot_shed_taint_external_source_stamps_proposal() {
     // Lineage carries the engine-gathered external source id.
     let lineage = prop.model_meta.as_ref().expect("Tier-B").source_event_ids.clone();
     assert!(lineage.contains(&sid), "lineage carries the external source's file_ingested id");
-    // The append chokepoint stamped origin:"external" (taint never shed).
-    assert_eq!(prop.content["origin"], json!("external"), "external source taints the proposal");
-    // The verdict (recorded summary) is Untrusted + loud.
-    assert_eq!(prop.content["verdict_summary"]["taint"], json!("Untrusted"), "verdict taint=Untrusted");
-    assert_eq!(prop.content["verdict_summary"]["requires_loud_modal"], json!(true), "loud modal required");
+    // The append chokepoint stamped origin:"external" — the provenance is preserved (never shed).
+    assert_eq!(prop.content["origin"], json!("external"), "external source's provenance is recorded");
+    // SP5 (c): an IN-SCOPE authorized mandate source yields a Clean / not-loud verdict (auto-appliable).
+    // An unauthorized / out-of-scope source would stay Untrusted + loud (proven in tests/reconcile.rs).
+    assert_eq!(prop.content["verdict_summary"]["taint"], json!("Clean"), "in-scope mandate source ⇒ Clean verdict");
+    assert_eq!(prop.content["verdict_summary"]["requires_loud_modal"], json!(false), "Clean ⇒ not loud (auto-appliable)");
     log.verify_chain().unwrap();
 }
 
