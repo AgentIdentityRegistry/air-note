@@ -12,6 +12,10 @@
   --text-primary: #0b0f17;
   --text-secondary: rgba(11, 15, 23, 0.62);
   --text-tertiary: rgba(11, 15, 23, 0.42);
+  --diff-add-bg: #eafaef;
+  --diff-del-bg: #fdecea;
+  --diff-add-fg: #0a7d3c;
+  --diff-del-fg: #a3242b;
   --elev-1: 0 1px 2px rgba(11, 15, 23, 0.05);
   --elev-2: 0 8px 20px rgba(11, 15, 23, 0.12);
   --elev-3: 0 10px 24px rgba(11, 15, 23, 0.14);
@@ -52,6 +56,10 @@
   --elev-1: 0 1px 2px rgba(0, 0, 0, 0.28);
   --elev-2: 0 8px 20px rgba(0, 0, 0, 0.32);
   --elev-3: 0 10px 24px rgba(0, 0, 0, 0.36);
+  --diff-add-bg: color-mix(in srgb, var(--success) 22%, var(--surface));
+  --diff-del-bg: color-mix(in srgb, var(--error) 22%, var(--surface));
+  --diff-add-fg: color-mix(in srgb, var(--success) 90%, white);
+  --diff-del-fg: color-mix(in srgb, var(--error) 90%, white);
 }
 
 :root[data-skin="minimal_dark"] {
@@ -64,6 +72,10 @@
   --text-tertiary: rgba(255, 255, 255, 0.42);
   --primary: #4b82ff;
   --accent: #4b82ff;
+  --diff-add-bg: color-mix(in srgb, var(--success) 22%, var(--surface));
+  --diff-del-bg: color-mix(in srgb, var(--error) 22%, var(--surface));
+  --diff-add-fg: color-mix(in srgb, var(--success) 90%, white);
+  --diff-del-fg: color-mix(in srgb, var(--error) 90%, white);
 }
 
 :root[data-skin="jrpg"] {
