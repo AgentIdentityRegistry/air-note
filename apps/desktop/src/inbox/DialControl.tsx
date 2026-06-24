@@ -25,7 +25,7 @@ export function DialControl({ did }: { did: string }) {
         {OPTIONS.map((o) => (
           <button key={o} disabled={busy} onClick={() => change(o)}
             style={{ padding: "4px 10px", fontSize: 12, border: "none", cursor: "pointer",
-              background: o === value ? "var(--primary)" : "var(--surface)", color: o === value ? "var(--surface)" : "var(--text-primary)" }}>
+              background: o === value ? "var(--primary)" : "var(--surface)", color: o === value ? "var(--on-primary)" : "var(--text-primary)" }}>
             {o}
           </button>
         ))}

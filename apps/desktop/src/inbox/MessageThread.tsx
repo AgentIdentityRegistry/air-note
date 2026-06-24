@@ -14,7 +14,7 @@ export function MessageThread({ items, onRetry }: { items: ThreadItem[]; onRetry
           <div key={it.envelope_id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "80%" }}>
             <div style={{
               padding: "8px 12px", borderRadius: 10, fontSize: 14,
-              background: mine ? "var(--primary)" : "var(--surface-soft)", color: mine ? "var(--surface)" : "var(--text-primary)",
+              background: mine ? "var(--primary)" : "var(--surface-soft)", color: mine ? "var(--on-primary)" : "var(--text-primary)",
               opacity: it.status === "pending" ? 0.6 : 1,
             }}>{bodyText(it.body)}</div>
             <div style={{ display: "flex", gap: 4, marginTop: 2, justifyContent: mine ? "flex-end" : "flex-start", flexWrap: "wrap" }}>
