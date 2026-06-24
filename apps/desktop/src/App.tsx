@@ -63,7 +63,8 @@ function Shell() {
   return (
     <div className="app-shell">
       <Sidebar view={view} onNavigate={setView} inboxUnread={totalUnread} reviewCount={reviewCount} />
-      <main className="main-area">
+      {/* The inbox fills the viewport and owns its own scroll; other panels scroll the whole area. */}
+      <main className={view === "inbox" ? "main-area main-area-fill" : "main-area"}>
         <MainSearch onOpen={openSearch} />
         {view === "identity" ? (
           <IdentityPanel />
