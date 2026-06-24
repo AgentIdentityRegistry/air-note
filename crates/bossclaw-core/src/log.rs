@@ -44,6 +44,13 @@ use crate::store::Store;
 /// source for what value gets written today.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// The distinctive phrase the engine's defense-in-depth loud-gate
+/// ([`EventLog::execute_write_inner`]) embeds when it refuses a loud write made without
+/// `acknowledged_loud`. Single-sourced so the refusal site here, the desktop classifier that maps
+/// the refusal back to a "risky → leave queued" outcome (`bossclaw_core::LOUD_ACK_REQUIRED_MSG`),
+/// and the loud-gate tests all agree on ONE string — no duplicated magic literal to drift.
+pub const LOUD_ACK_REQUIRED_MSG: &str = "loud write requires acknowledged_loud";
+
 /// Per-target depth of the N-deep recoverable-undo store (M6a, spec L3 §7.3).
 /// After each write, older `undo_state` rows for the same `canonical_target` are
 /// GC'd so at most this many remain (by `created_at`/rowid order). `16` is the
@@ -3375,7 +3382,7 @@ impl EventLog {
         // future caller. The ONLY sanctioned ack-without-UI path is `undo_write` (a hash-verified
         // inverse of an already-approved write), which passes true with a documented exemption.
         if verdict.requires_loud_modal && !acknowledged_loud {
-            return Err(reject("loud write requires acknowledged_loud (refused fail-closed)"));
+            return Err(reject(&format!("{LOUD_ACK_REQUIRED_MSG} (refused fail-closed)")));
         }
 
         // The whole TOCTOU-critical window is held under the rename mutex (spec §9).

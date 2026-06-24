@@ -96,6 +96,24 @@ impl std::fmt::Display for EngineOpError {
     }
 }
 
+/// Classify an error string returned by the engine's execute path into an `EngineOpError`.
+///
+/// The engine's defense-in-depth loud-gate (`execute_write_inner`) refuses a loud write with a
+/// known phrase (`bossclaw_core::LOUD_ACK_REQUIRED_MSG`). Surface that as `NeedsLoudConfirm`
+/// (not `Core`) so the auto-apply sweep treats it as the benign "risky → leave queued" case rather
+/// than an unexpected fault that pollutes the unexpected-error log channel. Any other engine error
+/// stays `Core`. The phrase is the discriminator because the engine reports it as the generic
+/// `BossclawError::InvalidInput` (shared by every fail-closed reject), so the typed variant alone
+/// cannot distinguish the loud-reject — only its message can. The substring is single-sourced from
+/// the engine const so the refusal site and this classifier can never drift.
+fn execute_error_to_engine_op_error(msg: String) -> EngineOpError {
+    if msg.contains(bossclaw_core::LOUD_ACK_REQUIRED_MSG) {
+        EngineOpError::NeedsLoudConfirm(msg)
+    } else {
+        EngineOpError::Core(msg)
+    }
+}
+
 /// A row in the Review queue, projected from one open `PendingProposal`. The
 /// `requires_loud_modal` is lifted out of the propose-time `verdict_summary` for the badge/card.
 #[derive(Debug, Clone)]
@@ -835,8 +853,14 @@ impl EngineHandle {
             // Thread the caller's ack to the ENGINE loud-gate (SP5 change d): this op already
             // refused above unless acked-or-not-loud, so the engine gate sees a consistent value
             // (defense-in-depth — the same check now lives in execute_write_inner for every caller).
+            // Classify the engine's error: its defense-in-depth loud-gate in `execute_write_inner`
+            // refuses a loud write → map that to `NeedsLoudConfirm` (not `Core`) so the auto-apply
+            // sweep treats it as the benign "risky → leave queued" case and the unexpected-error log
+            // channel stays meaningful. Defense in depth only: the line-828 fresh-verdict check above
+            // normally fires first because BOTH it and the engine gate read the SAME fresh `gated`
+            // verdict — so this path is unreachable today, only IF the two ever diverge in the future.
             let fw_id = log.execute_write_resolving(gated, &p.id, acknowledged_loud)
-                .map_err(|e| EngineOpError::Core(e.to_string()))?;
+                .map_err(|e| execute_error_to_engine_op_error(e.to_string()))?;
             Ok(ApplyResult { file_written_id: fw_id })
         })
         .await
@@ -989,6 +1013,26 @@ mod tests {
         let v = e.embed(&["hello".to_string()]).unwrap();
         assert_eq!(v[0].len(), 8);
         assert_eq!(e.model_id(), "mock-v1");
+    }
+
+    /// The engine's defense-in-depth loud-gate (`execute_write_inner`) refuses a loud write with a
+    /// known phrase; the classifier maps that to `NeedsLoudConfirm` so the sweep treats it as a
+    /// clean skip, and any other engine error to `Core`. This is a pure classifier test — a full
+    /// end-to-end test through `apply_proposal` is NOT possible because that path is unreachable
+    /// (its line-828 fresh-verdict check fires first, from the same verdict the engine gate reads).
+    #[test]
+    fn execute_error_to_engine_op_error_maps_loud_reject_else_core() {
+        // The engine wraps the loud-reject as `InvalidInput("execute_write fail-closed: <MSG>
+        // (refused fail-closed)")`. Build the sample FROM the shared const so this test can't drift
+        // from the real phrase either.
+        let loud = execute_error_to_engine_op_error(format!(
+            "execute_write fail-closed: {} (refused fail-closed)",
+            bossclaw_core::LOUD_ACK_REQUIRED_MSG,
+        ));
+        assert!(matches!(loud, EngineOpError::NeedsLoudConfirm(_)), "loud-reject phrase ⇒ NeedsLoudConfirm");
+
+        let other = execute_error_to_engine_op_error("some unrelated engine failure".into());
+        assert!(matches!(other, EngineOpError::Core(_)), "any other message ⇒ Core");
     }
 
     #[tokio::test]
