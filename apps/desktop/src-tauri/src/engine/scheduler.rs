@@ -17,6 +17,25 @@ use std::time::Duration;
 /// thermal throttling is M7 (named limitation).
 pub const EVOLVE_INTERVAL: Duration = Duration::from_secs(300);
 
+/// Hard cap on mandate proposals auto-applied per sweep (mirrors the engine's per-tick proposal
+/// cap). Excess clean proposals spill to the next tick (~5-min-per-excess latency, accepted —
+/// see the spec failure matrix). Lives desktop-side: the sweep is an app action (Approach A).
+pub const MANDATE_AUTOAPPLY_PER_SWEEP: usize = 8;
+
+/// PURE candidate selection for the auto-apply sweep (the unit-tested core). Given `(id, producer)`
+/// pairs in oldest-first order, return up to `cap` ids whose producer is EXACTLY the M6c mandate
+/// proposer — fail-closed: any other value, including empty/unknown, is excluded (the producer
+/// filter is a contract/UX boundary; the taint/loud gate at apply is the security gate). Keeps
+/// oldest-first so the sweep is fair.
+pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String> {
+    pending
+        .iter()
+        .filter(|(_id, producer)| producer == bossclaw_core::graph::M6C_PROPOSER_PRODUCER)
+        .take(cap)
+        .map(|(id, _producer)| id.clone())
+        .collect()
+}
+
 /// Whether one scheduler wake should run an evolve tick or skip it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TickGate {
@@ -66,6 +85,18 @@ pub fn spawn(engine: Arc<EngineHandle>, identity: IdentityStore) {
             {
                 // Records telemetry inside; a `Busy` (manual tick overlap) is a harmless skip.
                 let _ = engine.evolve_once(onboarded).await;
+                // SP5: right after the tick, auto-apply the CLEAN mandate proposals it produced and
+                // leave risky ones queued. INTENTIONALLY coupled to the Run tick — on Ollama-down no
+                // tick runs, so an already-queued clean proposal waits until Ollama returns (accepted
+                // coupling, spec failure matrix). No-ops when mandates are off (the sweep re-reads the
+                // flag per item; with none on it finds no M6c candidates). Per-item errors are
+                // swallowed+logged inside the sweep so one bad proposal can't break the cadence; here
+                // we surface a one-line summary so the autonomous loop is observable (MF5 / security L1).
+                match engine.mandate_autoapply_sweep(onboarded).await {
+                    Ok(0) => {} // nothing applied this tick — stay quiet.
+                    Ok(n) => eprintln!("mandate sweep: auto-applied {n} clean mandate write(s)"),
+                    Err(e) => eprintln!("mandate sweep: aborted before applying: {e}"),
+                }
             }
         }
     });
@@ -83,5 +114,23 @@ mod tests {
         assert_eq!(decide_tick(true, true, false, 5), Skip); // ollama unavailable
         assert_eq!(decide_tick(true, true, true, 0), Skip); // empty queue
         assert_eq!(decide_tick(true, true, true, 5), Run); // all conditions met
+    }
+
+    #[test]
+    fn sweep_candidates_filters_to_m6c_oldest_first_and_caps() {
+        // (id, producer) pairs in oldest-first order; only m6c survive, capped at the limit.
+        let pending = vec![
+            ("p1".to_string(), "m6b-reconciler".to_string()),
+            ("p2".to_string(), "m6c-mandate-proposer".to_string()),
+            ("p3".to_string(), "m6c-mandate-proposer".to_string()),
+            ("p4".to_string(), "".to_string()), // empty/unknown → never
+            ("p5".to_string(), "m6c-mandate-proposer".to_string()),
+        ];
+        let picked = sweep_candidates(&pending, 2);
+        assert_eq!(picked, vec!["p2".to_string(), "p3".to_string()],
+            "only m6c, oldest-first, capped at 2 (p5 spills to the next tick)");
+        // An empty/unknown producer is NEVER auto-appliable.
+        let none = sweep_candidates(&[("x".to_string(), "".to_string())], 8);
+        assert!(none.is_empty(), "empty producer is never swept");
     }
 }

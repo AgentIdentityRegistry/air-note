@@ -92,8 +92,9 @@ fn file_written_records_resolves_proposal_only_when_set() {
         .expect("propose_write")
     };
 
-    // Plain write → no `resolves_proposal` key.
-    let plain_id = log.execute_write(gate_create("plain.txt")).expect("execute_write");
+    // Plain write → no `resolves_proposal` key. The cited source is an ingested (external) file
+    // ⇒ Untrusted ⇒ loud, so this success-path write acks to clear the engine loud-gate (SP5 d).
+    let plain_id = log.execute_write(gate_create("plain.txt"), true).expect("execute_write");
     let plain = log.event_by_id(&plain_id).unwrap().unwrap();
     assert_eq!(plain.event_type, "file_written");
     assert!(
@@ -103,7 +104,7 @@ fn file_written_records_resolves_proposal_only_when_set() {
 
     // Resolving write → the key carries the proposal id.
     let resolved_id = log
-        .execute_write_resolving(gate_create("resolved.txt"), "prop-xyz")
+        .execute_write_resolving(gate_create("resolved.txt"), "prop-xyz", true)
         .expect("execute_write_resolving");
     let resolved = log.event_by_id(&resolved_id).unwrap().unwrap();
     assert_eq!(resolved.content["resolves_proposal"], json!("prop-xyz"));
@@ -260,7 +261,9 @@ fn proposal_bytes_round_trip_through_execute_write_resolving() {
             rationale: "apply reconciliation proposal".to_string(),
         })
         .expect("propose_write");
-    let written_id = log.execute_write_resolving(gated, &pid).expect("execute_write_resolving");
+    // The cited source is an ingested (external) file ⇒ Untrusted ⇒ loud; this confirm-path test
+    // drives it to success, so it acks the engine loud-gate (SP5 change d).
+    let written_id = log.execute_write_resolving(gated, &pid, true).expect("execute_write_resolving");
 
     // The file now holds the corrected bytes, and the record back-references the proposal.
     assert_eq!(std::fs::read(&target).unwrap(), corrected.to_vec());
@@ -1184,7 +1187,9 @@ fn proposal_round_trip_emit_confirm_execute_resolve_undo() {
         "fresh, write-granted target → the gate passes (reject_reason: {:?})",
         gated.verdict.reject_reason
     );
-    let fw_id = log.execute_write_resolving(gated, &pid).expect("execute_write_resolving");
+    // The proposal targets an ingested file with an ingested lineage ⇒ Untrusted ⇒ loud; this
+    // lifecycle test confirms it onto disk, so it acks the engine loud-gate (SP5 change d).
+    let fw_id = log.execute_write_resolving(gated, &pid, true).expect("execute_write_resolving");
 
     // ── Assert the lifecycle CLOSES. ──
     // 1. the on-disk target now holds the corrected bytes the side table cached.
@@ -1208,4 +1213,372 @@ fn proposal_round_trip_emit_confirm_execute_resolve_undo() {
     assert_eq!(original_on_disk, original.to_vec(), "sanity: the snapshot equals the seeded body");
 
     log.verify_chain().unwrap();
+}
+
+// ── SP5 (c) trust-rule tests ────────────────────────────────────────────────
+// Fixture: `dest` is a FRESH WRITE-ONLY-granted tempdir holding the mandate target (a mandate
+// target MUST be outside every read root — add_mandate guard #4); a SEPARATE read-granted `scope`
+// tempdir holds one ingested source. The mandate authorizes `scope` as the source for
+// `dest/synced.md`. Returns (log, home, dest, scope, gated) — home/dest/scope kept alive by the
+// caller; `gated` is the verdict for the rewrite citing the ingested source.
+#[cfg(unix)]
+fn trust_fixture(
+    source_body: &[u8],
+    new_body: &[u8],
+) -> (bossclaw_core::EventLog, tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, bossclaw_core::actuator::GatedProposal) {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    // The harness gives an onboarded log; its `files` dir is read+write so we do NOT use it for a
+    // mandate target — create a fresh WRITE-ONLY dest dir instead.
+    let (log, home, _files) = common::open_log_with_write_grant();
+    let dest = tempfile::tempdir().unwrap();
+    log.add_write_grant(dest.path()).unwrap(); // write-ONLY (no add_grant) → valid mandate target root.
+    let target = dest.path().join("synced.md");
+    std::fs::write(&target, b"stale\n").unwrap();
+    // A SEPARATE read-granted scope dir holds the source; ingest it so it is `external`.
+    let scope = tempfile::tempdir().unwrap();
+    log.add_grant(scope.path()).unwrap();
+    let src_path = scope.path().join("src.md");
+    std::fs::write(&src_path, source_body).unwrap();
+    let src_id = common::ingest_one(&log, &src_path);
+    // Grant the mandate: target in `dest` (write-only), sources under `scope` (read).
+    log.add_mandate(&target, scope.path(), "sync the target from scope").unwrap();
+    log.rebuild_graph().unwrap();
+    let gated = log.propose_write(WriteProposal {
+        target: target.clone(),
+        new_content: new_body.to_vec(),
+        op: WriteOp::Edit,
+        source_event_ids: vec![src_id],
+        rationale: "mandate sync".to_string(),
+    }).unwrap();
+    (log, home, dest, scope, gated)
+}
+
+#[cfg(unix)]
+#[test]
+fn mandate_in_scope_clean_source_is_not_loud() {
+    let (_log, _home, _dest, _scope, gated) = trust_fixture(b"clean source text\n", b"clean new text\n");
+    assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Clean,
+        "an in-scope authorized source must NOT taint the mandate's target");
+    assert!(!gated.verdict.requires_loud_modal, "clean + in-scope ⇒ not loud (auto-appliable)");
+}
+
+#[cfg(unix)]
+#[test]
+fn mandate_secret_shaped_content_is_loud_even_in_scope() {
+    // All-in-scope, but the NEW content is secret-shaped (>=32-char alnum run) → diff_flags → loud.
+    let (_log, _home, _dest, _scope, gated) = trust_fixture(
+        b"clean source\n",
+        b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n",
+    );
+    assert!(gated.verdict.requires_loud_modal,
+        "secret-shaped content forces loud via diff_flags even when sources are in-scope");
+}
+
+#[cfg(unix)]
+#[test]
+fn mandate_out_of_scope_source_is_loud() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    let (log, _home, dest, scope_a, _gated) = trust_fixture(b"clean\n", b"new\n");
+    // scope_a is the mandate's authorized scope (from the fixture); scope_b is a DIFFERENT
+    // read-granted dir whose source is OUT of scope.
+    let scope_b = tempfile::tempdir().unwrap();
+    log.add_grant(scope_b.path()).unwrap();
+    let outside = scope_b.path().join("evil.md");
+    std::fs::write(&outside, b"out of scope source\n").unwrap();
+    let outside_id = common::ingest_one(&log, &outside);
+    let _ = &scope_a; // the in-scope dir is kept alive; the proposal cites the OUT-of-scope source.
+    let target = dest.path().join("synced.md"); // `dest` is now a TempDir (write-only mandate root).
+    let gated = log.propose_write(WriteProposal {
+        target, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
+        source_event_ids: vec![outside_id], rationale: "x".to_string(),
+    }).unwrap();
+    assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Untrusted,
+        "an out-of-scope external source still taints");
+    assert!(gated.verdict.requires_loud_modal, "out-of-scope ⇒ loud → queued, never auto-applied");
+}
+
+#[cfg(unix)]
+#[test]
+fn mandate_sibling_scope_prefix_is_loud_segment_aware() {
+    // L1: a source under `<scope>-evil` (a sibling sharing a string prefix) must NOT be cleared —
+    // containment is segment-aware, so `/p/scope-evil/x` is not "under" `/p/scope`.
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    let (log, _home, _files) = common::open_log_with_write_grant();
+    // The mandate target lives in a FRESH WRITE-ONLY dir (outside every read root — guard #4).
+    let dest = tempfile::tempdir().unwrap();
+    log.add_write_grant(dest.path()).unwrap();
+    let target = dest.path().join("synced.md");
+    std::fs::write(&target, b"stale\n").unwrap();
+    // Build sibling dirs `scope` and `scope-evil` under the SAME parent.
+    let parent = tempfile::tempdir().unwrap();
+    let scope = parent.path().join("scope");
+    let evil = parent.path().join("scope-evil");
+    std::fs::create_dir(&scope).unwrap();
+    std::fs::create_dir(&evil).unwrap();
+    log.add_grant(&scope).unwrap();
+    log.add_grant(&evil).unwrap();
+    let evil_src = evil.join("s.md");
+    std::fs::write(&evil_src, b"sibling source\n").unwrap();
+    let evil_id = common::ingest_one(&log, &evil_src);
+    log.add_mandate(&target, &scope, "sync from scope only").unwrap();
+    log.rebuild_graph().unwrap();
+    let gated = log.propose_write(WriteProposal {
+        target: target.clone(), new_content: b"new\n".to_vec(), op: WriteOp::Edit,
+        source_event_ids: vec![evil_id], rationale: "x".to_string(),
+    }).unwrap();
+    assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Untrusted,
+        "a sibling `scope-evil` path must NOT be cleared (segment-aware containment)");
+    assert!(gated.verdict.requires_loud_modal);
+}
+
+#[cfg(unix)]
+#[test]
+fn mandate_after_revoke_is_loud_again() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    let (log, _home, _dest, scope, gated_before) = trust_fixture(b"clean\n", b"new\n");
+    assert_eq!(gated_before.verdict.taint, bossclaw_core::actuator::Taint::Clean, "clean while granted");
+    // Revoke the only active mandate, then re-gate the SAME shape → taints again.
+    let m = log.active_mandates().unwrap().into_iter().next().unwrap();
+    log.revoke_mandate(&m.mandate_grant_id).unwrap();
+    log.rebuild_graph().unwrap();
+    // Fetch the already-ingested source id from the projection (ingest is idempotent; no re-ingest).
+    let canonical_src = std::fs::canonicalize(scope.path().join("src.md")).unwrap()
+        .to_string_lossy().to_string();
+    let src_id = log.current_files().unwrap().into_iter()
+        .find(|r| r.canonical_path == canonical_src).map(|r| r.file_event_id).unwrap();
+    // Reuse the original target directly off the prior gated proposal (GatedProposal.proposal pub).
+    let target = gated_before.proposal.target.clone();
+    let gated_after = log.propose_write(WriteProposal {
+        target, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
+        source_event_ids: vec![src_id], rationale: "x".to_string(),
+    }).unwrap();
+    assert_eq!(gated_after.verdict.taint, bossclaw_core::actuator::Taint::Untrusted,
+        "after revoke there is no active mandate → the source re-taints");
+    assert!(gated_after.verdict.requires_loud_modal);
+}
+
+#[cfg(unix)]
+#[test]
+fn mandate_unresolvable_target_taints_all_candidates() {
+    // M2: if the target cannot be canonicalized, every external candidate must be escalated
+    // (taint, never skip). We force unresolvability by proposing an EDIT to a path that does
+    // not exist (Edit canonicalizes the target itself, which then fails → canonical == None).
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    let (log, _home, _files) = common::open_log_with_write_grant();
+    // Mandate target + the propose target both live in a FRESH WRITE-ONLY dir (guard #4).
+    let dest = tempfile::tempdir().unwrap();
+    log.add_write_grant(dest.path()).unwrap();
+    let scope = tempfile::tempdir().unwrap();
+    log.add_grant(scope.path()).unwrap();
+    let src = scope.path().join("s.md");
+    std::fs::write(&src, b"clean\n").unwrap();
+    let src_id = common::ingest_one(&log, &src);
+    // A mandate whose target is a real (write-granted, read-free) file, so add_mandate's guards pass…
+    let real_target = dest.path().join("real.md");
+    std::fs::write(&real_target, b"x\n").unwrap();
+    log.add_mandate(&real_target, scope.path(), "r").unwrap();
+    log.rebuild_graph().unwrap();
+    // …but PROPOSE against a NON-EXISTENT target path (Edit ⇒ canonicalize fails ⇒ None).
+    let missing = dest.path().join("does-not-exist.md");
+    let gated = log.propose_write(WriteProposal {
+        target: missing, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
+        source_event_ids: vec![src_id], rationale: "x".to_string(),
+    }).unwrap();
+    assert!(gated.verdict.reject_reason.is_some(), "an unresolvable Edit target is a reject_reason");
+    assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Untrusted,
+        "an unresolvable target escalates ALL external candidates (taint, never skip)");
+}
+
+#[cfg(unix)]
+#[test]
+fn m6b_reconcile_target_stays_loud_trust_rule_did_not_leak() {
+    // The SCOPING PROOF: an M6b-style proposal whose TARGET is an INGESTED file (inside a read
+    // root) must still be Untrusted/loud — the trust rule keys on `m.target == proposal target`,
+    // and a mandate target is OUTSIDE every read root (the add_mandate self-loop guard), so the
+    // two sets are disjoint and the rule can never clear an ingested-target write.
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    // The harness `dir` is read+write-granted; an ingested file under it is a valid M6b target.
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let scope = tempfile::tempdir().unwrap();
+    log.add_grant(scope.path()).unwrap();
+    let src = scope.path().join("s.md");
+    std::fs::write(&src, b"clean\n").unwrap();
+    let src_id = common::ingest_one(&log, &src);
+    // The TARGET is itself an ingested file under a read root.
+    let ingested_target = dir.join("note.md");
+    std::fs::write(&ingested_target, b"old\n").unwrap();
+    let _tgt_id = common::ingest_one(&log, &ingested_target);
+    // A mandate exists for some OTHER target (so active_mandates is non-empty), proving the rule
+    // is consulted yet still does not clear THIS ingested-target write.
+    let other = tempfile::tempdir().unwrap();
+    log.add_write_grant(other.path()).unwrap();
+    let other_target = other.path().join("synced.md");
+    std::fs::write(&other_target, b"x\n").unwrap();
+    log.add_mandate(&other_target, scope.path(), "r").unwrap();
+    log.rebuild_graph().unwrap();
+    // Propose a rewrite of the INGESTED target citing the clean source.
+    let gated = log.propose_write(WriteProposal {
+        target: ingested_target.clone(), new_content: b"new\n".to_vec(), op: WriteOp::Edit,
+        source_event_ids: vec![src_id], rationale: "reconcile".to_string(),
+    }).unwrap();
+    assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Untrusted,
+        "Step-4 engine-anchored taint keeps an ingested-TARGET write loud (rule did not leak)");
+    assert!(gated.verdict.requires_loud_modal);
+}
+
+// ── SP5 (d) engine loud-gate tests ──────────────────────────────────────────
+/// Build a gated LOUD proposal (secret-shaped content ⇒ requires_loud_modal) against a real
+/// write-granted, ingested file. Returns (log, home-keepalive, dir-keepalive, gated, target).
+#[cfg(unix)]
+fn loud_gated(
+) -> (bossclaw_core::EventLog, tempfile::TempDir, std::path::PathBuf, bossclaw_core::actuator::GatedProposal, std::path::PathBuf) {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    // `dir` is read+write-granted; `home` is the keepalive TempDir.
+    let (log, home, dir) = common::open_log_with_write_grant();
+    let target = dir.join("note.md");
+    std::fs::write(&target, b"placeholder\n").unwrap();
+    let id = common::ingest_one(&log, &target); // ingested ⇒ external ⇒ Untrusted too
+    let gated = log.propose_write(WriteProposal {
+        target: target.clone(),
+        new_content: b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec(),
+        op: WriteOp::Edit,
+        source_event_ids: vec![id],
+        rationale: "loud".to_string(),
+    }).unwrap();
+    assert!(gated.verdict.requires_loud_modal, "secret-shaped + ingested ⇒ loud");
+    (log, home, dir, gated, target)
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_write_loud_without_ack_fails_closed_then_permits_with_ack() {
+    let (log, _home, _dir, gated, target) = loud_gated();
+    let original = std::fs::read(&target).unwrap();
+    // Public entry without ack → fail closed, file untouched.
+    let err = log.execute_write(gated.clone(), false).unwrap_err();
+    assert!(err.to_string().contains("loud write requires acknowledged_loud"),
+        "a loud write without the ack must fail closed: {err}");
+    assert_eq!(std::fs::read(&target).unwrap(), original, "no write happened without the ack");
+    // With ack → it writes.
+    let fw = log.execute_write(gated, true).unwrap();
+    assert!(!fw.is_empty(), "the ack lets the loud write through");
+    assert_ne!(std::fs::read(&target).unwrap(), original, "the file changed after the acked write");
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_write_resolving_loud_without_ack_fails_closed() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let target = dir.join("note.md");
+    std::fs::write(&target, b"placeholder\n").unwrap();
+    let fid = common::ingest_one(&log, &target);
+    // Record an open proposal so execute_write_resolving has an id to resolve.
+    let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
+    let hash = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&new_bytes)) };
+    let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+    let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+    let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+        op: WriteOp::Edit, source_event_ids: vec![fid.clone()], rationale: "loud".to_string() }).unwrap();
+    let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+        "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+        "base_content_hash": gated.verdict.base_content_hash});
+    let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64, "loud",
+        &key, &vs, std::slice::from_ref(&fid)).unwrap();
+    log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+    let original = std::fs::read(&target).unwrap();
+    // ack=false → fail closed; the proposal stays open + the file is untouched.
+    let err = log.execute_write_resolving(gated, &pid, false).unwrap_err();
+    assert!(err.to_string().contains("loud write requires acknowledged_loud"), "fail closed: {err}");
+    assert_eq!(std::fs::read(&target).unwrap(), original, "no write without the ack");
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_of_a_tainted_write_succeeds_via_the_exemption() {
+    // The undo exemption (H1): an undo cites the original file_written (external ⇒ re-gate is
+    // loud), so WITHOUT the `acknowledged_loud = true` exemption inside undo_write, every undo of
+    // a tainted-file write would fail closed. Assert it succeeds.
+    let (log, _home, _dir, gated, target) = loud_gated();
+    let original = std::fs::read(&target).unwrap();
+    let fw = log.execute_write(gated, true).unwrap(); // apply the loud write (acked)
+    let changed = std::fs::read(&target).unwrap();
+    assert_ne!(changed, original, "applied");
+    // Undo must restore the original even though the re-gate of the inverse is loud.
+    log.undo_write(&fw).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), original, "undo restored the pre-write bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_proposals_surface_producer_for_m6c_vs_m6b() {
+    let (log, _home, dir) = common::open_write_grant_and_external_target();
+    let path = dir.join("n.md");
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let lineage = common::seed_memory(&log, "Alice works at Acme"); // returns the memory id
+    let key_a = serde_json::json!({"src":"entity:a","relation":"r","dst":"entity:b"});
+    let key_b = serde_json::json!({"src":"entity:c","relation":"r","dst":"entity:d"});
+    let vs = serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true});
+
+    let m6c = log.append_write_proposal_with(&canonical, "edit", "deadbeef", 0, "why-c",
+        &key_a, &vs, std::slice::from_ref(&lineage), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+    let m6b = log.append_write_proposal_with(&canonical, "edit", "feedface", 0, "why-b",
+        &key_b, &vs, std::slice::from_ref(&lineage), bossclaw_core::graph::M6B_PROPOSER_PRODUCER).unwrap();
+
+    let pending = log.pending_proposals().unwrap();
+    let by_id = |id: &str| pending.iter().find(|p| p.id == id).unwrap().clone();
+    assert_eq!(by_id(&m6c).producer, "m6c-mandate-proposer", "M6c producer surfaced");
+    assert_eq!(by_id(&m6b).producer, "m6b-reconciler", "M6b producer surfaced");
+}
+
+#[cfg(unix)]
+#[test]
+fn mandate_writes_attributes_m6c_excludes_m6b_and_flips_undone() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    use sha2::{Digest, Sha256};
+    // `dir` is a read+write-granted PathBuf (the harness grants both).
+    let (log, _home, dir) = common::open_log_with_write_grant();
+
+    // Helper: write `file` with `old`, ingest it, then apply a rewrite to `new` resolving a
+    // proposal stamped with `producer`. Returns (file_written_id, canonical_target).
+    let apply_via = |file: &str, old: &[u8], new: &[u8], producer: &str| -> (String, String) {
+        let path = dir.join(file);
+        std::fs::write(&path, old).unwrap();
+        let fid = common::ingest_one(&log, &path);
+        let hash = hex::encode(Sha256::digest(new));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":file});
+        let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new.to_vec(),
+            op: WriteOp::Edit, source_event_ids: vec![fid.clone()], rationale: "sync".to_string() }).unwrap();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new.len() as u64, "sync",
+            &key, &vs, std::slice::from_ref(&fid), producer).unwrap();
+        log.put_proposal_bytes(&pid, new, &hash).unwrap();
+        // Apply (acked — these are loud because ingested ⇒ Untrusted; the activity list test
+        // only cares about attribution, so pass true to let the write land).
+        let fw = log.execute_write_resolving(gated, &pid, true).unwrap();
+        (fw, canonical)
+    };
+
+    let (m6c_fw, m6c_target) = apply_via("mandated.md", b"old-c\n", b"new-c\n",
+        bossclaw_core::graph::M6C_PROPOSER_PRODUCER);
+    let (_m6b_fw, _m6b_target) = apply_via("reconciled.md", b"old-b\n", b"new-b\n",
+        bossclaw_core::graph::M6B_PROPOSER_PRODUCER);
+
+    let writes = log.mandate_writes().unwrap();
+    assert_eq!(writes.len(), 1, "only the M6c write is attributed to a mandate");
+    let w = &writes[0];
+    assert_eq!(w.file_written_id, m6c_fw);
+    assert_eq!(w.target, m6c_target);
+    assert!(!w.undone, "not undone yet");
+    assert!(!w.written_at.is_empty(), "written_at carried");
+
+    // Undo the M6c write → its row flips `undone` (the undo is a file_written carrying undo_of,
+    // no resolves_proposal, so it is excluded from the join and only flips the original's flag).
+    log.undo_write(&m6c_fw).unwrap();
+    let writes2 = log.mandate_writes().unwrap();
+    assert_eq!(writes2.len(), 1, "the undo does not add an attributed row (it has no resolves_proposal)");
+    assert!(writes2[0].undone, "undone flips true after undo_write");
 }

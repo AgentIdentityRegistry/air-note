@@ -9,6 +9,7 @@ const base: ProposalDto = {
   new_content_hash: "abc",
   rationale: "Alice now works at Globex",
   requires_loud_modal: false,
+  producer: "",
 };
 
 describe("toProposalRow", () => {
@@ -32,5 +33,10 @@ describe("toProposalRow", () => {
     const r = toProposalRow({ ...base, target: "alice.md" });
     expect(r.fileName).toBe("alice.md");
     expect(r.folder).toBe("");
+  });
+
+  it("flags an m6c proposal as from a mandate", () => {
+    expect(toProposalRow({ ...base, producer: "m6c-mandate-proposer" }).fromMandate).toBe(true);
+    expect(toProposalRow({ ...base, producer: "m6b-reconciler" }).fromMandate).toBe(false);
   });
 });

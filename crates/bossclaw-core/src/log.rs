@@ -381,6 +381,10 @@ pub struct PendingProposal {
     pub inducing_key: serde_json::Value,
     /// Lineage event ids (`model_meta.source_event_ids`); empty if absent.
     pub source_event_ids: Vec<String>,
+    /// The proposer's producer stamp (`model_meta.model_id`): `"m6b-reconciler"` for an M6b
+    /// reconcile proposal, `"m6c-mandate-proposer"` for an M6c mandate proposal; empty when
+    /// `model_meta` is absent. The desktop sweep auto-applies iff this is exactly the M6c stamp.
+    pub producer: String,
     /// The propose-time verdict summary `{requires_loud_modal, taint, allowed, base_content_hash}`
     /// (`content["verdict_summary"]`).
     pub verdict_summary: serde_json::Value,
@@ -401,6 +405,23 @@ impl PendingProposal {
             .and_then(|v| v.as_bool())
             .unwrap_or(true)
     }
+}
+
+/// One applied write attributed to a mandate (M6c), projected for the desktop Mandate-activity
+/// list. Built by [`EventLog::mandate_writes`] via a join — an applied write is stamped with the
+/// actuator producer, not the proposer, so the discriminator is the resolved proposal's producer.
+/// `#[cfg(unix)]` like the rest of the mandate/confirm surface.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MandateWriteRecord {
+    /// The `file_written` event id (also the handle Undo passes to `undo_write`).
+    pub file_written_id: String,
+    /// Canonical target path written (`content["target"]`).
+    pub target: String,
+    /// RFC-3339 time the write was recorded (`ts`).
+    pub written_at: String,
+    /// True iff a LATER `file_written` carries `undo_of == this.file_written_id`.
+    pub undone: bool,
 }
 
 impl EventLog {
@@ -2369,10 +2390,12 @@ impl EventLog {
                         .and_then(|v| v.as_str()).map(|s| s.to_string());
                     let source_event_ids = ev.model_meta.as_ref()
                         .map(|m| m.source_event_ids.clone()).unwrap_or_default();
+                    let producer = ev.model_meta.as_ref()
+                        .map(|m| m.model_id.clone()).unwrap_or_default();
                     proposal_keys.insert(id.clone(), (target.clone(), inducing_key.to_string()));
                     open.push(PendingProposal {
                         id, target, op, new_content_hash, rationale,
-                        inducing_key, source_event_ids, base_content_hash, verdict_summary,
+                        inducing_key, source_event_ids, producer, base_content_hash, verdict_summary,
                     });
                 }
                 t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
@@ -3042,6 +3065,10 @@ impl EventLog {
         // `filter_map` to the resolvable subset and judge only those — that would
         // let a confused-deputy hide the inducing event behind a bogus id that
         // reads "clean" because it is simply absent.
+        // Candidate external sources gathered in Step 1 but NOT escalated yet (SP5 c): a
+        // mandate may authorize them against THIS target, which we can only test after Step 2
+        // resolves the canonical target. Each is `(event_id, ingested canonical_path)`.
+        let mut external_candidates: Vec<(String, Option<String>)> = Vec::new();
         if p.source_event_ids.is_empty() {
             reject_reason.get_or_insert_with(|| "source_event_ids is empty".to_string());
         } else {
@@ -3050,12 +3077,16 @@ impl EventLog {
                     Some(ev) => {
                         let prov = Self::provenance_from_event(&ev);
                         if prov.is_external {
-                            taint = Taint::Untrusted;
+                            // DEFER escalation: record the candidate + its ingested path. The
+                            // `origin_path` on the provenance is the source's canonical path
+                            // (from the files projection), the exact stored form we compare
+                            // against `m.source_scope` — never re-canonicalize a live path (M2).
+                            external_candidates.push((prov.event_id.clone(), prov.origin_path.clone()));
                         }
                         provenance.push(prov);
                     }
                     None => {
-                        // Unresolvable cited source ⇒ fail closed over the set.
+                        // Unresolvable cited source ⇒ fail closed over the set (target-independent).
                         taint = Taint::Untrusted;
                     }
                 }
@@ -3088,6 +3119,44 @@ impl EventLog {
                 false
             }
         };
+
+        // ── Step 1.5: escalate deferred external candidates unless a mandate authorizes them ──
+        // (SP5 change c, SECURITY-CRITICAL.) An external cited source does NOT taint iff some
+        // ACTIVE mandate `m` has `m.target == canonical_target` AND the source's ingested
+        // canonical_path is segment-aware UNDER `m.source_scope`. FAIL-CLOSED ORDERING (M2/L1):
+        //   • if the target is unresolvable (`canonical == None`) → escalate EVERY candidate;
+        //   • else escalate each candidate UNLESS authorized.
+        // `active_mandates()` is read ONCE here, inside this gate evaluation (an in-flight revoke
+        // is caught by the apply-time re-gate). Both sides of the containment test are STORED
+        // canonical forms (scope canonical-at-grant; source canonical-from-projection) compared
+        // with segment-aware `Path::starts_with` — never re-canonicalize a live (symlinkable) path.
+        if !external_candidates.is_empty() {
+            match &canonical {
+                None => {
+                    // Unresolvable target ⇒ cannot authorize anything ⇒ taint ALL (never skip).
+                    taint = Taint::Untrusted;
+                }
+                Some(canonical_target) => {
+                    let canonical_target_str = canonical_target.to_string_lossy().to_string();
+                    let mandates = self.active_mandates()?;
+                    for (_src_id, src_canonical) in &external_candidates {
+                        let authorized = match src_canonical {
+                            // A candidate with no recorded ingested path cannot be proven
+                            // in-scope → fail closed (taint).
+                            None => false,
+                            Some(src_path) => mandates.iter().any(|m| {
+                                m.target == canonical_target_str
+                                    && std::path::Path::new(src_path)
+                                        .starts_with(std::path::Path::new(&m.source_scope))
+                            }),
+                        };
+                        if !authorized {
+                            taint = Taint::Untrusted;
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Step 3: op × existence matrix ─────────────────────────────────────────
         // One `symlink_metadata` probe (NOFOLLOW semantics: it describes the final
@@ -3230,10 +3299,12 @@ impl EventLog {
     pub fn execute_write(
         &self,
         confirmed: crate::actuator::GatedProposal,
+        acknowledged_loud: bool,
     ) -> Result<String, BossclawError> {
         // The public entry: a normal (non-undo) write carries no `undo_of` and
         // resolves no proposal (the recorded `file_written` is byte-identical to M6a).
-        self.execute_write_inner(confirmed, None, None)
+        // The caller's loud acknowledgement is threaded to the engine loud-gate.
+        self.execute_write_inner(confirmed, None, None, acknowledged_loud)
     }
 
     /// As [`execute_write`](Self::execute_write), but records that this write RESOLVES
@@ -3241,13 +3312,23 @@ impl EventLog {
     /// `content["resolves_proposal"]` on the `file_written`. The write itself (re-checks,
     /// base guard, atomic mutate, undo capture, sole-constructor append) is identical;
     /// only the recorded provenance gains the back-reference. Carries no `undo_of`.
+    ///
+    /// SECURITY (SP5): this TRUSTS `confirmed.verdict` without recomputing it. Callers MUST obtain
+    /// `confirmed` from a `propose_write()` run against the CURRENT filesystem + grants +
+    /// active_mandates immediately prior, so `execute_write_inner`'s loud-gate judges a FRESH
+    /// verdict. The desktop `apply_proposal` does exactly this (re-proposes, then passes the user's
+    /// `acknowledged_loud`); the autonomous mandate sweep passes `acknowledged_loud = false` so a
+    /// fresh-loud verdict fails closed. Never pass a stored/aged verdict — a propose-time-clean
+    /// verdict that is now loud (e.g. a mandate revoked between propose and apply) would otherwise
+    /// be applied unchecked.
     #[cfg(unix)]
     pub fn execute_write_resolving(
         &self,
         confirmed: crate::actuator::GatedProposal,
         resolves_proposal: &str,
+        acknowledged_loud: bool,
     ) -> Result<String, BossclawError> {
-        self.execute_write_inner(confirmed, None, Some(resolves_proposal))
+        self.execute_write_inner(confirmed, None, Some(resolves_proposal), acknowledged_loud)
     }
 
     /// The shared execute path for both [`execute_write`](Self::execute_write) (the
@@ -3263,6 +3344,7 @@ impl EventLog {
         confirmed: crate::actuator::GatedProposal,
         undo_of: Option<&str>,
         resolves_proposal: Option<&str>,
+        acknowledged_loud: bool,
     ) -> Result<String, BossclawError> {
         use crate::actuator::WriteOp;
         use std::os::unix::ffi::OsStrExt;
@@ -3283,6 +3365,17 @@ impl EventLog {
         }
         if !verdict.allowed {
             return Err(reject("verdict.allowed is false (target not under an active write grant)"));
+        }
+
+        // ── Step 1a.5: ENGINE-ENFORCED loud-gate (SP5 change d, SECURITY-CRITICAL) ─
+        // A loud write (Untrusted ∪ Delete ∪ secret/value-shaped) is refused unless the caller
+        // passed `acknowledged_loud == true`. This makes "a loud write needs an explicit ack" an
+        // engine INVARIANT for every caller — desktop apply (threads the user's value), the
+        // autonomous sweep (passes false ⇒ a loud mandate write can never auto-apply), and any
+        // future caller. The ONLY sanctioned ack-without-UI path is `undo_write` (a hash-verified
+        // inverse of an already-approved write), which passes true with a documented exemption.
+        if verdict.requires_loud_modal && !acknowledged_loud {
+            return Err(reject("loud write requires acknowledged_loud (refused fail-closed)"));
         }
 
         // The whole TOCTOU-critical window is held under the rename mutex (spec §9).
@@ -3910,9 +4003,14 @@ impl EventLog {
         if let Some(reason) = &gated.verdict.reject_reason {
             return Err(fail(&format!("re-gated undo proposal rejected: {reason}")));
         }
-        // An undo records NO frame and resolves NO M6b proposal (it carries `undo_of`,
-        // not `resolves_proposal`).
-        let undo_event_id = self.execute_write_inner(gated, Some(file_written_id), None)?;
+        // An undo records NO frame and resolves NO M6b proposal (it carries `undo_of`, not
+        // `resolves_proposal`). It passes `acknowledged_loud = true` as the SOLE sanctioned
+        // ack-without-UI exemption (SP5 change d): an undo is a hash-verified inverse-restore of
+        // `pre_bytes` already validated against the recorded base_content_hash — the inverse of an
+        // already-approved write, never fresh untrusted content. Its re-gate is loud (the inverse
+        // cites the original external file_written), so without this exemption every undo of a
+        // tainted-file write would fail closed.
+        let undo_event_id = self.execute_write_inner(gated, Some(file_written_id), None, true)?;
 
         // ── Pop this frame + hand the stack top off to the previous frame ─────────
         // The undo succeeded, so this frame is consumed: delete it. Then, if a previous
@@ -6596,6 +6694,74 @@ impl EventLog {
             .unwrap_or_else(|_| GENESIS.to_string());
         hw.save(&Mark { count, tip_hash })
     }
+
+    /// Every applied write attributable to a MANDATE (M6c), newest-LAST in event order
+    /// (`events_of_types` returns `seq ASC`; the desktop reverses for newest-first display).
+    ///
+    /// Attribution requires a JOIN: a `file_written` is stamped `ACTUATOR_PRODUCER`, so the only
+    /// link to a mandate is `content.resolves_proposal` → a `write_proposal` whose
+    /// `model_meta.model_id == M6C_PROPOSER_PRODUCER`. Two invariants govern the join (SP5 L2 +
+    /// security L3):
+    ///   • COMPLETENESS — because Option B removed the preventive review, an applied M6c write that
+    ///     never surfaced (with no Undo offered) would be an invisible autonomous change. In PRACTICE
+    ///     the join is TOTAL: an M6c `write_proposal` is never GC'd while its `file_written` is live
+    ///     (a resolved proposal is retained), so every applied M6c write is attributable here.
+    ///   • FAIL-CLOSED against FALSE attribution — a row is included ONLY when its resolved proposal's
+    ///     producer is PROVABLY `M6C_PROPOSER_PRODUCER`. A `file_written` whose `resolves_proposal`
+    ///     cannot be resolved to a known M6c producer is EXCLUDED (not "degraded to target-only"):
+    ///     claiming an unprovable write is a mandate write would be worse than omitting it, and the
+    ///     completeness invariant means this exclusion is unreachable for a real M6c write anyway.
+    /// `#[cfg(unix)]` (mandate surface).
+    #[cfg(unix)]
+    pub fn mandate_writes(&self) -> Result<Vec<MandateWriteRecord>, BossclawError> {
+        use std::collections::{HashMap, HashSet};
+        // proposal id → producer (from write_proposal events).
+        let mut producer_of: HashMap<String, String> = HashMap::new();
+        // file_written_id → (target, written_at) for the FORWARD (non-undo) applied writes that
+        // resolve a proposal.
+        let mut applied: Vec<(String, String, String, String)> = Vec::new(); // (fw_id, target, ts, resolves)
+        // the set of file_written ids that a later undo cites (`undo_of`).
+        let mut undone_ids: HashSet<String> = HashSet::new();
+
+        for ev in self.events_of_types(&[
+            crate::graph::WRITE_PROPOSAL_EVENT_TYPE,
+            crate::graph::FILE_WRITTEN_EVENT_TYPE,
+        ])? {
+            match ev.event_type.as_str() {
+                t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    let producer = ev.model_meta.as_ref()
+                        .map(|m| m.model_id.clone()).unwrap_or_default();
+                    producer_of.insert(ev.id.clone(), producer);
+                }
+                _ => {
+                    // file_written. An UNDO carries `undo_of` and NO `resolves_proposal` — record
+                    // the undone id and skip it as an attributed row.
+                    if let Some(undone) = ev.content.get("undo_of").and_then(|v| v.as_str()) {
+                        undone_ids.insert(undone.to_string());
+                        continue;
+                    }
+                    if let Some(resolves) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        let target = ev.content.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        applied.push((ev.id.clone(), target, ev.ts.clone(), resolves.to_string()));
+                    }
+                }
+            }
+        }
+
+        Ok(applied
+            .into_iter()
+            .filter(|(_fw, _t, _ts, resolves)| {
+                // Keep ONLY writes whose resolved proposal is an M6c mandate proposal. An
+                // unresolvable producer (GC'd proposal) cannot be proven M6c ⇒ excluded (in
+                // practice unreachable — an M6c proposal outlives its file_written).
+                producer_of.get(resolves).map(|p| p == crate::graph::M6C_PROPOSER_PRODUCER).unwrap_or(false)
+            })
+            .map(|(fw, target, ts, _resolves)| {
+                let undone = undone_ids.contains(&fw);
+                MandateWriteRecord { file_written_id: fw, target, written_at: ts, undone }
+            })
+            .collect())
+    }
 }
 
 /// The text fed to the embedder for an event, or `None` if the event is not
@@ -6967,7 +7133,7 @@ mod tests {
             rationale: "w8 ordering".to_string(),
         };
         let gated = log.propose_write(proposal).unwrap();
-        let id = log.execute_write(gated).unwrap();
+        let id = log.execute_write(gated, false).unwrap();
         undo_test_hooks::clear_pre_mutate_probe();
 
         assert!(probe_fired.load(Ordering::SeqCst), "the pre-mutate probe must have fired");
@@ -7012,7 +7178,7 @@ mod tests {
             rationale: "tamper".to_string(),
         };
         let gated = log.propose_write(proposal).unwrap();
-        let write_id = log.execute_write(gated).unwrap();
+        let write_id = log.execute_write(gated, false).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"v1 edited bytes");
 
         // Tamper the stored pre_bytes (so its hash != recorded base_content_hash),

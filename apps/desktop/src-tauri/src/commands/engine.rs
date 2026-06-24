@@ -240,13 +240,14 @@ pub struct ProposalDto {
     pub new_content_hash: String,
     pub rationale: String,
     pub requires_loud_modal: bool,
+    pub producer: String,
 }
 impl From<crate::engine::ProposalSummary> for ProposalDto {
     fn from(p: crate::engine::ProposalSummary) -> Self {
         Self {
             id: p.id, target: p.target, op: p.op,
             new_content_hash: p.new_content_hash, rationale: p.rationale,
-            requires_loud_modal: p.requires_loud_modal,
+            requires_loud_modal: p.requires_loud_modal, producer: p.producer,
         }
     }
 }
@@ -348,6 +349,79 @@ pub async fn engine_set_evolve_enabled(
 pub async fn engine_set_proposals_enabled(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
     let onboarded = state.identity_store.is_onboarded();
     state.engine.set_proposals_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
+}
+
+/// Flip the sticky mandates off-switch (SP5 global Mandates on/off). Off by default.
+#[tauri::command]
+pub async fn engine_set_mandates_enabled(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_mandates_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
+}
+
+/// Read the sticky mandates flag (SF5 — the UI toggle reads this on mount to reflect persisted state).
+#[tauri::command]
+pub async fn engine_mandates_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.mandates_enabled(onboarded).await.map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+pub struct MandateDto {
+    pub mandate_grant_id: String,
+    pub target: String,
+    pub source_scope: String,
+    pub recipe: String,
+    pub granted_at: String,
+    pub revoked: bool,
+}
+impl From<crate::engine::MandateSummary> for MandateDto {
+    fn from(m: crate::engine::MandateSummary) -> Self {
+        Self {
+            mandate_grant_id: m.mandate_grant_id, target: m.target, source_scope: m.source_scope,
+            recipe: m.recipe, granted_at: m.granted_at, revoked: m.revoked,
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_add_mandate(target: String, source_scope: String, recipe: String, state: State<'_, AppState>) -> Result<MandateDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let m = state.engine.add_mandate(onboarded, std::path::PathBuf::from(target),
+        std::path::PathBuf::from(source_scope), recipe).await.map_err(|e| e.to_string())?;
+    Ok(MandateDto::from(m))
+}
+
+#[tauri::command]
+pub async fn engine_revoke_mandate(mandate_grant_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.revoke_mandate(onboarded, mandate_grant_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn engine_list_mandates(state: State<'_, AppState>) -> Result<Vec<MandateDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let mandates = state.engine.list_mandates(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(mandates.into_iter().map(MandateDto::from).collect())
+}
+
+#[derive(Serialize)]
+pub struct MandateWriteDto {
+    pub file_written_id: String,
+    pub target: String,
+    pub written_at: String,
+    pub undone: bool,
+}
+impl From<crate::engine::MandateWriteSummary> for MandateWriteDto {
+    fn from(r: crate::engine::MandateWriteSummary) -> Self {
+        Self { file_written_id: r.file_written_id, target: r.target, written_at: r.written_at, undone: r.undone }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_mandate_writes(state: State<'_, AppState>) -> Result<Vec<MandateWriteDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let writes = state.engine.mandate_writes(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(writes.into_iter().map(MandateWriteDto::from).collect())
 }
 
 /// Run one evolve tick now ("Evolve now"). Returns the tick report.
@@ -548,5 +622,81 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("undo_write fail-closed") && msg.contains("no undo record"),
             "expected the undo_write fail-closed signature (arg bound + op ran), got: {msg}");
+    }
+
+    #[test]
+    fn engine_add_mandate_binds_camelcase_arg_over_ipc() {
+        use crate::air::identity::{IdentityMetadata, IdentityStore};
+        use crate::air::types::Did;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = CmdTestVault::new();
+        let identity_store = IdentityStore::new(vault.clone(), dir.path().to_path_buf());
+        identity_store.save_signing_key(&[7u8; 32]).unwrap();
+        identity_store.save_metadata(&IdentityMetadata {
+            did: Did("did:wba:AIR-TEST:cmd".to_string()),
+            name: "Test".to_string(),
+            created_at: "2026-06-23T00:00:00Z".to_string(),
+        }).unwrap();
+        let engine = Arc::new(crate::engine::EngineHandle::new(
+            vault, dir.path().to_path_buf(),
+            Arc::new(crate::engine::embed::MockEmbedderProvider::new(8)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        ));
+        let state = AppState {
+            air_client: Arc::new(crate::air::MockAirClient::new()),
+            identity_store,
+            inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
+            engine,
+        };
+
+        // ACL: a mock app has NO capability grant, so without this the request is rejected with
+        // "engine_add_mandate not allowed. Plugin not found" BEFORE arg deserialization — and a
+        // negative assertion would vacuously pass. The invoke URL `http://tauri.localhost` is a
+        // Remote origin, so the grant must name that exact origin.
+        let origin: tauri::utils::acl::RemoteUrlPattern =
+            "http://tauri.localhost".parse().expect("valid remote url pattern");
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.runtime_authority_mut().__allow_command(
+            "engine_add_mandate".to_string(),
+            tauri::utils::acl::ExecutionContext::Remote { url: origin },
+        );
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![engine_add_mandate])
+            .build(context)
+            .expect("build mock app");
+        app.manage(state);
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        // A real (existing) but NOT write-granted target dir + a scope dir, so the op REACHES the
+        // engine grant guard and rejects with a deterministic signature (proving the op ran).
+        let target_dir = tempfile::tempdir().unwrap();
+        let scope_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("synced.md");
+        std::fs::write(&target, b"x\n").unwrap();
+
+        let res = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "engine_add_mandate".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                // camelCase `sourceScope` — must bind to the snake_case `source_scope` param.
+                body: tauri::ipc::InvokeBody::Json(serde_json::json!({
+                    "target": target.to_string_lossy(),
+                    "sourceScope": scope_dir.path().to_string_lossy(),
+                    "recipe": "r",
+                })),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        );
+        // POSITIVE op-ran assertion: the engine grant guard's "target not write-granted" signature
+        // can ONLY appear past the arg binding + the op. A routing reject, a missing-key
+        // deserialize error, or a wrong key (`source_scope` never bound) could never produce it.
+        let err = res.expect_err("an un-write-granted target makes add_mandate reject");
+        let msg = err.to_string();
+        assert!(msg.contains("not write-granted"),
+            "expected the engine grant-guard signature (sourceScope bound + op ran), got: {msg}");
     }
 }

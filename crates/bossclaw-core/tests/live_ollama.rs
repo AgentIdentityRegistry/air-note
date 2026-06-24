@@ -971,7 +971,9 @@ fn m6c_live_sync_end_to_end() {
                 rationale: "confirm the live mandate sync".into(),
             })
             .expect("propose_write returns a verdict");
-        log.execute_write_resolving(gated, &pid)
+        // Both cited sources are in-scope for this mandate ⇒ the SP5 (c) trust rule keeps the
+        // verdict Clean (not loud) ⇒ ack=false clears the engine loud-gate (SP5 change d).
+        log.execute_write_resolving(gated, &pid, false)
             .expect("the grounded proposal confirms onto disk");
         assert_eq!(
             std::fs::read(&target).unwrap(),

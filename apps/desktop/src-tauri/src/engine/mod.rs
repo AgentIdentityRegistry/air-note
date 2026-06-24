@@ -71,6 +71,11 @@ pub enum EngineOpError {
     /// pass `acknowledged_loud == true`. The op refuses to write — the UI must show the
     /// "I've reviewed this" confirm and retry with the ack. Carries the reason.
     NeedsLoudConfirm(String),
+    /// A mandate grant was refused by an engine grant-time guard (recipe too long, source scope not resolvable,
+    /// target not write-granted, or target under a read-grant root). Carries the reason so the
+    /// New-mandate form can show *why*. Distinct from `Core` so the UI can style it as a validation
+    /// error, not an engine fault.
+    Rejected(String),
     Join(String),
 }
 
@@ -85,6 +90,7 @@ impl std::fmt::Display for EngineOpError {
             EngineOpError::Stale(m) => write!(f, "the file changed since this was suggested: {m}"),
             EngineOpError::Revoked(m) => write!(f, "edits aren't allowed in this folder anymore: {m}"),
             EngineOpError::NeedsLoudConfirm(m) => write!(f, "this change needs an explicit review confirmation: {m}"),
+            EngineOpError::Rejected(m) => write!(f, "{m}"),
             EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
         }
     }
@@ -100,6 +106,9 @@ pub struct ProposalSummary {
     pub new_content_hash: String,
     pub rationale: String,
     pub requires_loud_modal: bool,
+    /// The proposer's producer stamp (`"m6b-reconciler"` / `"m6c-mandate-proposer"`), surfaced so
+    /// the Review UI can label a mandate-driven rewrite "from mandate".
+    pub producer: String,
 }
 
 impl ProposalSummary {
@@ -115,6 +124,47 @@ impl ProposalSummary {
             new_content_hash: p.new_content_hash,
             rationale: p.rationale,
             requires_loud_modal,
+            producer: p.producer,
+        }
+    }
+}
+
+/// A mandate row for the desktop Mandates list, projected from `bossclaw_core::Mandate` (the six
+/// fields map 1:1).
+#[derive(Debug, Clone)]
+pub struct MandateSummary {
+    pub mandate_grant_id: String,
+    pub target: String,
+    pub source_scope: String,
+    pub recipe: String,
+    pub granted_at: String,
+    pub revoked: bool,
+}
+
+/// One Mandate-activity row, projected from `bossclaw_core::MandateWriteRecord`.
+#[derive(Debug, Clone)]
+pub struct MandateWriteSummary {
+    pub file_written_id: String,
+    pub target: String,
+    pub written_at: String,
+    pub undone: bool,
+}
+
+impl From<bossclaw_core::MandateWriteRecord> for MandateWriteSummary {
+    fn from(r: bossclaw_core::MandateWriteRecord) -> Self {
+        Self { file_written_id: r.file_written_id, target: r.target, written_at: r.written_at, undone: r.undone }
+    }
+}
+
+impl From<bossclaw_core::Mandate> for MandateSummary {
+    fn from(m: bossclaw_core::Mandate) -> Self {
+        Self {
+            mandate_grant_id: m.mandate_grant_id,
+            target: m.target,
+            source_scope: m.source_scope,
+            recipe: m.recipe,
+            granted_at: m.granted_at,
+            revoked: m.revoked,
         }
     }
 }
@@ -352,10 +402,10 @@ impl EngineHandle {
     }
 
     /// Neutralize the engine's dangerous default-ON autonomy flags at startup, WITHOUT
-    /// clobbering a user's explicit choice. `evolve`/`proposals` are forced off ONLY when the
-    /// user never explicitly set them (`!explicitly_set`), so an explicit on/off persists across
-    /// opens (SP4 change-b). `mandates_enabled` is ALWAYS forced off until SP5, regardless of any
-    /// prior setting. Each setter is sticky; runs inside `get_or_open`'s first-open closure.
+    /// clobbering a user's explicit choice. `evolve`/`proposals`/`mandates` are forced off ONLY
+    /// when the user never explicitly set them (`!explicitly_set`), so an explicit on/off persists
+    /// across opens (SP4 change-b for evolve/proposals; SP5 for mandates). Each setter is sticky;
+    /// runs inside `get_or_open`'s first-open closure.
     fn prime_switches(log: &EventLog) -> Result<(), bossclaw_core::BossclawError> {
         use bossclaw_core::ConfigFlag;
         if !log.explicitly_set(ConfigFlag::Evolve)? && log.evolve_enabled()? {
@@ -364,8 +414,10 @@ impl EngineHandle {
         if !log.explicitly_set(ConfigFlag::Proposals)? && log.proposals_enabled()? {
             log.set_proposals_enabled(false)?;
         }
-        // SP5 not shipped: mandates stay forced OFF even if a prior build set them.
-        if log.mandates_enabled()? {
+        // SP5 ships mandates: persist an explicit user choice (force off ONLY when never set),
+        // exactly like evolve/proposals above. A fresh install still primes off (default-open,
+        // never-set ⇒ explicitly_set is false ⇒ force off).
+        if !log.explicitly_set(ConfigFlag::Mandates)? && log.mandates_enabled()? {
             log.set_mandates_enabled(false)?;
         }
         Ok(())
@@ -540,6 +592,87 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Flip the sticky engine mandates off-switch (SP5; gates the autonomous M6c proposer + the
+    /// desktop auto-apply sweep). Off by default; an explicit choice persists across launches via
+    /// `prime_switches`. Gated.
+    pub async fn set_mandates_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_mandates_enabled(enabled).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Read the sticky mandates on/off flag (SF5 — the UI toggle's mount-time read, so it reflects
+    /// the persisted state after relaunch rather than defaulting to OFF until clicked). Gated
+    /// `Result` form (a not-onboarded state surfaces via `Open(NotOnboarded)`). The sweep uses the
+    /// infallible `mandates_enabled_or_false` (Task 11) instead.
+    pub async fn mandates_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.mandates_enabled().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Grant a mandate (SP5). On success returns the new mandate's row. A grant-time guard
+    /// failure (recipe too long, source scope not resolvable, target not write-granted, target under a read
+    /// root) is surfaced as a TYPED `Rejected` error so the form can show *why*. Gated.
+    pub async fn add_mandate(&self, onboarded: bool, target: PathBuf, source_scope: PathBuf, recipe: String) -> Result<MandateSummary, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            let id = log.add_mandate(&target, &source_scope, &recipe).map_err(|e| match e {
+                // The engine's grant-time guards reject with InvalidInput — show the reason.
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })?;
+            // Re-read the just-granted mandate to return its full row (active_mandates is the
+            // single source of truth; the id we just minted must be present).
+            let mandate = log.active_mandates()
+                .map_err(|e| EngineOpError::Core(e.to_string()))?
+                .into_iter().find(|m| m.mandate_grant_id == id)
+                .ok_or_else(|| EngineOpError::Core("granted mandate not found after add".to_string()))?;
+            Ok(MandateSummary::from(mandate))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Revoke a mandate by its grant id (sticky; a revoke of an unknown id is a harmless no-op in
+    /// the engine). Gated.
+    pub async fn revoke_mandate(&self, onboarded: bool, mandate_grant_id: String) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.revoke_mandate(&mandate_grant_id).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Every ACTIVE mandate, oldest-first (the engine orders by `granted_at ASC`). Gated.
+    pub async fn list_mandates(&self, onboarded: bool) -> Result<Vec<MandateSummary>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            let mandates = log.active_mandates().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(mandates.into_iter().map(MandateSummary::from).collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Every applied write attributed to a mandate (M6c), for the Mandate-activity list. Gated.
+    pub async fn mandate_writes(&self, onboarded: bool) -> Result<Vec<MandateWriteSummary>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            let writes = log.mandate_writes().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(writes.into_iter().map(MandateWriteSummary::from).collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Every current ingested file (one per path). Gated.
     pub async fn list_files(&self, onboarded: bool) -> Result<Vec<bossclaw_core::graph::FileRecord>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -626,6 +759,9 @@ impl EngineHandle {
     /// `acknowledged_loud == false` the op REFUSES (`NeedsLoudConfirm`) — never a silent write.
     /// Only then does it execute (atomic temp+rename, durable undo, signed `file_written`). Nothing
     /// is written on any failure. Gated.
+    /// (A Create has no base hash; its anti-clobber is the engine's atomic no-clobber create, so the
+    /// base-hash arm is skipped for Create — the op-map runs first, then the base-hash arm gates on
+    /// `op != Create`.)
     pub async fn apply_proposal(&self, onboarded: bool, id: String, acknowledged_loud: bool) -> Result<ApplyResult, EngineOpError> {
         use sha2::{Digest, Sha256};
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -634,34 +770,40 @@ impl EngineHandle {
             let p = pending.into_iter().find(|p| p.id == id)
                 .ok_or_else(|| EngineOpError::Stale("proposal not found or already resolved".to_string()))?;
 
-            // ── ANTI-CLOBBER: compare the live file to the proposal's propose-time fingerprint. ──
-            // This is the TRUE staleness detector (a fresh propose_write below re-bases on the live
-            // file and cannot detect that it changed). Edit-only proposals always carry a base.
-            let live_bytes = std::fs::read(&p.target)
-                .map_err(|e| EngineOpError::Stale(format!("could not read target: {e}")))?;
-            let live_hash = hex::encode(Sha256::digest(&live_bytes));
-            match &p.base_content_hash {
-                Some(base) if *base != live_hash => {
-                    return Err(EngineOpError::Stale(format!(
-                        "the file changed since this was suggested (base {base} != live {live_hash})"
-                    )));
-                }
-                None => {
-                    // No recorded base (e.g. a legacy/minimal proposal) → cannot prove freshness.
-                    return Err(EngineOpError::Stale("proposal has no base fingerprint to verify against".to_string()));
-                }
-                _ => {} // base matches live → proceed.
-            }
-
-            // Map the proposal's OWN op back to a `WriteOp` (fail-closed on an unknown string —
-            // NEVER default to Edit). SP4's M6b only emits "edit", so this is behavior-identical
-            // today; mapping it keeps a future Create/Delete proposal from being mis-gated as Edit.
+            // Map the proposal's OWN op back to a `WriteOp` FIRST (fail-closed on an unknown
+            // string — NEVER default to Edit), because the base-hash anti-clobber below applies
+            // only to Edit/Delete (a Create has no base).
             let op = match p.op.as_str() {
                 "edit" => bossclaw_core::actuator::WriteOp::Edit,
                 "create" => bossclaw_core::actuator::WriteOp::Create,
                 "delete" => bossclaw_core::actuator::WriteOp::Delete,
                 other => return Err(EngineOpError::Core(format!("unknown proposal op: {other}"))),
             };
+
+            // ── ANTI-CLOBBER (Edit/Delete only): compare the live file to the proposal's
+            // propose-time fingerprint. This is the TRUE staleness detector (a fresh propose_write
+            // below re-bases on the live file and cannot detect that it changed). A CREATE has no
+            // base (target absent at propose) — its anti-clobber is the engine's ATOMIC no-clobber
+            // create at the syscall (RENAME_NOREPLACE on Linux; statat+renameat on macOS). We do
+            // NOT add a desktop absence pre-check: it would be a strictly weaker TOCTOU check than
+            // the engine's atomic no-clobber. So skip the base-hash arm entirely for a Create.
+            if op != bossclaw_core::actuator::WriteOp::Create {
+                let live_bytes = std::fs::read(&p.target)
+                    .map_err(|e| EngineOpError::Stale(format!("could not read target: {e}")))?;
+                let live_hash = hex::encode(Sha256::digest(&live_bytes));
+                match &p.base_content_hash {
+                    Some(base) if *base != live_hash => {
+                        return Err(EngineOpError::Stale(format!(
+                            "the file changed since this was suggested (base {base} != live {live_hash})"
+                        )));
+                    }
+                    None => {
+                        // No recorded base on an Edit/Delete (legacy/minimal) → cannot prove freshness.
+                        return Err(EngineOpError::Stale("proposal has no base fingerprint to verify against".to_string()));
+                    }
+                    _ => {} // base matches live → proceed.
+                }
+            }
             // Verified bytes (fail closed if the side-table row is missing/tampered).
             let bytes = log.get_proposal_bytes_checked(&p.id, &p.new_content_hash)
                 .map_err(|e| EngineOpError::Core(e.to_string()))?;
@@ -690,7 +832,10 @@ impl EngineHandle {
             }
             // execute is atomic temp+rename: it never partially writes, so a failure here also
             // leaves the file untouched. (Defensive: any execute error surfaces as Core.)
-            let fw_id = log.execute_write_resolving(gated, &p.id)
+            // Thread the caller's ack to the ENGINE loud-gate (SP5 change d): this op already
+            // refused above unless acked-or-not-loud, so the engine gate sees a consistent value
+            // (defense-in-depth — the same check now lives in execute_write_inner for every caller).
+            let fw_id = log.execute_write_resolving(gated, &p.id, acknowledged_loud)
                 .map_err(|e| EngineOpError::Core(e.to_string()))?;
             Ok(ApplyResult { file_written_id: fw_id })
         })
@@ -717,6 +862,64 @@ impl EngineHandle {
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// The SP5 auto-apply sweep: after an evolve tick, auto-apply the CLEAN mandate (M6c)
+    /// proposals and leave risky ones queued for SP4 Review. Lists pending proposals (oldest-first),
+    /// filters to the M6c producer, caps at `MANDATE_AUTOAPPLY_PER_SWEEP`, and for each calls
+    /// `apply_proposal(id, acknowledged_loud=false)`:
+    ///   • CLEAN → applies (the engine loud-gate permits a non-loud write with ack=false);
+    ///   • `NeedsLoudConfirm` (risky) → swallowed; stays open → surfaces in Review;
+    ///   • `Stale` / `Revoked` / not-found → swallowed; skipped (retried next tick);
+    ///   • any OTHER error → swallowed BUT logged (`eprintln!`) so one bad proposal cannot abort the
+    ///     sweep yet the autonomous loop is never silent about an unexpected fault.
+    /// Re-reads `mandates_enabled` PER ITEM (fast-kill if the user flips it off mid-sweep).
+    /// Returns the number applied. Gated. NOTE: each `apply_proposal` re-folds `pending_proposals`
+    /// internally, so a K-item sweep is 1+K O(events) folds — bounded by the cap (projection-table
+    /// optimization is the future fix).
+    pub async fn mandate_autoapply_sweep(&self, onboarded: bool) -> Result<usize, EngineOpError> {
+        // 1. Snapshot the candidate ids (pure filter + cap over the producer-tagged pending list).
+        let pending = self.list_proposals(onboarded).await?;
+        let pairs: Vec<(String, String)> =
+            pending.into_iter().map(|p| (p.id, p.producer)).collect();
+        let candidates = crate::engine::scheduler::sweep_candidates(
+            &pairs, crate::engine::scheduler::MANDATE_AUTOAPPLY_PER_SWEEP);
+
+        // 2. Apply each, re-reading the kill-switch per item. Risky/stale/revoked are swallowed.
+        let mut applied = 0usize;
+        for id in candidates {
+            // Fast-kill: stop the moment mandates are turned off mid-sweep.
+            if !self.mandates_enabled_or_false(onboarded).await {
+                break;
+            }
+            // Keep a copy of the id for an observability message (apply_proposal consumes it).
+            let id_for_log = id.clone();
+            match self.apply_proposal(onboarded, id, false).await {
+                Ok(_) => applied += 1,
+                // A loud (risky) proposal refuses without the ack → leave it queued for Review.
+                Err(EngineOpError::NeedsLoudConfirm(_)) => {}
+                // The file drifted / grant revoked / already resolved → skip; retried next tick.
+                Err(EngineOpError::Stale(_)) | Err(EngineOpError::Revoked(_)) => {}
+                // Any OTHER error (a transient/unexpected engine fault) is swallowed so one bad
+                // proposal cannot abort the whole sweep — but it is LOGGED so the autonomous loop
+                // is never silent about an anomaly (MF5 / security L1). Desktop has no log facade,
+                // so eprintln! (matching the existing vault.rs convention).
+                Err(e) => eprintln!("mandate sweep: proposal {id_for_log} apply failed unexpectedly (skipped): {e}"),
+            }
+        }
+        Ok(applied)
+    }
+
+    /// `mandates_enabled`, defaulting to false on any error (the sweep's per-item kill-switch read).
+    /// Mirrors `evolve_enabled_or_false`. Gated read; never panics the sweep.
+    pub async fn mandates_enabled_or_false(&self, onboarded: bool) -> bool {
+        let log = match self.get_or_open(onboarded).await {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        spawn_blocking(move || log.mandates_enabled().unwrap_or(false))
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -930,7 +1133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prime_switches_preserves_explicit_proposals_but_forces_mandates_off() {
+    async fn prime_switches_preserves_explicit_proposals_and_mandates() {
         let (vault, dir) = test_vault_and_dir();
         let handle = new_test_handle(vault.clone(), &dir);
         let log = handle.get_or_open(true).await.unwrap();
@@ -938,16 +1141,18 @@ mod tests {
         assert!(!log.proposals_enabled().unwrap());
         assert!(!log.mandates_enabled().unwrap());
 
-        // The user explicitly enables proposals.
+        // The user explicitly enables BOTH proposals and mandates.
         log.set_proposals_enabled(true).unwrap();
+        log.set_mandates_enabled(true).unwrap();
         assert!(log.proposals_enabled().unwrap());
+        assert!(log.mandates_enabled().unwrap());
         drop(log);
 
         // Re-open with a FRESH handle (same vault + db_path) → prime_switches runs again.
         let handle2 = new_test_handle(vault, &dir);
         let log2 = handle2.get_or_open(true).await.unwrap();
-        assert!(log2.proposals_enabled().unwrap(), "an explicit user true MUST persist across opens");
-        assert!(!log2.mandates_enabled().unwrap(), "mandates stay forced OFF until SP5");
+        assert!(log2.proposals_enabled().unwrap(), "an explicit proposals true MUST persist across opens");
+        assert!(log2.mandates_enabled().unwrap(), "an explicit mandates true MUST persist across opens (SP5)");
     }
 
     /// Tasks 5 + 6: `run_ingest` marks the index current, then `recall` round-trips through
@@ -1127,6 +1332,23 @@ mod tests {
         assert_eq!(proposals.len(), 1);
         assert!(proposals[0].id == pid && proposals[0].requires_loud_modal,
             "an absent/garbled verdict_summary fails loud (requires_loud_modal == true)");
+    }
+
+    #[tokio::test]
+    async fn list_proposals_surfaces_producer() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let lineage = seed_one_memory_id(&log, "Alice works at Acme");
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        let vs = serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true});
+        let pid = log.append_write_proposal_with("/tmp/x/n.md", "edit", "deadbeef", 0, "why",
+            &key, &vs, std::slice::from_ref(&lineage), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+        drop(log);
+
+        let proposals = handle.list_proposals(true).await.unwrap();
+        let p = proposals.iter().find(|p| p.id == pid).unwrap();
+        assert_eq!(p.producer, "m6c-mandate-proposer", "the M6c producer is surfaced on the summary");
     }
 
     #[tokio::test]
@@ -1318,6 +1540,89 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the ack lets the loud write through");
     }
 
+    #[tokio::test]
+    async fn apply_create_proposal_writes_new_file_and_refuses_if_target_reappeared() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+
+        // ---- happy path: a Create lands the new file ----
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        // A lineage event so the Tier-B proposal is valid (a Create cites SOME source).
+        let lineage = seed_one_memory_id(&log, "make a synced file");
+        let target = folder.path().join("new.md"); // does NOT exist yet → Create
+        let new_bytes = b"freshly synced content\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        // Gate a Create proposal (base_content_hash is None for a Create).
+        let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Create, source_event_ids: vec![lineage.clone()], rationale: "create".to_string() }).unwrap();
+        assert!(gated.verdict.base_content_hash.is_none(), "a Create carries no base hash");
+        // The recorded target is the canonical PARENT-joined path (Create canonicalizes the parent).
+        let canonical = gated.verdict.target_canonical.as_ref().unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "create", &hash, new_bytes.len() as u64,
+            "create", &key, &vs, std::slice::from_ref(&lineage)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // A Create is loud (ingested-target Step-4 taint doesn't apply, but a brand-new write to a
+        // tracked folder may still be non-loud if Clean; pass acknowledged_loud=false and, if the
+        // gate is loud, retry true — robust either way). Try false first:
+        let first = handle.apply_proposal(true, pid.clone(), false).await;
+        // A loud refuse fires pre-execute, so the first call does NOT consume the proposal — the
+        // retry below still finds it via pending_proposals (the same pid is reusable).
+        let applied = match first {
+            Ok(r) => r,
+            Err(EngineOpError::NeedsLoudConfirm(_)) => handle.apply_proposal(true, pid.clone(), true).await.unwrap(),
+            Err(e) => panic!("unexpected create apply error: {e:?}"),
+        };
+        assert!(!applied.file_written_id.is_empty(), "the Create returned a file_written id");
+        assert_eq!(std::fs::read(&target).unwrap(), new_bytes, "the new file was created with the bytes");
+
+        // ---- refuse path: a Create whose target now EXISTS is refused (engine atomic no-clobber) ----
+        let (vault2, dir2) = test_vault_and_dir();
+        let handle2 = new_test_handle(vault2, &dir2);
+        let log2 = handle2.get_or_open(true).await.unwrap();
+        let folder2 = tempfile::tempdir().unwrap();
+        log2.add_grant(folder2.path()).unwrap();
+        log2.add_write_grant(folder2.path()).unwrap();
+        let lineage2 = seed_one_memory_id(&log2, "make a synced file");
+        let target2 = folder2.path().join("appears.md"); // absent at propose
+        let new2 = b"would-be content\n".to_vec();
+        let hash2 = hex::encode(Sha256::digest(&new2));
+        let g2 = log2.propose_write(WriteProposal { target: target2.clone(), new_content: new2.clone(),
+            op: WriteOp::Create, source_event_ids: vec![lineage2.clone()], rationale: "create".to_string() }).unwrap();
+        let canon2 = g2.verdict.target_canonical.as_ref().unwrap().to_string_lossy().to_string();
+        let vs2 = serde_json::json!({"requires_loud_modal": g2.verdict.requires_loud_modal,
+            "taint": format!("{:?}", g2.verdict.taint), "allowed": g2.verdict.allowed,
+            "base_content_hash": g2.verdict.base_content_hash});
+        let pid2 = log2.append_write_proposal(&canon2, "create", &hash2, new2.len() as u64, "create",
+            &serde_json::json!({"src":"a","relation":"r","dst":"b"}), &vs2, std::slice::from_ref(&lineage2)).unwrap();
+        log2.put_proposal_bytes(&pid2, &new2, &hash2).unwrap();
+        drop(log2);
+
+        // The target reappears on disk BEFORE apply (a racer created it).
+        std::fs::write(&target2, b"already here\n").unwrap();
+        // Apply must fail closed (SF1): the FRESH `propose_write` re-gate runs `classify_op_existence`
+        // and, seeing op=Create against an EXISTING target, sets `reject_reason = "create target
+        // already exists"`; `apply_proposal` maps a `reject_reason` to `EngineOpError::Stale` (the
+        // `gated.verdict.reject_reason.is_some() => Stale` arm), so it fails BEFORE execute — the
+        // syscall atomic no-clobber is the deeper backstop but is not what fires here. Assert the
+        // SPECIFIC Stale variant, and that the racer's file is untouched.
+        let refused = handle2.apply_proposal(true, pid2, true).await;
+        assert!(matches!(refused, Err(EngineOpError::Stale(_))),
+            "a Create whose target reappeared must fail closed as Stale (re-gate classify_op_existence): {refused:?}");
+        assert_eq!(std::fs::read(&target2).unwrap(), b"already here\n".to_vec(),
+            "the racer's file is untouched (the apply never reached execute)");
+    }
+
     /// Task 7 (mint): with the stub returning one entity for the extraction schema, an
     /// enabled `evolve_once` over a seeded memory mints ≥1 entity, and a follow-up recall
     /// surfaces the new entity dossier-adjacent content (here: the entity itself is folded,
@@ -1490,6 +1795,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_mandates_enabled_toggles_the_engine_flag() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(!log.mandates_enabled().unwrap(), "primed off at first open");
+        drop(log);
+
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(log.mandates_enabled().unwrap(), "the op flips the sticky flag on");
+        drop(log);
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.set_mandates_enabled(false, true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandates_enabled_reflects_the_persisted_flag() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        // Off by default at first open.
+        assert!(!handle.mandates_enabled(true).await.unwrap(), "default off");
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        assert!(handle.mandates_enabled(true).await.unwrap(), "the getter reflects the flip");
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.mandates_enabled(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
     async fn decline_proposal_removes_it_from_pending() {
         let (vault, dir) = test_vault_and_dir();
         let handle = new_test_handle(vault, &dir);
@@ -1553,5 +1893,292 @@ mod tests {
             handle.undo_apply(false, applied.file_written_id).await,
             Err(EngineOpError::Open(EngineError::NotOnboarded))
         ));
+    }
+
+    #[tokio::test]
+    async fn mandate_crud_round_trip_and_grant_rejection_is_typed() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        // A mandate target must be WRITE-granted AND outside every read root (add_mandate guard #4),
+        // so `dest` is WRITE-ONLY (no add_grant); the read-granted `scope` holds the sources.
+        let dest = tempfile::tempdir().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        log.add_write_grant(dest.path()).unwrap(); // write-ONLY → valid mandate target root.
+        log.add_grant(scope.path()).unwrap();
+        let target = dest.path().join("synced.md");
+        std::fs::write(&target, b"x\n").unwrap();
+        drop(log);
+
+        // add → returns a MandateSummary with the canonical fields.
+        let m = handle.add_mandate(true, target.clone(), scope.path().to_path_buf(),
+            "keep it synced".to_string()).await.unwrap();
+        assert!(!m.mandate_grant_id.is_empty());
+        assert_eq!(m.recipe, "keep it synced");
+        assert!(!m.revoked);
+
+        // list → one active mandate.
+        let listed = handle.list_mandates(true).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].mandate_grant_id, m.mandate_grant_id);
+
+        // revoke → list empty.
+        handle.revoke_mandate(true, m.mandate_grant_id.clone()).await.unwrap();
+        assert!(handle.list_mandates(true).await.unwrap().is_empty(), "revoked → no active mandates");
+
+        // Grant rejection surfaces as a TYPED Rejected error. The recipe cap is guard #1 in
+        // add_mandate (log.rs:2807) — it fires BEFORE the write-grant (#3) and read-root (#4) checks,
+        // so a > MAX_RECIPE_LEN (2048) recipe rejects for the recipe reason, mapped to Rejected.
+        let huge = "a".repeat(3000);
+        let err = handle.add_mandate(true, target, scope.path().to_path_buf(), huge).await.unwrap_err();
+        assert!(matches!(err, EngineOpError::Rejected(_)),
+            "a grant-time guard failure (here: recipe too long) maps to a typed Rejected error: {err:?}");
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.list_mandates(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandate_writes_op_returns_applied_m6c_writes() {
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("mandated.md");
+        std::fs::write(&path, b"old\n").unwrap();
+        let fid = bossclaw_ingest_one(&log, &path);
+        let new_bytes = b"new\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        // Stamp the proposal M6c so it is attributable as a mandate write.
+        let gated = log.propose_write(bossclaw_core::actuator::WriteProposal {
+            target: path.clone(), new_content: new_bytes.clone(),
+            op: bossclaw_core::actuator::WriteOp::Edit, source_event_ids: vec![fid.clone()],
+            rationale: "sync".to_string() }).unwrap();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "sync", &key, &vs, std::slice::from_ref(&fid), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // Apply (loud because ingested ⇒ Untrusted → ack=true).
+        handle.apply_proposal(true, pid, true).await.unwrap();
+        let writes = handle.mandate_writes(true).await.unwrap();
+        assert_eq!(writes.len(), 1, "the applied M6c write is listed");
+        assert_eq!(writes[0].target, canonical);
+        assert!(!writes[0].undone);
+        assert!(!writes[0].file_written_id.is_empty());
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.mandate_writes(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    // Shared builder: ingest a source under a read-granted `scope`, grant a mandate for a target
+    // in a write-granted `dest`, and emit an M6c proposal rewriting the target from the source.
+    // Returns (handle, dest-keepalive, scope-keepalive, target path, canonical target, pid).
+    #[cfg(unix)]
+    async fn seed_clean_mandate_proposal(
+    ) -> (EngineHandle, tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, std::path::PathBuf, String, String) {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        // Mandate target dir is WRITE-ONLY (outside every read root — add_mandate guard #4); the
+        // read-granted `scope` holds the source.
+        let dest = tempfile::tempdir().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        log.add_write_grant(dest.path()).unwrap();
+        log.add_grant(scope.path()).unwrap();
+        let target = dest.path().join("synced.md");
+        std::fs::write(&target, b"old\n").unwrap();
+        let src = scope.path().join("s.md");
+        std::fs::write(&src, b"clean source body\n").unwrap();
+        let src_id = bossclaw_ingest_one(&log, &src);
+        log.add_mandate(&target, scope.path(), "sync from scope").unwrap();
+        log.rebuild_graph().unwrap();
+        // A CLEAN rewrite: in-scope authorized source + non-secret content ⇒ not loud (Task 1 rule).
+        let new_bytes = b"clean new content\n".to_vec();
+        let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![src_id.clone()], rationale: "sync".to_string() }).unwrap();
+        assert!(!gated.verdict.requires_loud_modal, "fixture must be CLEAN for the auto-apply test");
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "sync", &serde_json::json!({"src":"a","relation":"r","dst":"b"}), &vs,
+            std::slice::from_ref(&src_id), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+        (handle, dir, dest, scope, target, canonical, pid)
+    }
+
+    #[tokio::test]
+    async fn sweep_auto_applies_a_clean_mandate_proposal() {
+        let (handle, _dir, _dest, _scope, target, _canonical, pid) = seed_clean_mandate_proposal().await;
+        // Mandates ON (the sweep re-reads it per item).
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        let applied = handle.mandate_autoapply_sweep(true).await.unwrap();
+        assert_eq!(applied, 1, "the clean mandate proposal was auto-applied");
+        // POSITIVE mutation-verify: the file changed AND the proposal is resolved.
+        assert_eq!(std::fs::read(&target).unwrap(), b"clean new content\n".to_vec(), "the file gained the synced bytes");
+        assert!(handle.list_proposals(true).await.unwrap().iter().all(|p| p.id != pid), "proposal resolved");
+        // And it appears in the mandate-activity list with Undo.
+        let writes = handle.mandate_writes(true).await.unwrap();
+        assert_eq!(writes.len(), 1, "the auto-applied write is recorded for Undo");
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_a_risky_mandate_proposal_queued() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        // Mandate target dir is WRITE-ONLY (add_mandate guard #4); read-granted `scope` holds the source.
+        let dest = tempfile::tempdir().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        log.add_write_grant(dest.path()).unwrap();
+        log.add_grant(scope.path()).unwrap();
+        let target = dest.path().join("synced.md");
+        std::fs::write(&target, b"old\n").unwrap();
+        let src = scope.path().join("s.md");
+        std::fs::write(&src, b"clean source\n").unwrap();
+        let src_id = bossclaw_ingest_one(&log, &src);
+        log.add_mandate(&target, scope.path(), "sync").unwrap();
+        log.rebuild_graph().unwrap();
+        // RISKY: secret-shaped new content forces loud even though the source is in-scope.
+        let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
+        let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![src_id.clone()], rationale: "sync".to_string() }).unwrap();
+        assert!(gated.verdict.requires_loud_modal, "secret-shaped ⇒ loud");
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "sync", &serde_json::json!({"src":"a","relation":"r","dst":"b"}), &vs,
+            std::slice::from_ref(&src_id), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        let applied = handle.mandate_autoapply_sweep(true).await.unwrap();
+        assert_eq!(applied, 0, "a risky (loud) mandate proposal is NOT auto-applied");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old\n".to_vec(), "the file is untouched");
+        // SF3: the risky proposal stays queued AND still carries the m6c producer, so the Review
+        // surface can render its "from a mandate" label (the label path survives the sweep).
+        let queued = handle.list_proposals(true).await.unwrap();
+        let row = queued.iter().find(|p| p.id == pid).expect("the risky proposal stays queued for SP4 Review");
+        assert_eq!(row.producer, "m6c-mandate-proposer",
+            "the queued risky proposal keeps its m6c producer (the 'from mandate' label path)");
+    }
+
+    #[tokio::test]
+    async fn sweep_never_auto_applies_an_m6b_reconcile_proposal() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let target = folder.path().join("note.md");
+        std::fs::write(&target, b"old\n").unwrap();
+        let fid = bossclaw_ingest_one(&log, &target);
+        let new_bytes = b"new\n".to_vec();
+        let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Edit, source_event_ids: vec![fid.clone()], rationale: "reconcile".to_string() }).unwrap();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        // Stamp M6b (the reconciler) — the producer filter must exclude it from the sweep.
+        let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "reconcile", &serde_json::json!({"src":"a","relation":"r","dst":"b"}), &vs,
+            std::slice::from_ref(&fid), bossclaw_core::graph::M6B_PROPOSER_PRODUCER).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        let applied = handle.mandate_autoapply_sweep(true).await.unwrap();
+        assert_eq!(applied, 0, "an M6b reconcile proposal is NEVER auto-applied (producer filter)");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old\n".to_vec(), "the file is untouched");
+        assert!(handle.list_proposals(true).await.unwrap().iter().any(|p| p.id == pid),
+            "the M6b proposal stays queued for human review (SP4 unchanged)");
+    }
+
+    // Security L2: the per-item fast-kill. With TWO clean M6c proposals queued but mandates turned
+    // OFF, the sweep's per-item `mandates_enabled_or_false` read gates the FIRST iteration and breaks,
+    // so NOTHING is applied — proving the guard reads the LIVE flag, not a snapshot taken before the
+    // loop. (A true "flip AFTER the first apply, stop the second" assertion would need a production
+    // test-hook between iterations, which is out of scope; gating-with-the-flag-off pins the same
+    // live-read invariant deterministically.)
+    #[tokio::test]
+    async fn sweep_fast_kills_when_mandates_off_even_with_clean_candidates() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        // Both mandate targets live under a WRITE-ONLY dest (add_mandate guard #4); read-granted
+        // `scope` holds the shared source.
+        let dest = tempfile::tempdir().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        log.add_write_grant(dest.path()).unwrap();
+        log.add_grant(scope.path()).unwrap();
+        let src = scope.path().join("s.md");
+        std::fs::write(&src, b"clean source\n").unwrap();
+        let src_id = bossclaw_ingest_one(&log, &src);
+        // Two distinct mandates+targets, each yielding a CLEAN (in-scope, non-secret) M6c proposal.
+        let mut pids = Vec::new();
+        for name in ["a.md", "b.md"] {
+            let target = dest.path().join(name);
+            std::fs::write(&target, b"old\n").unwrap();
+            log.add_mandate(&target, scope.path(), "sync").unwrap();
+            log.rebuild_graph().unwrap();
+            let new_bytes = format!("clean new {name}\n").into_bytes();
+            let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+                op: WriteOp::Edit, source_event_ids: vec![src_id.clone()], rationale: "sync".to_string() }).unwrap();
+            assert!(!gated.verdict.requires_loud_modal, "fixture proposals must be CLEAN");
+            let hash = hex::encode(Sha256::digest(&new_bytes));
+            let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+            let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+                "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+                "base_content_hash": gated.verdict.base_content_hash});
+            let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new_bytes.len() as u64,
+                "sync", &serde_json::json!({"src":"a","relation":"r","dst":name}), &vs,
+                std::slice::from_ref(&src_id), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+            log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+            pids.push(pid);
+        }
+        drop(log);
+
+        // Mandates OFF (never enabled). The per-item kill-switch read gates the first iteration.
+        let applied = handle.mandate_autoapply_sweep(true).await.unwrap();
+        assert_eq!(applied, 0, "with mandates off the per-item fast-kill applies NOTHING");
+        // Both clean proposals are untouched on disk and still queued.
+        assert_eq!(std::fs::read(dest.path().join("a.md")).unwrap(), b"old\n".to_vec(), "a.md untouched");
+        assert_eq!(std::fs::read(dest.path().join("b.md")).unwrap(), b"old\n".to_vec(), "b.md untouched");
+        let queued = handle.list_proposals(true).await.unwrap();
+        assert!(pids.iter().all(|pid| queued.iter().any(|p| &p.id == pid)),
+            "both clean proposals stay queued when the sweep fast-kills");
     }
 }

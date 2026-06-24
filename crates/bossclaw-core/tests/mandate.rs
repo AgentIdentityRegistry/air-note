@@ -769,16 +769,23 @@ fn proof1b_cannot_widen_grant_rejected_at_execute_after_revoke() {
             rationale: "confirm".into(),
         })
         .expect("propose_write returns a verdict (rejecting, not erroring)");
-    let exec = log.execute_write_resolving(gated, &pid);
+    // ack=false: the revoked write-grant (`!allowed`) is the fail-closed cause under test; it is
+    // checked before the engine loud-gate, so the documented revoke rejection still fires (SP5 d).
+    let exec = log.execute_write_resolving(gated, &pid, false);
     assert!(exec.is_err(), "execute must fail closed once the grant is revoked (never-widen at execute)");
     assert!(!target.exists(), "no file was written after the grant was revoked");
     log.verify_chain().unwrap();
 }
 
-// ── PROOF 2 — cannot shed taint. ────────────────────────────────────────────────────
+// ── PROOF 2 — external PROVENANCE is preserved; an IN-SCOPE mandate yields a Clean verdict. ──
 // A mandate whose source is EXTERNAL (an ingested file, origin:"external") → the emitted
-// `write_proposal` carries that source's `file_ingested` id in `source_event_ids`, is
-// stamped origin:"external", and the gate verdict is Untrusted + requires_loud_modal.
+// `write_proposal` carries that source's `file_ingested` id in `source_event_ids` and is
+// stamped origin:"external" — the provenance taint is NEVER shed from the record.
+// SP5 change (c): because the source is IN the mandate's authorized `source_scope` and the
+// target is the mandate's own target, the gate VERDICT is Clean / not-loud (the user's grant
+// authorizes auto-apply). The complementary "an UNAUTHORIZED external source still taints"
+// security proof lives in tests/reconcile.rs (out-of-scope / sibling / m6b-target / post-revoke
+// all stay Untrusted + loud — the trust rule cannot launder taint for anything unauthorized).
 #[test]
 fn proof2_cannot_shed_taint_external_source_stamps_proposal() {
     let (log, _tmp, src, out) = phase_log();
@@ -796,11 +803,12 @@ fn proof2_cannot_shed_taint_external_source_stamps_proposal() {
     // Lineage carries the engine-gathered external source id.
     let lineage = prop.model_meta.as_ref().expect("Tier-B").source_event_ids.clone();
     assert!(lineage.contains(&sid), "lineage carries the external source's file_ingested id");
-    // The append chokepoint stamped origin:"external" (taint never shed).
-    assert_eq!(prop.content["origin"], json!("external"), "external source taints the proposal");
-    // The verdict (recorded summary) is Untrusted + loud.
-    assert_eq!(prop.content["verdict_summary"]["taint"], json!("Untrusted"), "verdict taint=Untrusted");
-    assert_eq!(prop.content["verdict_summary"]["requires_loud_modal"], json!(true), "loud modal required");
+    // The append chokepoint stamped origin:"external" — the provenance is preserved (never shed).
+    assert_eq!(prop.content["origin"], json!("external"), "external source's provenance is recorded");
+    // SP5 (c): an IN-SCOPE authorized mandate source yields a Clean / not-loud verdict (auto-appliable).
+    // An unauthorized / out-of-scope source would stay Untrusted + loud (proven in tests/reconcile.rs).
+    assert_eq!(prop.content["verdict_summary"]["taint"], json!("Clean"), "in-scope mandate source ⇒ Clean verdict");
+    assert_eq!(prop.content["verdict_summary"]["requires_loud_modal"], json!(false), "Clean ⇒ not loud (auto-appliable)");
     log.verify_chain().unwrap();
 }
 
@@ -945,7 +953,9 @@ fn proof4_convergence_with_a_nondeterministic_model() {
             rationale: "confirm".into(),
         })
         .unwrap();
-    log.execute_write_resolving(gated, &pid).unwrap();
+    // The source is in-scope for this mandate, so the SP5 (c) trust rule keeps the verdict Clean
+    // (not loud) ⇒ ack=false clears the engine loud-gate (SP5 change d).
+    log.execute_write_resolving(gated, &pid, false).unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), bytes, "the confirmed bytes are on disk");
     let calls_after_tick1 = reasoner.calls();
 
@@ -1104,7 +1114,8 @@ fn proof9_confirmed_write_is_not_reingested_as_a_source() {
             rationale: "confirm".into(),
         })
         .unwrap();
-    log.execute_write_resolving(gated, &pid).unwrap();
+    // In-scope mandate source ⇒ SP5 (c) trust rule keeps it Clean (not loud) ⇒ ack=false (SP5 d).
+    log.execute_write_resolving(gated, &pid, false).unwrap();
 
     // Re-run ingest over the read root: the target lives OUTSIDE it, so the write is NOT
     // discovered as a source (the structural self-loop guarantee). The sources_hash is

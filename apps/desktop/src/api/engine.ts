@@ -50,6 +50,7 @@ export type ProposalDto = {
   new_content_hash: string;
   rationale: string;
   requires_loud_modal: boolean;
+  producer: string;
 };
 export type PreviewDto = {
   path: string;
@@ -77,3 +78,29 @@ export const declineProposal = (id: string, reason: string): Promise<void> =>
   invoke<void>("engine_decline_proposal", { id, reason });
 export const undoApply = (fileWrittenId: string): Promise<void> =>
   invoke<void>("engine_undo_apply", { fileWrittenId });
+
+export type MandateDto = {
+  mandate_grant_id: string;
+  target: string;
+  source_scope: string;
+  recipe: string;
+  granted_at: string;
+  revoked: boolean;
+};
+export type MandateWriteDto = {
+  file_written_id: string;
+  target: string;
+  written_at: string;
+  undone: boolean;
+};
+
+export const setMandatesEnabled = (enabled: boolean): Promise<void> =>
+  invoke<void>("engine_set_mandates_enabled", { enabled });
+export const mandatesEnabled = (): Promise<boolean> => invoke<boolean>("engine_mandates_enabled");
+export const addMandate = (target: string, sourceScope: string, recipe: string): Promise<MandateDto> =>
+  invoke<MandateDto>("engine_add_mandate", { target, sourceScope, recipe });
+export const revokeMandate = (mandateGrantId: string): Promise<void> =>
+  invoke<void>("engine_revoke_mandate", { mandateGrantId });
+export const listMandates = (): Promise<MandateDto[]> => invoke<MandateDto[]>("engine_list_mandates");
+export const mandateWrites = (): Promise<MandateWriteDto[]> =>
+  invoke<MandateWriteDto[]>("engine_mandate_writes");
