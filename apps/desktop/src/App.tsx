@@ -10,11 +10,10 @@ import { GenerateAndRegister } from "./onboarding/GenerateAndRegister";
 import { Done } from "./onboarding/Done";
 import { IdentityPanel } from "./identity/IdentityPanel";
 import { InboxPanel } from "./inbox/InboxPanel";
-import { MemoryPanel } from "./memory/MemoryPanel";
-import { ReviewPanel } from "./review/ReviewPanel";
-import { MandatesPanel } from "./mandates/MandatesPanel";
+import { BrainPanel } from "./memory/BrainPanel";
 import { AirSettings } from "./settings/AirSettings";
 import { Sidebar } from "./shell/Sidebar";
+import { MainSearch } from "./shell/MainSearch";
 import { useReviewCount } from "./shell/useReviewCount";
 import type { View } from "./shell/nav";
 import { CommandPalette } from "./search/CommandPalette";
@@ -63,20 +62,18 @@ function Shell() {
 
   return (
     <div className="app-shell">
-      <Sidebar view={view} onNavigate={setView} inboxUnread={totalUnread} reviewCount={reviewCount} onOpenSearch={openSearch} />
-      <main className="main-area">
+      <Sidebar view={view} onNavigate={setView} inboxUnread={totalUnread} reviewCount={reviewCount} />
+      {/* The inbox fills the viewport and owns its own scroll; other panels scroll the whole area. */}
+      <main className={view === "inbox" ? "main-area main-area-fill" : "main-area"}>
+        <MainSearch onOpen={openSearch} />
         {view === "identity" ? (
           <IdentityPanel />
         ) : view === "inbox" ? (
           <InboxPanel />
-        ) : view === "memory" ? (
-          <MemoryPanel />
-        ) : view === "review" ? (
-          <ReviewPanel />
-        ) : view === "mandates" ? (
-          <MandatesPanel />
-        ) : (
+        ) : view === "settings" ? (
           <AirSettings />
+        ) : (
+          <BrainPanel view={view} onSubNav={setView} reviewCount={reviewCount} />
         )}
       </main>
       <CommandPalette open={searchOpen} onClose={() => setSearchOpen(false)} onNavigate={navigateTo} />

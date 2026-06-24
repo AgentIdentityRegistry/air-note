@@ -38,7 +38,7 @@ export function SourcesPanel() {
   const active = activeGrants(grants);
 
   if (unavailable) {
-    return <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine.</p>;
+    return <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach your agent’s memory.</p>;
   }
 
   const onAdd = async () => {
@@ -130,12 +130,12 @@ export function SourcesPanel() {
       </p>
 
       <div style={{ display: "flex", gap: 8, margin: "8px 0" }}>
-        <Button variant="secondary" onClick={onAdd}>Add folder</Button>
+        <Button variant="secondary" onClick={onAdd}>Add Folder</Button>
         <Button variant="primary" onClick={onIngest} disabled={busy || active.length === 0}>
-          {busy ? "Ingesting…" : "Ingest now"}
+          {busy ? "Ingesting…" : "Ingest Now"}
         </Button>
         <Button variant="secondary" onClick={() => void onAllowAll(!everyWritable)} disabled={busy || active.length === 0}>
-          {everyWritable ? "Disallow all edits" : "Allow all edits"}
+          {everyWritable ? "Disallow All Edits" : "Allow All Edits"}
         </Button>
       </div>
 
@@ -150,7 +150,7 @@ export function SourcesPanel() {
             <li key={g.canonical_root} style={{ marginBottom: 4 }}>
               <code>{g.canonical_root}</code>{" "}
               <button className="secondary-btn" disabled={busy} onClick={() => void onToggleWritable(g.canonical_root, !editable)} style={{ marginLeft: 8 }}>
-                {editable ? "Disallow edits" : "Allow edits"}
+                {editable ? "Disallow Edits" : "Allow Edits"}
               </button>
               <button className="danger-btn" disabled={busy} onClick={() => onRevoke(g.canonical_root)} style={{ marginLeft: 8 }}>Revoke</button>
             </li>
@@ -161,8 +161,8 @@ export function SourcesPanel() {
 
       {writable.size > 0 && evolveOn === false ? (
         <p style={{ fontSize: 13, color: "var(--error)" }}>
-          Edits are enabled, but the learning loop is off, so no changes will be proposed.{" "}
-          <button className="secondary-btn" disabled={busy} onClick={() => void onEnableEvolve()}>Turn learning on</button>
+          Edits are enabled, but learning is off, so no changes will be proposed.{" "}
+          <button className="secondary-btn" disabled={busy} onClick={() => void onEnableEvolve()}>Turn Learning On</button>
         </p>
       ) : null}
 

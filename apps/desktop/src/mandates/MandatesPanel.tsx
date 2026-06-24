@@ -147,7 +147,7 @@ export function MandatesPanel() {
     return (
       <Card>
         <h2 style={{ margin: 0 }}>Mandates</h2>
-        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine. Set up your identity first.</p>
+        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach your agent’s memory. Set up your identity first.</p>
       </Card>
     );
   }
@@ -155,6 +155,10 @@ export function MandatesPanel() {
   return (
     <div>
       <h2 style={{ margin: "0 0 8px" }}>Mandates</h2>
+      <p style={{ color: "var(--text-secondary)", fontSize: 13, margin: "0 0 12px", lineHeight: 1.5 }}>
+        A mandate is a standing rule: “keep this file of mine up to date from these folders.” Your agent
+        watches the folders and proposes an edit for you to approve — it never rewrites the file on its own.
+      </p>
       {error ? <p style={{ color: "var(--error)", fontSize: 13 }}>{error}</p> : null}
 
       <Card>
@@ -164,62 +168,73 @@ export function MandatesPanel() {
           onChange={(next) => void onToggle(next)}
           label={
             <>
-              Mandates {enabled ? "on" : "off"} — when on, the brain keeps each mandate’s target file in
-              sync and auto-applies clean changes (risky ones go to Review).
+              Mandates are {enabled ? "on" : "off"} — when on, your agent keeps each file in sync and
+              applies clean changes for you; anything risky waits for you in Review.
             </>
           }
         />
       </Card>
 
       <Card>
-        <div style={{ fontWeight: 600, marginBottom: 8 }}>New mandate</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <input
-              placeholder="Target file (in an edit-enabled folder)"
-              value={target}
-              onChange={(e) => setTarget(e.target.value)}
-              style={{ flex: 1, padding: 6, fontFamily: "inherit", fontSize: 13 }}
-            />
-            <Button variant="secondary" disabled={busy} onClick={() => void onPickTarget()}>Pick file…</Button>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>New Mandate</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 13, fontWeight: 500 }}>File to keep updated</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input
+                placeholder="e.g. ~/Notes/team-roster.md"
+                value={target}
+                onChange={(e) => setTarget(e.target.value)}
+                style={{ flex: 1, padding: 6, fontFamily: "inherit", fontSize: 13 }}
+              />
+              <Button variant="secondary" disabled={busy} onClick={() => void onPickTarget()}>Pick File…</Button>
+            </div>
+            <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>Must be in a folder you’ve allowed edits on.</span>
           </div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <input
-              placeholder="Source folder (read-granted)"
-              value={sourceScope}
-              onChange={(e) => setSourceScope(e.target.value)}
-              style={{ flex: 1, padding: 6, fontFamily: "inherit", fontSize: 13 }}
-            />
-            <Button variant="secondary" disabled={busy} onClick={() => void onPickScope()}>Pick folder…</Button>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 13, fontWeight: 500 }}>Folders to watch</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <input
+                placeholder="e.g. ~/Notes/people"
+                value={sourceScope}
+                onChange={(e) => setSourceScope(e.target.value)}
+                style={{ flex: 1, padding: 6, fontFamily: "inherit", fontSize: 13 }}
+              />
+              <Button variant="secondary" disabled={busy} onClick={() => void onPickScope()}>Pick Folder…</Button>
+            </div>
+            <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>Your agent reads these to keep the file current.</span>
           </div>
-          <textarea
-            placeholder="Recipe: how to keep the target in sync from the sources"
-            value={recipe}
-            onChange={(e) => setRecipe(e.target.value)}
-            rows={3}
-            style={{ padding: 6, fontFamily: "inherit", fontSize: 13 }}
-          />
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 13, fontWeight: 500 }}>How to keep it in sync</span>
+            <textarea
+              placeholder="e.g. Keep the roster sorted by name; add anyone new I’ve written about."
+              value={recipe}
+              onChange={(e) => setRecipe(e.target.value)}
+              rows={3}
+              style={{ padding: 6, fontFamily: "inherit", fontSize: 13 }}
+            />
+          </div>
           {formError ? <p style={{ color: "var(--error)", fontSize: 13, margin: 0 }}>{formError}</p> : null}
           <div>
-            <Button variant="primary" disabled={busy} onClick={() => void onCreate()}>Create mandate</Button>
+            <Button variant="primary" disabled={busy} onClick={() => void onCreate()}>Create Mandate</Button>
           </div>
         </div>
       </Card>
 
       <Card>
-        <div style={{ fontWeight: 600, marginBottom: 8 }}>Active mandates</div>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Active Mandates</div>
         {mandates.length === 0 ? (
-          <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No mandates yet.</p>
+          <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No mandates yet. Create one above to keep a file in sync.</p>
         ) : (
-          <ul style={{ paddingLeft: 18, fontSize: 13 }}>
+          <ul style={{ listStyle: "none", paddingLeft: 0, margin: 0, fontSize: 13 }}>
             {mandates.map((m) => {
               const row = toMandateRow(m);
               return (
-                <li key={row.id} style={{ marginBottom: 8 }}>
+                <li key={row.id} style={{ marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid var(--border-soft)" }}>
                   <div><code>{row.targetName}</code> <span style={{ color: "var(--text-secondary)" }}>in {row.targetFolder}</span></div>
-                  <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>from <code>{row.sourceScope}</code></div>
-                  <div style={{ fontSize: 12 }}>Recipe: {row.recipe}</div>
-                  <button disabled={busy} onClick={() => void onRevoke(row.id)} style={{ marginTop: 4 }}>Revoke</button>
+                  <div style={{ color: "var(--text-secondary)", fontSize: 12 }}>Watching <code>{row.sourceScope}</code></div>
+                  <div style={{ fontSize: 12, color: "var(--text-secondary)" }}>How: {row.recipe}</div>
+                  <button disabled={busy} onClick={() => void onRevoke(row.id)} style={{ marginTop: 6 }}>Remove</button>
                 </li>
               );
             })}
@@ -228,9 +243,9 @@ export function MandatesPanel() {
       </Card>
 
       <Card>
-        <div style={{ fontWeight: 600, marginBottom: 8 }}>Recent mandate activity</div>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Recent Mandate Activity</div>
         {writes.length === 0 ? (
-          <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No mandate changes yet.</p>
+          <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No changes yet. Edits your agent makes will show up here, with an Undo.</p>
         ) : (
           <ul style={{ paddingLeft: 18, fontSize: 13 }}>
             {[...writes].reverse().map((w) => {

@@ -215,6 +215,25 @@ label {
   background: color-mix(in srgb, var(--surface-soft) 78%, var(--surface)) !important;
 }
 
+.tab-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  box-shadow: none;
+  font-size: 0.78rem;
+  font-weight: 520;
+  padding: 5px 10px;
+}
+
+.tab-inline:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--surface) 62%, transparent);
+}
+
 .tab-inline.active {
   border-color: color-mix(in srgb, var(--border-soft) 90%, transparent) !important;
   background: color-mix(in srgb, var(--surface-soft) 70%, var(--surface)) !important;
@@ -377,7 +396,9 @@ label {
 }
 
 .app-shell {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   display: grid;
   grid-template-columns: 228px 1fr;
   gap: 0;
@@ -573,14 +594,35 @@ label {
   box-shadow: inset 2px 0 0 var(--primary);
 }
 
-.sidebar-footer {
-  display: grid;
-  gap: 10px;
+.sidebar-footer-icons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.sidebar-footer p {
-  margin: 0;
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
+  background: transparent;
+  box-shadow: none;
+}
+
+.icon-btn:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--surface) 62%, transparent);
+  border-color: color-mix(in srgb, var(--text-secondary) 20%, var(--border-soft));
+}
+
+.icon-btn.active {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--primary) 8%, var(--surface));
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 
 .main-area {
@@ -588,7 +630,85 @@ label {
   padding: 12px 14px;
   display: grid;
   gap: 12px;
-  min-height: 100vh;
+  align-content: start;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Inbox variant: fill the viewport and let the panel own its scroll (no page-level scroll). */
+.main-area-fill {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.main-area-fill > .inbox-root {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Inbox 3-pane: fixed header/banners, a fixed conversation list, a thread column whose
+   message area scrolls and whose composer is pinned to the bottom. */
+.inbox-root {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 0;
+}
+
+.inbox-header {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.inbox-banner {
+  flex: 0 0 auto;
+  margin-top: 8px;
+}
+
+.inbox-grid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.inbox-list-col {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.inbox-thread-col {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.inbox-thread-head {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.inbox-thread-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.inbox-thread-anchor {
+  flex: 0 0 auto;
+  width: 1px;
+  height: 1px;
 }
 
 .panel {
@@ -1724,8 +1844,13 @@ label {
 }
 
 @media (max-width: 1080px) {
+  /* Narrow widths: stack the sidebar and let the page scroll normally instead of locking to
+     the viewport, so the stacked nav and the inbox don't fight over a fixed height. */
   .app-shell {
     grid-template-columns: 1fr;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
   }
 
   .sidebar {
@@ -1735,7 +1860,15 @@ label {
   }
 
   .tab-list {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .main-area-fill {
+    overflow: visible;
+  }
+
+  .inbox-grid {
+    grid-template-columns: 1fr;
   }
 
   .stats-grid,
@@ -1750,11 +1883,6 @@ label {
   .slide-panel {
     width: min(900px, 100%);
   }
-}
-
-.theme-toggle-btn {
-  width: 100%;
-  text-align: left;
 }
 
 .app-loading {
@@ -1863,21 +1991,39 @@ label {
 }
 
 
-.sidebar-top {
-  display: grid;
-  gap: 10px;
-}
-
-.sidebar-search-trigger {
-  width: 100%;
+.main-search {
+  flex: 0 0 auto;
+  width: min(var(--chat-column-max), 100%);
+  margin: 0 auto;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--elev-1);
   color: var(--text-secondary);
+  padding: 12px 14px;
+  text-align: left;
 }
 
-.sidebar-search-kbd {
+.main-search:hover {
+  border-color: color-mix(in srgb, var(--text-secondary) 22%, var(--border-soft));
+  background: color-mix(in srgb, var(--surface-soft) 60%, var(--surface));
+}
+
+.main-search-icon {
+  font-size: 1rem;
+  color: var(--text-tertiary);
+  line-height: 1;
+}
+
+.main-search-placeholder {
+  flex: 1;
+  font-size: 0.82rem;
+}
+
+.main-search-kbd {
   font-size: 0.7rem;
   color: var(--text-tertiary);
   border: 1px solid var(--border-soft);
