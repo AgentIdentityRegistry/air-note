@@ -1738,3 +1738,9 @@ label {
     width: min(900px, 100%);
   }
 }
+
+.theme-toggle-btn {
+  width: 100%;
+  text-align: left;
+}
+
