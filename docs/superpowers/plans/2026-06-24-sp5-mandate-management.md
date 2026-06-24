@@ -56,23 +56,28 @@
 
 **What changes (grounded against the real `propose_write`, log.rs:3021-3193):** Today Step 1 (3045-3063) escalates `taint = Untrusted` the moment a cited source resolves to an `is_external` event. The rule: an external source must NOT escalate iff an active mandate authorizes it for THIS target. Ordering is load-bearing — Step 1 must record external candidates WITHOUT escalating; after Step 2 yields `Some(canonical_target)`, a new step escalates each candidate UNLESS authorized; an unresolvable target escalates ALL candidates (taint, never skip).
 
-- [ ] Add the test-support fixture + the load-bearing tests in `crates/bossclaw-core/tests/reconcile.rs` (append at end of file). These use the REAL harness (grounded, discrepancy note 5): `common::open_log_with_write_grant() -> (EventLog, TempDir, PathBuf)` (the returned `PathBuf` is a read+write-granted `dest`) and the **2-arg** `common::ingest_one(log, path)` (it builds its own `MockEmbedder` — do NOT pass one). The fixture grants a mandate whose target is in `dest` and whose `source_scope` is a SEPARATE read-granted `scope` tempdir, then returns the `propose_write` verdict for a rewrite citing the ingested source. It returns the `home`/`scope` TempDirs so the caller keeps them alive:
+- [ ] Add the test-support fixture + the load-bearing tests in `crates/bossclaw-core/tests/reconcile.rs` (append at end of file). These use the REAL harness (grounded, discrepancy note 5): `common::open_log_with_write_grant() -> (EventLog, TempDir, PathBuf)` and the **2-arg** `common::ingest_one(log, path)` (it builds its own `MockEmbedder` — do NOT pass one).
+  **CRITICAL grant invariant (verified against `add_mandate` log.rs:2807-2847):** a mandate TARGET must be under a WRITE grant AND **outside every active READ-grant root** (guard #4 rejects a read-granted target with `"mandate target must be outside every read-grant root"`). The harness's returned `files` dir is granted BOTH read AND write (`common/mod.rs:40-41`), so it **cannot** hold a mandate target. Therefore the fixture **ignores** the harness `files` dir, puts the mandate target in a FRESH **write-ONLY** tempdir (`add_write_grant`, NO `add_grant`), and keeps the read-granted SOURCE in a separate `scope` tempdir. It returns the `home`/`dest`/`scope` TempDirs so the caller keeps them alive:
 
 ```rust
 // ── SP5 (c) trust-rule tests ────────────────────────────────────────────────
-// Fixture: `dest` (read+write-granted by the harness) holds the mandate target; a SEPARATE
-// read-granted `scope` tempdir holds one ingested source file. The mandate authorizes `scope`
-// as the source for `dest/synced.md`. Returns (log, home, dest, scope, gated) — `home`/`scope`
-// kept alive by the caller; `gated` is the verdict for the rewrite citing the ingested source.
+// Fixture: `dest` is a FRESH WRITE-ONLY-granted tempdir holding the mandate target (a mandate
+// target MUST be outside every read root — add_mandate guard #4); a SEPARATE read-granted `scope`
+// tempdir holds one ingested source. The mandate authorizes `scope` as the source for
+// `dest/synced.md`. Returns (log, home, dest, scope, gated) — home/dest/scope kept alive by the
+// caller; `gated` is the verdict for the rewrite citing the ingested source.
 #[cfg(unix)]
 fn trust_fixture(
     source_body: &[u8],
     new_body: &[u8],
-) -> (bossclaw_core::EventLog, tempfile::TempDir, std::path::PathBuf, tempfile::TempDir, bossclaw_core::actuator::GatedProposal) {
+) -> (bossclaw_core::EventLog, tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, bossclaw_core::actuator::GatedProposal) {
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    // The harness opens an onboarded log + a read+write-granted `dest` files dir.
-    let (log, home, dest) = common::open_log_with_write_grant();
-    let target = dest.join("synced.md");
+    // The harness gives an onboarded log; its `files` dir is read+write so we do NOT use it for a
+    // mandate target — create a fresh WRITE-ONLY dest dir instead.
+    let (log, home, _files) = common::open_log_with_write_grant();
+    let dest = tempfile::tempdir().unwrap();
+    log.add_write_grant(dest.path()).unwrap(); // write-ONLY (no add_grant) → valid mandate target root.
+    let target = dest.path().join("synced.md");
     std::fs::write(&target, b"stale\n").unwrap();
     // A SEPARATE read-granted scope dir holds the source; ingest it so it is `external`.
     let scope = tempfile::tempdir().unwrap();
@@ -80,7 +85,7 @@ fn trust_fixture(
     let src_path = scope.path().join("src.md");
     std::fs::write(&src_path, source_body).unwrap();
     let src_id = common::ingest_one(&log, &src_path);
-    // Grant the mandate: target in `dest`, sources under `scope`.
+    // Grant the mandate: target in `dest` (write-only), sources under `scope` (read).
     log.add_mandate(&target, scope.path(), "sync the target from scope").unwrap();
     log.rebuild_graph().unwrap();
     let gated = log.propose_write(WriteProposal {
@@ -127,7 +132,7 @@ fn mandate_out_of_scope_source_is_loud() {
     std::fs::write(&outside, b"out of scope source\n").unwrap();
     let outside_id = common::ingest_one(&log, &outside);
     let _ = &scope_a; // the in-scope dir is kept alive; the proposal cites the OUT-of-scope source.
-    let target = dest.join("synced.md");
+    let target = dest.path().join("synced.md"); // `dest` is now a TempDir (write-only mandate root).
     let gated = log.propose_write(WriteProposal {
         target, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
         source_event_ids: vec![outside_id], rationale: "x".to_string(),
@@ -143,8 +148,11 @@ fn mandate_sibling_scope_prefix_is_loud_segment_aware() {
     // L1: a source under `<scope>-evil` (a sibling sharing a string prefix) must NOT be cleared —
     // containment is segment-aware, so `/p/scope-evil/x` is not "under" `/p/scope`.
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let (log, _home, dest) = common::open_log_with_write_grant();
-    let target = dest.join("synced.md");
+    let (log, _home, _files) = common::open_log_with_write_grant();
+    // The mandate target lives in a FRESH WRITE-ONLY dir (outside every read root — guard #4).
+    let dest = tempfile::tempdir().unwrap();
+    log.add_write_grant(dest.path()).unwrap();
+    let target = dest.path().join("synced.md");
     std::fs::write(&target, b"stale\n").unwrap();
     // Build sibling dirs `scope` and `scope-evil` under the SAME parent.
     let parent = tempfile::tempdir().unwrap();
@@ -201,19 +209,22 @@ fn mandate_unresolvable_target_taints_all_candidates() {
     // (taint, never skip). We force unresolvability by proposing an EDIT to a path that does
     // not exist (Edit canonicalizes the target itself, which then fails → canonical == None).
     use bossclaw_core::actuator::{WriteOp, WriteProposal};
-    let (log, _home, dest) = common::open_log_with_write_grant();
+    let (log, _home, _files) = common::open_log_with_write_grant();
+    // Mandate target + the propose target both live in a FRESH WRITE-ONLY dir (guard #4).
+    let dest = tempfile::tempdir().unwrap();
+    log.add_write_grant(dest.path()).unwrap();
     let scope = tempfile::tempdir().unwrap();
     log.add_grant(scope.path()).unwrap();
     let src = scope.path().join("s.md");
     std::fs::write(&src, b"clean\n").unwrap();
     let src_id = common::ingest_one(&log, &src);
-    // A mandate whose target is a real (write-granted) file, so add_mandate's guards pass…
-    let real_target = dest.join("real.md");
+    // A mandate whose target is a real (write-granted, read-free) file, so add_mandate's guards pass…
+    let real_target = dest.path().join("real.md");
     std::fs::write(&real_target, b"x\n").unwrap();
     log.add_mandate(&real_target, scope.path(), "r").unwrap();
     log.rebuild_graph().unwrap();
     // …but PROPOSE against a NON-EXISTENT target path (Edit ⇒ canonicalize fails ⇒ None).
-    let missing = dest.join("does-not-exist.md");
+    let missing = dest.path().join("does-not-exist.md");
     let gated = log.propose_write(WriteProposal {
         target: missing, new_content: b"new\n".to_vec(), op: WriteOp::Edit,
         source_event_ids: vec![src_id], rationale: "x".to_string(),
@@ -1100,11 +1111,11 @@ EOF
         let (vault, dir) = test_vault_and_dir();
         let handle = new_test_handle(vault, &dir);
         let log = handle.get_or_open(true).await.unwrap();
-        // Real dirs: a write-granted dest (target) + a read-granted scope (sources).
+        // A mandate target must be WRITE-granted AND outside every read root (add_mandate guard #4),
+        // so `dest` is WRITE-ONLY (no add_grant); the read-granted `scope` holds the sources.
         let dest = tempfile::tempdir().unwrap();
         let scope = tempfile::tempdir().unwrap();
-        log.add_grant(dest.path()).unwrap();
-        log.add_write_grant(dest.path()).unwrap();
+        log.add_write_grant(dest.path()).unwrap(); // write-ONLY → valid mandate target root.
         log.add_grant(scope.path()).unwrap();
         let target = dest.path().join("synced.md");
         std::fs::write(&target, b"x\n").unwrap();
@@ -1126,11 +1137,13 @@ EOF
         handle.revoke_mandate(true, m.mandate_grant_id.clone()).await.unwrap();
         assert!(handle.list_mandates(true).await.unwrap().is_empty(), "revoked → no active mandates");
 
-        // Grant rejection surfaces as a TYPED Rejected error (recipe > MAX_RECIPE_LEN 2048).
+        // Grant rejection surfaces as a TYPED Rejected error. The recipe cap is guard #1 in
+        // add_mandate (log.rs:2807) — it fires BEFORE the write-grant (#3) and read-root (#4) checks,
+        // so a > MAX_RECIPE_LEN (2048) recipe rejects for the recipe reason, mapped to Rejected.
         let huge = "a".repeat(3000);
         let err = handle.add_mandate(true, target, scope.path().to_path_buf(), huge).await.unwrap_err();
         assert!(matches!(err, EngineOpError::Rejected(_)),
-            "a grant-time guard failure maps to a typed Rejected error: {err:?}");
+            "a grant-time guard failure (here: recipe too long) maps to a typed Rejected error: {err:?}");
 
         // Not onboarded → gate.
         assert!(matches!(
@@ -1879,9 +1892,10 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
         let (vault, dir) = test_vault_and_dir();
         let handle = new_test_handle(vault, &dir);
         let log = handle.get_or_open(true).await.unwrap();
+        // Mandate target dir is WRITE-ONLY (outside every read root — add_mandate guard #4); the
+        // read-granted `scope` holds the source.
         let dest = tempfile::tempdir().unwrap();
         let scope = tempfile::tempdir().unwrap();
-        log.add_grant(dest.path()).unwrap();
         log.add_write_grant(dest.path()).unwrap();
         log.add_grant(scope.path()).unwrap();
         let target = dest.path().join("synced.md");
@@ -1931,9 +1945,9 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
         let (vault, dir) = test_vault_and_dir();
         let handle = new_test_handle(vault, &dir);
         let log = handle.get_or_open(true).await.unwrap();
+        // Mandate target dir is WRITE-ONLY (add_mandate guard #4); read-granted `scope` holds the source.
         let dest = tempfile::tempdir().unwrap();
         let scope = tempfile::tempdir().unwrap();
-        log.add_grant(dest.path()).unwrap();
         log.add_write_grant(dest.path()).unwrap();
         log.add_grant(scope.path()).unwrap();
         let target = dest.path().join("synced.md");
@@ -2020,9 +2034,10 @@ pub fn sweep_candidates(pending: &[(String, String)], cap: usize) -> Vec<String>
         let (vault, dir) = test_vault_and_dir();
         let handle = new_test_handle(vault, &dir);
         let log = handle.get_or_open(true).await.unwrap();
+        // Both mandate targets live under a WRITE-ONLY dest (add_mandate guard #4); read-granted
+        // `scope` holds the shared source.
         let dest = tempfile::tempdir().unwrap();
         let scope = tempfile::tempdir().unwrap();
-        log.add_grant(dest.path()).unwrap();
         log.add_write_grant(dest.path()).unwrap();
         log.add_grant(scope.path()).unwrap();
         let src = scope.path().join("s.md");
