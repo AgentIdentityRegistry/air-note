@@ -186,10 +186,10 @@ export function MemoryPanel() {
             onClick={onToggleEvolve}
             disabled={!status || toggling || !ollamaReady}
           >
-            {status?.enabled ? "Turn evolve off" : "Turn evolve on"}
+            {status?.enabled ? "Turn Evolve Off" : "Turn Evolve On"}
           </Button>
           <Button variant="primary" onClick={onEvolveNow} disabled={evolving || !ollamaReady || !status?.enabled}>
-            {evolving ? "Evolving…" : "Evolve now"}
+            {evolving ? "Evolving…" : "Evolve Now"}
           </Button>
         </div>
 

@@ -142,7 +142,7 @@ export function ReviewPanel() {
     return (
       <Card>
         <h2 style={{ margin: 0 }}>Review</h2>
-        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine. Set up your identity first, then enable a folder for edits.</p>
+        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach your agent’s memory. Set up your identity first, then enable a folder for edits.</p>
       </Card>
     );
   }
@@ -223,7 +223,7 @@ export function ReviewPanel() {
 
       {confirmFor ? (
         <Card>
-          <div style={{ fontWeight: 600, color: "var(--error)" }}>Confirm this edit</div>
+          <div style={{ fontWeight: 600, color: "var(--error)" }}>Confirm This Edit</div>
           <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
             This rewrites a file your agent learned from. Review the before/after, then confirm you’ve read it.
           </p>
@@ -247,7 +247,7 @@ export function ReviewPanel() {
                 }
               }}
             >
-              Apply anyway
+              Apply Anyway
             </Button>
             <Button variant="secondary" disabled={busy} onClick={() => { setConfirmFor(null); setReviewed(false); }}>
               Cancel
@@ -258,7 +258,7 @@ export function ReviewPanel() {
 
       {applied.length > 0 ? (
         <Card>
-          <div style={{ fontWeight: 600 }}>Recently applied</div>
+          <div style={{ fontWeight: 600 }}>Recently Applied</div>
           <ul style={{ paddingLeft: 18, fontSize: 13 }}>
             {applied.map((a) => (
               <li key={a.fileWrittenId} style={{ marginBottom: 4 }}>

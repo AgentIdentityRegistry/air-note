@@ -57,7 +57,7 @@ export function InboxPanel() {
 
       {!online ? (
         <div className="inbox-banner" style={{ padding: "8px 12px", borderRadius: 8, background: "color-mix(in srgb, var(--error) 10%, var(--surface))", color: "var(--error)", fontSize: 13 }}>
-          daemon offline — reconnecting. History is read-only.
+          Your agent is offline — reconnecting. History is read-only.
         </div>
       ) : null}
       {archiveError ? (

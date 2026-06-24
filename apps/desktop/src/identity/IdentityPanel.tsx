@@ -31,7 +31,7 @@ export function IdentityPanel() {
       </div>
 
       <div style={{ marginTop: 12 }}>
-        <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Trust score</div>
+        <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Trust Score</div>
         <div style={{ fontSize: 16 }}>{trustScore ?? "—"}</div>
       </div>
 

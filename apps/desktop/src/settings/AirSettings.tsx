@@ -20,7 +20,7 @@ export function AirSettings() {
       <SourcesPanel />
 
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>Danger zone</div>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>Danger Zone</div>
         <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
           Reset will delete your agent&apos;s identity and require re-onboarding.
         </p>

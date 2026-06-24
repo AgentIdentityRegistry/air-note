@@ -26,7 +26,7 @@ export function Composer({ to, disabled, onSend }: {
           onChange={(e) => setRecipient(e.target.value)} />
       ) : null}
       <div style={{ display: "flex", gap: 8 }}>
-        <Input value={text} placeholder={disabled ? "daemon offline" : "Message…"} disabled={disabled}
+        <Input value={text} placeholder={disabled ? "Agent offline" : "Message…"} disabled={disabled}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }} />
         <Button variant="primary" disabled={!canSend} onClick={submit}>Send</Button>
