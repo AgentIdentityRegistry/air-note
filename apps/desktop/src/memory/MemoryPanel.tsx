@@ -52,8 +52,8 @@ export function MemoryPanel() {
   if (unavailable) {
     return (
       <Card>
-        <h2 style={{ margin: 0 }}>Memory</h2>
-        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach the memory engine.</p>
+        <h2 style={{ margin: 0 }}>Brain</h2>
+        <p style={{ color: "var(--text-secondary)" }}>Couldn’t reach your agent’s memory.</p>
       </Card>
     );
   }
@@ -104,7 +104,7 @@ export function MemoryPanel() {
 
   return (
     <Card>
-      <h2 style={{ margin: 0 }}>Memory</h2>
+      <h2 style={{ margin: 0 }}>Brain</h2>
       <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
         Search everything the agent has read and learned. Everything stays on your machine.
       </p>

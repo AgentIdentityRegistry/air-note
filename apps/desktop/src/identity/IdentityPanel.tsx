@@ -10,7 +10,7 @@ export function IdentityPanel() {
 
   return (
     <Card>
-      <h2 style={{ margin: 0 }}>Your agent</h2>
+      <h2 style={{ margin: 0 }}>Agent Identity Registry</h2>
 
       <div style={{ marginTop: 16 }}>
         <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Name</div>

@@ -17,11 +17,6 @@ export function AirSettings() {
     <Card>
       <h2 style={{ margin: 0 }}>Settings</h2>
 
-      <p style={{ marginTop: 16, color: "var(--text-secondary)", lineHeight: 1.5 }}>
-        AIR endpoint is configured via the <code>AIR_AGENT_USE_REAL_AIR</code>{" "}
-        environment variable at launch. (Settings UI for this comes in v1.1.)
-      </p>
-
       <SourcesPanel />
 
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
