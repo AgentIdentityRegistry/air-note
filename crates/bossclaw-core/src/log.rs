@@ -407,6 +407,23 @@ impl PendingProposal {
     }
 }
 
+/// One applied write attributed to a mandate (M6c), projected for the desktop Mandate-activity
+/// list. Built by [`EventLog::mandate_writes`] via a join — an applied write is stamped with the
+/// actuator producer, not the proposer, so the discriminator is the resolved proposal's producer.
+/// `#[cfg(unix)]` like the rest of the mandate/confirm surface.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MandateWriteRecord {
+    /// The `file_written` event id (also the handle Undo passes to `undo_write`).
+    pub file_written_id: String,
+    /// Canonical target path written (`content["target"]`).
+    pub target: String,
+    /// RFC-3339 time the write was recorded (`ts`).
+    pub written_at: String,
+    /// True iff a LATER `file_written` carries `undo_of == this.file_written_id`.
+    pub undone: bool,
+}
+
 impl EventLog {
     /// Open (creating if needed) an event log at `path`, encrypted with `dek`,
     /// signing with `key`.
@@ -6667,6 +6684,74 @@ impl EventLog {
             .query_row("SELECT hash FROM events ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
             .unwrap_or_else(|_| GENESIS.to_string());
         hw.save(&Mark { count, tip_hash })
+    }
+
+    /// Every applied write attributable to a MANDATE (M6c), newest-LAST in event order
+    /// (`events_of_types` returns `seq ASC`; the desktop reverses for newest-first display).
+    ///
+    /// Attribution requires a JOIN: a `file_written` is stamped `ACTUATOR_PRODUCER`, so the only
+    /// link to a mandate is `content.resolves_proposal` → a `write_proposal` whose
+    /// `model_meta.model_id == M6C_PROPOSER_PRODUCER`. Two invariants govern the join (SP5 L2 +
+    /// security L3):
+    ///   • COMPLETENESS — because Option B removed the preventive review, an applied M6c write that
+    ///     never surfaced (with no Undo offered) would be an invisible autonomous change. In PRACTICE
+    ///     the join is TOTAL: an M6c `write_proposal` is never GC'd while its `file_written` is live
+    ///     (a resolved proposal is retained), so every applied M6c write is attributable here.
+    ///   • FAIL-CLOSED against FALSE attribution — a row is included ONLY when its resolved proposal's
+    ///     producer is PROVABLY `M6C_PROPOSER_PRODUCER`. A `file_written` whose `resolves_proposal`
+    ///     cannot be resolved to a known M6c producer is EXCLUDED (not "degraded to target-only"):
+    ///     claiming an unprovable write is a mandate write would be worse than omitting it, and the
+    ///     completeness invariant means this exclusion is unreachable for a real M6c write anyway.
+    /// `#[cfg(unix)]` (mandate surface).
+    #[cfg(unix)]
+    pub fn mandate_writes(&self) -> Result<Vec<MandateWriteRecord>, BossclawError> {
+        use std::collections::{HashMap, HashSet};
+        // proposal id → producer (from write_proposal events).
+        let mut producer_of: HashMap<String, String> = HashMap::new();
+        // file_written_id → (target, written_at) for the FORWARD (non-undo) applied writes that
+        // resolve a proposal.
+        let mut applied: Vec<(String, String, String, String)> = Vec::new(); // (fw_id, target, ts, resolves)
+        // the set of file_written ids that a later undo cites (`undo_of`).
+        let mut undone_ids: HashSet<String> = HashSet::new();
+
+        for ev in self.events_of_types(&[
+            crate::graph::WRITE_PROPOSAL_EVENT_TYPE,
+            crate::graph::FILE_WRITTEN_EVENT_TYPE,
+        ])? {
+            match ev.event_type.as_str() {
+                t if t == crate::graph::WRITE_PROPOSAL_EVENT_TYPE => {
+                    let producer = ev.model_meta.as_ref()
+                        .map(|m| m.model_id.clone()).unwrap_or_default();
+                    producer_of.insert(ev.id.clone(), producer);
+                }
+                _ => {
+                    // file_written. An UNDO carries `undo_of` and NO `resolves_proposal` — record
+                    // the undone id and skip it as an attributed row.
+                    if let Some(undone) = ev.content.get("undo_of").and_then(|v| v.as_str()) {
+                        undone_ids.insert(undone.to_string());
+                        continue;
+                    }
+                    if let Some(resolves) = ev.content.get("resolves_proposal").and_then(|v| v.as_str()) {
+                        let target = ev.content.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        applied.push((ev.id.clone(), target, ev.ts.clone(), resolves.to_string()));
+                    }
+                }
+            }
+        }
+
+        Ok(applied
+            .into_iter()
+            .filter(|(_fw, _t, _ts, resolves)| {
+                // Keep ONLY writes whose resolved proposal is an M6c mandate proposal. An
+                // unresolvable producer (GC'd proposal) cannot be proven M6c ⇒ excluded (in
+                // practice unreachable — an M6c proposal outlives its file_written).
+                producer_of.get(resolves).map(|p| p == crate::graph::M6C_PROPOSER_PRODUCER).unwrap_or(false)
+            })
+            .map(|(fw, target, ts, _resolves)| {
+                let undone = undone_ids.contains(&fw);
+                MandateWriteRecord { file_written_id: fw, target, written_at: ts, undone }
+            })
+            .collect())
     }
 }
 

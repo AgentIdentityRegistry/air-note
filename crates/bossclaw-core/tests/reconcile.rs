@@ -1530,3 +1530,55 @@ fn pending_proposals_surface_producer_for_m6c_vs_m6b() {
     assert_eq!(by_id(&m6c).producer, "m6c-mandate-proposer", "M6c producer surfaced");
     assert_eq!(by_id(&m6b).producer, "m6b-reconciler", "M6b producer surfaced");
 }
+
+#[cfg(unix)]
+#[test]
+fn mandate_writes_attributes_m6c_excludes_m6b_and_flips_undone() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    use sha2::{Digest, Sha256};
+    // `dir` is a read+write-granted PathBuf (the harness grants both).
+    let (log, _home, dir) = common::open_log_with_write_grant();
+
+    // Helper: write `file` with `old`, ingest it, then apply a rewrite to `new` resolving a
+    // proposal stamped with `producer`. Returns (file_written_id, canonical_target).
+    let apply_via = |file: &str, old: &[u8], new: &[u8], producer: &str| -> (String, String) {
+        let path = dir.join(file);
+        std::fs::write(&path, old).unwrap();
+        let fid = common::ingest_one(&log, &path);
+        let hash = hex::encode(Sha256::digest(new));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":file});
+        let gated = log.propose_write(WriteProposal { target: path.clone(), new_content: new.to_vec(),
+            op: WriteOp::Edit, source_event_ids: vec![fid.clone()], rationale: "sync".to_string() }).unwrap();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new.len() as u64, "sync",
+            &key, &vs, std::slice::from_ref(&fid), producer).unwrap();
+        log.put_proposal_bytes(&pid, new, &hash).unwrap();
+        // Apply (acked — these are loud because ingested ⇒ Untrusted; the activity list test
+        // only cares about attribution, so pass true to let the write land).
+        let fw = log.execute_write_resolving(gated, &pid, true).unwrap();
+        (fw, canonical)
+    };
+
+    let (m6c_fw, m6c_target) = apply_via("mandated.md", b"old-c\n", b"new-c\n",
+        bossclaw_core::graph::M6C_PROPOSER_PRODUCER);
+    let (_m6b_fw, _m6b_target) = apply_via("reconciled.md", b"old-b\n", b"new-b\n",
+        bossclaw_core::graph::M6B_PROPOSER_PRODUCER);
+
+    let writes = log.mandate_writes().unwrap();
+    assert_eq!(writes.len(), 1, "only the M6c write is attributed to a mandate");
+    let w = &writes[0];
+    assert_eq!(w.file_written_id, m6c_fw);
+    assert_eq!(w.target, m6c_target);
+    assert!(!w.undone, "not undone yet");
+    assert!(!w.written_at.is_empty(), "written_at carried");
+
+    // Undo the M6c write → its row flips `undone` (the undo is a file_written carrying undo_of,
+    // no resolves_proposal, so it is excluded from the join and only flips the original's flag).
+    log.undo_write(&m6c_fw).unwrap();
+    let writes2 = log.mandate_writes().unwrap();
+    assert_eq!(writes2.len(), 1, "the undo does not add an attributed row (it has no resolves_proposal)");
+    assert!(writes2[0].undone, "undone flips true after undo_write");
+}
