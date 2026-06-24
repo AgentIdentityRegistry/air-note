@@ -132,6 +132,7 @@ fn main() {
             get_identity,
             get_trust_score,
             create_identity,
+            rename_identity,
             reset_identity,
             #[cfg(unix)]
             commands::engine::engine_status,
