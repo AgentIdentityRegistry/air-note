@@ -1508,3 +1508,25 @@ fn undo_of_a_tainted_write_succeeds_via_the_exemption() {
     log.undo_write(&fw).unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), original, "undo restored the pre-write bytes");
 }
+
+#[cfg(unix)]
+#[test]
+fn pending_proposals_surface_producer_for_m6c_vs_m6b() {
+    let (log, _home, dir) = common::open_write_grant_and_external_target();
+    let path = dir.join("n.md");
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let lineage = common::seed_memory(&log, "Alice works at Acme"); // returns the memory id
+    let key_a = serde_json::json!({"src":"entity:a","relation":"r","dst":"entity:b"});
+    let key_b = serde_json::json!({"src":"entity:c","relation":"r","dst":"entity:d"});
+    let vs = serde_json::json!({"requires_loud_modal": false, "taint": "Clean", "allowed": true});
+
+    let m6c = log.append_write_proposal_with(&canonical, "edit", "deadbeef", 0, "why-c",
+        &key_a, &vs, std::slice::from_ref(&lineage), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+    let m6b = log.append_write_proposal_with(&canonical, "edit", "feedface", 0, "why-b",
+        &key_b, &vs, std::slice::from_ref(&lineage), bossclaw_core::graph::M6B_PROPOSER_PRODUCER).unwrap();
+
+    let pending = log.pending_proposals().unwrap();
+    let by_id = |id: &str| pending.iter().find(|p| p.id == id).unwrap().clone();
+    assert_eq!(by_id(&m6c).producer, "m6c-mandate-proposer", "M6c producer surfaced");
+    assert_eq!(by_id(&m6b).producer, "m6b-reconciler", "M6b producer surfaced");
+}

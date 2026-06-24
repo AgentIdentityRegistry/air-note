@@ -381,6 +381,10 @@ pub struct PendingProposal {
     pub inducing_key: serde_json::Value,
     /// Lineage event ids (`model_meta.source_event_ids`); empty if absent.
     pub source_event_ids: Vec<String>,
+    /// The proposer's producer stamp (`model_meta.model_id`): `"m6b-reconciler"` for an M6b
+    /// reconcile proposal, `"m6c-mandate-proposer"` for an M6c mandate proposal; empty when
+    /// `model_meta` is absent. The desktop sweep auto-applies iff this is exactly the M6c stamp.
+    pub producer: String,
     /// The propose-time verdict summary `{requires_loud_modal, taint, allowed, base_content_hash}`
     /// (`content["verdict_summary"]`).
     pub verdict_summary: serde_json::Value,
@@ -2369,10 +2373,12 @@ impl EventLog {
                         .and_then(|v| v.as_str()).map(|s| s.to_string());
                     let source_event_ids = ev.model_meta.as_ref()
                         .map(|m| m.source_event_ids.clone()).unwrap_or_default();
+                    let producer = ev.model_meta.as_ref()
+                        .map(|m| m.model_id.clone()).unwrap_or_default();
                     proposal_keys.insert(id.clone(), (target.clone(), inducing_key.to_string()));
                     open.push(PendingProposal {
                         id, target, op, new_content_hash, rationale,
-                        inducing_key, source_event_ids, base_content_hash, verdict_summary,
+                        inducing_key, source_event_ids, producer, base_content_hash, verdict_summary,
                     });
                 }
                 t if t == crate::graph::WRITE_REJECTED_EVENT_TYPE => {
