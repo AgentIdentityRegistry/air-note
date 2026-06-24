@@ -13,12 +13,12 @@ export function IdentityPanel() {
       <h2 style={{ margin: 0 }}>Your agent</h2>
 
       <div style={{ marginTop: 16 }}>
-        <div style={{ fontSize: 13, color: "#666" }}>Name</div>
+        <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Name</div>
         <div style={{ fontSize: 16 }}>{identity.name}</div>
       </div>
 
       <div style={{ marginTop: 12 }}>
-        <div style={{ fontSize: 13, color: "#666" }}>DID</div>
+        <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>DID</div>
         <div
           style={{
             fontSize: 12,
@@ -31,7 +31,7 @@ export function IdentityPanel() {
       </div>
 
       <div style={{ marginTop: 12 }}>
-        <div style={{ fontSize: 13, color: "#666" }}>Trust score</div>
+        <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Trust score</div>
         <div style={{ fontSize: 16 }}>{trustScore ?? "—"}</div>
       </div>
 
