@@ -543,6 +543,10 @@ label {
   font-weight: 520;
   font-size: 0.78rem;
   padding: 7px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .tab-btn:hover {
