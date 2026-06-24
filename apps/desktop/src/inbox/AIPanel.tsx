@@ -24,7 +24,7 @@ export function AIPanel({ selectedPeer }: Props) {
     return (
       <div style={wrapStyle}>
         <StatusBadge tone="neutral">AI replies</StatusBadge>
-        <span style={{ fontSize: 13, color: "#888", marginLeft: 8 }}>
+        <span style={{ fontSize: 13, color: "var(--text-tertiary)", marginLeft: 8 }}>
           configure a reply model to enable AI drafts
         </span>
       </div>
@@ -40,7 +40,7 @@ export function AIPanel({ selectedPeer }: Props) {
 
   return (
     <div style={wrapStyle}>
-      <span style={{ fontSize: 12, fontWeight: 600, color: "#555", marginBottom: 4, display: "block" }}>
+      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 4, display: "block" }}>
         AI drafts
       </span>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -90,7 +90,7 @@ function ReplyRow({ envelopeId, view, approveSend, edit, discard }: RowProps) {
     return (
       <div style={rowStyle}>
         <StatusBadge tone="neutral">drafting…</StatusBadge>
-        <p style={draftTextStyle}>{view.text || <em style={{ color: "#aaa" }}>generating…</em>}</p>
+        <p style={draftTextStyle}>{view.text || <em style={{ color: "var(--text-tertiary)" }}>generating…</em>}</p>
       </div>
     );
   }
@@ -164,7 +164,7 @@ function ReplyRow({ envelopeId, view, approveSend, edit, discard }: RowProps) {
             <StatusBadge tone="error">failed</StatusBadge>
           )}
           {view.reason ? (
-            <span style={{ fontSize: 12, color: "#A75D61" }}>{view.reason}</span>
+            <span style={{ fontSize: 12, color: "var(--error)" }}>{view.reason}</span>
           ) : null}
         </div>
         {/* Retry is only offered when retryable AND the row is still in `drafted` state.
@@ -194,21 +194,21 @@ const wrapStyle: React.CSSProperties = {
   marginTop: 12,
   padding: "10px 12px",
   borderRadius: 8,
-  border: "1px solid #E8EAED",
-  background: "#F8F9FB",
+  border: "1px solid var(--border-soft)",
+  background: "var(--surface-soft)",
 };
 
 const rowStyle: React.CSSProperties = {
   padding: "8px 10px",
   borderRadius: 6,
-  background: "white",
-  border: "1px solid #E0E3E8",
+  background: "var(--surface)",
+  border: "1px solid var(--border-soft)",
 };
 
 const draftTextStyle: React.CSSProperties = {
   margin: "6px 0 0",
   fontSize: 13,
-  color: "#1a1a1a",
+  color: "var(--text-primary)",
   lineHeight: 1.5,
   whiteSpace: "pre-wrap",
 };
@@ -216,7 +216,7 @@ const draftTextStyle: React.CSSProperties = {
 const sentTextStyle: React.CSSProperties = {
   margin: "4px 0 0",
   fontSize: 12,
-  color: "#888",
+  color: "var(--text-tertiary)",
   lineHeight: 1.4,
   whiteSpace: "pre-wrap",
 };
@@ -227,7 +227,7 @@ const textareaStyle: React.CSSProperties = {
   fontFamily: "inherit",
   padding: "6px 8px",
   borderRadius: 6,
-  border: "1px solid #ccc",
+  border: "1px solid var(--border-soft)",
   resize: "vertical",
   boxSizing: "border-box",
 };
