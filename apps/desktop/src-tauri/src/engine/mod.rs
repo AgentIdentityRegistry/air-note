@@ -733,6 +733,9 @@ impl EngineHandle {
     /// `acknowledged_loud == false` the op REFUSES (`NeedsLoudConfirm`) — never a silent write.
     /// Only then does it execute (atomic temp+rename, durable undo, signed `file_written`). Nothing
     /// is written on any failure. Gated.
+    /// (A Create has no base hash; its anti-clobber is the engine's atomic no-clobber create, so the
+    /// base-hash arm is skipped for Create — the op-map runs first, then the base-hash arm gates on
+    /// `op != Create`.)
     pub async fn apply_proposal(&self, onboarded: bool, id: String, acknowledged_loud: bool) -> Result<ApplyResult, EngineOpError> {
         use sha2::{Digest, Sha256};
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -741,34 +744,40 @@ impl EngineHandle {
             let p = pending.into_iter().find(|p| p.id == id)
                 .ok_or_else(|| EngineOpError::Stale("proposal not found or already resolved".to_string()))?;
 
-            // ── ANTI-CLOBBER: compare the live file to the proposal's propose-time fingerprint. ──
-            // This is the TRUE staleness detector (a fresh propose_write below re-bases on the live
-            // file and cannot detect that it changed). Edit-only proposals always carry a base.
-            let live_bytes = std::fs::read(&p.target)
-                .map_err(|e| EngineOpError::Stale(format!("could not read target: {e}")))?;
-            let live_hash = hex::encode(Sha256::digest(&live_bytes));
-            match &p.base_content_hash {
-                Some(base) if *base != live_hash => {
-                    return Err(EngineOpError::Stale(format!(
-                        "the file changed since this was suggested (base {base} != live {live_hash})"
-                    )));
-                }
-                None => {
-                    // No recorded base (e.g. a legacy/minimal proposal) → cannot prove freshness.
-                    return Err(EngineOpError::Stale("proposal has no base fingerprint to verify against".to_string()));
-                }
-                _ => {} // base matches live → proceed.
-            }
-
-            // Map the proposal's OWN op back to a `WriteOp` (fail-closed on an unknown string —
-            // NEVER default to Edit). SP4's M6b only emits "edit", so this is behavior-identical
-            // today; mapping it keeps a future Create/Delete proposal from being mis-gated as Edit.
+            // Map the proposal's OWN op back to a `WriteOp` FIRST (fail-closed on an unknown
+            // string — NEVER default to Edit), because the base-hash anti-clobber below applies
+            // only to Edit/Delete (a Create has no base).
             let op = match p.op.as_str() {
                 "edit" => bossclaw_core::actuator::WriteOp::Edit,
                 "create" => bossclaw_core::actuator::WriteOp::Create,
                 "delete" => bossclaw_core::actuator::WriteOp::Delete,
                 other => return Err(EngineOpError::Core(format!("unknown proposal op: {other}"))),
             };
+
+            // ── ANTI-CLOBBER (Edit/Delete only): compare the live file to the proposal's
+            // propose-time fingerprint. This is the TRUE staleness detector (a fresh propose_write
+            // below re-bases on the live file and cannot detect that it changed). A CREATE has no
+            // base (target absent at propose) — its anti-clobber is the engine's ATOMIC no-clobber
+            // create at the syscall (RENAME_NOREPLACE on Linux; statat+renameat on macOS). We do
+            // NOT add a desktop absence pre-check: it would be a strictly weaker TOCTOU check than
+            // the engine's atomic no-clobber. So skip the base-hash arm entirely for a Create.
+            if op != bossclaw_core::actuator::WriteOp::Create {
+                let live_bytes = std::fs::read(&p.target)
+                    .map_err(|e| EngineOpError::Stale(format!("could not read target: {e}")))?;
+                let live_hash = hex::encode(Sha256::digest(&live_bytes));
+                match &p.base_content_hash {
+                    Some(base) if *base != live_hash => {
+                        return Err(EngineOpError::Stale(format!(
+                            "the file changed since this was suggested (base {base} != live {live_hash})"
+                        )));
+                    }
+                    None => {
+                        // No recorded base on an Edit/Delete (legacy/minimal) → cannot prove freshness.
+                        return Err(EngineOpError::Stale("proposal has no base fingerprint to verify against".to_string()));
+                    }
+                    _ => {} // base matches live → proceed.
+                }
+            }
             // Verified bytes (fail closed if the side-table row is missing/tampered).
             let bytes = log.get_proposal_bytes_checked(&p.id, &p.new_content_hash)
                 .map_err(|e| EngineOpError::Core(e.to_string()))?;
@@ -1445,6 +1454,89 @@ mod tests {
         // acknowledged_loud=true → applies.
         handle.apply_proposal(true, pid, true).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), new_bytes, "the ack lets the loud write through");
+    }
+
+    #[tokio::test]
+    async fn apply_create_proposal_writes_new_file_and_refuses_if_target_reappeared() {
+        use bossclaw_core::actuator::{WriteOp, WriteProposal};
+        use sha2::{Digest, Sha256};
+
+        // ---- happy path: a Create lands the new file ----
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        // A lineage event so the Tier-B proposal is valid (a Create cites SOME source).
+        let lineage = seed_one_memory_id(&log, "make a synced file");
+        let target = folder.path().join("new.md"); // does NOT exist yet → Create
+        let new_bytes = b"freshly synced content\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        // Gate a Create proposal (base_content_hash is None for a Create).
+        let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+            op: WriteOp::Create, source_event_ids: vec![lineage.clone()], rationale: "create".to_string() }).unwrap();
+        assert!(gated.verdict.base_content_hash.is_none(), "a Create carries no base hash");
+        // The recorded target is the canonical PARENT-joined path (Create canonicalizes the parent).
+        let canonical = gated.verdict.target_canonical.as_ref().unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal(&canonical, "create", &hash, new_bytes.len() as u64,
+            "create", &key, &vs, std::slice::from_ref(&lineage)).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // A Create is loud (ingested-target Step-4 taint doesn't apply, but a brand-new write to a
+        // tracked folder may still be non-loud if Clean; pass acknowledged_loud=false and, if the
+        // gate is loud, retry true — robust either way). Try false first:
+        let first = handle.apply_proposal(true, pid.clone(), false).await;
+        // A loud refuse fires pre-execute, so the first call does NOT consume the proposal — the
+        // retry below still finds it via pending_proposals (the same pid is reusable).
+        let applied = match first {
+            Ok(r) => r,
+            Err(EngineOpError::NeedsLoudConfirm(_)) => handle.apply_proposal(true, pid.clone(), true).await.unwrap(),
+            Err(e) => panic!("unexpected create apply error: {e:?}"),
+        };
+        assert!(!applied.file_written_id.is_empty(), "the Create returned a file_written id");
+        assert_eq!(std::fs::read(&target).unwrap(), new_bytes, "the new file was created with the bytes");
+
+        // ---- refuse path: a Create whose target now EXISTS is refused (engine atomic no-clobber) ----
+        let (vault2, dir2) = test_vault_and_dir();
+        let handle2 = new_test_handle(vault2, &dir2);
+        let log2 = handle2.get_or_open(true).await.unwrap();
+        let folder2 = tempfile::tempdir().unwrap();
+        log2.add_grant(folder2.path()).unwrap();
+        log2.add_write_grant(folder2.path()).unwrap();
+        let lineage2 = seed_one_memory_id(&log2, "make a synced file");
+        let target2 = folder2.path().join("appears.md"); // absent at propose
+        let new2 = b"would-be content\n".to_vec();
+        let hash2 = hex::encode(Sha256::digest(&new2));
+        let g2 = log2.propose_write(WriteProposal { target: target2.clone(), new_content: new2.clone(),
+            op: WriteOp::Create, source_event_ids: vec![lineage2.clone()], rationale: "create".to_string() }).unwrap();
+        let canon2 = g2.verdict.target_canonical.as_ref().unwrap().to_string_lossy().to_string();
+        let vs2 = serde_json::json!({"requires_loud_modal": g2.verdict.requires_loud_modal,
+            "taint": format!("{:?}", g2.verdict.taint), "allowed": g2.verdict.allowed,
+            "base_content_hash": g2.verdict.base_content_hash});
+        let pid2 = log2.append_write_proposal(&canon2, "create", &hash2, new2.len() as u64, "create",
+            &serde_json::json!({"src":"a","relation":"r","dst":"b"}), &vs2, std::slice::from_ref(&lineage2)).unwrap();
+        log2.put_proposal_bytes(&pid2, &new2, &hash2).unwrap();
+        drop(log2);
+
+        // The target reappears on disk BEFORE apply (a racer created it).
+        std::fs::write(&target2, b"already here\n").unwrap();
+        // Apply must fail closed (SF1): the FRESH `propose_write` re-gate runs `classify_op_existence`
+        // and, seeing op=Create against an EXISTING target, sets `reject_reason = "create target
+        // already exists"`; `apply_proposal` maps a `reject_reason` to `EngineOpError::Stale` (the
+        // `gated.verdict.reject_reason.is_some() => Stale` arm), so it fails BEFORE execute — the
+        // syscall atomic no-clobber is the deeper backstop but is not what fires here. Assert the
+        // SPECIFIC Stale variant, and that the racer's file is untouched.
+        let refused = handle2.apply_proposal(true, pid2, true).await;
+        assert!(matches!(refused, Err(EngineOpError::Stale(_))),
+            "a Create whose target reappeared must fail closed as Stale (re-gate classify_op_existence): {refused:?}");
+        assert_eq!(std::fs::read(&target2).unwrap(), b"already here\n".to_vec(),
+            "the racer's file is untouched (the apply never reached execute)");
     }
 
     /// Task 7 (mint): with the stub returning one entity for the extraction schema, an
