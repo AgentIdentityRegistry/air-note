@@ -49,9 +49,9 @@ export function GenerateAndRegister() {
           style={{
             marginTop: 16,
             padding: 12,
-            background: "#fdeaea",
+            background: "color-mix(in srgb, var(--error) 18%, var(--surface))",
             borderRadius: 6,
-            color: "#b00",
+            color: "var(--error)",
           }}
         >
           {state.error}
