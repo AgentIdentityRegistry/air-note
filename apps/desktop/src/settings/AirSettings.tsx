@@ -17,19 +17,19 @@ export function AirSettings() {
     <Card>
       <h2 style={{ margin: 0 }}>Settings</h2>
 
-      <p style={{ marginTop: 16, color: "#666", lineHeight: 1.5 }}>
+      <p style={{ marginTop: 16, color: "var(--text-secondary)", lineHeight: 1.5 }}>
         AIR endpoint is configured via the <code>AIR_AGENT_USE_REAL_AIR</code>{" "}
         environment variable at launch. (Settings UI for this comes in v1.1.)
       </p>
 
       <SourcesPanel />
 
-      <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #eee" }}>
+      <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Danger zone</div>
-        <p style={{ color: "#666", fontSize: 13 }}>
+        <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
           Reset will delete your agent&apos;s identity and require re-onboarding.
         </p>
-        <Button variant="secondary" onClick={handleReset} style={{ color: "#b00" }}>
+        <Button variant="secondary" className="danger-btn" onClick={handleReset}>
           Reset agent
         </Button>
       </div>
