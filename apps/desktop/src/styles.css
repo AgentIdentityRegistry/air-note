@@ -1744,3 +1744,14 @@ label {
   text-align: left;
 }
 
+.app-loading {
+  padding: 2rem;
+  color: var(--text-secondary);
+}
+
+.onboarding-wrap {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
