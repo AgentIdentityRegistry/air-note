@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { IdentityProvider, useIdentity } from "./state/identity";
 import { OnboardingProvider, useOnboarding } from "./state/onboarding";
 import { InboxProvider, useInbox } from "./state/inbox";
@@ -17,6 +17,9 @@ import { AirSettings } from "./settings/AirSettings";
 import { Sidebar } from "./shell/Sidebar";
 import { useReviewCount } from "./shell/useReviewCount";
 import type { View } from "./shell/nav";
+import { CommandPalette } from "./search/CommandPalette";
+import { useCommandPaletteHotkey } from "./shell/useCommandPaletteHotkey";
+import type { NavTarget } from "./search/types";
 
 export default function App() {
   return (
@@ -36,10 +39,18 @@ export default function App() {
 
 function Shell() {
   const { identity, loading } = useIdentity();
-  const { totalUnread } = useInbox();
+  const { totalUnread, select } = useInbox();
   const reviewCount = useReviewCount(!!identity);
   const [view, setView] = useState<View>("identity");
   const [onboardingDone, setOnboardingDone] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const openSearch = useCallback(() => setSearchOpen(true), []);
+  useCommandPaletteHotkey(openSearch);
+
+  const navigateTo = useCallback((target: NavTarget) => {
+    setView(target.view);
+    if (target.view === "inbox" && target.convKey) select(target.convKey);
+  }, [select]);
 
   if (loading) return <div className="app-loading">Loading…</div>;
   if (!identity && !onboardingDone) {
@@ -52,7 +63,7 @@ function Shell() {
 
   return (
     <div className="app-shell">
-      <Sidebar view={view} onNavigate={setView} inboxUnread={totalUnread} reviewCount={reviewCount} />
+      <Sidebar view={view} onNavigate={setView} inboxUnread={totalUnread} reviewCount={reviewCount} onOpenSearch={openSearch} />
       <main className="main-area">
         {view === "identity" ? (
           <IdentityPanel />
@@ -68,6 +79,7 @@ function Shell() {
           <AirSettings />
         )}
       </main>
+      <CommandPalette open={searchOpen} onClose={() => setSearchOpen(false)} onNavigate={navigateTo} />
     </div>
   );
 }

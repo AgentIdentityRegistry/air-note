@@ -7,11 +7,13 @@ export function Sidebar({
   onNavigate,
   inboxUnread,
   reviewCount,
+  onOpenSearch,
 }: {
   view: View;
   onNavigate: (v: View) => void;
   inboxUnread: number;
   reviewCount: number;
+  onOpenSearch: () => void;
 }) {
   const { theme, toggleTheme } = useTheme();
   const countFor = (v: View): number | undefined =>
@@ -19,8 +21,19 @@ export function Sidebar({
 
   return (
     <aside className="sidebar">
-      <div className="brand">
-        <h1>AIR Agent</h1>
+      <div className="sidebar-top">
+        <div className="brand">
+          <h1>AIR Agent</h1>
+        </div>
+        <button
+          type="button"
+          className="secondary-btn sidebar-search-trigger"
+          onClick={onOpenSearch}
+          aria-label="Open global search"
+        >
+          <span>Search…</span>
+          <span className="sidebar-search-kbd">⌘K</span>
+        </button>
       </div>
 
       <nav className="tab-list" aria-label="Primary">
