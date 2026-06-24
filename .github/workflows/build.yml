@@ -182,3 +182,19 @@ jobs:
         run: cargo test -p bossclaw-core --features sandbox-test-hooks -- --ignored
         env:
           BOSSCLAW_MARKITDOWN_VENV: ${{ runner.temp }}/m5b-venv
+
+  # Supply-chain audit (RustSec). `cargo audit --deny warnings` fails on ANY advisory — a real
+  # vulnerability OR a newly-unmaintained crate — that is NOT in the documented allowlist at
+  # .cargo/audit.toml. The allowlist holds only the known ecosystem-unmaintained transitive deps
+  # (the gtk-rs GTK3 stack, unic-*, etc.); a real new advisory (e.g. the quinn-proto RUSTSEC-2026-0185
+  # we caught manually) fails CI here instead of slipping onto main. Lockfile-only, so one runner.
+  cargo-audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (deny warnings; allowlist in .cargo/audit.toml)
+        run: cargo audit --deny warnings
