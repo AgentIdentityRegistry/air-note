@@ -575,14 +575,35 @@ label {
   box-shadow: inset 2px 0 0 var(--primary);
 }
 
-.sidebar-footer {
-  display: grid;
-  gap: 10px;
+.sidebar-footer-icons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.sidebar-footer p {
-  margin: 0;
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
+  background: transparent;
+  box-shadow: none;
+}
+
+.icon-btn:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--surface) 62%, transparent);
+  border-color: color-mix(in srgb, var(--text-secondary) 20%, var(--border-soft));
+}
+
+.icon-btn.active {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--primary) 8%, var(--surface));
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 
 .main-area {
@@ -1843,11 +1864,6 @@ label {
   .slide-panel {
     width: min(900px, 100%);
   }
-}
-
-.theme-toggle-btn {
-  width: 100%;
-  text-align: left;
 }
 
 .app-loading {

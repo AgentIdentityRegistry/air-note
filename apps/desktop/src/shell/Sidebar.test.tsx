@@ -46,10 +46,18 @@ describe("Sidebar", () => {
     expect(onNavigate).toHaveBeenCalledWith("memory");
   });
 
-  it("toggles the theme from the footer button", () => {
+  it("toggles the theme from the footer icon button", () => {
     renderSidebar();
     expect(document.documentElement.dataset.theme).toBe("light");
     fireEvent.click(screen.getByRole("button", { name: /theme/i }));
     expect(document.documentElement.dataset.theme).toBe("dark");
+  });
+
+  it("navigates to Settings from the footer gear icon and marks it active", () => {
+    const { onNavigate } = renderSidebar({ view: "settings" });
+    const settings = screen.getByRole("button", { name: "Settings" });
+    expect(settings).toHaveClass("active");
+    fireEvent.click(settings);
+    expect(onNavigate).toHaveBeenCalledWith("settings");
   });
 });
