@@ -1863,21 +1863,38 @@ label {
 }
 
 
-.sidebar-top {
-  display: grid;
-  gap: 10px;
-}
-
-.sidebar-search-trigger {
-  width: 100%;
+.main-search {
+  width: min(var(--chat-column-max), 100%);
+  margin: 0 auto;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  box-shadow: var(--elev-1);
   color: var(--text-secondary);
+  padding: 12px 14px;
+  text-align: left;
 }
 
-.sidebar-search-kbd {
+.main-search:hover {
+  border-color: color-mix(in srgb, var(--text-secondary) 22%, var(--border-soft));
+  background: color-mix(in srgb, var(--surface-soft) 60%, var(--surface));
+}
+
+.main-search-icon {
+  font-size: 1rem;
+  color: var(--text-tertiary);
+  line-height: 1;
+}
+
+.main-search-placeholder {
+  flex: 1;
+  font-size: 0.82rem;
+}
+
+.main-search-kbd {
   font-size: 0.7rem;
   color: var(--text-tertiary);
   border: 1px solid var(--border-soft);

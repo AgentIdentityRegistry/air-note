@@ -7,13 +7,11 @@ export function Sidebar({
   onNavigate,
   inboxUnread,
   reviewCount,
-  onOpenSearch,
 }: {
   view: View;
   onNavigate: (v: View) => void;
   inboxUnread: number;
   reviewCount: number;
-  onOpenSearch: () => void;
 }) {
   const { theme, toggleTheme } = useTheme();
   // The review count surfaces on the Brain (memory) tab now that Review lives inside the Brain hub.
@@ -22,19 +20,8 @@ export function Sidebar({
 
   return (
     <aside className="sidebar">
-      <div className="sidebar-top">
-        <div className="brand">
-          <h1>AIR Agent</h1>
-        </div>
-        <button
-          type="button"
-          className="secondary-btn sidebar-search-trigger"
-          onClick={onOpenSearch}
-          aria-label="Open global search"
-        >
-          <span>Search…</span>
-          <span className="sidebar-search-kbd">⌘K</span>
-        </button>
+      <div className="brand">
+        <h1>AIR Agent</h1>
       </div>
 
       <nav className="tab-list" aria-label="Primary">

@@ -13,6 +13,7 @@ import { InboxPanel } from "./inbox/InboxPanel";
 import { BrainPanel } from "./memory/BrainPanel";
 import { AirSettings } from "./settings/AirSettings";
 import { Sidebar } from "./shell/Sidebar";
+import { MainSearch } from "./shell/MainSearch";
 import { useReviewCount } from "./shell/useReviewCount";
 import type { View } from "./shell/nav";
 import { CommandPalette } from "./search/CommandPalette";
@@ -61,8 +62,9 @@ function Shell() {
 
   return (
     <div className="app-shell">
-      <Sidebar view={view} onNavigate={setView} inboxUnread={totalUnread} reviewCount={reviewCount} onOpenSearch={openSearch} />
+      <Sidebar view={view} onNavigate={setView} inboxUnread={totalUnread} reviewCount={reviewCount} />
       <main className="main-area">
+        <MainSearch onOpen={openSearch} />
         {view === "identity" ? (
           <IdentityPanel />
         ) : view === "inbox" ? (

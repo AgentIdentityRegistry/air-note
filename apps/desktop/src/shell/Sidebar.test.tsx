@@ -7,13 +7,12 @@ import { ThemeProvider } from "../state/theme";
 
 function renderSidebar(props: Partial<ComponentProps<typeof Sidebar>> = {}) {
   const onNavigate = vi.fn();
-  const onOpenSearch = vi.fn();
   render(
     <ThemeProvider>
-      <Sidebar view="identity" onNavigate={onNavigate} inboxUnread={0} reviewCount={0} onOpenSearch={onOpenSearch} {...props} />
+      <Sidebar view="identity" onNavigate={onNavigate} inboxUnread={0} reviewCount={0} {...props} />
     </ThemeProvider>,
   );
-  return { onNavigate, onOpenSearch };
+  return { onNavigate };
 }
 
 describe("Sidebar", () => {
@@ -52,11 +51,5 @@ describe("Sidebar", () => {
     expect(document.documentElement.dataset.theme).toBe("light");
     fireEvent.click(screen.getByRole("button", { name: /theme/i }));
     expect(document.documentElement.dataset.theme).toBe("dark");
-  });
-
-  it("calls onOpenSearch when the search trigger is clicked", () => {
-    const { onOpenSearch } = renderSidebar();
-    fireEvent.click(screen.getByRole("button", { name: /open global search/i }));
-    expect(onOpenSearch).toHaveBeenCalledOnce();
   });
 });
