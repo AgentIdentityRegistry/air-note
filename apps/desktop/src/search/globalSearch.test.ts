@@ -44,4 +44,12 @@ describe("globalSearch", () => {
     expect(out.conversations.map((r) => r.id)).toEqual(["conv:did:key:alpha"]);
     expect(out.files.map((r) => r.id)).toEqual(["file:f1"]);
   });
+
+  it("isolates a failing listFiles: empty files group + error flag, others still return", async () => {
+    const out = await globalSearch("alpha", deps({ listFiles: vi.fn(async () => { throw new Error("fs down"); }) }));
+    expect(out.files).toEqual([]);
+    expect(out.errors.files).toBe(true);
+    expect(out.memory.map((r) => r.id)).toEqual(["mem:e1"]);
+    expect(out.conversations.map((r) => r.id)).toEqual(["conv:did:key:alpha"]);
+  });
 });

@@ -1,5 +1,5 @@
 import type { FileRecordDto } from "../api/engine";
-import type { SearchResult } from "./types";
+import { type SearchResult, RESULTS_PER_GROUP } from "./types";
 
 /** Last path segment, handling both posix (/) and windows (\) separators. */
 export function basename(path: string): string {
@@ -8,7 +8,7 @@ export function basename(path: string): string {
 }
 
 /** Pure client-side filter over the already-loaded file list (name/path). */
-export function filterFiles(files: FileRecordDto[], query: string, cap = 5): SearchResult[] {
+export function filterFiles(files: FileRecordDto[], query: string, cap = RESULTS_PER_GROUP): SearchResult[] {
   const q = query.trim().toLowerCase();
   if (!q) return [];
   return files

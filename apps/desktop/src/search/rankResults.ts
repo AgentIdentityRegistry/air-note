@@ -1,9 +1,9 @@
 import type { HitDto } from "../api/engine";
 import { KIND_LABEL } from "../memory/recallView";
-import type { GroupedResults, SearchResult } from "./types";
+import { type GroupedResults, type SearchResult, RESULTS_PER_GROUP } from "./types";
 
 /** Map recall hits to memory SearchResults (capped, ordered as recall returned them). */
-export function memoryResults(hits: HitDto[], cap = 5): SearchResult[] {
+export function memoryResults(hits: HitDto[], cap = RESULTS_PER_GROUP): SearchResult[] {
   return hits.slice(0, cap).map((h) => ({
     id: `mem:${h.event_id}`,
     kind: "memory" as const,

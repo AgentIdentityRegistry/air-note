@@ -27,3 +27,6 @@ export const EMPTY_RESULTS: GroupedResults = {
   files: [],
   errors: { memory: false, conversations: false, files: false },
 };
+
+/** Max results shown per group (memory / conversations / files) in the command palette. */
+export const RESULTS_PER_GROUP = 5;

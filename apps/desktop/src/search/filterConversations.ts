@@ -1,8 +1,8 @@
 import type { Conversation } from "../inbox/model";
-import type { SearchResult } from "./types";
+import { type SearchResult, RESULTS_PER_GROUP } from "./types";
 
 /** Pure client-side filter over already-loaded conversation summaries (title + preview). */
-export function filterConversations(convs: Conversation[], query: string, cap = 5): SearchResult[] {
+export function filterConversations(convs: Conversation[], query: string, cap = RESULTS_PER_GROUP): SearchResult[] {
   const q = query.trim().toLowerCase();
   if (!q) return [];
   return convs
