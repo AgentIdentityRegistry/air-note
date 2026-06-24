@@ -150,6 +150,12 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_mandates_enabled,
             #[cfg(unix)]
+            commands::engine::engine_add_mandate,
+            #[cfg(unix)]
+            commands::engine::engine_revoke_mandate,
+            #[cfg(unix)]
+            commands::engine::engine_list_mandates,
+            #[cfg(unix)]
             commands::engine::engine_list_grants,
             #[cfg(unix)]
             commands::engine::engine_run_ingest,

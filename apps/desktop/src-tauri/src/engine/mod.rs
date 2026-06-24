@@ -71,6 +71,11 @@ pub enum EngineOpError {
     /// pass `acknowledged_loud == true`. The op refuses to write — the UI must show the
     /// "I've reviewed this" confirm and retry with the ack. Carries the reason.
     NeedsLoudConfirm(String),
+    /// A mandate grant was refused by an engine grant-time guard (recipe too long, > 256 sources,
+    /// target not write-granted, or target under a read-grant root). Carries the reason so the
+    /// New-mandate form can show *why*. Distinct from `Core` so the UI can style it as a validation
+    /// error, not an engine fault.
+    Rejected(String),
     Join(String),
 }
 
@@ -85,6 +90,7 @@ impl std::fmt::Display for EngineOpError {
             EngineOpError::Stale(m) => write!(f, "the file changed since this was suggested: {m}"),
             EngineOpError::Revoked(m) => write!(f, "edits aren't allowed in this folder anymore: {m}"),
             EngineOpError::NeedsLoudConfirm(m) => write!(f, "this change needs an explicit review confirmation: {m}"),
+            EngineOpError::Rejected(m) => write!(f, "{m}"),
             EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
         }
     }
@@ -115,6 +121,31 @@ impl ProposalSummary {
             new_content_hash: p.new_content_hash,
             rationale: p.rationale,
             requires_loud_modal,
+        }
+    }
+}
+
+/// A mandate row for the desktop Mandates list, projected from `bossclaw_core::Mandate` (the six
+/// fields map 1:1).
+#[derive(Debug, Clone)]
+pub struct MandateSummary {
+    pub mandate_grant_id: String,
+    pub target: String,
+    pub source_scope: String,
+    pub recipe: String,
+    pub granted_at: String,
+    pub revoked: bool,
+}
+
+impl From<bossclaw_core::Mandate> for MandateSummary {
+    fn from(m: bossclaw_core::Mandate) -> Self {
+        Self {
+            mandate_grant_id: m.mandate_grant_id,
+            target: m.target,
+            source_scope: m.source_scope,
+            recipe: m.recipe,
+            granted_at: m.granted_at,
+            revoked: m.revoked,
         }
     }
 }
@@ -562,6 +593,51 @@ impl EngineHandle {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
             log.mandates_enabled().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Grant a mandate (SP5). On success returns the new mandate's row. A grant-time guard
+    /// failure (recipe too long, > 256 sources, target not write-granted, target under a read
+    /// root) is surfaced as a TYPED `Rejected` error so the form can show *why*. Gated.
+    pub async fn add_mandate(&self, onboarded: bool, target: PathBuf, source_scope: PathBuf, recipe: String) -> Result<MandateSummary, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            let id = log.add_mandate(&target, &source_scope, &recipe).map_err(|e| match e {
+                // The engine's grant-time guards reject with InvalidInput — show the reason.
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })?;
+            // Re-read the just-granted mandate to return its full row (active_mandates is the
+            // single source of truth; the id we just minted must be present).
+            let mandate = log.active_mandates()
+                .map_err(|e| EngineOpError::Core(e.to_string()))?
+                .into_iter().find(|m| m.mandate_grant_id == id)
+                .ok_or_else(|| EngineOpError::Core("granted mandate not found after add".to_string()))?;
+            Ok(MandateSummary::from(mandate))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Revoke a mandate by its grant id (sticky; a revoke of an unknown id is a harmless no-op in
+    /// the engine). Gated.
+    pub async fn revoke_mandate(&self, onboarded: bool, mandate_grant_id: String) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.revoke_mandate(&mandate_grant_id).map(|_| ()).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Every ACTIVE mandate, oldest-first (the engine orders by `granted_at ASC`). Gated.
+    pub async fn list_mandates(&self, onboarded: bool) -> Result<Vec<MandateSummary>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            let mandates = log.active_mandates().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(mandates.into_iter().map(MandateSummary::from).collect())
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
@@ -1618,6 +1694,52 @@ mod tests {
 
         assert!(matches!(
             handle.undo_apply(false, applied.file_written_id).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandate_crud_round_trip_and_grant_rejection_is_typed() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        // A mandate target must be WRITE-granted AND outside every read root (add_mandate guard #4),
+        // so `dest` is WRITE-ONLY (no add_grant); the read-granted `scope` holds the sources.
+        let dest = tempfile::tempdir().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        log.add_write_grant(dest.path()).unwrap(); // write-ONLY → valid mandate target root.
+        log.add_grant(scope.path()).unwrap();
+        let target = dest.path().join("synced.md");
+        std::fs::write(&target, b"x\n").unwrap();
+        drop(log);
+
+        // add → returns a MandateSummary with the canonical fields.
+        let m = handle.add_mandate(true, target.clone(), scope.path().to_path_buf(),
+            "keep it synced".to_string()).await.unwrap();
+        assert!(!m.mandate_grant_id.is_empty());
+        assert_eq!(m.recipe, "keep it synced");
+        assert!(!m.revoked);
+
+        // list → one active mandate.
+        let listed = handle.list_mandates(true).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].mandate_grant_id, m.mandate_grant_id);
+
+        // revoke → list empty.
+        handle.revoke_mandate(true, m.mandate_grant_id.clone()).await.unwrap();
+        assert!(handle.list_mandates(true).await.unwrap().is_empty(), "revoked → no active mandates");
+
+        // Grant rejection surfaces as a TYPED Rejected error. The recipe cap is guard #1 in
+        // add_mandate (log.rs:2807) — it fires BEFORE the write-grant (#3) and read-root (#4) checks,
+        // so a > MAX_RECIPE_LEN (2048) recipe rejects for the recipe reason, mapped to Rejected.
+        let huge = "a".repeat(3000);
+        let err = handle.add_mandate(true, target, scope.path().to_path_buf(), huge).await.unwrap_err();
+        assert!(matches!(err, EngineOpError::Rejected(_)),
+            "a grant-time guard failure (here: recipe too long) maps to a typed Rejected error: {err:?}");
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.list_mandates(false).await,
             Err(EngineOpError::Open(EngineError::NotOnboarded))
         ));
     }
