@@ -3042,6 +3042,10 @@ impl EventLog {
         // `filter_map` to the resolvable subset and judge only those — that would
         // let a confused-deputy hide the inducing event behind a bogus id that
         // reads "clean" because it is simply absent.
+        // Candidate external sources gathered in Step 1 but NOT escalated yet (SP5 c): a
+        // mandate may authorize them against THIS target, which we can only test after Step 2
+        // resolves the canonical target. Each is `(event_id, ingested canonical_path)`.
+        let mut external_candidates: Vec<(String, Option<String>)> = Vec::new();
         if p.source_event_ids.is_empty() {
             reject_reason.get_or_insert_with(|| "source_event_ids is empty".to_string());
         } else {
@@ -3050,12 +3054,16 @@ impl EventLog {
                     Some(ev) => {
                         let prov = Self::provenance_from_event(&ev);
                         if prov.is_external {
-                            taint = Taint::Untrusted;
+                            // DEFER escalation: record the candidate + its ingested path. The
+                            // `origin_path` on the provenance is the source's canonical path
+                            // (from the files projection), the exact stored form we compare
+                            // against `m.source_scope` — never re-canonicalize a live path (M2).
+                            external_candidates.push((prov.event_id.clone(), prov.origin_path.clone()));
                         }
                         provenance.push(prov);
                     }
                     None => {
-                        // Unresolvable cited source ⇒ fail closed over the set.
+                        // Unresolvable cited source ⇒ fail closed over the set (target-independent).
                         taint = Taint::Untrusted;
                     }
                 }
@@ -3088,6 +3096,44 @@ impl EventLog {
                 false
             }
         };
+
+        // ── Step 1.5: escalate deferred external candidates unless a mandate authorizes them ──
+        // (SP5 change c, SECURITY-CRITICAL.) An external cited source does NOT taint iff some
+        // ACTIVE mandate `m` has `m.target == canonical_target` AND the source's ingested
+        // canonical_path is segment-aware UNDER `m.source_scope`. FAIL-CLOSED ORDERING (M2/L1):
+        //   • if the target is unresolvable (`canonical == None`) → escalate EVERY candidate;
+        //   • else escalate each candidate UNLESS authorized.
+        // `active_mandates()` is read ONCE here, inside this gate evaluation (an in-flight revoke
+        // is caught by the apply-time re-gate). Both sides of the containment test are STORED
+        // canonical forms (scope canonical-at-grant; source canonical-from-projection) compared
+        // with segment-aware `Path::starts_with` — never re-canonicalize a live (symlinkable) path.
+        if !external_candidates.is_empty() {
+            match &canonical {
+                None => {
+                    // Unresolvable target ⇒ cannot authorize anything ⇒ taint ALL (never skip).
+                    taint = Taint::Untrusted;
+                }
+                Some(canonical_target) => {
+                    let canonical_target_str = canonical_target.to_string_lossy().to_string();
+                    let mandates = self.active_mandates()?;
+                    for (_src_id, src_canonical) in &external_candidates {
+                        let authorized = match src_canonical {
+                            // A candidate with no recorded ingested path cannot be proven
+                            // in-scope → fail closed (taint).
+                            None => false,
+                            Some(src_path) => mandates.iter().any(|m| {
+                                m.target == canonical_target_str
+                                    && std::path::Path::new(src_path)
+                                        .starts_with(std::path::Path::new(&m.source_scope))
+                            }),
+                        };
+                        if !authorized {
+                            taint = Taint::Untrusted;
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Step 3: op × existence matrix ─────────────────────────────────────────
         // One `symlink_metadata` probe (NOFOLLOW semantics: it describes the final
