@@ -9,6 +9,7 @@ const base: ProposalDto = {
   new_content_hash: "abc",
   rationale: "Alice now works at Globex",
   requires_loud_modal: false,
+  producer: "",
 };
 
 describe("toProposalRow", () => {
