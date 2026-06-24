@@ -71,7 +71,7 @@ pub enum EngineOpError {
     /// pass `acknowledged_loud == true`. The op refuses to write — the UI must show the
     /// "I've reviewed this" confirm and retry with the ack. Carries the reason.
     NeedsLoudConfirm(String),
-    /// A mandate grant was refused by an engine grant-time guard (recipe too long, > 256 sources,
+    /// A mandate grant was refused by an engine grant-time guard (recipe too long, source scope not resolvable,
     /// target not write-granted, or target under a read-grant root). Carries the reason so the
     /// New-mandate form can show *why*. Distinct from `Core` so the UI can style it as a validation
     /// error, not an engine fault.
@@ -618,7 +618,7 @@ impl EngineHandle {
     }
 
     /// Grant a mandate (SP5). On success returns the new mandate's row. A grant-time guard
-    /// failure (recipe too long, > 256 sources, target not write-granted, target under a read
+    /// failure (recipe too long, source scope not resolvable, target not write-granted, target under a read
     /// root) is surfaced as a TYPED `Rejected` error so the form can show *why*. Gated.
     pub async fn add_mandate(&self, onboarded: bool, target: PathBuf, source_scope: PathBuf, recipe: String) -> Result<MandateSummary, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
