@@ -43,6 +43,21 @@ pub fn open_log_with_write_grant() -> (EventLog, TempDir, PathBuf) {
     (log, home, dir)
 }
 
+/// Reopen an `EventLog` at `db_path` with the SAME deterministic DEK + signing key the harness
+/// factories use, so a test can prove on-disk durability (events survive a fresh open from disk,
+/// not just the in-memory handle). The original handle should be dropped first. Use `home.path()
+/// .join("m.db")` — the path `open_log_with_write_grant` opened.
+pub fn reopen_log_at(db_path: &Path) -> EventLog {
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    EventLog::open(db_path, &DEK, key).expect("reopen EventLog from disk")
+}
+
+/// A `MockEmbedder` at the harness's fixed dimension, for the maintenance ops (e.g.
+/// `rebuild_indexes`) that require an embedder. Matches the dim `ingest_one` embeds with.
+pub fn mock_embedder() -> MockEmbedder {
+    MockEmbedder::new(EMBED_DIM)
+}
+
 /// Ingest one already-written file under a granted dir and return its `file_ingested`
 /// event id. Uses the native UTF-8 parser path (plain `.md`/`.txt`), so it is fully
 /// hermetic — no sandboxed markitdown subprocess. Resolves the id from the public
