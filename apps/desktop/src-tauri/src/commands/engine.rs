@@ -404,6 +404,26 @@ pub async fn engine_list_mandates(state: State<'_, AppState>) -> Result<Vec<Mand
     Ok(mandates.into_iter().map(MandateDto::from).collect())
 }
 
+#[derive(Serialize)]
+pub struct MandateWriteDto {
+    pub file_written_id: String,
+    pub target: String,
+    pub written_at: String,
+    pub undone: bool,
+}
+impl From<crate::engine::MandateWriteSummary> for MandateWriteDto {
+    fn from(r: crate::engine::MandateWriteSummary) -> Self {
+        Self { file_written_id: r.file_written_id, target: r.target, written_at: r.written_at, undone: r.undone }
+    }
+}
+
+#[tauri::command]
+pub async fn engine_mandate_writes(state: State<'_, AppState>) -> Result<Vec<MandateWriteDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let writes = state.engine.mandate_writes(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(writes.into_iter().map(MandateWriteDto::from).collect())
+}
+
 /// Run one evolve tick now ("Evolve now"). Returns the tick report.
 #[tauri::command]
 pub async fn engine_evolve_now(state: State<'_, AppState>) -> Result<EvolveReportDto, String> {

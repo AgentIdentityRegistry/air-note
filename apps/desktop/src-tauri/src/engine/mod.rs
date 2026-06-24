@@ -141,6 +141,21 @@ pub struct MandateSummary {
     pub revoked: bool,
 }
 
+/// One Mandate-activity row, projected from `bossclaw_core::MandateWriteRecord`.
+#[derive(Debug, Clone)]
+pub struct MandateWriteSummary {
+    pub file_written_id: String,
+    pub target: String,
+    pub written_at: String,
+    pub undone: bool,
+}
+
+impl From<bossclaw_core::MandateWriteRecord> for MandateWriteSummary {
+    fn from(r: bossclaw_core::MandateWriteRecord) -> Self {
+        Self { file_written_id: r.file_written_id, target: r.target, written_at: r.written_at, undone: r.undone }
+    }
+}
+
 impl From<bossclaw_core::Mandate> for MandateSummary {
     fn from(m: bossclaw_core::Mandate) -> Self {
         Self {
@@ -642,6 +657,17 @@ impl EngineHandle {
         spawn_blocking(move || {
             let mandates = log.active_mandates().map_err(|e| EngineOpError::Core(e.to_string()))?;
             Ok(mandates.into_iter().map(MandateSummary::from).collect())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Every applied write attributed to a mandate (M6c), for the Mandate-activity list. Gated.
+    pub async fn mandate_writes(&self, onboarded: bool) -> Result<Vec<MandateWriteSummary>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            let writes = log.mandate_writes().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(writes.into_iter().map(MandateWriteSummary::from).collect())
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
@@ -1853,6 +1879,50 @@ mod tests {
         // Not onboarded → gate.
         assert!(matches!(
             handle.list_mandates(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandate_writes_op_returns_applied_m6c_writes() {
+        use sha2::{Digest, Sha256};
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        log.add_grant(folder.path()).unwrap();
+        log.add_write_grant(folder.path()).unwrap();
+        let path = folder.path().join("mandated.md");
+        std::fs::write(&path, b"old\n").unwrap();
+        let fid = bossclaw_ingest_one(&log, &path);
+        let new_bytes = b"new\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&new_bytes));
+        let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+        let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+        // Stamp the proposal M6c so it is attributable as a mandate write.
+        let gated = log.propose_write(bossclaw_core::actuator::WriteProposal {
+            target: path.clone(), new_content: new_bytes.clone(),
+            op: bossclaw_core::actuator::WriteOp::Edit, source_event_ids: vec![fid.clone()],
+            rationale: "sync".to_string() }).unwrap();
+        let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+            "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+            "base_content_hash": gated.verdict.base_content_hash});
+        let pid = log.append_write_proposal_with(&canonical, "edit", &hash, new_bytes.len() as u64,
+            "sync", &key, &vs, std::slice::from_ref(&fid), bossclaw_core::graph::M6C_PROPOSER_PRODUCER).unwrap();
+        log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+        drop(log);
+
+        // Apply (loud because ingested ⇒ Untrusted → ack=true).
+        handle.apply_proposal(true, pid, true).await.unwrap();
+        let writes = handle.mandate_writes(true).await.unwrap();
+        assert_eq!(writes.len(), 1, "the applied M6c write is listed");
+        assert_eq!(writes[0].target, canonical);
+        assert!(!writes[0].undone);
+        assert!(!writes[0].file_written_id.is_empty());
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.mandate_writes(false).await,
             Err(EngineOpError::Open(EngineError::NotOnboarded))
         ));
     }
