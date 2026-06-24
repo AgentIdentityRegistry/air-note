@@ -27,6 +27,13 @@ export const EMPTY_RESULTS: GroupedResults = {
   files: [],
   errors: { memory: false, conversations: false, files: false },
 };
+// Frozen: this is a shared singleton (initial reducer state, empty-query result). Mutating it
+// would corrupt every consumer, so lock it at every level.
+Object.freeze(EMPTY_RESULTS);
+Object.freeze(EMPTY_RESULTS.memory);
+Object.freeze(EMPTY_RESULTS.conversations);
+Object.freeze(EMPTY_RESULTS.files);
+Object.freeze(EMPTY_RESULTS.errors);
 
 /** Max results shown per group (memory / conversations / files) in the command palette. */
 export const RESULTS_PER_GROUP = 5;

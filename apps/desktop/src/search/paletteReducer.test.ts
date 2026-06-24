@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { paletteReducer, initialPaletteState, selectedResult, type PaletteState } from "./paletteReducer";
-import type { GroupedResults } from "./types";
+import { EMPTY_RESULTS, type GroupedResults } from "./types";
 
 const results: GroupedResults = {
   memory: [{ id: "mem:1", kind: "memory", title: "M", snippet: "", target: { view: "memory" } }],
@@ -45,5 +45,19 @@ describe("paletteReducer", () => {
     expect(selectedResult(ready())?.id).toBe("mem:1");
     expect(selectedResult(paletteReducer(ready(), { type: "move", delta: 1 }))?.id).toBe("conv:1");
     expect(selectedResult(initialPaletteState)).toBeNull();
+  });
+
+  it("loading is idempotent: dispatching loading while already loading returns the same state reference", () => {
+    const loading = paletteReducer(initialPaletteState, { type: "loading" });
+    expect(loading.status).toBe("loading");
+    expect(paletteReducer(loading, { type: "loading" })).toBe(loading); // same reference, no re-render
+  });
+});
+
+describe("EMPTY_RESULTS", () => {
+  it("is deeply frozen so the shared singleton can't be mutated", () => {
+    expect(Object.isFrozen(EMPTY_RESULTS)).toBe(true);
+    expect(Object.isFrozen(EMPTY_RESULTS.memory)).toBe(true);
+    expect(Object.isFrozen(EMPTY_RESULTS.errors)).toBe(true);
   });
 });

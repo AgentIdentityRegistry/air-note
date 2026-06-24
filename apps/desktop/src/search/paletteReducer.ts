@@ -29,7 +29,7 @@ export function paletteReducer(state: PaletteState, action: PaletteAction): Pale
     case "setQuery":
       return { ...state, query: action.query };
     case "loading":
-      return { ...state, status: "loading" };
+      return state.status === "loading" ? state : { ...state, status: "loading" };
     case "setResults":
       return { ...state, results: action.results, selectedIndex: 0, status: "ready" };
     case "move": {
@@ -37,6 +37,10 @@ export function paletteReducer(state: PaletteState, action: PaletteAction): Pale
       if (n === 0) return state;
       const next = (state.selectedIndex + action.delta + n) % n;
       return { ...state, selectedIndex: next };
+    }
+    default: {
+      const _exhaustive: never = action;
+      return _exhaustive;
     }
   }
 }
