@@ -1,0 +1,43 @@
+# cargo-audit allowlist — read by the `cargo-audit` CI job (.github/workflows/build.yml),
+# which runs `cargo audit --deny warnings`. Every ID below is an UNMAINTAINED/UNSOUND
+# *informational* advisory on a TRANSITIVE dependency we do not directly control — there are
+# ZERO vulnerabilities in this list. It is the explicit, reviewed record of known ecosystem
+# debt: a new advisory NOT listed here (a real vulnerability, or a newly-unmaintained crate)
+# fails CI, so this stays meaningful. Revisit when the gtk-rs / Tauri stack moves to GTK4.
+#
+# Attribution verified via `cargo tree -i <crate> [--target x86_64-unknown-linux-gnu]`
+# on 2026-06-24 (Tauri 2.11.2). None of these are direct dependencies.
+
+[advisories]
+ignore = [
+    # gtk-rs GTK3 bindings (gtk-rs 0.18 generation): the entire GTK3 binding family is
+    # deprecated upstream. Pulled in by Tauri 2.x's Linux webview/menu stack
+    # (tauri -> muda -> gtk -> {atk, gdk, ...}). Unfixable until Tauri/wry/muda move to GTK4.
+    "RUSTSEC-2024-0411", # gdkwayland-sys 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0412", # gdk 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0413", # atk 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0414", # gdkx11-sys 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0415", # gtk 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0416", # atk-sys 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0417", # gdkx11 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0418", # gdk-sys 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0419", # gtk3-macros 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0420", # gtk-sys 0.18 — gtk-rs GTK3 bindings unmaintained
+    "RUSTSEC-2024-0429", # glib 0.18 — unsound VariantStrIter; same gtk-rs 0.18 generation
+    "RUSTSEC-2024-0370", # proc-macro-error — via glib-macros (gtk-rs GTK3 stack)
+
+    # unic-* (Unicode crates): unmaintained. Pulled in by Tauri itself
+    # (tauri-utils -> urlpattern -> unic-*). Upstream (Tauri).
+    "RUSTSEC-2025-0075", # unic-char-range — unmaintained (via urlpattern <- Tauri)
+    "RUSTSEC-2025-0080", # unic-common — unmaintained (via urlpattern <- Tauri)
+    "RUSTSEC-2025-0081", # unic-char-property — unmaintained (via urlpattern <- Tauri)
+    "RUSTSEC-2025-0098", # unic-ucd-version — unmaintained (via urlpattern <- Tauri)
+    "RUSTSEC-2025-0100", # unic-ucd-ident — unmaintained (via urlpattern <- Tauri)
+
+    # Other transitive unmaintained crates (no direct dependency; bumping the parent is
+    # either impossible from here or carries disproportionate risk for an informational warning).
+    "RUSTSEC-2024-0384", # instant — transitive (build/other-target); no maintained drop-in via our tree
+    "RUSTSEC-2024-0388", # derivative — via keyring -> zbus -> secret-service (Linux keychain)
+    "RUSTSEC-2024-0436", # paste — via tokenizers (HF) -> macro_rules_attribute
+    "RUSTSEC-2025-0141", # bincode 1.x — via hnsw_rs (vector index); 2.x would change the on-disk index format
+]
