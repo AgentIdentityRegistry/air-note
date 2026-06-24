@@ -1273,7 +1273,7 @@ label {
 }
 
 .chat-delete-btn {
-  color: color-mix(in srgb, var(--text-primary) 80%, var(--danger));
+  color: color-mix(in srgb, var(--text-primary) 80%, var(--error));
 }
 
 .chat-header-meta {
