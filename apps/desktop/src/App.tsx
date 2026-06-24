@@ -10,9 +10,7 @@ import { GenerateAndRegister } from "./onboarding/GenerateAndRegister";
 import { Done } from "./onboarding/Done";
 import { IdentityPanel } from "./identity/IdentityPanel";
 import { InboxPanel } from "./inbox/InboxPanel";
-import { MemoryPanel } from "./memory/MemoryPanel";
-import { ReviewPanel } from "./review/ReviewPanel";
-import { MandatesPanel } from "./mandates/MandatesPanel";
+import { BrainPanel } from "./memory/BrainPanel";
 import { AirSettings } from "./settings/AirSettings";
 import { Sidebar } from "./shell/Sidebar";
 import { useReviewCount } from "./shell/useReviewCount";
@@ -69,14 +67,10 @@ function Shell() {
           <IdentityPanel />
         ) : view === "inbox" ? (
           <InboxPanel />
-        ) : view === "memory" ? (
-          <MemoryPanel />
-        ) : view === "review" ? (
-          <ReviewPanel />
-        ) : view === "mandates" ? (
-          <MandatesPanel />
-        ) : (
+        ) : view === "settings" ? (
           <AirSettings />
+        ) : (
+          <BrainPanel view={view} onSubNav={setView} reviewCount={reviewCount} />
         )}
       </main>
       <CommandPalette open={searchOpen} onClose={() => setSearchOpen(false)} onNavigate={navigateTo} />

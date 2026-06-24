@@ -22,22 +22,28 @@ describe("Sidebar", () => {
     delete document.documentElement.dataset.theme;
   });
 
-  it("renders the five primary nav items plus Settings", () => {
+  it("renders the three primary nav tabs plus Settings (Review/Mandates live in Brain)", () => {
     renderSidebar();
-    for (const label of ["Identity", "Inbox", "Memory", "Review", "Mandates", "Settings"]) {
-      expect(screen.getByRole("button", { name: new RegExp(label) })).toBeInTheDocument();
+    // Exact names (not regex): "AIR" must not match "AIR Note".
+    for (const label of ["AIR", "AIR Note", "Brain", "Settings"]) {
+      expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
     }
   });
 
-  it("shows the inbox unread + review badges", () => {
+  it("shows the inbox unread badge on AIR Note and the review badge on Brain", () => {
     renderSidebar({ inboxUnread: 7, reviewCount: 2 });
     expect(screen.getByText("7")).toBeInTheDocument();
     expect(screen.getByText("2")).toBeInTheDocument();
   });
 
+  it("marks Brain active for any Brain view (memory/review/mandates)", () => {
+    renderSidebar({ view: "review" });
+    expect(screen.getByRole("button", { name: /Brain/ })).toHaveClass("active");
+  });
+
   it("calls onNavigate when a nav item is clicked", () => {
     const { onNavigate } = renderSidebar();
-    fireEvent.click(screen.getByRole("button", { name: /Memory/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Brain/ }));
     expect(onNavigate).toHaveBeenCalledWith("memory");
   });
 

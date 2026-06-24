@@ -1,4 +1,4 @@
-import { type View, MAIN_NAV } from "./nav";
+import { type View, MAIN_NAV, isBrainView } from "./nav";
 import { NavItem } from "./NavItem";
 import { useTheme } from "../state/theme";
 
@@ -16,8 +16,9 @@ export function Sidebar({
   onOpenSearch: () => void;
 }) {
   const { theme, toggleTheme } = useTheme();
+  // The review count surfaces on the Brain (memory) tab now that Review lives inside the Brain hub.
   const countFor = (v: View): number | undefined =>
-    v === "inbox" ? inboxUnread : v === "review" ? reviewCount : undefined;
+    v === "inbox" ? inboxUnread : v === "memory" ? reviewCount : undefined;
 
   return (
     <aside className="sidebar">
@@ -43,7 +44,7 @@ export function Sidebar({
             view={item.view}
             label={item.label}
             count={countFor(item.view)}
-            active={view === item.view}
+            active={item.view === "memory" ? isBrainView(view) : view === item.view}
             onNavigate={onNavigate}
           />
         ))}
