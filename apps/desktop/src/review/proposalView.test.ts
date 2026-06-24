@@ -34,4 +34,9 @@ describe("toProposalRow", () => {
     expect(r.fileName).toBe("alice.md");
     expect(r.folder).toBe("");
   });
+
+  it("flags an m6c proposal as from a mandate", () => {
+    expect(toProposalRow({ ...base, producer: "m6c-mandate-proposer" }).fromMandate).toBe(true);
+    expect(toProposalRow({ ...base, producer: "m6b-reconciler" }).fromMandate).toBe(false);
+  });
 });

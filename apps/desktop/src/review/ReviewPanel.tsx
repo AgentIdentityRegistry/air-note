@@ -173,6 +173,7 @@ export function ReviewPanel() {
                 <div>
                   <div style={{ fontWeight: 600 }}>
                     {row.opLabel}: <code>{row.fileName}</code>{" "}
+                    {row.fromMandate ? <span style={{ color: "#06c", fontSize: 12 }}>· from a mandate</span> : null}{" "}
                     {row.risky ? <span style={{ color: "#b00", fontSize: 12 }}>⚠ needs careful review</span> : null}
                   </div>
                   <div style={{ color: "#666", fontSize: 12 }}><code>{row.folder}</code> · enabled ✓</div>
