@@ -350,6 +350,20 @@ pub async fn engine_set_proposals_enabled(enabled: bool, state: State<'_, AppSta
     state.engine.set_proposals_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
 }
 
+/// Flip the sticky mandates off-switch (SP5 global Mandates on/off). Off by default.
+#[tauri::command]
+pub async fn engine_set_mandates_enabled(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_mandates_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
+}
+
+/// Read the sticky mandates flag (SF5 — the UI toggle reads this on mount to reflect persisted state).
+#[tauri::command]
+pub async fn engine_mandates_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.mandates_enabled(onboarded).await.map_err(|e| e.to_string())
+}
+
 /// Run one evolve tick now ("Evolve now"). Returns the tick report.
 #[tauri::command]
 pub async fn engine_evolve_now(state: State<'_, AppState>) -> Result<EvolveReportDto, String> {

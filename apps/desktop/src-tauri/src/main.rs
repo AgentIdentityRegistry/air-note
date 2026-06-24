@@ -146,6 +146,10 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_set_proposals_enabled,
             #[cfg(unix)]
+            commands::engine::engine_set_mandates_enabled,
+            #[cfg(unix)]
+            commands::engine::engine_mandates_enabled,
+            #[cfg(unix)]
             commands::engine::engine_list_grants,
             #[cfg(unix)]
             commands::engine::engine_run_ingest,

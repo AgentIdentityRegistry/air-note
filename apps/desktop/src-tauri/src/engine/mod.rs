@@ -542,6 +542,31 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Flip the sticky engine mandates off-switch (SP5; gates the autonomous M6c proposer + the
+    /// desktop auto-apply sweep). Off by default; an explicit choice persists across launches via
+    /// `prime_switches`. Gated.
+    pub async fn set_mandates_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_mandates_enabled(enabled).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Read the sticky mandates on/off flag (SF5 — the UI toggle's mount-time read, so it reflects
+    /// the persisted state after relaunch rather than defaulting to OFF until clicked). Gated
+    /// `Result` form (a not-onboarded state surfaces via `Open(NotOnboarded)`). The sweep uses the
+    /// infallible `mandates_enabled_or_false` (Task 11) instead.
+    pub async fn mandates_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.mandates_enabled().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Every current ingested file (one per path). Gated.
     pub async fn list_files(&self, onboarded: bool) -> Result<Vec<bossclaw_core::graph::FileRecord>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -1492,6 +1517,41 @@ mod tests {
         // Not onboarded → gate.
         assert!(matches!(
             handle.set_proposals_enabled(false, true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_mandates_enabled_toggles_the_engine_flag() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(!log.mandates_enabled().unwrap(), "primed off at first open");
+        drop(log);
+
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        let log = handle.get_or_open(true).await.unwrap();
+        assert!(log.mandates_enabled().unwrap(), "the op flips the sticky flag on");
+        drop(log);
+
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.set_mandates_enabled(false, true).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mandates_enabled_reflects_the_persisted_flag() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+        // Off by default at first open.
+        assert!(!handle.mandates_enabled(true).await.unwrap(), "default off");
+        handle.set_mandates_enabled(true, true).await.unwrap();
+        assert!(handle.mandates_enabled(true).await.unwrap(), "the getter reflects the flip");
+        // Not onboarded → gate.
+        assert!(matches!(
+            handle.mandates_enabled(false).await,
             Err(EngineOpError::Open(EngineError::NotOnboarded))
         ));
     }
