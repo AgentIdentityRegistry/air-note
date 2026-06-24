@@ -690,7 +690,10 @@ impl EngineHandle {
             }
             // execute is atomic temp+rename: it never partially writes, so a failure here also
             // leaves the file untouched. (Defensive: any execute error surfaces as Core.)
-            let fw_id = log.execute_write_resolving(gated, &p.id)
+            // Thread the caller's ack to the ENGINE loud-gate (SP5 change d): this op already
+            // refused above unless acked-or-not-loud, so the engine gate sees a consistent value
+            // (defense-in-depth — the same check now lives in execute_write_inner for every caller).
+            let fw_id = log.execute_write_resolving(gated, &p.id, acknowledged_loud)
                 .map_err(|e| EngineOpError::Core(e.to_string()))?;
             Ok(ApplyResult { file_written_id: fw_id })
         })

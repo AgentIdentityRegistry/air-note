@@ -769,7 +769,9 @@ fn proof1b_cannot_widen_grant_rejected_at_execute_after_revoke() {
             rationale: "confirm".into(),
         })
         .expect("propose_write returns a verdict (rejecting, not erroring)");
-    let exec = log.execute_write_resolving(gated, &pid);
+    // ack=false: the revoked write-grant (`!allowed`) is the fail-closed cause under test; it is
+    // checked before the engine loud-gate, so the documented revoke rejection still fires (SP5 d).
+    let exec = log.execute_write_resolving(gated, &pid, false);
     assert!(exec.is_err(), "execute must fail closed once the grant is revoked (never-widen at execute)");
     assert!(!target.exists(), "no file was written after the grant was revoked");
     log.verify_chain().unwrap();
@@ -945,7 +947,9 @@ fn proof4_convergence_with_a_nondeterministic_model() {
             rationale: "confirm".into(),
         })
         .unwrap();
-    log.execute_write_resolving(gated, &pid).unwrap();
+    // The source is in-scope for this mandate, so the SP5 (c) trust rule keeps the verdict Clean
+    // (not loud) ⇒ ack=false clears the engine loud-gate (SP5 change d).
+    log.execute_write_resolving(gated, &pid, false).unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), bytes, "the confirmed bytes are on disk");
     let calls_after_tick1 = reasoner.calls();
 
@@ -1104,7 +1108,8 @@ fn proof9_confirmed_write_is_not_reingested_as_a_source() {
             rationale: "confirm".into(),
         })
         .unwrap();
-    log.execute_write_resolving(gated, &pid).unwrap();
+    // In-scope mandate source ⇒ SP5 (c) trust rule keeps it Clean (not loud) ⇒ ack=false (SP5 d).
+    log.execute_write_resolving(gated, &pid, false).unwrap();
 
     // Re-run ingest over the read root: the target lives OUTSIDE it, so the write is NOT
     // discovered as a source (the structural self-loop guarantee). The sources_hash is

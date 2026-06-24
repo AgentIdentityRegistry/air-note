@@ -3276,10 +3276,12 @@ impl EventLog {
     pub fn execute_write(
         &self,
         confirmed: crate::actuator::GatedProposal,
+        acknowledged_loud: bool,
     ) -> Result<String, BossclawError> {
         // The public entry: a normal (non-undo) write carries no `undo_of` and
         // resolves no proposal (the recorded `file_written` is byte-identical to M6a).
-        self.execute_write_inner(confirmed, None, None)
+        // The caller's loud acknowledgement is threaded to the engine loud-gate.
+        self.execute_write_inner(confirmed, None, None, acknowledged_loud)
     }
 
     /// As [`execute_write`](Self::execute_write), but records that this write RESOLVES
@@ -3292,8 +3294,9 @@ impl EventLog {
         &self,
         confirmed: crate::actuator::GatedProposal,
         resolves_proposal: &str,
+        acknowledged_loud: bool,
     ) -> Result<String, BossclawError> {
-        self.execute_write_inner(confirmed, None, Some(resolves_proposal))
+        self.execute_write_inner(confirmed, None, Some(resolves_proposal), acknowledged_loud)
     }
 
     /// The shared execute path for both [`execute_write`](Self::execute_write) (the
@@ -3309,6 +3312,7 @@ impl EventLog {
         confirmed: crate::actuator::GatedProposal,
         undo_of: Option<&str>,
         resolves_proposal: Option<&str>,
+        acknowledged_loud: bool,
     ) -> Result<String, BossclawError> {
         use crate::actuator::WriteOp;
         use std::os::unix::ffi::OsStrExt;
@@ -3329,6 +3333,17 @@ impl EventLog {
         }
         if !verdict.allowed {
             return Err(reject("verdict.allowed is false (target not under an active write grant)"));
+        }
+
+        // ── Step 1a.5: ENGINE-ENFORCED loud-gate (SP5 change d, SECURITY-CRITICAL) ─
+        // A loud write (Untrusted ∪ Delete ∪ secret/value-shaped) is refused unless the caller
+        // passed `acknowledged_loud == true`. This makes "a loud write needs an explicit ack" an
+        // engine INVARIANT for every caller — desktop apply (threads the user's value), the
+        // autonomous sweep (passes false ⇒ a loud mandate write can never auto-apply), and any
+        // future caller. The ONLY sanctioned ack-without-UI path is `undo_write` (a hash-verified
+        // inverse of an already-approved write), which passes true with a documented exemption.
+        if verdict.requires_loud_modal && !acknowledged_loud {
+            return Err(reject("loud write requires acknowledged_loud (refused fail-closed)"));
         }
 
         // The whole TOCTOU-critical window is held under the rename mutex (spec §9).
@@ -3956,9 +3971,14 @@ impl EventLog {
         if let Some(reason) = &gated.verdict.reject_reason {
             return Err(fail(&format!("re-gated undo proposal rejected: {reason}")));
         }
-        // An undo records NO frame and resolves NO M6b proposal (it carries `undo_of`,
-        // not `resolves_proposal`).
-        let undo_event_id = self.execute_write_inner(gated, Some(file_written_id), None)?;
+        // An undo records NO frame and resolves NO M6b proposal (it carries `undo_of`, not
+        // `resolves_proposal`). It passes `acknowledged_loud = true` as the SOLE sanctioned
+        // ack-without-UI exemption (SP5 change d): an undo is a hash-verified inverse-restore of
+        // `pre_bytes` already validated against the recorded base_content_hash — the inverse of an
+        // already-approved write, never fresh untrusted content. Its re-gate is loud (the inverse
+        // cites the original external file_written), so without this exemption every undo of a
+        // tainted-file write would fail closed.
+        let undo_event_id = self.execute_write_inner(gated, Some(file_written_id), None, true)?;
 
         // ── Pop this frame + hand the stack top off to the previous frame ─────────
         // The undo succeeded, so this frame is consumed: delete it. Then, if a previous
@@ -7013,7 +7033,7 @@ mod tests {
             rationale: "w8 ordering".to_string(),
         };
         let gated = log.propose_write(proposal).unwrap();
-        let id = log.execute_write(gated).unwrap();
+        let id = log.execute_write(gated, false).unwrap();
         undo_test_hooks::clear_pre_mutate_probe();
 
         assert!(probe_fired.load(Ordering::SeqCst), "the pre-mutate probe must have fired");
@@ -7058,7 +7078,7 @@ mod tests {
             rationale: "tamper".to_string(),
         };
         let gated = log.propose_write(proposal).unwrap();
-        let write_id = log.execute_write(gated).unwrap();
+        let write_id = log.execute_write(gated, false).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"v1 edited bytes");
 
         // Tamper the stored pre_bytes (so its hash != recorded base_content_hash),

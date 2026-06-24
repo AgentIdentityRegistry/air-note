@@ -92,8 +92,9 @@ fn file_written_records_resolves_proposal_only_when_set() {
         .expect("propose_write")
     };
 
-    // Plain write → no `resolves_proposal` key.
-    let plain_id = log.execute_write(gate_create("plain.txt")).expect("execute_write");
+    // Plain write → no `resolves_proposal` key. The cited source is an ingested (external) file
+    // ⇒ Untrusted ⇒ loud, so this success-path write acks to clear the engine loud-gate (SP5 d).
+    let plain_id = log.execute_write(gate_create("plain.txt"), true).expect("execute_write");
     let plain = log.event_by_id(&plain_id).unwrap().unwrap();
     assert_eq!(plain.event_type, "file_written");
     assert!(
@@ -103,7 +104,7 @@ fn file_written_records_resolves_proposal_only_when_set() {
 
     // Resolving write → the key carries the proposal id.
     let resolved_id = log
-        .execute_write_resolving(gate_create("resolved.txt"), "prop-xyz")
+        .execute_write_resolving(gate_create("resolved.txt"), "prop-xyz", true)
         .expect("execute_write_resolving");
     let resolved = log.event_by_id(&resolved_id).unwrap().unwrap();
     assert_eq!(resolved.content["resolves_proposal"], json!("prop-xyz"));
@@ -260,7 +261,9 @@ fn proposal_bytes_round_trip_through_execute_write_resolving() {
             rationale: "apply reconciliation proposal".to_string(),
         })
         .expect("propose_write");
-    let written_id = log.execute_write_resolving(gated, &pid).expect("execute_write_resolving");
+    // The cited source is an ingested (external) file ⇒ Untrusted ⇒ loud; this confirm-path test
+    // drives it to success, so it acks the engine loud-gate (SP5 change d).
+    let written_id = log.execute_write_resolving(gated, &pid, true).expect("execute_write_resolving");
 
     // The file now holds the corrected bytes, and the record back-references the proposal.
     assert_eq!(std::fs::read(&target).unwrap(), corrected.to_vec());
@@ -1184,7 +1187,9 @@ fn proposal_round_trip_emit_confirm_execute_resolve_undo() {
         "fresh, write-granted target → the gate passes (reject_reason: {:?})",
         gated.verdict.reject_reason
     );
-    let fw_id = log.execute_write_resolving(gated, &pid).expect("execute_write_resolving");
+    // The proposal targets an ingested file with an ingested lineage ⇒ Untrusted ⇒ loud; this
+    // lifecycle test confirms it onto disk, so it acks the engine loud-gate (SP5 change d).
+    let fw_id = log.execute_write_resolving(gated, &pid, true).expect("execute_write_resolving");
 
     // ── Assert the lifecycle CLOSES. ──
     // 1. the on-disk target now holds the corrected bytes the side table cached.
@@ -1419,4 +1424,87 @@ fn m6b_reconcile_target_stays_loud_trust_rule_did_not_leak() {
     assert_eq!(gated.verdict.taint, bossclaw_core::actuator::Taint::Untrusted,
         "Step-4 engine-anchored taint keeps an ingested-TARGET write loud (rule did not leak)");
     assert!(gated.verdict.requires_loud_modal);
+}
+
+// ── SP5 (d) engine loud-gate tests ──────────────────────────────────────────
+/// Build a gated LOUD proposal (secret-shaped content ⇒ requires_loud_modal) against a real
+/// write-granted, ingested file. Returns (log, home-keepalive, dir-keepalive, gated, target).
+#[cfg(unix)]
+fn loud_gated(
+) -> (bossclaw_core::EventLog, tempfile::TempDir, std::path::PathBuf, bossclaw_core::actuator::GatedProposal, std::path::PathBuf) {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    // `dir` is read+write-granted; `home` is the keepalive TempDir.
+    let (log, home, dir) = common::open_log_with_write_grant();
+    let target = dir.join("note.md");
+    std::fs::write(&target, b"placeholder\n").unwrap();
+    let id = common::ingest_one(&log, &target); // ingested ⇒ external ⇒ Untrusted too
+    let gated = log.propose_write(WriteProposal {
+        target: target.clone(),
+        new_content: b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec(),
+        op: WriteOp::Edit,
+        source_event_ids: vec![id],
+        rationale: "loud".to_string(),
+    }).unwrap();
+    assert!(gated.verdict.requires_loud_modal, "secret-shaped + ingested ⇒ loud");
+    (log, home, dir, gated, target)
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_write_loud_without_ack_fails_closed_then_permits_with_ack() {
+    let (log, _home, _dir, gated, target) = loud_gated();
+    let original = std::fs::read(&target).unwrap();
+    // Public entry without ack → fail closed, file untouched.
+    let err = log.execute_write(gated.clone(), false).unwrap_err();
+    assert!(err.to_string().contains("loud write requires acknowledged_loud"),
+        "a loud write without the ack must fail closed: {err}");
+    assert_eq!(std::fs::read(&target).unwrap(), original, "no write happened without the ack");
+    // With ack → it writes.
+    let fw = log.execute_write(gated, true).unwrap();
+    assert!(!fw.is_empty(), "the ack lets the loud write through");
+    assert_ne!(std::fs::read(&target).unwrap(), original, "the file changed after the acked write");
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_write_resolving_loud_without_ack_fails_closed() {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    let (log, _home, dir) = common::open_log_with_write_grant();
+    let target = dir.join("note.md");
+    std::fs::write(&target, b"placeholder\n").unwrap();
+    let fid = common::ingest_one(&log, &target);
+    // Record an open proposal so execute_write_resolving has an id to resolve.
+    let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
+    let hash = { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(&new_bytes)) };
+    let canonical = std::fs::canonicalize(&target).unwrap().to_string_lossy().to_string();
+    let key = serde_json::json!({"src":"a","relation":"r","dst":"b"});
+    let gated = log.propose_write(WriteProposal { target: target.clone(), new_content: new_bytes.clone(),
+        op: WriteOp::Edit, source_event_ids: vec![fid.clone()], rationale: "loud".to_string() }).unwrap();
+    let vs = serde_json::json!({"requires_loud_modal": gated.verdict.requires_loud_modal,
+        "taint": format!("{:?}", gated.verdict.taint), "allowed": gated.verdict.allowed,
+        "base_content_hash": gated.verdict.base_content_hash});
+    let pid = log.append_write_proposal(&canonical, "edit", &hash, new_bytes.len() as u64, "loud",
+        &key, &vs, std::slice::from_ref(&fid)).unwrap();
+    log.put_proposal_bytes(&pid, &new_bytes, &hash).unwrap();
+    let original = std::fs::read(&target).unwrap();
+    // ack=false → fail closed; the proposal stays open + the file is untouched.
+    let err = log.execute_write_resolving(gated, &pid, false).unwrap_err();
+    assert!(err.to_string().contains("loud write requires acknowledged_loud"), "fail closed: {err}");
+    assert_eq!(std::fs::read(&target).unwrap(), original, "no write without the ack");
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_of_a_tainted_write_succeeds_via_the_exemption() {
+    // The undo exemption (H1): an undo cites the original file_written (external ⇒ re-gate is
+    // loud), so WITHOUT the `acknowledged_loud = true` exemption inside undo_write, every undo of
+    // a tainted-file write would fail closed. Assert it succeeds.
+    let (log, _home, _dir, gated, target) = loud_gated();
+    let original = std::fs::read(&target).unwrap();
+    let fw = log.execute_write(gated, true).unwrap(); // apply the loud write (acked)
+    let changed = std::fs::read(&target).unwrap();
+    assert_ne!(changed, original, "applied");
+    // Undo must restore the original even though the re-gate of the inverse is loud.
+    log.undo_write(&fw).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), original, "undo restored the pre-write bytes");
 }

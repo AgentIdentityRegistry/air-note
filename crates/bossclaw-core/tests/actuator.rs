@@ -702,7 +702,7 @@ fn execute_create_writes_file_and_records_event() {
     let gated = log
         .propose_write(proposal(&target, WriteOp::Create, b"fresh bytes", std::slice::from_ref(&clean)))
         .unwrap();
-    let id = log.execute_write(gated).unwrap();
+    let id = log.execute_write(gated, false).unwrap();
 
     // FS mutated: the file now exists with EXACTLY the proposed bytes.
     assert_eq!(std::fs::read(&target).unwrap(), b"fresh bytes");
@@ -740,7 +740,7 @@ fn execute_edit_overwrites_file_and_records_prev_hash() {
     let gated = log
         .propose_write(proposal(&target, WriteOp::Edit, b"new contents here", &[clean]))
         .unwrap();
-    let id = log.execute_write(gated).unwrap();
+    let id = log.execute_write(gated, false).unwrap();
 
     assert_eq!(std::fs::read(&target).unwrap(), b"new contents here");
 
@@ -768,7 +768,9 @@ fn execute_delete_hard_deletes_file_and_records_zero_size() {
     let gated = log
         .propose_write(proposal(&target, WriteOp::Delete, b"", &[clean]))
         .unwrap();
-    let id = log.execute_write(gated).unwrap();
+    // A Delete is loud by op (requires_loud_modal), so the clean-source happy-path delete
+    // needs the explicit ack to clear the engine loud-gate (SP5 change d).
+    let id = log.execute_write(gated, true).unwrap();
 
     // Hard-deleted: the file is GONE (no OS trash — spec W5).
     assert!(!target.exists(), "delete must hard-remove the file");
@@ -815,7 +817,7 @@ fn execute_toctou_path_swap_to_symlink_fails_closed() {
     std::fs::remove_file(&target).unwrap();
     std::os::unix::fs::symlink(&secret, &target).unwrap();
 
-    let err = log.execute_write(gated);
+    let err = log.execute_write(gated, false);
     assert!(err.is_err(), "a final-component swapped to a symlink must fail closed");
     assert_eq!(
         std::fs::read(&secret).unwrap(),
@@ -859,7 +861,7 @@ fn execute_same_content_different_inode_swap_fails_closed() {
     let ino_after = std::fs::metadata(&target).unwrap().ino_u64();
     assert_ne!(ino_before, ino_after, "the swap must produce a different inode (else the test is moot)");
 
-    let err = log.execute_write(gated);
+    let err = log.execute_write(gated, false);
     assert!(
         err.is_err(),
         "a same-content different-inode swap must fail closed on the (dev,ino) half of the guard"
@@ -886,7 +888,7 @@ fn execute_base_content_change_fails_closed() {
     // Mutate the base bytes IN PLACE (same inode, different content) after propose.
     std::fs::write(&target, b"version two changed").unwrap();
 
-    let err = log.execute_write(gated);
+    let err = log.execute_write(gated, false);
     assert!(err.is_err(), "a base content change since propose must fail closed");
     assert_eq!(
         std::fs::read(&target).unwrap(),
@@ -914,7 +916,7 @@ fn execute_create_racing_existing_file_fails_closed() {
     // RACE: a file appears at the target name before execute.
     std::fs::write(&target, b"someone else got here first").unwrap();
 
-    let err = log.execute_write(gated);
+    let err = log.execute_write(gated, false);
     assert!(err.is_err(), "Create must not clobber a file that raced into place");
     assert_eq!(
         std::fs::read(&target).unwrap(),
@@ -942,7 +944,7 @@ fn execute_grant_revoked_between_propose_and_execute_fails_closed() {
     // Revoke the write grant AFTER propose. execute re-checks → fail-closed.
     log.revoke_write_grant(dir.path()).unwrap();
 
-    let err = log.execute_write(gated);
+    let err = log.execute_write(gated, false);
     assert!(err.is_err(), "a grant revoked since propose must fail closed at execute");
     assert_eq!(std::fs::read(&target).unwrap(), b"original", "the file is untouched after a revoked-grant reject");
 }
@@ -964,7 +966,7 @@ fn execute_refuses_a_rejected_verdict() {
     assert!(gated.verdict.reject_reason.is_some(), "precondition: the verdict is rejected");
 
     assert!(
-        log.execute_write(gated).is_err(),
+        log.execute_write(gated, false).is_err(),
         "execute must refuse a verdict that carries a reject_reason"
     );
 }
@@ -984,17 +986,17 @@ fn no_tier_a_file_written_can_be_produced() {
     // Produce several file_written events across all three ops.
     let create_t = dir.path().join("a.txt");
     let g = log.propose_write(proposal(&create_t, WriteOp::Create, b"a", std::slice::from_ref(&clean))).unwrap();
-    log.execute_write(g).unwrap();
+    log.execute_write(g, false).unwrap();
 
     let edit_t = dir.path().join("b.txt");
     std::fs::write(&edit_t, b"old").unwrap();
     let g = log.propose_write(proposal(&edit_t, WriteOp::Edit, b"new", std::slice::from_ref(&clean))).unwrap();
-    log.execute_write(g).unwrap();
+    log.execute_write(g, false).unwrap();
 
     let del_t = dir.path().join("c.txt");
     std::fs::write(&del_t, b"bye").unwrap();
     let g = log.propose_write(proposal(&del_t, WriteOp::Delete, b"", &[clean])).unwrap();
-    log.execute_write(g).unwrap();
+    log.execute_write(g, true).unwrap(); // Delete is loud by op → ack to clear the gate (SP5 d).
 
     // EVERY file_written in the log is Tier-B (model_meta is Some, with non-empty sources).
     let all = log.stream_all().unwrap();
@@ -1053,7 +1055,8 @@ fn execute_l11_tracked_file_edit_is_stamped_external() {
     // event matches (execute-side L11 augmentation + chokepoint stamp).
     assert_eq!(gated.verdict.taint, Taint::Untrusted, "propose-side anchor flags it");
 
-    let id = log.execute_write(gated).unwrap();
+    // Untrusted ⇒ loud; this test drives the loud write to success, so it acks (SP5 change d).
+    let id = log.execute_write(gated, true).unwrap();
     let ev = file_written_event(&log, &id);
 
     // The chokepoint stamped the signed content external (because a re-derived source
@@ -1086,7 +1089,9 @@ fn do_edit(log: &EventLog, target: &std::path::Path, new_content: &[u8], clean: 
     let gated = log
         .propose_write(proposal(target, WriteOp::Edit, new_content, std::slice::from_ref(&clean.to_string())))
         .unwrap();
-    log.execute_write(gated).unwrap()
+    // do_edit always runs a clean, non-secret Edit (short content, clean memory source) → not
+    // loud → no ack needed (SP5 change d).
+    log.execute_write(gated, false).unwrap()
 }
 
 // ── undo of Edit restores the prior content + records file_written(undo_of) ────
@@ -1138,7 +1143,7 @@ fn undo_create_removes_the_file() {
     let gated = log
         .propose_write(proposal(&target, WriteOp::Create, b"new file", std::slice::from_ref(&clean)))
         .unwrap();
-    let write_id = log.execute_write(gated).unwrap();
+    let write_id = log.execute_write(gated, false).unwrap();
     assert!(target.exists(), "precondition: create made the file");
 
     let undo_id = log.undo_write(&write_id).unwrap();
@@ -1163,7 +1168,8 @@ fn undo_delete_recreates_file_from_pre_bytes() {
     let gated = log
         .propose_write(proposal(&target, WriteOp::Delete, b"", std::slice::from_ref(&clean)))
         .unwrap();
-    let write_id = log.execute_write(gated).unwrap();
+    // Delete is loud by op; the happy-path delete acks to clear the engine loud-gate (SP5 d).
+    let write_id = log.execute_write(gated, true).unwrap();
     assert!(!target.exists(), "precondition: delete removed the file");
 
     let undo_id = log.undo_write(&write_id).unwrap();
