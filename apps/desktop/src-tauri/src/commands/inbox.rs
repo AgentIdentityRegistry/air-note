@@ -125,6 +125,22 @@ pub async fn inbox_conversations() -> Result<Value, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// All pinned contacts with their DID keys, for the §6 did→display-name join (Milestone C).
+/// Mirrors `inbox_conversations`: no args, guards on file existence, reads on a blocking task.
+#[tauri::command]
+pub async fn inbox_contacts() -> Result<Value, String> {
+    let home = bridge_home();
+    if !home.join("contacts.json").exists() {
+        return Ok(json!([]));
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let contacts = air_rs::inbox::stores::list_contacts(&home);
+        serde_json::to_value(contacts).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// History for one peer, one room, or recent across peers when both are None.
 #[tauri::command]
 pub async fn inbox_history(

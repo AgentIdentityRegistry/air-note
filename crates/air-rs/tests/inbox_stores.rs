@@ -64,3 +64,39 @@ fn identity_meta_reads_only_public_fields() {
     assert_eq!(meta.did, "did:wba:x:agents:AIR-2JE0");
     assert_eq!(meta.name.as_deref(), Some("peters-agent"));
 }
+
+#[test]
+fn list_contacts_returns_all_with_did_keys_and_registry_fields() {
+    let h = home();
+    fs::write(
+        h.path().join("contacts.json"),
+        r#"{"version":1,"contacts":{
+            "did:wba:x:agents:AIR-1":{"alias":"kenny","air_id":"AIR-1","name":"Kenny","username":"kenny","public_key_multibase":"zA","verified_at_pin":true},
+            "did:wba:x:agents:AIR-2":{"air_id":"AIR-2","public_key_multibase":"zB"}
+        }}"#,
+    )
+    .unwrap();
+    let got = list_contacts(h.path()); // sorted by did for determinism
+    assert_eq!(got.len(), 2);
+
+    assert_eq!(got[0].did, "did:wba:x:agents:AIR-1");
+    assert_eq!(got[0].alias.as_deref(), Some("kenny"));
+    assert_eq!(got[0].name.as_deref(), Some("Kenny"));
+    assert_eq!(got[0].username.as_deref(), Some("kenny"));
+    assert!(got[0].verified_at_pin);
+
+    // minimal record: registry fields absent → None; verified defaults to false
+    assert_eq!(got[1].did, "did:wba:x:agents:AIR-2");
+    assert_eq!(got[1].alias, None);
+    assert_eq!(got[1].name, None);
+    assert_eq!(got[1].username, None);
+    assert!(!got[1].verified_at_pin);
+}
+
+#[test]
+fn list_contacts_is_empty_on_missing_or_corrupt_file() {
+    let h = home();
+    assert!(list_contacts(h.path()).is_empty()); // missing
+    fs::write(h.path().join("contacts.json"), "{ not json").unwrap();
+    assert!(list_contacts(h.path()).is_empty()); // corrupt → fail-soft
+}
