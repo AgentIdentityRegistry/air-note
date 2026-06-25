@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import { ToggleSwitch } from "../components/ui/ToggleSwitch";
@@ -9,12 +9,12 @@ import { Composer } from "./Composer";
 import { DialControl } from "./DialControl";
 import { NeedsDaemon } from "./NeedsDaemon";
 import { AIPanel } from "./AIPanel";
+import { shortDid, conversationLabel } from "./displayName";
 import type { ThreadItem } from "./model";
 
-const short = (did: string) => did.replace(/^did:wba:[^:]+:agents:/, "");
-
 export function InboxPanel() {
-  const { gate, adoption, online, archiveError, conversations, selected, thread, includeSpam, select, setIncludeSpam, send } = useInbox();
+  const { gate, adoption, online, archiveError, conversations, contacts, selected, thread, includeSpam, select, setIncludeSpam, send } = useInbox();
+  const contactList = useMemo(() => [...contacts.values()], [contacts]);
   const [composing, setComposing] = useState(false);
   // Keep the message area pinned to the newest message when the thread grows or the
   // conversation changes. `scrollIntoView` is guarded because jsdom does not implement it.
@@ -51,7 +51,7 @@ export function InboxPanel() {
 
       {adoption?.state === "adopted" && adoption.dormant_did ? (
         <div className="inbox-banner" style={{ fontSize: 12, color: "var(--text-secondary)" }}>
-          This app previously created {short(adoption.dormant_did)}; it is now dormant. Active agent: {short(adoption.did)}.
+          This app previously created {shortDid(adoption.dormant_did)}; it is now dormant. Active agent: {shortDid(adoption.did)}.
         </div>
       ) : null}
 
@@ -68,23 +68,32 @@ export function InboxPanel() {
 
       <div className="inbox-grid">
         <div className="inbox-list-col">
-          <ConversationList conversations={conversations} selected={showConv ? selected : null} onSelect={(k) => { setComposing(false); select(k); }} />
+          <ConversationList conversations={conversations} contacts={contacts} selected={showConv ? selected : null} onSelect={(k) => { setComposing(false); select(k); }} />
         </div>
         <div className="inbox-thread-col">
           {showPane ? (
             <>
               {showConv && selected ? (
-                <div className="inbox-thread-head">
-                  <span style={{ fontSize: 13, fontWeight: 600 }}>{isRoom ? "👥 " : ""}{short(selected)}</span>
-                  {!isRoom ? <DialControl did={selected} /> : null}
-                </div>
+                (() => {
+                  const headContact = !isRoom ? contacts.get(selected) : undefined;
+                  const { label, handle } = conversationLabel(selected, isRoom ? "room" : "peer", headContact);
+                  return (
+                    <div className="inbox-thread-head">
+                      <span style={{ fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+                        <span>{isRoom ? "👥 " : ""}{label}</span>
+                        {handle ? <span style={{ color: "var(--text-secondary)", fontWeight: 400, fontSize: 12 }}>{handle}</span> : null}
+                      </span>
+                      {!isRoom ? <DialControl did={selected} /> : null}
+                    </div>
+                  );
+                })()
               ) : <div className="inbox-thread-head"><span style={{ fontSize: 13, fontWeight: 600 }}>New Message</span></div>}
               <div className="inbox-thread-scroll">
                 {showConv ? <MessageThread items={thread} onRetry={onRetry} /> : null}
                 {showConv ? <AIPanel selectedPeer={selected ?? null} /> : null}
                 <div ref={bottomRef} className="inbox-thread-anchor" />
               </div>
-              <Composer key={showNew ? "new" : selected} to={showNew ? null : selected} disabled={!online} onSend={handleSend} />
+              <Composer key={showNew ? "new" : selected} to={showNew ? null : selected} contacts={contactList} disabled={!online} onSend={handleSend} />
             </>
           ) : (
             <div style={{ color: "var(--text-secondary)", fontSize: 13, padding: 12 }}>Select a conversation, or start a new message.</div>

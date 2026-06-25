@@ -31,6 +31,15 @@ export type ConversationSummary = {
   conv_key: string; kind: "room" | "peer"; last_timestamp: string; count: number;
 };
 
+/** A pinned contact + its DID key (mirrors air-rs `ContactView`; snake_case crosses as-is). */
+export type ContactView = {
+  did: string;
+  alias: string | null;
+  name: string | null;
+  username: string | null;
+  verified_at_pin: boolean;
+};
+
 export type Adoption =
   | { state: "adopted"; did: string; air_id: string; name: string | null; dormant_did: string | null }
   | { state: "needs_daemon" };
@@ -52,6 +61,7 @@ export const inboxStop = () => invoke<void>("inbox_stop");
 export const inboxSend = (to: string, body: unknown, threadId?: string, inReplyTo?: string) =>
   invoke<string>("inbox_send", { to, body, threadId, inReplyTo });
 export const inboxConversations = () => invoke<ConversationSummary[]>("inbox_conversations");
+export const inboxContacts = () => invoke<ContactView[]>("inbox_contacts");
 /** peer XOR room XOR neither (recent across peers). */
 export const inboxHistory = (peer?: string, room?: string, limit?: number, includeSpam?: boolean) =>
   invoke<ArchiveRow[]>("inbox_history", { peer, room, limit, includeSpam });

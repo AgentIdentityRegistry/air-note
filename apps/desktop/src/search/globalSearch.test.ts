@@ -15,6 +15,7 @@ const deps = (over: Partial<GlobalSearchDeps> = {}): GlobalSearchDeps => ({
   recall: vi.fn(async () => [hit("e1", "alpha memory")]),
   listFiles: vi.fn(async () => [file("/d/alpha.md", "f1")]),
   conversations: [conv("did:key:alpha", "alpha chat")],
+  contacts: new Map(),
   ...over,
 });
 

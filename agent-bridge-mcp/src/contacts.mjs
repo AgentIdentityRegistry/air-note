@@ -78,6 +78,7 @@ export async function resolveAgent(airUrl, didOrId) {
   let name = null;
   let verified = false;
   let trust_score = null;
+  let username = null; // the peer's published @handle (Milestone G), if claimed
   try {
     const recResp = await fetch(`${airUrl}/api/v1/agents/${airId}`);
     if (recResp.ok) {
@@ -85,6 +86,7 @@ export async function resolveAgent(airUrl, didOrId) {
       name = rec.name ?? null;
       verified = rec.verification_status?.verified ?? rec.verified ?? false;
       trust_score = rec.trust_score ?? null;
+      username = rec.username ?? null;
     }
   } catch {
     /* metadata optional */
@@ -99,6 +101,7 @@ export async function resolveAgent(airUrl, didOrId) {
     name,
     verified,
     trust_score,
+    username,
   };
 }
 
@@ -121,6 +124,8 @@ export async function addContact(airUrl, { to, alias }) {
     air_id: resolved.air_id,
     did: resolved.did,
     name: resolved.name,
+    // preserve a known handle if the registry momentarily returns null; a real release self-heals on the next clean re-pin
+    username: resolved.username ?? prior?.username ?? null,
     public_key_multibase: resolved.publicKeyMultibase, // PINNED
     fingerprint: resolved.fingerprint.short,
     fingerprint_full: resolved.fingerprint.sha256_hex,

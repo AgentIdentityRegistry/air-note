@@ -1,13 +1,14 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
-  inboxStart, inboxStop, inboxSend, inboxHistory, inboxConversations, inboxStatus, inboxIdentity,
-  onInboxEvent, type InboxMessage, type Adoption, type ConversationSummary,
+  inboxStart, inboxStop, inboxSend, inboxHistory, inboxConversations, inboxContacts, inboxStatus, inboxIdentity,
+  onInboxEvent, type InboxMessage, type Adoption, type ConversationSummary, type ContactView,
 } from "../api/inbox";
 import { getIdentity } from "../api/tauri";
 import {
   fromArchiveRow, fromLiveMessage, makeOptimistic, convKey, dedupeById, groupConversations,
   type ThreadItem, type Conversation,
 } from "../inbox/model";
+import { contactsByDid } from "../inbox/displayName";
 import { onSendStart, onSendOk, onSendErr, type SendState } from "../inbox/sendState";
 import { addUnread, clearConv } from "../inbox/unread";
 import { mergeSidebar } from "../inbox/sidebar";
@@ -18,6 +19,7 @@ type InboxCtx = {
   online: boolean;
   archiveError: boolean;
   conversations: Conversation[];
+  contacts: Map<string, ContactView>;
   selected: string | null;
   thread: ThreadItem[];
   includeSpam: boolean;
@@ -36,6 +38,7 @@ export function InboxProvider({ children }: { children: ReactNode }) {
   const [online, setOnline] = useState(false);
   const [archiveError, setArchiveError] = useState(false);
   const [summaries, setSummaries] = useState<ConversationSummary[]>([]);
+  const [contacts, setContacts] = useState<Map<string, ContactView>>(new Map());
   const [recent, setRecent] = useState<ThreadItem[]>([]);       // bulk cross-peer backfill (previews)
   const [threadRows, setThreadRows] = useState<ThreadItem[]>([]); // deep history for the open conv
   const [live, setLive] = useState<ThreadItem[]>([]);
@@ -103,6 +106,14 @@ export function InboxProvider({ children }: { children: ReactNode }) {
     return () => { alive = false; };
   }, [gate, includeSpam]);
 
+  // Load the contact book once ready, for did→display-name resolution (Milestone C).
+  useEffect(() => {
+    if (gate !== "ready") return;
+    let alive = true;
+    inboxContacts().then((cs) => { if (alive) setContacts(contactsByDid(cs)); }).catch(() => {});
+    return () => { alive = false; };
+  }, [gate]);
+
   // Is the selected conversation a room? Derived so the deep-load effect can depend on a stable
   // boolean (not the whole summaries/recent/live arrays) and re-fire only on real changes (m1/m2).
   const selectedIsRoom = useMemo(
@@ -162,7 +173,7 @@ export function InboxProvider({ children }: { children: ReactNode }) {
 
   return (
     <Ctx.Provider value={{
-      gate, adoption, online, archiveError, conversations, selected, thread, includeSpam, totalUnread,
+      gate, adoption, online, archiveError, conversations, contacts, selected, thread, includeSpam, totalUnread,
       select, setIncludeSpam, send,
     }}>
       {children}

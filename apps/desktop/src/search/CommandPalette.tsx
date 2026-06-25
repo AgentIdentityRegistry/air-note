@@ -22,7 +22,7 @@ export function CommandPalette({
   /** Injectable for tests; defaults to the real façade. */
   search?: SearchFn;
 }) {
-  const { conversations } = useInbox();
+  const { conversations, contacts } = useInbox();
   const [state, dispatch] = useReducer(paletteReducer, initialPaletteState);
   const inputRef = useRef<HTMLInputElement>(null);
   // Latest conversations, read at debounce-fire time. Kept OUT of the search effect's
@@ -31,6 +31,10 @@ export function CommandPalette({
   // re-dispatch "loading" (a non-bailing reducer case) — an infinite render loop.
   const conversationsRef = useRef(conversations);
   conversationsRef.current = conversations;
+  // Same trap as conversationsRef: useInbox() hands us a fresh Map identity each render,
+  // so contacts must be read via ref at fire-time, never enter the search effect's deps.
+  const contactsRef = useRef(contacts);
+  contactsRef.current = contacts;
 
   // Reset + focus on open.
   useEffect(() => {
@@ -50,7 +54,7 @@ export function CommandPalette({
     }
     dispatch({ type: "loading" });
     const id = setTimeout(() => {
-      search(q, defaultSearchDeps(conversationsRef.current)).then((results) => dispatch({ type: "setResults", results }));
+      search(q, defaultSearchDeps(conversationsRef.current, contactsRef.current)).then((results) => dispatch({ type: "setResults", results }));
     }, DEBOUNCE_MS);
     return () => clearTimeout(id);
     // conversations intentionally read via ref (see conversationsRef above), not a dep.

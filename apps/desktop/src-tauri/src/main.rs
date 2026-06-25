@@ -197,6 +197,7 @@ fn main() {
             commands::inbox::inbox_stop,
             commands::inbox::inbox_send,
             commands::inbox::inbox_conversations,
+            commands::inbox::inbox_contacts,
             commands::inbox::inbox_history,
             commands::inbox::inbox_policy_get,
             commands::inbox::inbox_policy_set,
