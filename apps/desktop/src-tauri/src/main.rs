@@ -133,6 +133,8 @@ fn main() {
             get_trust_score,
             create_identity,
             rename_identity,
+            check_username,
+            claim_username,
             reset_identity,
             #[cfg(unix)]
             commands::engine::engine_status,

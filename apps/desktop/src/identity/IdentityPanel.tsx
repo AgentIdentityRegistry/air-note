@@ -3,8 +3,9 @@ import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import { Input } from "../components/Input";
 import { useIdentity } from "../state/identity";
-import { renameIdentity } from "../api/tauri";
+import { renameIdentity, checkUsername, claimUsername, UsernameCheck } from "../api/tauri";
 import { validateDisplayName } from "./displayName";
+import { validateUsername } from "./username";
 
 export function IdentityPanel() {
   const { identity, trustScore, loading, refresh } = useIdentity();
@@ -85,6 +86,8 @@ export function IdentityPanel() {
         )}
       </div>
 
+      <UsernameSection username={identity.username} onClaimed={refresh} />
+
       <div style={{ marginTop: 12 }}>
         <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>DID</div>
         <div
@@ -110,4 +113,135 @@ export function IdentityPanel() {
       </div>
     </Card>
   );
+}
+
+/** The published unique @handle. Deliberately a SEPARATE section from the local-name rename:
+ *  the rename edits `identity.name` (freely editable, local), while the @handle is published,
+ *  globally unique, and claim-once (changing it later costs a 30-day cooldown). Flow: type a
+ *  draft → Check availability → Claim (only when available). */
+function UsernameSection({
+  username,
+  onClaimed,
+}: {
+  username: string | null;
+  onClaimed: () => Promise<void>;
+}) {
+  const [draft, setDraft] = useState("");
+  const [check, setCheck] = useState<UsernameCheck | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [claiming, setClaiming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Already claimed → read-only with a cooldown note. The handle is claim-once for normal use.
+  if (username) {
+    return (
+      <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
+        <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Public username</div>
+        <div style={{ fontSize: 16, fontWeight: 600 }}>@{username}</div>
+        <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 4 }}>
+          This is your published unique handle. Changing it has a 30-day cooldown.
+        </div>
+      </div>
+    );
+  }
+
+  const validation = validateUsername(draft);
+  // Local charset/length validation gates the Check button so we don't ask the registry about
+  // an obviously-invalid handle. A stale check is invalidated whenever the draft changes.
+  const canCheck = !checking && validation.ok;
+  const canClaim = !claiming && check?.valid === true && check.available;
+
+  const onDraftChange = (value: string) => {
+    setDraft(value);
+    setCheck(null);
+    setError(null);
+  };
+
+  const runCheck = async () => {
+    if (!canCheck) return;
+    setChecking(true);
+    setError(null);
+    setCheck(null);
+    try {
+      setCheck(await checkUsername(draft.trim()));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const runClaim = async () => {
+    if (!canClaim) return;
+    setClaiming(true);
+    setError(null);
+    try {
+      await claimUsername(draft.trim());
+      await onClaimed();
+      // After refresh the parent re-renders with `username` set, so this section flips to read mode.
+    } catch (e) {
+      // A 409 (taken / cooldown) arrives as a bare string here; show it inline.
+      setError(String(e));
+    } finally {
+      setClaiming(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
+      <div style={{ fontSize: 13, color: "var(--text-secondary)" }}>Public username</div>
+      <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginBottom: 8 }}>
+        Claim a unique, published @handle for your agent. This is different from the local name
+        above, and can only be claimed once (changing it later has a 30-day cooldown).
+      </div>
+      <div className="chat-rename-wrap">
+        <Input
+          value={draft}
+          disabled={claiming}
+          placeholder="your_handle"
+          aria-label="Public username"
+          onChange={(e) => onDraftChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && canCheck) void runCheck();
+          }}
+        />
+        <Button variant="secondary" disabled={!canCheck} onClick={() => void runCheck()}>
+          {checking ? "Checking…" : "Check"}
+        </Button>
+        <Button disabled={!canClaim} onClick={() => void runClaim()}>
+          {claiming ? "Claiming…" : "Claim"}
+        </Button>
+      </div>
+
+      {/* Local validation feedback shows before the user has run a registry check. */}
+      {draft !== "" && !validation.ok && !check ? (
+        <div style={{ color: "var(--error)", fontSize: 13, marginTop: 6 }}>{validation.error}</div>
+      ) : null}
+
+      {check ? <CheckResult check={check} /> : null}
+
+      {error ? (
+        <div style={{ color: "var(--error)", fontSize: 13, marginTop: 6 }}>{error}</div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Renders the registry's verdict for a checked handle: available (green), or the
+ *  taken/cooldown/invalid reason (red). */
+function CheckResult({ check }: { check: UsernameCheck }) {
+  if (check.valid && check.available) {
+    return (
+      <div style={{ color: "var(--success)", fontSize: 13, marginTop: 6 }}>
+        @{check.username} is available.
+      </div>
+    );
+  }
+  // Not available (or invalid): prefer the registry's reason/error message.
+  const message = !check.valid
+    ? check.error ?? "That username isn’t valid."
+    : check.reason === "cooldown"
+      ? `@${check.username} is in a 30-day cooldown.`
+      : `@${check.username} is already taken.`;
+  return <div style={{ color: "var(--error)", fontSize: 13, marginTop: 6 }}>{message}</div>;
 }

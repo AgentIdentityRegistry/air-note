@@ -577,6 +577,7 @@ mod tests {
         identity_store.save_metadata(&IdentityMetadata {
             did: Did("did:wba:AIR-TEST:cmd".to_string()),
             name: "Test".to_string(),
+            username: None,
             created_at: "2026-06-23T00:00:00Z".to_string(),
         }).unwrap();
         let engine = Arc::new(crate::engine::EngineHandle::new(
@@ -649,6 +650,7 @@ mod tests {
         identity_store.save_metadata(&IdentityMetadata {
             did: Did("did:wba:AIR-TEST:cmd".to_string()),
             name: "Test".to_string(),
+            username: None,
             created_at: "2026-06-23T00:00:00Z".to_string(),
         }).unwrap();
         let engine = Arc::new(crate::engine::EngineHandle::new(
