@@ -10,7 +10,7 @@ type StatusBadgeProps = {
 
 export function StatusBadge({ tone = "neutral", className, children }: StatusBadgeProps) {
   return (
-    <span className={["status-badge", "status-badge-compact", `status-${tone}`, className].filter(Boolean).join(" ")}>
+    <span className={["status-badge", `status-${tone}`, className].filter(Boolean).join(" ")}>
       {children}
     </span>
   );
