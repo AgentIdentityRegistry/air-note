@@ -1,5 +1,6 @@
 import { recall as recallOp, listFiles as listFilesOp, type HitDto, type FileRecordDto } from "../api/engine";
 import type { Conversation } from "../inbox/model";
+import type { ContactView } from "../api/inbox";
 import { filterConversations } from "./filterConversations";
 import { filterFiles } from "./filterFiles";
 import { memoryResults } from "./rankResults";
@@ -10,6 +11,7 @@ export type GlobalSearchDeps = {
   recall: (q: string, k: number) => Promise<HitDto[]>;
   listFiles: () => Promise<FileRecordDto[]>;
   conversations: Conversation[];
+  contacts: Map<string, ContactView>;
 };
 
 /**
@@ -24,7 +26,7 @@ export async function globalSearch(query: string, deps: GlobalSearchDeps): Promi
 
   return {
     memory: mem.status === "fulfilled" ? memoryResults(mem.value, RESULTS_PER_GROUP) : [],
-    conversations: filterConversations(deps.conversations, q),
+    conversations: filterConversations(deps.conversations, q, deps.contacts),
     files: files.status === "fulfilled" ? filterFiles(files.value, q) : [],
     errors: {
       memory: mem.status === "rejected",
@@ -34,9 +36,13 @@ export async function globalSearch(query: string, deps: GlobalSearchDeps): Promi
   };
 }
 
-/** Wire the real engine ops + the live conversation list at the call site. */
-export const defaultSearchDeps = (conversations: Conversation[]): GlobalSearchDeps => ({
+/** Wire the real engine ops + the live conversation list + contacts map at the call site. */
+export const defaultSearchDeps = (
+  conversations: Conversation[],
+  contacts: Map<string, ContactView>,
+): GlobalSearchDeps => ({
   recall: recallOp,
   listFiles: listFilesOp,
   conversations,
+  contacts,
 });

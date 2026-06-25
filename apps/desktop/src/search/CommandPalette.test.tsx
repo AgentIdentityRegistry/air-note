@@ -4,8 +4,8 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { CommandPalette } from "./CommandPalette";
 import type { GroupedResults } from "./types";
 
-// Stub the inbox hook (the palette reads conversations from it).
-vi.mock("../state/inbox", () => ({ useInbox: () => ({ conversations: [] }) }));
+// Stub the inbox hook (the palette reads conversations + contacts from it).
+vi.mock("../state/inbox", () => ({ useInbox: () => ({ conversations: [], contacts: new Map() }) }));
 
 const grouped: GroupedResults = {
   memory: [{ id: "mem:1", kind: "memory", title: "Memory", snippet: "alpha memory", target: { view: "memory" } }],
