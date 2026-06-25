@@ -6,7 +6,7 @@
 
 **Architecture:** The data already lives in `~/.air-msg/contacts.json` (per-contact `alias` + registry `name`). Milestone G's published `@handle` is returned by the registry agent-GET but never captured — so the data pipeline grows by one field end-to-end: `agent-bridge-mcp` captures `username` → `air-rs` reads it → a new `inbox_contacts` Tauri command exposes the contact book → React builds a `did → ContactView` map and resolves display names through one shared, unit-tested resolver (`displayName.ts`). No SQL changes; `contacts.json` stays read-only from the desktop. Precedence: **user `alias` → registry `name` → `short(did)`**; `@handle` shows as a secondary line and as the composer's address label.
 
-**Tech Stack:** Node ESM (`agent-bridge-mcp`, `node:test`), Rust (`air-rs` lib + `bossclaw_desktop` Tauri commands, `cargo test`), React + TypeScript (`@bossclaw/desktop`, `vitest` + `tsc`).
+**Tech Stack:** Node ESM (`agent-bridge-mcp`, `node:test`), Rust (`air-rs` lib + `air_agent_desktop` Tauri commands, `cargo test`), React + TypeScript (`@air-agent/desktop`, `vitest` + `tsc`).
 
 **Source spec:** `docs/superpowers/specs/2026-06-25-air-agent-review-fixes-design.md` § "Milestone C". Scope decision (2026-06-25): **also surface peer `@handle`** (Peter), so Task 1 (agent-bridge-mcp capture) is in scope — the spec's "agent-bridge-mcp needs zero changes" no longer applies.
 
@@ -357,8 +357,8 @@ In `apps/desktop/src-tauri/src/main.rs`, find the `tauri::generate_handler![` li
 
 - [ ] **Step 7: Verify the desktop backend compiles + clippy clean**
 
-Run: `cd ~/air-note && cargo test -p air-rs && cargo check -p bossclaw_desktop && cargo clippy -p air-rs -p bossclaw_desktop --all-targets -- -D warnings`
-Expected: PASS, no warnings. (`bossclaw_desktop` needs `apps/desktop/dist/` to exist for `generate_context!`; if `cargo check` errors on a missing dist, run `npm run build --workspace @bossclaw/desktop` once, or rely on the existing `dist/`.)
+Run: `cd ~/air-note && cargo test -p air-rs && cargo check -p air_agent_desktop && cargo clippy -p air-rs -p air_agent_desktop --all-targets -- -D warnings`
+Expected: PASS, no warnings. (`air_agent_desktop` needs `apps/desktop/dist/` to exist for `generate_context!`; if `cargo check` errors on a missing dist, run `npm run build --workspace @air-agent/desktop` once, or rely on the existing `dist/`.)
 
 - [ ] **Step 8: Commit**
 
@@ -1017,7 +1017,7 @@ git commit -m "feat(search): match conversations by contact name + @handle (Mile
 ```bash
 cd ~/air-note
 cargo test -p air-rs
-cargo clippy -p air-rs -p bossclaw_desktop --all-targets -- -D warnings
+cargo clippy -p air-rs -p air_agent_desktop --all-targets -- -D warnings
 ( cd agent-bridge-mcp && node --test )
 ( cd apps/desktop && npm run typecheck && npx vitest run )
 ```
