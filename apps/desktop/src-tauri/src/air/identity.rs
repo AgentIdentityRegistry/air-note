@@ -8,6 +8,10 @@ use std::sync::Arc;
 pub struct IdentityMetadata {
     pub did: Did,
     pub name: String,
+    /// The published unique `@handle` (lowercased, charset-validated), once claimed.
+    /// `#[serde(default)]` so identity.json written before Milestone G still loads.
+    #[serde(default)]
+    pub username: Option<String>,
     pub created_at: String,
 }
 

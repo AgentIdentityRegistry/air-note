@@ -41,7 +41,20 @@ export const a2aDemoRoundTrip = (): Promise<A2ADemoResult> =>
 export type IdentityMetadata = {
   did: string;
   name: string;
+  /** The published unique @handle, once claimed; null until then. */
+  username: string | null;
   created_at: string;
+};
+
+/** Result of `check_username` — mirrors the Rust `UsernameCheck`. The registry always answers:
+ *  a valid handle carries `available` + `reason` ("available"|"taken"|"cooldown"); an invalid
+ *  one carries `error` (and `valid=false`). */
+export type UsernameCheck = {
+  username: string;
+  valid: boolean;
+  available: boolean;
+  reason: string | null;
+  error: string | null;
 };
 
 export async function isOnboarded(): Promise<boolean> {
@@ -68,6 +81,18 @@ export async function createIdentity(
  *  JS `newName` key to the Rust command's `new_name` argument. */
 export async function renameIdentity(name: string): Promise<IdentityMetadata> {
   return invoke<IdentityMetadata>("rename_identity", { newName: name });
+}
+
+/** Check whether a published @handle is available (un-normalized raw input; the registry
+ *  normalizes + decides). Unauthenticated — does NOT claim the handle. */
+export async function checkUsername(username: string): Promise<UsernameCheck> {
+  return invoke<UsernameCheck>("check_username", { username });
+}
+
+/** Claim a published unique @handle for this agent. On success returns the updated metadata
+ *  (with `username` set). Throws a bare error string on 409 (taken / in 30-day cooldown). */
+export async function claimUsername(username: string): Promise<IdentityMetadata> {
+  return invoke<IdentityMetadata>("claim_username", { username });
 }
 
 export async function resetIdentity(): Promise<void> {

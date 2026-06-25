@@ -13,10 +13,26 @@ impl Did {
 pub struct AgentRecord {
     pub did: Did,
     pub name: String,
+    #[serde(default)]
+    pub username: Option<String>,
     pub manifest_url: Option<String>,
     pub trust_score: TrustScore,
     pub created_at: String, // ISO 8601
     pub updated_at: String,
+}
+
+/// Result of `GET /agents/check-username`. The registry returns 200 in all cases:
+/// a valid handle carries `available` + `reason` ("available"|"taken"|"cooldown");
+/// an invalid handle carries `error` with a human message (and `valid=false`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsernameCheck {
+    pub username: String,
+    pub valid: bool,
+    pub available: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

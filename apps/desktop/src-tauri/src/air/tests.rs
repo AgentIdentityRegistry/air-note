@@ -60,6 +60,63 @@ async fn mock_update_requires_secret() {
 }
 
 #[tokio::test]
+async fn mock_claim_username_secret_and_conflict() {
+    let client = MockAirClient::new();
+    let did_a = Did("did:wba:example.com:alice-agent".to_string());
+    let manifest = AgentManifest {
+        name: "Alice".to_string(),
+        description: String::new(),
+        capabilities: vec![],
+        owner_hint: None,
+    };
+    let resp_a = client.register(&did_a, &manifest).await.unwrap();
+
+    // Wrong secret is rejected before any handle is recorded.
+    let bad = client.claim_username(&did_a, "wrong-secret", "alice").await;
+    assert!(matches!(bad, Err(AirError::Unauthorized)));
+
+    // Right secret claims the handle.
+    let good = client.claim_username(&did_a, &resp_a.agent_secret, "alice").await;
+    assert!(good.is_ok());
+
+    // A different DID claiming the same handle conflicts.
+    let did_b = Did("did:wba:example.com:bob-agent".to_string());
+    let resp_b = client.register(&did_b, &manifest).await.unwrap();
+    let taken = client.claim_username(&did_b, &resp_b.agent_secret, "alice").await;
+    assert!(matches!(taken, Err(AirError::Conflict(_))));
+}
+
+#[tokio::test]
+async fn mock_check_username_reflects_claims() {
+    let client = MockAirClient::new();
+    let did = Did("did:wba:example.com:carol-agent".to_string());
+    let manifest = AgentManifest {
+        name: "Carol".to_string(),
+        description: String::new(),
+        capabilities: vec![],
+        owner_hint: None,
+    };
+    let resp = client.register(&did, &manifest).await.unwrap();
+
+    // Unclaimed, valid handle → available.
+    let before = client.check_username("carol").await.unwrap();
+    assert!(before.valid);
+    assert!(before.available);
+
+    client.claim_username(&did, &resp.agent_secret, "carol").await.unwrap();
+
+    // Same handle after claim → no longer available.
+    let after = client.check_username("carol").await.unwrap();
+    assert!(after.valid);
+    assert!(!after.available);
+
+    // An invalid handle is reported invalid (and never available).
+    let invalid = client.check_username("ab").await.unwrap();
+    assert!(!invalid.valid);
+    assert!(!invalid.available);
+}
+
+#[tokio::test]
 async fn mock_lookup_missing_returns_not_found() {
     let client = MockAirClient::new();
     let did = Did("did:wba:example.com:does-not-exist".to_string());
@@ -107,10 +164,12 @@ fn identity_serde_round_trip() {
     let id = IdentityMetadata {
         did: Did("did:wba:bossclaw.ai:abc123".to_string()),
         name: "My Agent".to_string(),
+        username: None,
         created_at: "2026-05-18T12:00:00Z".to_string(),
     };
     let json = serde_json::to_string(&id).unwrap();
     let back: IdentityMetadata = serde_json::from_str(&json).unwrap();
     assert_eq!(back.did, id.did);
     assert_eq!(back.name, id.name);
+    assert_eq!(back.username, id.username);
 }

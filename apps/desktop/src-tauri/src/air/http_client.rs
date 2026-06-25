@@ -27,6 +27,7 @@ impl HttpAirClient {
         match StatusCode::from_u16(status).ok() {
             Some(StatusCode::NOT_FOUND) => AirError::NotFound(body),
             Some(StatusCode::UNAUTHORIZED) | Some(StatusCode::FORBIDDEN) => AirError::Unauthorized,
+            Some(StatusCode::CONFLICT) => AirError::Conflict(body),
             _ => AirError::Api { status, body },
         }
     }
@@ -97,6 +98,49 @@ impl AirClient for HttpAirClient {
         resp.json::<AgentRecord>()
             .await
             .map_err(|e| AirError::Other(e.to_string()))
+    }
+
+    async fn check_username(&self, username: &str) -> Result<UsernameCheck, AirError> {
+        let url = format!(
+            "{}/agents/check-username?username={}",
+            self.base_url,
+            urlencoding::encode(username)
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AirError::NotReachable(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(Self::map_error(resp).await);
+        }
+        resp.json::<UsernameCheck>()
+            .await
+            .map_err(|e| AirError::Other(e.to_string()))
+    }
+
+    async fn claim_username(
+        &self,
+        did: &Did,
+        agent_secret: &str,
+        username: &str,
+    ) -> Result<(), AirError> {
+        let url = format!("{}/agents/{}", self.base_url, urlencoding::encode(&did.0));
+        let resp = self
+            .http
+            .put(&url)
+            .header("X-Agent-Secret", agent_secret)
+            .json(&json!({ "username": username }))
+            .send()
+            .await
+            .map_err(|e| AirError::NotReachable(e.to_string()))?;
+        // Success returns a summary object, not an AgentRecord — don't parse a body.
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::map_error(resp).await)
+        }
     }
 
     async fn trust_score(&self, did: &Did) -> Result<TrustScore, AirError> {

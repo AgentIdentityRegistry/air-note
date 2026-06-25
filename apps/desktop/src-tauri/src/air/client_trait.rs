@@ -11,6 +11,8 @@ pub enum AirError {
     NotFound(String),
     #[error("auth failed (bad agent_secret)")]
     Unauthorized,
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("other: {0}")]
     Other(String),
 }
@@ -34,6 +36,20 @@ pub trait AirClient: Send + Sync {
         agent_secret: &str,
         manifest: &AgentManifest,
     ) -> Result<AgentRecord, AirError>;
+
+    /// Check whether a username (raw, un-normalized) is valid + available. Unauthenticated.
+    /// The registry always answers 200: see `UsernameCheck` for the valid vs. invalid shapes.
+    async fn check_username(&self, username: &str) -> Result<UsernameCheck, AirError>;
+
+    /// Claim a published unique `@handle` for an agent (requires per-agent secret).
+    /// `Err(AirError::Conflict)` means taken or in cooldown; `Err(AirError::Unauthorized)`
+    /// means a bad secret. Success carries no body — the registry returns only a summary.
+    async fn claim_username(
+        &self,
+        did: &Did,
+        agent_secret: &str,
+        username: &str,
+    ) -> Result<(), AirError>;
 
     /// Get trust score (may be derived from record.trust_score; cheap lookup).
     async fn trust_score(&self, did: &Did) -> Result<TrustScore, AirError>;

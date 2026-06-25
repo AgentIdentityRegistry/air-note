@@ -1,5 +1,6 @@
 use crate::air::{
     build_did, generate_keypair, AgentManifest, AirClient, IdentityMetadata, IdentityStore,
+    UsernameCheck,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -78,6 +79,7 @@ pub async fn create_identity(
     let meta = IdentityMetadata {
         did: resp.did.clone(),
         name,
+        username: None,
         created_at: resp.record.created_at,
     };
     state.identity_store.save_metadata(&meta)?;
@@ -103,6 +105,28 @@ fn validate_display_name(raw: &str) -> Result<String, String> {
         return Err(format!("Name is too long (max {MAX_DISPLAY_NAME_LEN} characters)."));
     }
     Ok(trimmed.to_string())
+}
+
+/// Validate + normalize a proposed published `@handle`. Pure + deterministic so it can be
+/// unit-tested without `AppState`; mirrored client-side by `validateUsername` (src/identity/
+/// username.ts) for fast feedback. Trims, lowercases, then enforces `^[a-z0-9_]{3,30}$` on the
+/// result (ASCII only — anything that still doesn't match after lowercasing is rejected). Returns
+/// the normalized handle or a human-readable message. The reserved-word denylist is the registry's
+/// job: keeping the desktop check to charset/length only means we never block a handle the registry
+/// would actually accept.
+fn validate_username(raw: &str) -> Result<String, String> {
+    let handle = raw.trim().to_lowercase();
+    let len = handle.chars().count();
+    if !(3..=30).contains(&len) {
+        return Err("Username must be 3–30 characters.".to_string());
+    }
+    let charset_ok = handle
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !charset_ok {
+        return Err("Username can only use letters, numbers, and underscores.".to_string());
+    }
+    Ok(handle)
 }
 
 /// The pure validate-+-mutate core of a rename: validates `raw` and, on success, sets only
@@ -135,6 +159,52 @@ pub async fn rename_identity(
     Ok(meta)
 }
 
+/// Check whether a published `@handle` is available, without claiming it. Unauthenticated —
+/// just proxies the registry's `check-username` so the UI can show available/taken/cooldown/invalid
+/// as the user types. The registry is the authority; the bare `username` is passed through un-normalized.
+#[tauri::command]
+pub async fn check_username(
+    state: State<'_, AppState>,
+    username: String,
+) -> Result<UsernameCheck, String> {
+    state
+        .air_client
+        .check_username(&username)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Claim a published unique `@handle` for this agent. Validates + normalizes the handle locally,
+/// authenticates with the on-file agent secret, asks the registry to claim it, and — only on
+/// success — records `username` in identity.json. A 409 (taken / in 30-day cooldown) surfaces as a
+/// bare error string for the UI to show inline. The DID, keypair, and name are left untouched.
+#[tauri::command]
+pub async fn claim_username(
+    state: State<'_, AppState>,
+    username: String,
+) -> Result<IdentityMetadata, String> {
+    let handle = validate_username(&username)?;
+    let mut meta = state
+        .identity_store
+        .load_metadata()?
+        .ok_or_else(|| "No identity yet. Set up your agent first.".to_string())?;
+    let secret = state
+        .identity_store
+        .load_air_secret()?
+        .ok_or_else(|| "No agent secret on file; can’t claim a username.".to_string())?;
+
+    state
+        .air_client
+        .claim_username(&meta.did, &secret, &handle)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Persist only after the registry confirms the claim.
+    meta.username = Some(handle);
+    state.identity_store.save_metadata(&meta)?;
+    Ok(meta)
+}
+
 #[tauri::command]
 pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
     // Clear identity first, then tear the engine down so a re-onboard starts on a clean
@@ -162,6 +232,7 @@ mod rename_tests {
         IdentityMetadata {
             did: Did("did:wba:example.com:agent".to_string()),
             name: "Old Name".to_string(),
+            username: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         }
     }
@@ -207,6 +278,43 @@ mod rename_tests {
         let at_cap = "x".repeat(MAX_DISPLAY_NAME_LEN);
         apply_rename(&mut meta, &at_cap).unwrap();
         assert_eq!(meta.name, at_cap);
+    }
+}
+
+// Pure charset/length tests for the published-handle validator. The command path
+// (`claim_username`) layers store I/O + a network call on top; this asserts the rule itself.
+#[cfg(test)]
+mod username_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_plain_and_underscore_digit_handles() {
+        assert_eq!(validate_username("alice"), Ok("alice".to_string()));
+        assert_eq!(validate_username("alice_99"), Ok("alice_99".to_string()));
+    }
+
+    #[test]
+    fn lowercases_before_validating() {
+        assert_eq!(validate_username("Alice"), Ok("alice".to_string()));
+        assert_eq!(validate_username("  ALICE_99  "), Ok("alice_99".to_string()));
+    }
+
+    #[test]
+    fn rejects_too_short_too_long_and_empty() {
+        assert!(validate_username("").is_err());
+        assert!(validate_username("ab").is_err());
+        assert!(validate_username(&"a".repeat(31)).is_err());
+        // Boundary lengths are accepted.
+        assert_eq!(validate_username("abc"), Ok("abc".to_string()));
+        assert_eq!(validate_username(&"a".repeat(30)), Ok("a".repeat(30)));
+    }
+
+    #[test]
+    fn rejects_hyphen_space_and_other_punctuation() {
+        assert!(validate_username("al-ice").is_err());
+        assert!(validate_username("al ice").is_err());
+        assert!(validate_username("alice!").is_err());
+        assert!(validate_username("a@lice").is_err());
     }
 }
 
