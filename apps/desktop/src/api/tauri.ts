@@ -63,6 +63,13 @@ export async function createIdentity(
   return invoke<IdentityMetadata>("create_identity", { name, domain });
 }
 
+/** Rename the LOCAL display name only (freely editable; shown in the UI/chat). Does NOT touch
+ *  the DID, keypair, or created_at, and is NOT the published unique @handle. Tauri v2 maps the
+ *  JS `newName` key to the Rust command's `new_name` argument. */
+export async function renameIdentity(name: string): Promise<IdentityMetadata> {
+  return invoke<IdentityMetadata>("rename_identity", { newName: name });
+}
+
 export async function resetIdentity(): Promise<void> {
   return invoke<void>("reset_identity");
 }
