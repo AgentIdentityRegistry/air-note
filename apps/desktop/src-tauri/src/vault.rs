@@ -182,6 +182,71 @@ pub fn secret_delete_cached(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Webview-reachable provider-key commands (Milestone D Phase 1).
+// Minimal surface: set / delete / has. NO `vault_get` — the webview must never
+// be able to read a stored secret back (XSS→exfil). Internal Rust reads still
+// use `secret_get_cached`. Every command is allow-listed to provider keys only.
+// ---------------------------------------------------------------------------
+
+/// The provider API keys the webview is allowed to write/delete/check. Excludes
+/// `session_jwt` (auth-flow managed) and `web_auth::*` (those go via `web_auth_set`).
+const SETTABLE_PROVIDER_KEYS: [&str; 6] = [
+    "openai_compat_api_key",
+    "openai_api_key",
+    "anthropic_api_key",
+    "google_api_key",
+    "brave_api_key",
+    "tavily_api_key",
+];
+
+/// Reject any key not on the provider allow-list. Runs before any keychain access.
+fn validate_provider_key(key: &str) -> Result<(), String> {
+    if SETTABLE_PROVIDER_KEYS.contains(&key) {
+        Ok(())
+    } else {
+        Err(format!("'{key}' is not a settable provider key"))
+    }
+}
+
+/// Save a provider API key into the OS-keychain blob. Trims surrounding whitespace
+/// (a pasted trailing newline must not corrupt an auth header). Rejects unknown keys
+/// and empty values BEFORE touching the keychain.
+#[tauri::command]
+pub fn vault_set(key: String, value: String) -> Result<(), String> {
+    validate_provider_key(&key)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("API key is empty.".to_string());
+    }
+    // Defense-in-depth: an API key is opaque printable ASCII; reject control chars
+    // (CR/LF/NUL/DEL/other C0) so a pasted/injected value can never break an auth
+    // header or URL query in a downstream consumer (Phase 2), regardless of how it
+    // builds the request.
+    if trimmed.bytes().any(|b| b.is_ascii_control()) {
+        return Err("API key contains invalid control characters.".to_string());
+    }
+    secret_set_cached(&key, trimmed)
+}
+
+/// Whether a non-empty value is stored for this provider key. Returns a bool only —
+/// NEVER the secret itself (mirrors `web_auth_has`).
+#[tauri::command]
+pub fn vault_has(key: String) -> Result<bool, String> {
+    validate_provider_key(&key)?;
+    match secret_get_cached(&key)? {
+        Some(value) => Ok(!value.trim().is_empty()),
+        None => Ok(false),
+    }
+}
+
+/// Delete a stored provider API key.
+#[tauri::command]
+pub fn vault_delete(key: String) -> Result<(), String> {
+    validate_provider_key(&key)?;
+    secret_delete_cached(&key)
+}
+
 #[allow(dead_code)] // Phase 2 migration helper; kept for upcoming vault refactor
 pub fn secret_cache_clear() -> Result<(), String> {
     let mut cache = SECRET_CACHE
@@ -249,5 +314,48 @@ mod blob_migrate_tests {
         assert_eq!(Entry::new(new_s, key).unwrap().get_password().unwrap(), payload);
 
         let _ = Entry::new(new_s, key).unwrap().delete_password();
+    }
+}
+
+#[cfg(test)]
+mod vault_command_tests {
+    use super::*;
+
+    #[test]
+    fn allow_list_accepts_the_six_provider_keys() {
+        for k in [
+            "openai_compat_api_key", "openai_api_key", "anthropic_api_key",
+            "google_api_key", "brave_api_key", "tavily_api_key",
+        ] {
+            assert!(validate_provider_key(k).is_ok(), "{k} should be settable");
+        }
+    }
+
+    #[test]
+    fn allow_list_rejects_session_jwt_and_unknown_keys() {
+        assert!(validate_provider_key("session_jwt").is_err());
+        assert!(validate_provider_key("web_auth::example.com").is_err());
+        assert!(validate_provider_key("anything_else").is_err());
+        assert!(validate_provider_key("").is_err());
+    }
+
+    #[test]
+    fn vault_set_rejects_bad_key_before_touching_keychain() {
+        assert!(vault_set("session_jwt".into(), "x".into()).is_err());
+        assert!(vault_set("bogus".into(), "x".into()).is_err());
+    }
+
+    #[test]
+    fn vault_set_rejects_empty_value_before_touching_keychain() {
+        assert!(vault_set("anthropic_api_key".into(), "   ".into()).is_err());
+        assert!(vault_set("anthropic_api_key".into(), "".into()).is_err());
+    }
+
+    #[test]
+    fn vault_set_rejects_control_chars_before_touching_keychain() {
+        // Interior CR/LF/NUL/tab → Err before secret_set_cached (header/query injection-proofing).
+        assert!(vault_set("anthropic_api_key".into(), "sk-\ninjected".into()).is_err());
+        assert!(vault_set("anthropic_api_key".into(), "a\tb".into()).is_err());
+        assert!(vault_set("anthropic_api_key".into(), "a\0b".into()).is_err());
     }
 }
