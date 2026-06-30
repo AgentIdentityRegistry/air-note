@@ -101,6 +101,73 @@ pub(crate) fn extract_anthropic_result(resp: &Value) -> Result<Value, BossclawEr
     Err(BossclawError::Reasoner("anthropic response had no forced tool_use block".into()))
 }
 
+/// Build the OpenAI-compat `/v1/chat/completions` body. `fallback=false` uses
+/// native `json_schema`; `fallback=true` switches to `json_object` and folds
+/// the schema into the system text (some compat servers reject json_schema).
+/// No `temperature` (parity with the Anthropic arm). Spec §8 R7 + §3.1.
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner's OpenAI-compat arm.
+pub(crate) fn build_openai_request(
+    model: &str,
+    system: &str,
+    prompt: &str,
+    schema: &Value,
+    fallback: bool,
+) -> Value {
+    let (system_text, response_format) = if fallback {
+        (
+            format!(
+                "{system}\n\nRespond with a single JSON object that conforms to this JSON schema:\n{schema}"
+            ),
+            json!({ "type": "json_object" }),
+        )
+    } else {
+        (
+            system.to_string(),
+            json!({
+                "type": "json_schema",
+                "json_schema": { "name": "result", "schema": schema, "strict": false }
+            }),
+        )
+    };
+    json!({
+        "model": model,
+        "stream": false,
+        "response_format": response_format,
+        "messages": [
+            { "role": "system", "content": system_text },
+            { "role": "user", "content": prompt }
+        ]
+    })
+}
+
+/// Extract `choices[0].message.content` and parse it as JSON, tolerating a
+/// ```json fence. Parse failure -> `BossclawError::Reasoner` (retryable no-op).
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner after the OpenAI-compat call returns.
+pub(crate) fn extract_openai_result(resp: &Value) -> Result<Value, BossclawError> {
+    let content = resp
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BossclawError::Reasoner("openai response missing message content".into()))?;
+    let trimmed = strip_json_fence(content);
+    serde_json::from_str(trimmed)
+        .map_err(|e| BossclawError::Reasoner(format!("openai content not valid JSON: {e}")))
+}
+
+/// Strip a leading ```json / ``` fence and trailing ``` if present.
+#[allow(dead_code)] // Private helper for `extract_openai_result`, consumed by Task 6.
+fn strip_json_fence(s: &str) -> &str {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t);
+    t.trim().strip_suffix("```").unwrap_or(t).trim()
+}
+
 /// A `reqwest` DNS resolver that screens every resolved address through
 /// `is_blocked_ip` before any socket is opened. This is the connect-time pin
 /// that closes the rebind race (`web_access.rs:171` documents the residual gap
@@ -205,5 +272,42 @@ mod tests {
         // No tool_use block -> Err, not panic.
         let bad = serde_json::json!({ "content": [ { "type": "text", "text": "no tool" } ] });
         assert!(extract_anthropic_result(&bad).is_err());
+    }
+
+    #[test]
+    fn openai_request_variants_and_tolerant_extract() {
+        let schema = bossclaw_core::reason::extraction_schema();
+
+        let primary = build_openai_request("gpt-5-mini", "SYS", "PROMPT", &schema, false);
+        assert_eq!(primary["model"], "gpt-5-mini");
+        assert_eq!(primary["messages"][0]["role"], "system");
+        assert_eq!(primary["messages"][1]["role"], "user");
+        assert_eq!(primary["response_format"]["type"], "json_schema");
+        assert_eq!(primary["response_format"]["json_schema"]["schema"], schema);
+        assert_eq!(primary["response_format"]["json_schema"]["strict"], false);
+        assert!(primary.get("temperature").is_none());
+
+        // Fallback body uses json_object and folds the schema into the system text.
+        let fallback = build_openai_request("gpt-5-mini", "SYS", "PROMPT", &schema, true);
+        assert_eq!(fallback["response_format"]["type"], "json_object");
+        assert!(fallback["messages"][0]["content"].as_str().unwrap().contains("schema"));
+
+        // Clean JSON content.
+        let clean = serde_json::json!({
+            "choices": [ { "message": { "content": "{\"match\":\"x\"}" } } ]
+        });
+        assert_eq!(extract_openai_result(&clean).unwrap()["match"], "x");
+
+        // Fenced content -> stripped + parsed.
+        let fenced = serde_json::json!({
+            "choices": [ { "message": { "content": "```json\n{\"match\":\"y\"}\n```" } } ]
+        });
+        assert_eq!(extract_openai_result(&fenced).unwrap()["match"], "y");
+
+        // Non-JSON content -> Err, not panic.
+        let junk = serde_json::json!({
+            "choices": [ { "message": { "content": "sorry, I cannot" } } ]
+        });
+        assert!(extract_openai_result(&junk).is_err());
     }
 }
