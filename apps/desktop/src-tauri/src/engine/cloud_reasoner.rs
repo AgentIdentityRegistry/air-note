@@ -201,26 +201,26 @@ impl Resolve for PinnedResolver {
 #[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
 const CLOUD_TIMEOUT_SECS: u64 = 120;
 
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
-static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-
 /// The one hardened blocking client (connection pool + SSRF resolver + no
 /// redirects + timeout), built lazily on first use. First use is always on a
 /// `spawn_blocking` thread, so no async runtime is captured (spec R6).
+/// Returns `None` if the client cannot be built — fail-closed: no hardened
+/// client means no egress (Task 6 maps `None` to a retryable no-op tick),
+/// never a silent fall-back to an un-pinned, redirect-following default client.
 #[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
-pub(crate) fn blocking_client() -> &'static reqwest::blocking::Client {
-    CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .dns_resolver(Arc::new(PinnedResolver))
-            // LLM APIs never legitimately redirect; never forward auth headers across hops.
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(CLOUD_TIMEOUT_SECS))
-            .build()
-            // A client we cannot build means we cannot egress: the safe direction.
-            // Builder failure is effectively unreachable (no proxy/TLS config that
-            // can fail); fall back to a default client only to keep this infallible.
-            .unwrap_or_else(|_| reqwest::blocking::Client::new())
-    })
+pub(crate) fn blocking_client() -> Option<&'static reqwest::blocking::Client> {
+    static CLIENT: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .dns_resolver(Arc::new(PinnedResolver))
+                // LLM APIs never legitimately redirect; never forward auth headers across hops.
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(CLOUD_TIMEOUT_SECS))
+                .build()
+                .ok() // build failure -> None -> no client -> no egress (fail-closed)
+        })
+        .as_ref()
 }
 
 #[cfg(test)]
