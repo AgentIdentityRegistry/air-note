@@ -1112,6 +1112,20 @@ pub(crate) fn parse_reasoner_config(raw: Option<serde_json::Value>) -> reason::R
     ReasonerConfig { mode, provider, model, base_url }
 }
 
+/// Phase 2b boot reseed: copy the persisted (signed-log) reasoner config into the
+/// in-memory cell the provider closure reads each tick, so a Cloud choice survives
+/// restart. `async` because it reads the engine's signed log; `main.rs` `block_on`s it.
+/// Fail-safe: a read with no signed config (or `onboarded=false`) yields the Local default.
+#[cfg(unix)]
+pub(crate) async fn reseed_reasoner_cell(
+    engine: &EngineHandle,
+    cell: &std::sync::Mutex<reason::ReasonerConfig>,
+    onboarded: bool,
+) {
+    let seeded = engine.reasoner_config_or_default(onboarded).await;
+    *cell.lock().unwrap_or_else(|p| p.into_inner()) = seeded;
+}
+
 /// An 8-hex-char fingerprint of a provider key: the first 4 bytes of its SHA-256, hex-encoded.
 /// The R1 signed consent binds this so a key rotation (different fp) forces re-consent. The
 /// key itself is never stored or logged — only this digest. Consumed by the engine reads above.
@@ -2513,5 +2527,26 @@ mod tests {
         let queued = handle.list_proposals(true).await.unwrap();
         assert!(pids.iter().all(|pid| queued.iter().any(|p| &p.id == pid)),
             "both clean proposals stay queued when the sweep fast-kills");
+    }
+
+    #[tokio::test]
+    async fn reseed_reasoner_cell_loads_signed_cloud_config_into_the_cell() {
+        // Restart-persistence WIRING (Phase 2b): on boot, reseed_reasoner_cell must copy
+        // the signed-log config into the in-memory cell the provider closure reads.
+        let (vault, dir) = test_vault_and_dir();
+        let h = new_test_handle(vault, &dir);
+        let cell = std::sync::Mutex::new(crate::engine::reason::ReasonerConfig::default());
+        assert_eq!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Local);
+
+        h.set_reasoner_config(true, serde_json::json!({
+            "mode": "cloud", "provider": "anthropic",
+            "model": "claude-sonnet-4-6", "base_url": null
+        })).await.expect("set cloud config");
+
+        super::reseed_reasoner_cell(&h, &cell, true).await;
+
+        let got = cell.lock().unwrap().clone();
+        assert_eq!(got.mode, crate::engine::reason::ReasonerMode::Cloud);
+        assert_eq!(got.model, "claude-sonnet-4-6");
     }
 }
