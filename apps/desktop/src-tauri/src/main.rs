@@ -62,6 +62,15 @@ fn main() {
             let identity_store = IdentityStore::new(vault.clone(), data_dir.clone());
             #[cfg(not(unix))]
             let identity_store = IdentityStore::new(vault, data_dir);
+            // The shared reasoner-config cell (Milestone D Phase 2a). The provider closure reads
+            // it on every evolve tick; the reasoner-config commands write it through. It starts at
+            // the Local default each boot — re-seeding it from the persisted signed log after
+            // onboarding (so a Cloud config survives restart) is deferred to Phase 2b. For 2a
+            // cloud is never enabled (no UI), so the cell stays Local, which is correct.
+            #[cfg(unix)]
+            let reasoner_cfg = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::engine::reason::ReasonerConfig::default(),
+            ));
             #[cfg(unix)]
             let engine = {
                 let resource_dir = app.path().resource_dir().expect("resource dir");
@@ -70,8 +79,14 @@ fn main() {
                 // `<resource_dir>/resources/models/potion-base-8M`, NOT `<resource_dir>/models/...`.
                 let model_dir = resource_dir.join("resources/models/potion-base-8M");
                 let provider = std::sync::Arc::new(crate::engine::embed::ResourceModel2Vec::new(model_dir));
-                let reasoner_provider =
-                    std::sync::Arc::new(crate::engine::reason::OllamaReasonerProvider::new());
+                // Config-driven reasoner: reads the shared cell so a mode flip (Local↔Cloud) takes
+                // effect without a restart. Replaces the always-Ollama provider.
+                let reasoner_provider = {
+                    let cell = reasoner_cfg.clone();
+                    std::sync::Arc::new(crate::engine::reason::ConfigReasonerProvider::new(
+                        move || cell.lock().unwrap().clone(),
+                    ))
+                };
                 std::sync::Arc::new(crate::engine::EngineHandle::new(
                     vault,
                     data_dir,
@@ -101,6 +116,8 @@ fn main() {
                 inbox: std::sync::Arc::new(crate::inbox::manager::InboxManager::new()),
                 #[cfg(unix)]
                 engine,
+                #[cfg(unix)]
+                reasoner_cfg,
             });
             Ok(())
         })
@@ -193,6 +210,12 @@ fn main() {
             commands::engine::engine_evolve_now,
             #[cfg(unix)]
             commands::engine::engine_ollama_status,
+            #[cfg(unix)]
+            commands::engine::engine_get_reasoner_config,
+            #[cfg(unix)]
+            commands::engine::engine_set_reasoner_config,
+            #[cfg(unix)]
+            commands::engine::engine_enable_cloud_reasoner,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

@@ -215,10 +215,7 @@ pub(crate) fn blocking_client() -> Option<&'static reqwest::blocking::Client> {
 }
 
 /// Which cloud provider arm to use. Canonical definition; `engine::reason`
-/// re-exports it for config plumbing (Task 9).
-// Variants are only constructed by `new`'s callers (Task 9) + the tests, so the
-// bin target sees them as never-constructed until then.
-#[allow(dead_code)]
+/// re-exports it for config plumbing (`parse_reasoner_config` constructs the variants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudProvider {
     Anthropic,
@@ -236,11 +233,9 @@ pub(crate) const ANTHROPIC_HOST: &str = "api.anthropic.com";
 /// vault AT CALL TIME (header-only, never stored on the struct, never logged),
 /// connects via the hardened blocking client, and returns parsed structured
 /// JSON — or a body-scrubbed `BossclawError::Reasoner` (a retryable no-op tick).
-// `new` is the only non-test entry point and lands in Task 9 (ConfigReasonerProvider);
-// until then the whole graph (this struct, its methods, and the request/extract/client
-// helpers they transitively reach) is unreferenced in the bin target. This single allow
-// on the struct + the one on the inherent impl below cover it without per-helper allows.
-#[allow(dead_code)]
+// `new` is reached via `build_reasoner` (the `ConfigReasonerProvider` + the R5 enable probe),
+// so the whole graph — this struct, its methods, and the request/extract/client helpers they
+// transitively reach — is live in the bin target.
 pub struct CloudReasoner {
     provider: CloudProvider,
     model: String,
@@ -249,7 +244,6 @@ pub struct CloudReasoner {
     model_id: String,
 }
 
-#[allow(dead_code)] // See the struct note: covers new + methods + transitively the egress helpers until Task 9.
 impl CloudReasoner {
     pub fn new(provider: CloudProvider, model: String, base_url: Option<String>) -> Self {
         let prefix = match provider {

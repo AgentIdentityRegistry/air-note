@@ -475,6 +475,120 @@ pub async fn engine_ollama_status() -> Result<OllamaStatusDto, String> {
     })
 }
 
+// ---- Cloud reasoner config (Milestone D Phase 2a, spec §3.5 / R2 / R5) ----
+
+/// Cheap, NETWORK-FREE pre-validation run at config-set time. The authoritative IP screening
+/// happens at connect time inside the hardened client's `PinnedResolver` (spec R2), so this does
+/// NO DNS lookup — it only rejects a config that can never be safe regardless of resolution:
+/// a non-HTTPS or literal-IP `base_url`. Returns a short human message on any violation.
+/// - Local mode (or any non-"cloud" mode): always Ok (local needs no URL).
+/// - Cloud + `anthropic`: base_url is ignored (host is pinned), so nothing to validate.
+/// - Cloud + `openai-compat`: base_url REQUIRED, must be HTTPS (via `normalize_https_base`),
+///   and must NOT be a literal IP host (spec R2: "reject literal-IP base_urls outright").
+pub(crate) fn validate_reasoner_config(config: &serde_json::Value) -> Result<(), String> {
+    // Anything that isn't an explicit "cloud" mode is Local — no validation needed.
+    if config.get("mode").and_then(|v| v.as_str()) != Some("cloud") {
+        return Ok(());
+    }
+    // Only openai-compat carries a user-supplied base_url; anthropic's host is pinned.
+    if config.get("provider").and_then(|v| v.as_str()) != Some("openai-compat") {
+        return Ok(());
+    }
+    let base_url = config
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "Cloud openai-compat reasoner requires a base URL.".to_string())?;
+    // Enforce HTTPS + normalize via the SAME helper the streaming path uses (single source of
+    // truth for the HTTPS rule). A non-HTTPS or unparseable URL fails here.
+    let normalized = crate::llm_stream::normalize_https_base(base_url)?;
+    // Reject a literal-IP host outright (no DNS): a base_url like `https://10.0.0.5` would let
+    // the user point the reasoner straight at an internal address, bypassing the intent of the
+    // connect-time resolver guard. `host_str()` returns `10.0.0.5` for IPv4 and `[::1]` (WITH
+    // brackets) for an IPv6 literal, so strip any surrounding brackets before the `IpAddr` parse —
+    // that catches both forms; a real hostname never parses as an `IpAddr`.
+    if let Ok(url) = reqwest::Url::parse(&normalized) {
+        if let Some(host) = url.host_str() {
+            let bare = host.trim_start_matches('[').trim_end_matches(']');
+            if bare.parse::<std::net::IpAddr>().is_ok() {
+                return Err("Provider base URL must be a hostname, not a literal IP.".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The reasoner config the Settings UI reads/writes: mode + provider + model + optional base_url,
+/// plus the live cloud-readiness flag. Serialized to the webview (serde renames to camelCase on
+/// the TS side via the twin). `ready` is `reasoner_ready_or_false` — for a Local config it is the
+/// CLOUD gate's `false` (local readiness is the scheduler's Ollama probe, surfaced separately).
+#[derive(serde::Serialize)]
+pub struct ReasonerConfigDto {
+    pub mode: String,        // "local" | "cloud"
+    pub provider: String,    // "anthropic" | "openai-compat"
+    pub model: String,
+    pub base_url: Option<String>,
+    pub ready: bool,
+}
+
+/// Read the persisted reasoner config + live cloud-readiness for the Settings UI. Fail-SAFE:
+/// the engine read defaults to Local on any error, and readiness is fail-closed to false.
+#[tauri::command]
+pub async fn engine_get_reasoner_config(
+    state: State<'_, AppState>,
+) -> Result<ReasonerConfigDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let config = state.engine.reasoner_config_or_default(onboarded).await;
+    let ready = state.engine.reasoner_ready_or_false(onboarded).await;
+    Ok(ReasonerConfigDto {
+        mode: match config.mode {
+            crate::engine::reason::ReasonerMode::Local => "local",
+            _ => "cloud",
+        }
+        .into(),
+        provider: crate::engine::reason::provider_str(config.provider).into(),
+        model: config.model,
+        base_url: config.base_url,
+        ready,
+    })
+}
+
+/// Persist the NON-security reasoner config (mode/provider/model/base_url) WITHOUT granting cloud
+/// consent — flipping to cloud still requires `engine_enable_cloud_reasoner`'s tested opt-in (R1).
+/// Validates network-free first, then writes the signed log, then refreshes the in-memory cell the
+/// provider reads so a mode change is picked up without a restart.
+#[tauri::command]
+pub async fn engine_set_reasoner_config(
+    config: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    validate_reasoner_config(&config)?;
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_reasoner_config(onboarded, config.clone()).await.map_err(|e| e.to_string())?;
+    // Write-through cache: update the cell the `ConfigReasonerProvider` closure reads.
+    if let Ok(mut cell) = state.reasoner_cfg.lock() {
+        *cell = crate::engine::parse_reasoner_config(Some(config));
+    }
+    Ok(())
+}
+
+/// The R5 "test-key-on-enable" opt-in to cloud: validate network-free, then the engine proves the
+/// provider key works with ONE trivial probe BEFORE signing config + consent (a probe failure
+/// writes NOTHING). On success, refresh the in-memory cell so the evolve loop egresses to cloud.
+#[tauri::command]
+pub async fn engine_enable_cloud_reasoner(
+    config: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    validate_reasoner_config(&config)?;
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.enable_cloud_reasoner(onboarded, config.clone()).await.map_err(|e| e.to_string())?;
+    if let Ok(mut cell) = state.reasoner_cfg.lock() {
+        *cell = crate::engine::parse_reasoner_config(Some(config));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +706,7 @@ mod tests {
             identity_store,
             inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
             engine,
+            reasoner_cfg: Arc::new(Mutex::new(crate::engine::reason::ReasonerConfig::default())),
         };
 
         // Grant the `main` window permission to invoke `engine_undo_apply`, so the request ROUTES
@@ -663,6 +778,7 @@ mod tests {
             identity_store,
             inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
             engine,
+            reasoner_cfg: Arc::new(Mutex::new(crate::engine::reason::ReasonerConfig::default())),
         };
 
         // ACL: a mock app has NO capability grant, so without this the request is rejected with
@@ -714,5 +830,253 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not write-granted"),
             "expected the engine grant-guard signature (sourceScope bound + op ran), got: {msg}");
+    }
+
+    // ---- Cloud reasoner config commands (Milestone D Phase 2a, Task 12b) ----
+    //
+    // NETWORK SAFETY (the #1 constraint): every test below stays NETWORK-FREE and never reads a
+    // real provider key. Tests 1 & 3 use a LOCAL config (no validation, no vault, no egress). The
+    // reject tests feed a CLOUD openai-compat config whose base_url fails `validate_reasoner_config`
+    // (non-HTTPS / literal-IP) BEFORE the command reaches the engine — so the vault and network are
+    // never touched. NONE invokes `engine_enable_cloud_reasoner` with a config that could reach
+    // `CloudReasoner::complete_json` (the R5 no-key path is unit-covered by
+    // `cloud_reasoner_missing_key_fails_closed`). A multi-second runtime would mean a real network
+    // call leaked in — these all complete near-instantly.
+
+    /// An onboarded test `AppState` over a temp-dir engine with mock embedder/reasoner + an
+    /// in-memory vault (so `is_onboarded()` is true and the signed log opens), plus a fresh
+    /// default-Local `reasoner_cfg` cell. Returns the temp dir so the caller keeps it alive.
+    fn onboarded_reasoner_state() -> (AppState, tempfile::TempDir) {
+        use crate::air::identity::{IdentityMetadata, IdentityStore};
+        use crate::air::types::Did;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = CmdTestVault::new();
+        let identity_store = IdentityStore::new(vault.clone(), dir.path().to_path_buf());
+        identity_store.save_signing_key(&[7u8; 32]).unwrap();
+        identity_store.save_metadata(&IdentityMetadata {
+            did: Did("did:wba:AIR-TEST:cmd".to_string()),
+            name: "Test".to_string(),
+            username: None,
+            created_at: "2026-06-23T00:00:00Z".to_string(),
+        }).unwrap();
+        let engine = Arc::new(crate::engine::EngineHandle::new(
+            vault, dir.path().to_path_buf(),
+            Arc::new(crate::engine::embed::MockEmbedderProvider::new(8)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        ));
+        let state = AppState {
+            air_client: Arc::new(crate::air::MockAirClient::new()),
+            identity_store,
+            inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
+            engine,
+            reasoner_cfg: Arc::new(Mutex::new(crate::engine::reason::ReasonerConfig::default())),
+        };
+        (state, dir)
+    }
+
+    /// Build a mock app whose `main` window may invoke each of `cmds` (Remote-origin ACL grant, as
+    /// the real webview's `http://tauri.localhost` invokes need), managing `state`. Mirrors the
+    /// single-command IPC tests above but allows a small set so a test can set-then-get.
+    fn reasoner_mock_app(
+        state: AppState,
+        cmds: &[&str],
+    ) -> tauri::App<tauri::test::MockRuntime> {
+        let origin: tauri::utils::acl::RemoteUrlPattern =
+            "http://tauri.localhost".parse().expect("valid remote url pattern");
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        for cmd in cmds {
+            context.runtime_authority_mut().__allow_command(
+                (*cmd).to_string(),
+                tauri::utils::acl::ExecutionContext::Remote { url: origin.clone() },
+            );
+        }
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![
+                engine_get_reasoner_config,
+                engine_set_reasoner_config,
+                engine_enable_cloud_reasoner,
+            ])
+            .build(context)
+            .expect("build mock app");
+        app.manage(state);
+        app
+    }
+
+    /// Invoke `cmd` on `webview` with a camelCase JSON `body`, returning the IPC result. The Err
+    /// arm is a `serde_json::Value` (Display-able), matching `get_ipc_response`'s signature.
+    fn invoke_reasoner(
+        webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+        cmd: &str,
+        body: serde_json::Value,
+    ) -> Result<tauri::ipc::InvokeResponseBody, serde_json::Value> {
+        tauri::test::get_ipc_response(
+            webview,
+            tauri::webview::InvokeRequest {
+                cmd: cmd.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "http://tauri.localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn engine_set_reasoner_config_binds_camelcase_and_persists() {
+        // A LOCAL config: zero network/vault/validation risk. Proves the command binds the
+        // `config` arg, writes the signed log, AND `engine_get_reasoner_config` reads it back.
+        let (state, _dir) = onboarded_reasoner_state();
+        let app = reasoner_mock_app(
+            state,
+            &["engine_set_reasoner_config", "engine_get_reasoner_config"],
+        );
+        let webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        // Invoke set with the `config` arg (the TS twin's payload key). The inner object uses the
+        // snake_case keys of the OPAQUE persisted config schema (`base_url`) — that value is not a
+        // Tauri command arg, so it is NOT camelCase-renamed; only the `config` arg name binds.
+        let set = invoke_reasoner(
+            &webview,
+            "engine_set_reasoner_config",
+            serde_json::json!({ "config": {
+                "mode": "local", "provider": "anthropic", "model": "x", "base_url": null
+            }}),
+        );
+        set.expect("set_reasoner_config (local) succeeds over IPC");
+
+        // get must read the just-written config back as Local.
+        let got = invoke_reasoner(&webview, "engine_get_reasoner_config", serde_json::json!({}))
+            .expect("get_reasoner_config succeeds over IPC");
+        let json = ipc_json(got);
+        assert_eq!(json.get("mode").and_then(|v| v.as_str()), Some("local"),
+            "the written local config reads back as mode=local, got: {json}");
+    }
+
+    #[test]
+    fn engine_set_reasoner_config_rejects_invalid_cloud() {
+        // A CLOUD openai-compat config with a LITERAL-IP base_url: `validate_reasoner_config`
+        // rejects it NETWORK-FREE (no DNS, no vault) before the engine is ever called.
+        let (state, _dir) = onboarded_reasoner_state();
+        let app = reasoner_mock_app(state, &["engine_set_reasoner_config"]);
+        let webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        let res = invoke_reasoner(
+            &webview,
+            "engine_set_reasoner_config",
+            serde_json::json!({ "config": {
+                "mode": "cloud", "provider": "openai-compat",
+                "model": "m", "base_url": "https://10.0.0.5"
+            }}),
+        );
+        let err = res.expect_err("a literal-IP cloud base_url is rejected at validation");
+        let msg = err.to_string();
+        assert!(msg.contains("literal IP"),
+            "expected the literal-IP validation message, got: {msg}");
+    }
+
+    #[test]
+    fn engine_get_reasoner_config_defaults_local_not_ready() {
+        // A fresh engine (no config written): get reports the fail-SAFE Local default. `ready` is
+        // the CLOUD gate's false here (local readiness is the scheduler's Ollama probe, surfaced
+        // elsewhere), so we only assert mode=local — the durable, network-free contract.
+        let (state, _dir) = onboarded_reasoner_state();
+        let app = reasoner_mock_app(state, &["engine_get_reasoner_config"]);
+        let webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        let got = invoke_reasoner(&webview, "engine_get_reasoner_config", serde_json::json!({}))
+            .expect("get_reasoner_config succeeds over IPC");
+        let json = ipc_json(got);
+        assert_eq!(json.get("mode").and_then(|v| v.as_str()), Some("local"),
+            "a fresh engine defaults to mode=local, got: {json}");
+        assert_eq!(json.get("ready").and_then(|v| v.as_bool()), Some(false),
+            "a fresh (un-consented) config is not cloud-ready, got: {json}");
+    }
+
+    #[test]
+    fn engine_enable_cloud_reasoner_rejects_invalid_config() {
+        // Enable with a NON-HTTPS openai-compat base_url: `validate_reasoner_config` rejects it
+        // BEFORE the engine's R5 probe, so this NEVER reaches the vault/network. A follow-up get
+        // must still report Local (nothing was enabled). This is the only enable IPC test, and it
+        // deliberately fails at validation — it can never reach `complete_json`.
+        let (state, _dir) = onboarded_reasoner_state();
+        let app = reasoner_mock_app(
+            state,
+            &["engine_enable_cloud_reasoner", "engine_get_reasoner_config"],
+        );
+        let webview =
+            tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+        let res = invoke_reasoner(
+            &webview,
+            "engine_enable_cloud_reasoner",
+            serde_json::json!({ "config": {
+                "mode": "cloud", "provider": "openai-compat",
+                "model": "m", "base_url": "http://x.example"
+            }}),
+        );
+        let err = res.expect_err("a non-HTTPS cloud base_url is rejected before the engine probe");
+        assert!(err.to_string().contains("HTTPS"),
+            "expected the HTTPS validation message, got: {err}");
+
+        // Nothing was enabled: the config is still the Local default.
+        let got = invoke_reasoner(&webview, "engine_get_reasoner_config", serde_json::json!({}))
+            .expect("get_reasoner_config succeeds over IPC");
+        let json = ipc_json(got);
+        assert_eq!(json.get("mode").and_then(|v| v.as_str()), Some("local"),
+            "a rejected enable leaves the config Local, got: {json}");
+    }
+
+    /// Decode a successful IPC response body to a `serde_json::Value` (the DTO is JSON-serialized).
+    fn ipc_json(body: tauri::ipc::InvokeResponseBody) -> serde_json::Value {
+        match body {
+            tauri::ipc::InvokeResponseBody::Json(s) => {
+                serde_json::from_str(&s).expect("IPC body is valid JSON")
+            }
+            other => panic!("expected a JSON IPC body, got: {other:?}"),
+        }
+    }
+
+    // ---- validate_reasoner_config unit coverage (pure, NETWORK-FREE) ----
+
+    #[test]
+    fn validate_reasoner_config_passes_local_and_anthropic() {
+        // Local needs no URL; anthropic's host is pinned so base_url is irrelevant.
+        assert!(validate_reasoner_config(&serde_json::json!({ "mode": "local" })).is_ok());
+        assert!(validate_reasoner_config(&serde_json::json!({
+            "mode": "cloud", "provider": "anthropic", "model": "m"
+        })).is_ok());
+        // A valid HTTPS hostname for openai-compat passes.
+        assert!(validate_reasoner_config(&serde_json::json!({
+            "mode": "cloud", "provider": "openai-compat",
+            "model": "m", "base_url": "https://api.example.com/v1"
+        })).is_ok());
+    }
+
+    #[test]
+    fn validate_reasoner_config_rejects_bad_openai_compat() {
+        // Missing base_url.
+        assert!(validate_reasoner_config(&serde_json::json!({
+            "mode": "cloud", "provider": "openai-compat", "model": "m"
+        })).is_err());
+        // Non-HTTPS.
+        assert!(validate_reasoner_config(&serde_json::json!({
+            "mode": "cloud", "provider": "openai-compat",
+            "model": "m", "base_url": "http://api.example.com"
+        })).is_err());
+        // Literal IPv4 host.
+        assert!(validate_reasoner_config(&serde_json::json!({
+            "mode": "cloud", "provider": "openai-compat",
+            "model": "m", "base_url": "https://10.0.0.5"
+        })).is_err());
+        // Literal IPv6 host (bracketed).
+        assert!(validate_reasoner_config(&serde_json::json!({
+            "mode": "cloud", "provider": "openai-compat",
+            "model": "m", "base_url": "https://[::1]"
+        })).is_err());
     }
 }

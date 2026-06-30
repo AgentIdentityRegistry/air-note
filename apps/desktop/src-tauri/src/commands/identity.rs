@@ -13,6 +13,11 @@ pub struct AppState {
     // Engine spine is Unix-only until M7 (bossclaw-core doesn't build on Windows yet).
     #[cfg(unix)]
     pub engine: std::sync::Arc<crate::engine::EngineHandle>,
+    // Shared cell the `ConfigReasonerProvider` closure reads (write-through cache): the
+    // reasoner-config commands update it so the evolve loop picks up mode changes without a
+    // restart (Milestone D Phase 2a). Unix-gated like `engine` since the reasoner lives there.
+    #[cfg(unix)]
+    pub reasoner_cfg: std::sync::Arc<std::sync::Mutex<crate::engine::reason::ReasonerConfig>>,
 }
 
 #[tauri::command]

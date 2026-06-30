@@ -18,45 +18,17 @@ pub trait ReasonerProvider: Send + Sync {
     fn reasoner(&self) -> Result<Arc<dyn Reasoner>, EngineOpError>;
 }
 
-/// Production provider: yields `bossclaw_core::OllamaReasoner` (loopback-fail-closed)
-/// on first use and caches it for the process lifetime.
-pub struct OllamaReasonerProvider {
-    cell: Mutex<Option<Arc<dyn Reasoner>>>,
-}
-
-impl OllamaReasonerProvider {
-    pub fn new() -> Self {
-        Self { cell: Mutex::new(None) }
-    }
-}
-
-impl Default for OllamaReasonerProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ReasonerProvider for OllamaReasonerProvider {
-    fn reasoner(&self) -> Result<Arc<dyn Reasoner>, EngineOpError> {
-        let mut guard = self.cell.lock().expect("reasoner cell poisoned");
-        if let Some(r) = guard.as_ref() {
-            return Ok(r.clone());
-        }
-        let arc: Arc<dyn Reasoner> = Arc::new(bossclaw_core::OllamaReasoner::new(REASONER_MODEL_ID));
-        *guard = Some(arc.clone());
-        Ok(arc)
-    }
-}
+// The production provider is `ConfigReasonerProvider` (below), wired in `main.rs`. It reads a
+// shared config cell and builds Local (Ollama) or Cloud (`CloudReasoner`) via `build_reasoner`,
+// rebuilding when the config fingerprint changes — superseding the old always-Ollama provider.
 
 // Canonical `CloudProvider` lives in `cloud_reasoner`; re-exported here so the
-// config plumbing (Tasks 9/10/12) names a single type. Consumed by Task 9/10/12.
-#[allow(unused_imports)]
+// config plumbing (provider + commands + main.rs) names a single type.
 pub use crate::engine::cloud_reasoner::CloudProvider;
 use crate::engine::cloud_reasoner::CloudReasoner;
 
 /// A stable string identity for a config; the provider rebuilds when it changes.
-/// Consumed by `ConfigReasonerProvider` (and reachable from main.rs at Task 12).
-#[allow(dead_code)]
+/// Consumed by `ConfigReasonerProvider::reasoner`.
 pub fn config_fingerprint(c: &ReasonerConfig) -> String {
     let mode = match c.mode {
         ReasonerMode::Local => "local",
@@ -69,19 +41,16 @@ pub fn config_fingerprint(c: &ReasonerConfig) -> String {
     format!("{mode}|{provider}|{}|{}", c.model, c.base_url.as_deref().unwrap_or(""))
 }
 
-#[allow(dead_code)]
 type ConfigReader = Box<dyn Fn() -> ReasonerConfig + Send + Sync>;
 
 /// Config-driven reasoner provider: builds Ollama (Local) or `CloudReasoner`
 /// (Cloud) and memoizes keyed on the config fingerprint, rebuilding on change.
-/// Wired into `main.rs` by Task 12; reached by `provider_tests` until then.
-#[allow(dead_code)]
+/// Wired into `main.rs` (reads the shared `reasoner_cfg` cell).
 pub struct ConfigReasonerProvider {
     read_config: ConfigReader,
     cell: Mutex<Option<(String, Arc<dyn Reasoner>)>>,
 }
 
-#[allow(dead_code)] // new + build are reached only via provider_tests until main.rs wires this at Task 12.
 impl ConfigReasonerProvider {
     pub fn new(read_config: impl Fn() -> ReasonerConfig + Send + Sync + 'static) -> Self {
         Self { read_config: Box::new(read_config), cell: Mutex::new(None) }
@@ -127,17 +96,14 @@ impl ReasonerProvider for ConfigReasonerProvider {
 }
 
 /// Which reasoner the evolve loop drives: the local Ollama probe, or a signed,
-/// consented cloud provider. Consumed by Task 9/10/12.
-#[allow(dead_code)]
+/// consented cloud provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonerMode {
     Local,
     Cloud,
 }
 
-/// The reasoner config the scheduler reads to decide mode + readiness. Consumed
-/// by Task 9/10/12.
-#[allow(dead_code)]
+/// The reasoner config the scheduler reads to decide mode + readiness.
 #[derive(Debug, Clone)]
 pub struct ReasonerConfig {
     pub mode: ReasonerMode,
@@ -166,8 +132,7 @@ pub(crate) fn provider_str(p: CloudProvider) -> &'static str {
 
 /// The host the config WOULD connect to (Anthropic is pinned; OpenAI-compat uses
 /// the base_url host). Returns None if an OpenAI-compat base_url is missing/invalid.
-/// Consumed by Task 9/10/12.
-#[allow(dead_code)]
+/// Consumed by `enable_cloud_reasoner` (consent host) + `reasoner_ready`.
 pub fn config_host(config: &ReasonerConfig) -> Option<String> {
     match config.provider {
         CloudProvider::Anthropic => Some(crate::engine::cloud_reasoner::ANTHROPIC_HOST.to_string()),
@@ -179,8 +144,7 @@ pub fn config_host(config: &ReasonerConfig) -> Option<String> {
 
 /// Fail-closed readiness. Local: follows the caller's probe. Cloud: a signed
 /// consent record must EXIST and MATCH (provider, host, vault key fingerprint);
-/// any mismatch -> not ready (spec R1). Consumed by Task 9/10/12.
-#[allow(dead_code)]
+/// any mismatch -> not ready (spec R1). Consumed by `reasoner_ready_or_false`.
 pub fn reasoner_ready(
     config: &ReasonerConfig,
     consent: Option<&serde_json::Value>,
@@ -246,13 +210,6 @@ mod tests {
         let p = MockReasonerProvider::new("test-model");
         let r = p.reasoner().expect("reasoner builds");
         assert_eq!(r.model_id(), "test-model");
-    }
-    #[test]
-    fn ollama_provider_caches_one_instance() {
-        let p = OllamaReasonerProvider::new();
-        let a = p.reasoner().expect("a");
-        let b = p.reasoner().expect("b");
-        assert!(std::sync::Arc::ptr_eq(&a, &b), "second call returns the cached Arc");
     }
 }
 

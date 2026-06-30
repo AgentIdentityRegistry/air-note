@@ -133,7 +133,7 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|_| "Unable to access app data directory".to_string())
 }
 
-fn normalize_https_base(input: &str) -> Result<String, String> {
+pub(crate) fn normalize_https_base(input: &str) -> Result<String, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("Provider base URL is empty.".to_string());

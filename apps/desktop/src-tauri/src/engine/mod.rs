@@ -53,12 +53,12 @@ pub enum EngineOpError {
     Open(EngineError),
     Core(String),
     Embedder(String),
-    /// Reasoner BUILD failure — part of the `ReasonerProvider` seam's error surface. In SP3
-    /// the only provider is `OllamaReasonerProvider`, whose `OllamaReasoner::new` is
-    /// infallible (loopback is verified per-call inside `complete_json`, surfaced through
-    /// `evolve_once` as `Core`), so nothing constructs this variant YET. It is load-bearing
-    /// for the future fallible (cloud BYO-key) provider that drops in behind the same seam
-    /// (spec §"Future hooks"); the `?` on `reasoner()` in `evolve_once` already routes to it.
+    /// Reasoner BUILD failure — part of the `ReasonerProvider` seam's error surface. The
+    /// production `ConfigReasonerProvider` builds infallibly today (Local→`OllamaReasoner::new`
+    /// and Cloud→`CloudReasoner::new` are both infallible; reachability is verified per-call
+    /// inside `complete_json`, surfaced through `evolve_once` as `Core`), so nothing constructs
+    /// this variant YET. It is load-bearing for a future fallible provider that drops in behind
+    /// the same seam; the `?` on `reasoner()` in `evolve_once` already routes to it.
     #[allow(dead_code)]
     Reasoner(String),
     /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve").
@@ -948,13 +948,12 @@ impl EngineHandle {
     }
 
     // ---- Cloud reasoner (Milestone D Phase 2a, spec R1/R5/R8) ----
-    // Consumed by Task 12b (IPC commands) + Task 10 (scheduler). The `#[allow(dead_code)]`
-    // on each reflects that this file has no in-crate caller until those tasks wire main.rs.
+    // Consumed by the Task 12b IPC commands (`engine_get/set/enable_*reasoner*`); the scheduler
+    // mode read (Task 10) is a later consumer of `reasoner_config_or_default`.
 
     /// The persisted reasoner config, or the fail-SAFE Local default on ANY error (R8 — a
     /// missing/garbage/unreadable record NEVER flips the brain to cloud egress). Gated read.
-    /// Consumed by Task 12b (`reasoner_config` command) + Task 10 (scheduler mode read).
-    #[allow(dead_code)] // Consumed by Task 12b/T10.
+    /// Consumed by `engine_get_reasoner_config` (+ Task 10 scheduler mode read).
     pub async fn reasoner_config_or_default(&self, onboarded: bool) -> reason::ReasonerConfig {
         let log = match self.get_or_open(onboarded).await {
             Ok(l) => l,
@@ -969,8 +968,7 @@ impl EngineHandle {
     /// Fingerprint of the vault key the given config's provider WOULD use, or `None` when no
     /// non-empty key is stored. Binds the R1 consent to the exact key in the vault, so a
     /// rotation/provider-change makes readiness fail until re-consent. Sync (cached vault read).
-    /// Consumed by Task 12b + the R5 enable flow below.
-    #[allow(dead_code)] // Consumed by Task 12b + enable_cloud_reasoner.
+    /// Consumed by `reasoner_ready_or_false` + the R5 enable flow below.
     fn current_key_fingerprint(&self, config: &reason::ReasonerConfig) -> Option<String> {
         let key_name = match config.provider {
             cloud_reasoner::CloudProvider::Anthropic => cloud_reasoner::ANTHROPIC_KEY_NAME,
@@ -987,8 +985,7 @@ impl EngineHandle {
     /// passes `local_probe_ready = false`, so for a Local config it returns false — LOCAL
     /// readiness stays the scheduler's Ollama probe (Task 10); this method exists to answer
     /// "is the consented CLOUD provider ready right now?" (spec R1). Gated read.
-    /// Consumed by Task 12b (`reasoner_ready` command).
-    #[allow(dead_code)] // Consumed by Task 12b.
+    /// Consumed by `engine_get_reasoner_config` (the DTO's `ready` flag).
     pub async fn reasoner_ready_or_false(&self, onboarded: bool) -> bool {
         let log = match self.get_or_open(onboarded).await {
             Ok(l) => l,
@@ -1009,8 +1006,7 @@ impl EngineHandle {
 
     /// Persist the NON-security reasoner config (mode/provider/model/base_url). Does NOT grant
     /// consent — flipping to cloud still requires `enable_cloud_reasoner`'s tested opt-in (R1).
-    /// Gated + signed (mirrors `set_mandates_enabled`). Consumed by Task 12b (`set_reasoner_config`).
-    #[allow(dead_code)] // Consumed by Task 12b.
+    /// Gated + signed (mirrors `set_mandates_enabled`). Consumed by `engine_set_reasoner_config`.
     pub async fn set_reasoner_config(&self, onboarded: bool, config: serde_json::Value) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
@@ -1024,8 +1020,7 @@ impl EngineHandle {
     /// (no memory/file content) BEFORE writing consent, then sign BOTH the config and the
     /// consent record (binding provider/host/key-fp). A probe failure (bad key, unreachable,
     /// missing key) returns a classified error and writes NOTHING — there is no path to enable
-    /// cloud on a bad key (spec R5). Gated + signed. Consumed by Task 12b (`enable_cloud_reasoner`).
-    #[allow(dead_code)] // Consumed by Task 12b.
+    /// cloud on a bad key (spec R5). Gated + signed. Consumed by `engine_enable_cloud_reasoner`.
     pub async fn enable_cloud_reasoner(&self, onboarded: bool, config: serde_json::Value) -> Result<(), EngineOpError> {
         // Gate first (mirrors the sibling switches): no probe / no write before onboarding.
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -1072,7 +1067,7 @@ impl EngineHandle {
 /// field falls back to the Local default for that part — unknown/garbage NEVER flips to cloud.
 /// `mode`: `"cloud"` → Cloud, anything else → Local. `provider`: `"openai-compat"` → OpenAiCompat,
 /// anything else → Anthropic. Consumed by the engine reasoner reads above + their tests.
-fn parse_reasoner_config(raw: Option<serde_json::Value>) -> reason::ReasonerConfig {
+pub(crate) fn parse_reasoner_config(raw: Option<serde_json::Value>) -> reason::ReasonerConfig {
     use reason::{ReasonerConfig, ReasonerMode};
     let default = ReasonerConfig::default();
     let Some(obj) = raw.as_ref().and_then(|v| v.as_object()) else {
