@@ -45,6 +45,32 @@ export const setEvolveEnabled = (enabled: boolean): Promise<void> =>
 export const evolveNow = (): Promise<EvolveReportDto> => invoke<EvolveReportDto>("engine_evolve_now");
 export const ollamaStatus = (): Promise<OllamaStatusDto> => invoke<OllamaStatusDto>("engine_ollama_status");
 
+export type ReasonerMode = "local" | "cloud";
+export type CloudProvider = "anthropic" | "openai-compat";
+export type ReasonerConfigDto = {
+  mode: ReasonerMode;
+  provider: CloudProvider;
+  model: string;
+  base_url: string | null;
+  ready: boolean;
+};
+/** Write payload — snake_case value keys (Tauri does not rename inner object keys). No `ready` (output-only). */
+export type ReasonerConfigInput = {
+  mode: ReasonerMode;
+  provider: CloudProvider;
+  model: string;
+  base_url: string | null;
+};
+
+export const getReasonerConfig = (): Promise<ReasonerConfigDto> =>
+  invoke<ReasonerConfigDto>("engine_get_reasoner_config");
+/** Persists config (no consent, never makes cloud ready). Used to switch back to Local. */
+export const setReasonerConfig = (config: ReasonerConfigInput): Promise<void> =>
+  invoke<void>("engine_set_reasoner_config", { config });
+/** The R5 enable flow: test-key probe → signs consent → activates cloud. The only path that makes cloud ready. */
+export const enableCloudReasoner = (config: ReasonerConfigInput): Promise<void> =>
+  invoke<void>("engine_enable_cloud_reasoner", { config });
+
 export type ProposalDto = {
   id: string;
   target: string;
