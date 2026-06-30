@@ -871,3 +871,18 @@ mod fence_tests {
         assert_eq!(s, "<<<SOURCE_BEGIN>>>\nAlice knows Bob.\n<<<SOURCE_END>>>\n");
     }
 }
+
+#[cfg(test)]
+mod confidence_tests {
+    use super::to_confidence_milli;
+
+    // R9 minor (b): out-of-range model confidences are absorbed by the clamp before
+    // signing, so a garbage/over-confident value can never serialize an out-of-band
+    // milli into the signed store (Rev 2 F3). In-range round-trips; ends clamp.
+    #[test]
+    fn to_confidence_milli_clamps_out_of_range() {
+        assert_eq!(to_confidence_milli(0.5), 500); // in-range
+        assert_eq!(to_confidence_milli(1.5), 1000); // >1.0 clamped to ceiling
+        assert_eq!(to_confidence_milli(-0.3), 0); // <0.0 clamped to floor
+    }
+}

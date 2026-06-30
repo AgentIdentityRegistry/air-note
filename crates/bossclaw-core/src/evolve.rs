@@ -59,6 +59,10 @@ pub struct EvolveReport {
     pub proposals_elided_cap: usize,
     /// True iff the tick short-circuited because the off-switch is engaged.
     pub skipped_disabled: bool,
+    /// Count of file-derived / `is_external` snippets included in this tick's
+    /// recall payload — surfaced so Phase 2b can disclose "N file-derived
+    /// snippets sent to the cloud" (spec R4). Local ticks set it too (harmless).
+    pub tainted_recall_snippets: usize,
 }
 
 /// A snapshot of loop health for the desktop (spec §8 observability surface).
@@ -91,7 +95,7 @@ pub fn debounce_due(now_ms: u128, last_append_ms: u128, debounce_ms: u128) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::debounce_due;
+    use super::{debounce_due, EvolveReport};
     use crate::extract::{truncate_for_reasoner, MAX_INPUT_TEXT_BYTES};
 
     #[test]
@@ -124,5 +128,11 @@ mod tests {
         assert!(big.starts_with(out), "prefix of the original");
         // Re-borrowing as &str proves it is on a char boundary (no panic).
         assert!(out.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn evolve_report_carries_tainted_recall_count_field() {
+        let report = EvolveReport::default();
+        assert_eq!(report.tainted_recall_snippets, 0);
     }
 }

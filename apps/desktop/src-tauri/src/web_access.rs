@@ -115,7 +115,7 @@ const MAX_REDIRECTS: usize = 5;
 /// link-local (incl. the `169.254.169.254` cloud-metadata endpoint), CGNAT, benchmarking,
 /// reserved, unspecified, broadcast, multicast, or documentation space. IPv4-in-IPv6
 /// forms are unwrapped so `::ffff:127.0.0.1` (and `::1`) are caught too.
-fn is_blocked_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
