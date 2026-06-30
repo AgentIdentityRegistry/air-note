@@ -506,6 +506,23 @@ impl EngineHandle {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         // Serialize manual + scheduled ticks: a second overlapping tick is Busy, not queued.
         let _guard = self.evolve_lock.try_lock().map_err(|_| EngineOpError::Busy("evolve"))?;
+        // Consent chokepoint for BOTH the scheduler AND manual `engine_evolve_now`:
+        // in cloud mode, refuse to build/run the reasoner unless a signed consent
+        // record matches the current config+key (reasoner_ready_or_false is
+        // fail-closed). Placed BEFORE the reasoner is built (and before any
+        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner
+        // and egresses nothing. Closes the manual-evolve consent-bypass (R1/R5/R8).
+        // The scheduler already pre-gates on readiness, so on that path this is a
+        // cheap re-confirm (2 log reads) — redundant but correct.
+        if matches!(
+            self.reasoner_config_or_default(onboarded).await.mode,
+            crate::engine::reason::ReasonerMode::Cloud
+        ) && !self.reasoner_ready_or_false(onboarded).await
+        {
+            return Err(EngineOpError::Reasoner(
+                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
+            ));
+        }
         let embedder = self.ensure_indexed(&log).await?;
         let reasoner = self.reasoner_provider.reasoner()?;
         let t0 = std::time::Instant::now();
@@ -1933,6 +1950,53 @@ mod tests {
         // The gates themselves are still off after the tick (prime_switches at open).
         assert!(!log.proposals_enabled().unwrap(), "proposals gate stays off");
         assert!(!log.mandates_enabled().unwrap(), "mandates gate stays off");
+    }
+
+    /// Milestone D / spec R1+R5+R8 (manual-evolve consent chokepoint): the manual evolve path
+    /// (`engine_evolve_now` → `evolve_once`) MUST be gated on the same signed-consent readiness
+    /// as the scheduler. With a CLOUD config written but NO signed consent (the exact exploit:
+    /// `set_reasoner_config({mode:"cloud",…})` then `evolve_now`), `evolve_once` must REFUSE —
+    /// the cloud reasoner is never built and NO network call happens. The gate fires before the
+    /// reasoner is constructed, so this test is network-free and sub-second even though the
+    /// (unused) provider would otherwise egress recall/memory context to api.anthropic.com.
+    #[tokio::test]
+    async fn evolve_once_refuses_cloud_without_signed_consent() {
+        let (vault, dir) = test_vault_and_dir();
+        // The StubReasoner is wired but, in cloud mode with no consent, the gate fires BEFORE
+        // any reasoner is built — so it is never invoked (no egress regardless of provider).
+        let handle =
+            new_test_handle_with_reasoner(vault, &dir, Arc::new(StubReasoner::new("stub-v1")));
+        let log = handle.get_or_open(true).await.unwrap();
+        // A non-empty queue so we exercise the cloud gate, not an empty-queue no-op.
+        seed_one_memory(&log, "Kenny works at Acme");
+        drop(log);
+
+        // Flip the config to CLOUD (writes the signed config + cell, but NO consent record),
+        // then enable evolve so we reach the cloud gate rather than the evolve-disabled return.
+        handle
+            .set_reasoner_config(
+                true,
+                serde_json::json!({
+                    "mode": "cloud",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-6",
+                    "base_url": null
+                }),
+            )
+            .await
+            .unwrap();
+        handle.set_evolve_enabled(true, true).await.unwrap();
+
+        // Cloud + no signed consent ⇒ refused: no reasoner built, no egress.
+        let err = handle.evolve_once(true).await.unwrap_err();
+        assert!(
+            matches!(err, EngineOpError::Reasoner(_)),
+            "cloud-not-ready evolve is a Reasoner error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("not ready"),
+            "error explains the cloud reasoner is not ready, got {err}"
+        );
     }
 
     /// Task 7 (evolve_lock): a second concurrent `evolve_once` returns `Busy("evolve")`.
