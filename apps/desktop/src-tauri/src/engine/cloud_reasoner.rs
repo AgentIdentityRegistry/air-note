@@ -9,6 +9,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use bossclaw_core::BossclawError;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use serde_json::{json, Value};
 
 use crate::web_access::is_blocked_ip;
 
@@ -51,6 +52,53 @@ pub(crate) fn classify_cloud_error(status: u16) -> BossclawError {
         _ => "provider_error",
     };
     BossclawError::Reasoner(format!("cloud reasoner {class} (HTTP {status})"))
+}
+
+/// Output budget for `/v1/messages`. REQUIRED field; sized for a ~16-memory
+/// extraction batch (spec §8 R7). Small values truncate the JSON tail.
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it builds the Anthropic request body.
+pub(crate) const ANTHROPIC_MAX_TOKENS: u32 = 4096;
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner to name + select the forced tool.
+pub(crate) const ANTHROPIC_TOOL_NAME: &str = "emit_result";
+
+/// Build the Anthropic `/v1/messages` body that FORCES one structured tool call
+/// whose input_schema is the engine schema. No `temperature`/`thinking`
+/// (rejected with 400 on current Opus models) and no `strict` (engine schemas
+/// lack `additionalProperties:false`). See spec §8 R7 + plan decision #2.
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner's Anthropic arm.
+pub(crate) fn build_anthropic_request(model: &str, system: &str, prompt: &str, schema: &Value) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "system": system,
+        "messages": [ { "role": "user", "content": prompt } ],
+        "tools": [ {
+            "name": ANTHROPIC_TOOL_NAME,
+            "description": "Return the structured result for this request.",
+            "input_schema": schema
+        } ],
+        "tool_choice": { "type": "tool", "name": ANTHROPIC_TOOL_NAME }
+    })
+}
+
+/// Pull the forced tool_use block's `.input` out of an Anthropic response.
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner after the Anthropic call returns.
+pub(crate) fn extract_anthropic_result(resp: &Value) -> Result<Value, BossclawError> {
+    let content = resp
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BossclawError::Reasoner("anthropic response missing content array".into()))?;
+    for block in content {
+        if block.get("type").and_then(Value::as_str) == Some("tool_use")
+            && block.get("name").and_then(Value::as_str) == Some(ANTHROPIC_TOOL_NAME)
+        {
+            return block
+                .get("input")
+                .cloned()
+                .ok_or_else(|| BossclawError::Reasoner("anthropic tool_use missing input".into()));
+        }
+    }
+    Err(BossclawError::Reasoner("anthropic response had no forced tool_use block".into()))
 }
 
 /// A `reqwest` DNS resolver that screens every resolved address through
@@ -123,5 +171,39 @@ mod tests {
         assert!(classify_cloud_error(404).to_string().contains("model_or_endpoint_not_found"));
         assert!(classify_cloud_error(503).to_string().contains("provider_5xx"));
         assert!(classify_cloud_error(418).to_string().contains("provider_error"));
+    }
+
+    #[test]
+    fn anthropic_request_and_extract_roundtrip() {
+        let schema = bossclaw_core::reason::adjudication_schema();
+        let body = build_anthropic_request("claude-sonnet-4-6", "SYS", "PROMPT", &schema);
+
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(body["max_tokens"], ANTHROPIC_MAX_TOKENS);
+        assert_eq!(body["system"], "SYS");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "PROMPT");
+        // Forced single tool, schema verbatim, no strict/temperature/thinking.
+        assert_eq!(body["tools"][0]["name"], ANTHROPIC_TOOL_NAME);
+        assert_eq!(body["tools"][0]["input_schema"], schema);
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], ANTHROPIC_TOOL_NAME);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("thinking").is_none());
+        assert!(body["tools"][0].get("strict").is_none());
+
+        // Extract the forced tool_use .input.
+        let resp = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "ignored" },
+                { "type": "tool_use", "name": ANTHROPIC_TOOL_NAME, "input": { "match": "abc" } }
+            ]
+        });
+        let out = extract_anthropic_result(&resp).expect("extract");
+        assert_eq!(out["match"], "abc");
+
+        // No tool_use block -> Err, not panic.
+        let bad = serde_json::json!({ "content": [ { "type": "text", "text": "no tool" } ] });
+        assert!(extract_anthropic_result(&bad).is_err());
     }
 }
