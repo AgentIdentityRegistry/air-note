@@ -7,6 +7,7 @@
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
+use bossclaw_core::BossclawError;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use crate::web_access::is_blocked_ip;
@@ -33,6 +34,23 @@ fn screen_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, BoxError> {
         .into());
     }
     Ok(addrs)
+}
+
+/// Map an HTTP status to a fixed error class + status string. The raw provider
+/// body is consumed by the caller for classification and DROPPED here — it can
+/// echo prompt content (= memory/file bytes), so it never enters the error
+/// string surfaced to the webview (spec §8 R3).
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when a provider call returns non-2xx.
+pub(crate) fn classify_cloud_error(status: u16) -> BossclawError {
+    let class = match status {
+        401 | 403 => "auth_rejected",
+        429 => "rate_limited",
+        400 | 422 => "bad_request",
+        404 => "model_or_endpoint_not_found",
+        500..=599 => "provider_5xx",
+        _ => "provider_error",
+    };
+    BossclawError::Reasoner(format!("cloud reasoner {class} (HTTP {status})"))
 }
 
 /// A `reqwest` DNS resolver that screens every resolved address through
@@ -87,5 +105,23 @@ mod tests {
 
         // Empty -> Err (nothing to connect to).
         assert!(screen_addrs(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn classify_cloud_error_never_leaks_body() {
+        // A 400 body containing a fake prompt substring must not survive into the error string.
+        let err = classify_cloud_error(400);
+        let msg = err.to_string();
+        assert!(msg.contains("bad_request"));
+        assert!(msg.contains("400"));
+        assert!(!msg.to_lowercase().contains("prompt"));
+        assert!(!msg.to_lowercase().contains("memory"));
+
+        assert!(classify_cloud_error(401).to_string().contains("auth_rejected"));
+        assert!(classify_cloud_error(403).to_string().contains("auth_rejected"));
+        assert!(classify_cloud_error(429).to_string().contains("rate_limited"));
+        assert!(classify_cloud_error(404).to_string().contains("model_or_endpoint_not_found"));
+        assert!(classify_cloud_error(503).to_string().contains("provider_5xx"));
+        assert!(classify_cloud_error(418).to_string().contains("provider_error"));
     }
 }
