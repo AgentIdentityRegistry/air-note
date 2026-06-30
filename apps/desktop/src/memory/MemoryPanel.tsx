@@ -3,8 +3,13 @@ import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import {
   recall, evolveStatus, setEvolveEnabled, evolveNow, ollamaStatus,
-  type HitDto, type EvolveStatusDto, type OllamaStatusDto,
+  getReasonerConfig, setReasonerConfig, enableCloudReasoner,
+  type HitDto, type EvolveStatusDto, type OllamaStatusDto, type ReasonerConfigDto,
 } from "../api/engine";
+import { vaultSet, vaultHas } from "../vault";
+import { ReasonerConfigPanel } from "./ReasonerConfigPanel";
+import { CloudEgressBanner } from "./CloudEgressBanner";
+import { searchBlurb, modeBlurb } from "./reasonerView";
 import { toRow } from "./recallView";
 import { formatEvolve } from "./evolveStatus";
 
@@ -28,12 +33,14 @@ export function MemoryPanel() {
   const [toggling, setToggling] = useState(false);
   const [evolveError, setEvolveError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState(false);
+  const [reasonerCfg, setReasonerCfg] = useState<ReasonerConfigDto | null>(null);
 
   const refreshStatus = async () => {
     try {
-      const [s, o] = await Promise.all([evolveStatus(), ollamaStatus()]);
+      const [s, o, r] = await Promise.all([evolveStatus(), ollamaStatus(), getReasonerConfig()]);
       setStatus(s);
       setOllama(o);
+      setReasonerCfg(r);
       setUnavailable(false);
     } catch {
       setUnavailable(true);
@@ -101,13 +108,16 @@ export function MemoryPanel() {
   };
 
   const ollamaReady = !!ollama?.reachable && !!ollama?.model_present;
+  const reasonerReady = !!reasonerCfg?.ready;
+  const isCloud = reasonerCfg?.mode === "cloud";
 
   return (
     <Card>
       <h2 style={{ margin: 0 }}>Brain</h2>
       <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
-        Search everything the agent has read and learned. Everything stays on your machine.
+        {searchBlurb(reasonerCfg?.mode ?? "local", reasonerCfg?.provider ?? "anthropic")}
       </p>
+      <CloudEgressBanner cfg={reasonerCfg} />
 
       <div style={{ display: "flex", gap: 8, margin: "12px 0" }}>
         <input
@@ -156,39 +166,48 @@ export function MemoryPanel() {
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Evolve</div>
         <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
-          A local model can organize memories into dossiers in the background. Off by default; runs only on your machine.
+          {modeBlurb(reasonerCfg?.mode ?? "local", reasonerCfg?.provider ?? "anthropic")}
         </p>
+
+        {reasonerCfg ? (
+          <ReasonerConfigPanel
+            cfg={reasonerCfg}
+            onSetConfig={setReasonerConfig}
+            onEnableCloud={enableCloudReasoner}
+            onVaultSet={vaultSet}
+            onVaultHas={vaultHas}
+            onChanged={refreshStatus}
+          />
+        ) : null}
 
         <p style={{ fontSize: 13, margin: "8px 0" }}>
           {status ? formatEvolve(status) : "Loading…"}
         </p>
 
-        <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
-          Local model:{" "}
-          {ollama == null
-            ? "checking…"
-            : ollamaReady
-            ? `ready (${ollama.model_tag})`
-            : ollama.reachable
-            ? `Ollama running, but ${ollama.model_tag} not installed`
-            : "Ollama not detected"}
-        </p>
+        {!isCloud && (
+          <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+            Local model:{" "}
+            {ollama == null
+              ? "checking…"
+              : ollamaReady
+              ? `ready (${ollama.model_tag})`
+              : ollama.reachable
+              ? `Ollama running, but ${ollama.model_tag} not installed`
+              : "Ollama not detected"}
+          </p>
+        )}
 
-        {!ollamaReady && ollama != null ? (
+        {!isCloud && !ollamaReady && ollama != null ? (
           <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>
             To enable, install Ollama and run <code>ollama pull qwen2.5:7b-instruct</code>.
           </p>
         ) : null}
 
         <div style={{ display: "flex", gap: 8, margin: "8px 0" }}>
-          <Button
-            variant="secondary"
-            onClick={onToggleEvolve}
-            disabled={!status || toggling || !ollamaReady}
-          >
+          <Button variant="secondary" onClick={onToggleEvolve} disabled={!status || toggling || !reasonerReady}>
             {status?.enabled ? "Turn Evolve Off" : "Turn Evolve On"}
           </Button>
-          <Button variant="primary" onClick={onEvolveNow} disabled={evolving || !ollamaReady || !status?.enabled}>
+          <Button variant="primary" onClick={onEvolveNow} disabled={evolving || !reasonerReady || !status?.enabled}>
             {evolving ? "Evolving…" : "Evolve Now"}
           </Button>
         </div>

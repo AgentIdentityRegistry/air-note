@@ -64,8 +64,8 @@ fn main() {
             let identity_store = IdentityStore::new(vault, data_dir);
             // The shared reasoner-config cell (Milestone D Phase 2a). The provider closure reads
             // it on every evolve tick; the reasoner-config commands write it through. It starts at
-            // the Local default each boot — re-seeding it from the persisted signed log after
-            // onboarding (so a Cloud config survives restart) is deferred to Phase 2b. For 2a
+            // the Local default each boot — re-seeding it from the persisted signed log on boot
+            // (so a Cloud config survives restart) is done just below (Phase 2b). For 2a
             // cloud is never enabled (no UI), so the cell stays Local, which is correct.
             #[cfg(unix)]
             let reasoner_cfg = std::sync::Arc::new(std::sync::Mutex::new(
@@ -94,6 +94,15 @@ fn main() {
                     reasoner_provider,
                 ))
             };
+            // Phase 2b: re-seed the reasoner-config cell from the signed log so a Cloud
+            // config chosen in a previous session survives restart. `.setup` is sync, so
+            // block on the async read (one local SQLite read, before the webview exists).
+            #[cfg(unix)]
+            tauri::async_runtime::block_on(crate::engine::reseed_reasoner_cell(
+                &engine,
+                &reasoner_cfg,
+                identity_store.is_onboarded(),
+            ));
             // Start the background evolve driver (OFF by default — it gates on the sticky
             // `evolve_enabled` off-switch + a present local Ollama + a non-empty queue each
             // wake). Spawned via `tauri::async_runtime::spawn` inside the scheduler; the
