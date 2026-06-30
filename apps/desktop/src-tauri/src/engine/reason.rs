@@ -52,6 +52,71 @@ impl ReasonerProvider for OllamaReasonerProvider {
 // config plumbing (Tasks 9/10/12) names a single type. Consumed by Task 9/10/12.
 #[allow(unused_imports)]
 pub use crate::engine::cloud_reasoner::CloudProvider;
+use crate::engine::cloud_reasoner::CloudReasoner;
+
+/// A stable string identity for a config; the provider rebuilds when it changes.
+/// Consumed by `ConfigReasonerProvider` (and reachable from main.rs at Task 12).
+#[allow(dead_code)]
+pub fn config_fingerprint(c: &ReasonerConfig) -> String {
+    let mode = match c.mode {
+        ReasonerMode::Local => "local",
+        ReasonerMode::Cloud => "cloud",
+    };
+    let provider = match c.provider {
+        CloudProvider::Anthropic => "anthropic",
+        CloudProvider::OpenAiCompat => "openai-compat",
+    };
+    format!("{mode}|{provider}|{}|{}", c.model, c.base_url.as_deref().unwrap_or(""))
+}
+
+#[allow(dead_code)]
+type ConfigReader = Box<dyn Fn() -> ReasonerConfig + Send + Sync>;
+
+/// Config-driven reasoner provider: builds Ollama (Local) or `CloudReasoner`
+/// (Cloud) and memoizes keyed on the config fingerprint, rebuilding on change.
+/// Wired into `main.rs` by Task 12; reached by `provider_tests` until then.
+#[allow(dead_code)]
+pub struct ConfigReasonerProvider {
+    read_config: ConfigReader,
+    cell: Mutex<Option<(String, Arc<dyn Reasoner>)>>,
+}
+
+#[allow(dead_code)] // new + build are reached only via provider_tests until main.rs wires this at Task 12.
+impl ConfigReasonerProvider {
+    pub fn new(read_config: impl Fn() -> ReasonerConfig + Send + Sync + 'static) -> Self {
+        Self { read_config: Box::new(read_config), cell: Mutex::new(None) }
+    }
+
+    fn build(config: &ReasonerConfig) -> Arc<dyn Reasoner> {
+        match config.mode {
+            ReasonerMode::Local => {
+                // Exactly as today: model id stays the hardcoded local tag (R8).
+                Arc::new(bossclaw_core::OllamaReasoner::new(REASONER_MODEL_ID))
+            }
+            ReasonerMode::Cloud => Arc::new(CloudReasoner::new(
+                config.provider,
+                config.model.clone(),
+                config.base_url.clone(),
+            )),
+        }
+    }
+}
+
+impl ReasonerProvider for ConfigReasonerProvider {
+    fn reasoner(&self) -> Result<Arc<dyn Reasoner>, EngineOpError> {
+        let config = (self.read_config)();
+        let fp = config_fingerprint(&config);
+        let mut guard = self.cell.lock().expect("reasoner cell poisoned");
+        if let Some((cached_fp, r)) = guard.as_ref() {
+            if *cached_fp == fp {
+                return Ok(r.clone());
+            }
+        }
+        let arc = Self::build(&config);
+        *guard = Some((fp, arc.clone()));
+        Ok(arc)
+    }
+}
 
 /// Which reasoner the evolve loop drives: the local Ollama probe, or a signed,
 /// consented cloud provider. Consumed by Task 9/10/12.
@@ -177,6 +242,40 @@ mod tests {
         let a = p.reasoner().expect("a");
         let b = p.reasoner().expect("b");
         assert!(std::sync::Arc::ptr_eq(&a, &b), "second call returns the cached Arc");
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn default_config_builds_local_ollama() {
+        // R8: no config -> default Local -> Ollama with the existing model id.
+        let cfg = std::sync::Arc::new(Mutex::new(ReasonerConfig::default()));
+        let cfg2 = cfg.clone();
+        let provider = ConfigReasonerProvider::new(move || cfg2.lock().unwrap().clone());
+        let r = provider.reasoner().unwrap();
+        assert_eq!(r.model_id(), REASONER_MODEL_ID);
+    }
+
+    #[test]
+    fn config_change_rebuilds() {
+        let cfg = std::sync::Arc::new(Mutex::new(ReasonerConfig::default()));
+        let cfg2 = cfg.clone();
+        let provider = ConfigReasonerProvider::new(move || cfg2.lock().unwrap().clone());
+        let first = provider.reasoner().unwrap();
+        // Flip to cloud Anthropic -> different reasoner (different model_id).
+        *cfg.lock().unwrap() = ReasonerConfig {
+            mode: ReasonerMode::Cloud,
+            provider: CloudProvider::Anthropic,
+            model: "claude-sonnet-4-6".into(),
+            base_url: None,
+        };
+        let second = provider.reasoner().unwrap();
+        assert_ne!(first.model_id(), second.model_id());
+        assert_eq!(second.model_id(), "anthropic:claude-sonnet-4-6");
     }
 }
 
