@@ -519,8 +519,9 @@ pub(crate) fn validate_reasoner_config(config: &serde_json::Value) -> Result<(),
 }
 
 /// The reasoner config the Settings UI reads/writes: mode + provider + model + optional base_url,
-/// plus the live cloud-readiness flag. Serialized to the webview (serde renames to camelCase on
-/// the TS side via the twin). `ready` is `reasoner_ready_or_false` — for a Local config it is the
+/// plus the live cloud-readiness flag. Serialized to the webview as-is — snake_case keys
+/// (`base_url`, not `baseUrl`); the TS `ReasonerConfigDto` twin mirrors these literally (no
+/// `#[serde(rename_all)]`). `ready` is `reasoner_ready_or_false` — for a Local config it is the
 /// CLOUD gate's `false` (local readiness is the scheduler's Ollama probe, surfaced separately).
 #[derive(serde::Serialize)]
 pub struct ReasonerConfigDto {
