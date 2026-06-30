@@ -277,6 +277,16 @@ mod ready_tests {
     }
 
     #[test]
+    fn fresh_install_is_local_and_not_cloud_ready() {
+        // R8: absent any config -> default Local -> egresses nothing.
+        let cfg = ReasonerConfig::default();
+        assert!(matches!(cfg.mode, ReasonerMode::Local));
+        // A cloud config with NO signed consent + no key -> never ready (can't egress).
+        let cloud = ReasonerConfig { mode: ReasonerMode::Cloud, ..ReasonerConfig::default() };
+        assert!(!reasoner_ready(&cloud, None, None, false));
+    }
+
+    #[test]
     fn cloud_ready_requires_matching_signed_consent() {
         let cfg = cloud_cfg();
         // No consent -> not ready.

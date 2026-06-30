@@ -242,6 +242,13 @@ pub struct CloudReasoner {
     /// OpenAI-compat only; already HTTPS-normalized + host-screened at config-set (Task 12).
     base_url: Option<String>,
     model_id: String,
+    /// TEST-ONLY key seam (compiled OUT of production via `#[cfg(test)]`, so it can
+    /// never be a vault bypass that ships): `None` = read the real vault; `Some(None)`
+    /// = force "no key" (deterministic fail-closed, no keychain touch, no network);
+    /// `Some(Some(k))` = force this key. Exercised by the R5 missing-key test so it is
+    /// network-free even on a dev machine that DOES have a configured provider key.
+    #[cfg(test)]
+    test_key_override: Option<Option<String>>,
 }
 
 impl CloudReasoner {
@@ -251,7 +258,29 @@ impl CloudReasoner {
             CloudProvider::OpenAiCompat => "openai-compat",
         };
         let model_id = format!("{prefix}:{model}");
-        Self { provider, model, base_url, model_id }
+        Self {
+            provider,
+            model,
+            base_url,
+            model_id,
+            // Production default: read the REAL vault. (Field exists only under cfg(test).)
+            #[cfg(test)]
+            test_key_override: None,
+        }
+    }
+
+    /// TEST-ONLY constructor: mirrors [`Self::new`] but forces `read_key` to use
+    /// `key` instead of the real vault (`None` = force missing key). Lets the R5
+    /// missing-key test assert fail-closed deterministically with NO keychain
+    /// access and NO network call, even where a provider key IS configured.
+    #[cfg(test)]
+    pub(crate) fn new_with_test_key(
+        provider: CloudProvider,
+        model: String,
+        base_url: Option<String>,
+        key: Option<String>,
+    ) -> Self {
+        Self { test_key_override: Some(key), ..Self::new(provider, model, base_url) }
     }
 
     fn key_name(&self) -> &'static str {
@@ -264,6 +293,17 @@ impl CloudReasoner {
     /// Read the provider key from the vault at CALL time (never stored on self,
     /// never logged). Empty/missing/error -> Err (fail-closed).
     fn read_key(&self) -> Result<String, BossclawError> {
+        // TEST-ONLY seam (compiled out of production): when set, bypass the real
+        // vault read so a test forces "no key" (or a fixed key) without touching the
+        // keychain — keeping the fail-closed test network-free. Never a production
+        // bypass: the whole `if` is gated by `#[cfg(test)]`.
+        #[cfg(test)]
+        if let Some(override_key) = &self.test_key_override {
+            return match override_key {
+                Some(k) if !k.trim().is_empty() => Ok(k.clone()),
+                _ => Err(BossclawError::Reasoner("cloud reasoner key missing in vault".into())),
+            };
+        }
         match crate::vault::secret_get_cached(self.key_name()) {
             Ok(Some(k)) if !k.trim().is_empty() => Ok(k),
             Ok(_) => Err(BossclawError::Reasoner("cloud reasoner key missing in vault".into())),
@@ -510,8 +550,16 @@ mod tests {
 
     #[test]
     fn cloud_reasoner_missing_key_fails_closed() {
-        // No vault key present -> complete_json returns Err (never a panic, never egress).
-        let r = CloudReasoner::new(CloudProvider::Anthropic, "claude-sonnet-4-6".into(), None);
+        // R5 fail path: missing key -> complete_json returns Err (never a panic, never
+        // egress). The test-key seam forces "no key" WITHOUT reading the real vault, so
+        // this is deterministic and network-free even on a machine that HAS a configured
+        // provider key (e.g. set via vault_set) — read_key returns Err before any send().
+        let r = CloudReasoner::new_with_test_key(
+            CloudProvider::Anthropic,
+            "claude-sonnet-4-6".into(),
+            None,
+            None, // forced missing key
+        );
         let schema = bossclaw_core::reason::adjudication_schema();
         let out = r.complete_json("sys", "prompt", &schema);
         assert!(out.is_err());

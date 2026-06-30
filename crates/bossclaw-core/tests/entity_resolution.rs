@@ -66,6 +66,56 @@ fn resolving_a_disjoint_mention_mints_a_new_entity() {
     assert_eq!(decision, ResolveDecision::Mint);
 }
 
+/// R9 minor (a): a reasoner that returns a `match` value which is NOT one of the
+/// offered candidate ids (a hallucinated / garbage id) must NOT crash and must NOT
+/// become a merge target — `resolve_mention` collapses it to `Mint`. Drives the
+/// MID-BAND (0.75 < cosine < 0.92) so the adjudicator is actually consulted (the
+/// other two tests short-circuit at cosine 1.0 / 0.0 before any model call).
+struct GarbageMatchReasoner;
+impl bossclaw_core::reason::Reasoner for GarbageMatchReasoner {
+    fn complete_json(
+        &self,
+        _system: &str,
+        _prompt: &str,
+        _schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, bossclaw_core::error::BossclawError> {
+        // A well-formed (schema-valid) answer whose id was never offered.
+        Ok(json!({ "match": "entity:THIS-ID-WAS-NEVER-A-CANDIDATE" }))
+    }
+    fn model_id(&self) -> &str {
+        "garbage-match-reasoner"
+    }
+}
+
+#[test]
+fn garbage_adjudication_id_mints_without_crashing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+
+    // MockEmbedder is a per-token bag-of-words (FNV bucket, L2-normalized). The
+    // entity has 4 distinct, collision-free tokens; the mention shares those 4 and
+    // adds 1 -> cosine = 4/sqrt(4*5) = 0.8944, squarely in the adjudicate mid-band.
+    let entity_text = "tokaa tokbb tokcc tokdd";
+    let mention = "tokaa tokbb tokcc tokdd tokee";
+    let m = log.append(mk_memory(entity_text)).unwrap();
+    let existing = log
+        .entity(entity_text, &[], "person", "m4-reasoner", std::slice::from_ref(&m))
+        .unwrap();
+    log.derive_entity_vector(&embedder, &existing, entity_text).unwrap();
+    log.rebuild_entity_index(&embedder).unwrap();
+
+    // The adjudicator returns a garbage id (not the real candidate) -> the engine
+    // must defensively reject it and MINT, never panic, never merge onto the garbage.
+    let reasoner = GarbageMatchReasoner;
+    let decision = log.resolve_mention(&embedder, &reasoner, mention).unwrap();
+    assert_eq!(
+        decision,
+        ResolveDecision::Mint,
+        "a hallucinated adjudication id must collapse to Mint, not Merge or panic"
+    );
+}
+
 #[test]
 fn entity_is_reachable_via_entity_index_but_never_via_recall() {
     // T-G (locked constraint #8): entity events are embedded for resolution but
