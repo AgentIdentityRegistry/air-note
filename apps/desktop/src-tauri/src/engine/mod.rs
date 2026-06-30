@@ -1049,12 +1049,10 @@ impl EngineHandle {
         // check would then reject) and the fp mirrors `current_key_fingerprint`.
         let host = reason::config_host(&parsed).unwrap_or_default();
         let fp = self.current_key_fingerprint(&parsed).unwrap_or_default();
-        let provider_wire = match parsed.provider {
-            cloud_reasoner::CloudProvider::Anthropic => "anthropic",
-            cloud_reasoner::CloudProvider::OpenAiCompat => "openai-compat",
-        };
+        // Reuse the consent READER's wire-string map (`reason::provider_str`) so the WRITER
+        // can never drift from what `reasoner_ready` compares against (review I-1).
         let consent = serde_json::json!({
-            "provider": provider_wire,
+            "provider": reason::provider_str(parsed.provider),
             "base_url_host": host,
             "key_fingerprint": fp,
             "consented_at": chrono::Utc::now().to_rfc3339(),

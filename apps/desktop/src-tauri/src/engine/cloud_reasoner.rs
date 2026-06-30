@@ -230,7 +230,7 @@ pub enum CloudProvider {
 /// rotation/provider-change re-consents). Keep these strings in sync.
 pub(crate) const ANTHROPIC_KEY_NAME: &str = "anthropic_api_key";
 pub(crate) const OPENAI_COMPAT_KEY_NAME: &str = "openai_compat_api_key";
-const ANTHROPIC_HOST: &str = "api.anthropic.com";
+pub(crate) const ANTHROPIC_HOST: &str = "api.anthropic.com";
 
 /// The desktop-side cloud reasoner (spec §8). Reads the provider key from the
 /// vault AT CALL TIME (header-only, never stored on the struct, never logged),

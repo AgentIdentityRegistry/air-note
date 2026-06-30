@@ -154,7 +154,10 @@ impl Default for ReasonerConfig {
 
 /// The wire string for a provider, matching the signed consent record's
 /// `provider` field (same strings as the `CloudReasoner::model_id` prefixes).
-fn provider_str(p: CloudProvider) -> &'static str {
+/// SHARED by the consent READER (`reasoner_ready`) and the consent WRITER
+/// (`engine/mod.rs`'s `enable_cloud_reasoner`) so the two can never drift —
+/// a drift would silently produce `ready==false` after a successful enable.
+pub(crate) fn provider_str(p: CloudProvider) -> &'static str {
     match p {
         CloudProvider::Anthropic => "anthropic",
         CloudProvider::OpenAiCompat => "openai-compat",
@@ -167,7 +170,7 @@ fn provider_str(p: CloudProvider) -> &'static str {
 #[allow(dead_code)]
 pub fn config_host(config: &ReasonerConfig) -> Option<String> {
     match config.provider {
-        CloudProvider::Anthropic => Some("api.anthropic.com".to_string()),
+        CloudProvider::Anthropic => Some(crate::engine::cloud_reasoner::ANTHROPIC_HOST.to_string()),
         CloudProvider::OpenAiCompat => reqwest::Url::parse(config.base_url.as_deref()?)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string())),
