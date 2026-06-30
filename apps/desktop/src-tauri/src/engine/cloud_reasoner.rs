@@ -9,7 +9,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use bossclaw_core::BossclawError;
+use bossclaw_core::{BossclawError, Reasoner};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::{json, Value};
 
@@ -22,8 +22,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// metadata, or if the set is empty. Used at connect time to close the
 /// DNS-rebind race that a pre-flight host check cannot (spec §8 R2).
 // Exercised by `tests::screen_addrs_rejects_any_blocked` and called from
-// `PinnedResolver::resolve`, which `blocking_client` installs — that reachability
-// keeps this live in the bin target (no `dead_code` allow needed).
+// `PinnedResolver::resolve` → `blocking_client` → the `CloudReasoner` arms. No
+// per-helper `dead_code` allow: the allow on `impl CloudReasoner` transitively
+// keeps this whole egress subgraph live until Task 9 wires a non-test caller.
 fn screen_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, BoxError> {
     if addrs.is_empty() {
         return Err("cloud reasoner DNS resolved to no addresses".into());
@@ -42,7 +43,6 @@ fn screen_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, BoxError> {
 /// body is consumed by the caller for classification and DROPPED here — it can
 /// echo prompt content (= memory/file bytes), so it never enters the error
 /// string surfaced to the webview (spec §8 R3).
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when a provider call returns non-2xx.
 pub(crate) fn classify_cloud_error(status: u16) -> BossclawError {
     let class = match status {
         401 | 403 => "auth_rejected",
@@ -57,16 +57,13 @@ pub(crate) fn classify_cloud_error(status: u16) -> BossclawError {
 
 /// Output budget for `/v1/messages`. REQUIRED field; sized for a ~16-memory
 /// extraction batch (spec §8 R7). Small values truncate the JSON tail.
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it builds the Anthropic request body.
 pub(crate) const ANTHROPIC_MAX_TOKENS: u32 = 4096;
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner to name + select the forced tool.
 pub(crate) const ANTHROPIC_TOOL_NAME: &str = "emit_result";
 
 /// Build the Anthropic `/v1/messages` body that FORCES one structured tool call
 /// whose input_schema is the engine schema. No `temperature`/`thinking`
 /// (rejected with 400 on current Opus models) and no `strict` (engine schemas
 /// lack `additionalProperties:false`). See spec §8 R7 + plan decision #2.
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner's Anthropic arm.
 pub(crate) fn build_anthropic_request(model: &str, system: &str, prompt: &str, schema: &Value) -> Value {
     json!({
         "model": model,
@@ -83,7 +80,6 @@ pub(crate) fn build_anthropic_request(model: &str, system: &str, prompt: &str, s
 }
 
 /// Pull the forced tool_use block's `.input` out of an Anthropic response.
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner after the Anthropic call returns.
 pub(crate) fn extract_anthropic_result(resp: &Value) -> Result<Value, BossclawError> {
     let content = resp
         .get("content")
@@ -106,7 +102,6 @@ pub(crate) fn extract_anthropic_result(resp: &Value) -> Result<Value, BossclawEr
 /// native `json_schema`; `fallback=true` switches to `json_object` and folds
 /// the schema into the system text (some compat servers reject json_schema).
 /// No `temperature` (parity with the Anthropic arm). Spec §8 R7 + §3.1.
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner's OpenAI-compat arm.
 pub(crate) fn build_openai_request(
     model: &str,
     system: &str,
@@ -143,7 +138,6 @@ pub(crate) fn build_openai_request(
 
 /// Extract `choices[0].message.content` and parse it as JSON, tolerating a
 /// ```json fence. Parse failure -> `BossclawError::Reasoner` (retryable no-op).
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner after the OpenAI-compat call returns.
 pub(crate) fn extract_openai_result(resp: &Value) -> Result<Value, BossclawError> {
     let content = resp
         .get("choices")
@@ -159,7 +153,6 @@ pub(crate) fn extract_openai_result(resp: &Value) -> Result<Value, BossclawError
 }
 
 /// Strip a leading ```json / ``` fence and trailing ``` if present.
-#[allow(dead_code)] // Private helper for `extract_openai_result`, consumed by Task 6.
 fn strip_json_fence(s: &str) -> &str {
     let t = s.trim();
     let t = t
@@ -198,7 +191,6 @@ impl Resolve for PinnedResolver {
 
 /// Request timeout: parity with OLLAMA_TIMEOUT_SECS (120s). The reasoner holds
 /// the evolve_lock during a tick, so a hung call self-DoSes the tick (spec R6).
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
 const CLOUD_TIMEOUT_SECS: u64 = 120;
 
 /// The one hardened blocking client (connection pool + SSRF resolver + no
@@ -207,7 +199,6 @@ const CLOUD_TIMEOUT_SECS: u64 = 120;
 /// Returns `None` if the client cannot be built — fail-closed: no hardened
 /// client means no egress (Task 6 maps `None` to a retryable no-op tick),
 /// never a silent fall-back to an un-pinned, redirect-following default client.
-#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
 pub(crate) fn blocking_client() -> Option<&'static reqwest::blocking::Client> {
     static CLIENT: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
     CLIENT
@@ -221,6 +212,163 @@ pub(crate) fn blocking_client() -> Option<&'static reqwest::blocking::Client> {
                 .ok() // build failure -> None -> no client -> no egress (fail-closed)
         })
         .as_ref()
+}
+
+/// Which cloud provider arm to use. Canonical definition; `engine::reason`
+/// re-exports it for config plumbing (Task 9).
+// Variants are only constructed by `new`'s callers (Task 9) + the tests, so the
+// bin target sees them as never-constructed until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudProvider {
+    Anthropic,
+    OpenAiCompat,
+}
+
+/// Vault key names — MUST match the chat-provider names in `llm_stream.rs`
+/// (the reasoner SHARES the chat key; the R1 consent binds its fingerprint so a
+/// rotation/provider-change re-consents). Keep these strings in sync.
+const ANTHROPIC_KEY_NAME: &str = "anthropic_api_key";
+const OPENAI_COMPAT_KEY_NAME: &str = "openai_compat_api_key";
+const ANTHROPIC_HOST: &str = "api.anthropic.com";
+
+/// The desktop-side cloud reasoner (spec §8). Reads the provider key from the
+/// vault AT CALL TIME (header-only, never stored on the struct, never logged),
+/// connects via the hardened blocking client, and returns parsed structured
+/// JSON — or a body-scrubbed `BossclawError::Reasoner` (a retryable no-op tick).
+// `new` is the only non-test entry point and lands in Task 9 (ConfigReasonerProvider);
+// until then the whole graph (this struct, its methods, and the request/extract/client
+// helpers they transitively reach) is unreferenced in the bin target. This single allow
+// on the struct + the one on the inherent impl below cover it without per-helper allows.
+#[allow(dead_code)]
+pub struct CloudReasoner {
+    provider: CloudProvider,
+    model: String,
+    /// OpenAI-compat only; already HTTPS-normalized + host-screened at config-set (Task 12).
+    base_url: Option<String>,
+    model_id: String,
+}
+
+#[allow(dead_code)] // See the struct note: covers new + methods + transitively the egress helpers until Task 9.
+impl CloudReasoner {
+    pub fn new(provider: CloudProvider, model: String, base_url: Option<String>) -> Self {
+        let prefix = match provider {
+            CloudProvider::Anthropic => "anthropic",
+            CloudProvider::OpenAiCompat => "openai-compat",
+        };
+        let model_id = format!("{prefix}:{model}");
+        Self { provider, model, base_url, model_id }
+    }
+
+    fn key_name(&self) -> &'static str {
+        match self.provider {
+            CloudProvider::Anthropic => ANTHROPIC_KEY_NAME,
+            CloudProvider::OpenAiCompat => OPENAI_COMPAT_KEY_NAME,
+        }
+    }
+
+    /// Read the provider key from the vault at CALL time (never stored on self,
+    /// never logged). Empty/missing/error -> Err (fail-closed).
+    fn read_key(&self) -> Result<String, BossclawError> {
+        match crate::vault::secret_get_cached(self.key_name()) {
+            Ok(Some(k)) if !k.trim().is_empty() => Ok(k),
+            Ok(_) => Err(BossclawError::Reasoner("cloud reasoner key missing in vault".into())),
+            Err(_) => Err(BossclawError::Reasoner("cloud reasoner key read failed".into())),
+        }
+    }
+
+    fn anthropic_complete(
+        &self,
+        key: &str,
+        system: &str,
+        prompt: &str,
+        schema: &Value,
+    ) -> Result<Value, BossclawError> {
+        let client = blocking_client()
+            .ok_or_else(|| BossclawError::Reasoner("cloud reasoner client unavailable".into()))?;
+        // Anthropic is pinned to the literal host; base_url is IGNORED (spec R2).
+        let endpoint = format!("https://{ANTHROPIC_HOST}/v1/messages");
+        let body = build_anthropic_request(&self.model, system, prompt, schema);
+        let resp = client
+            .post(&endpoint)
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .map_err(|e| BossclawError::Reasoner(format!("anthropic transport: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(classify_cloud_error(status.as_u16())); // body dropped (R3)
+        }
+        let payload: Value = resp
+            .json()
+            .map_err(|e| BossclawError::Reasoner(format!("anthropic response not JSON: {e}")))?;
+        extract_anthropic_result(&payload)
+    }
+
+    fn openai_complete(
+        &self,
+        key: &str,
+        system: &str,
+        prompt: &str,
+        schema: &Value,
+    ) -> Result<Value, BossclawError> {
+        let client = blocking_client()
+            .ok_or_else(|| BossclawError::Reasoner("cloud reasoner client unavailable".into()))?;
+        let base = self
+            .base_url
+            .as_deref()
+            .ok_or_else(|| BossclawError::Reasoner("openai-compat base_url missing".into()))?;
+        let endpoint = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+
+        let send = |fallback: bool| -> Result<(reqwest::StatusCode, Value), BossclawError> {
+            let body = build_openai_request(&self.model, system, prompt, schema, fallback);
+            let resp = client
+                .post(&endpoint)
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| BossclawError::Reasoner(format!("openai transport: {e}")))?;
+            let status = resp.status();
+            if status.is_success() {
+                let v: Value = resp
+                    .json()
+                    .map_err(|e| BossclawError::Reasoner(format!("openai response not JSON: {e}")))?;
+                Ok((status, v))
+            } else {
+                // Drain body for status only; classified later. Body dropped (R3).
+                Ok((status, Value::Null))
+            }
+        };
+
+        // Primary json_schema; on 400/404/422 retry once with json_object (R7).
+        let (status, payload) = send(false)?;
+        let (status, payload) = if matches!(status.as_u16(), 400 | 404 | 422) {
+            send(true)?
+        } else {
+            (status, payload)
+        };
+        if !status.is_success() {
+            return Err(classify_cloud_error(status.as_u16()));
+        }
+        extract_openai_result(&payload)
+    }
+}
+
+impl Reasoner for CloudReasoner {
+    fn complete_json(&self, system: &str, prompt: &str, schema: &Value) -> Result<Value, BossclawError> {
+        let key = self.read_key()?;
+        match self.provider {
+            CloudProvider::Anthropic => self.anthropic_complete(&key, system, prompt, schema),
+            CloudProvider::OpenAiCompat => self.openai_complete(&key, system, prompt, schema),
+        }
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
 }
 
 #[cfg(test)]
@@ -352,5 +500,37 @@ mod tests {
             .unwrap();
             assert!(built);
         });
+    }
+
+    #[test]
+    fn cloud_reasoner_model_id_is_provider_qualified() {
+        let a = CloudReasoner::new(CloudProvider::Anthropic, "claude-sonnet-4-6".into(), None);
+        assert_eq!(a.model_id(), "anthropic:claude-sonnet-4-6");
+        let o = CloudReasoner::new(
+            CloudProvider::OpenAiCompat,
+            "gpt-5-mini".into(),
+            Some("https://api.example.com".into()),
+        );
+        assert_eq!(o.model_id(), "openai-compat:gpt-5-mini");
+    }
+
+    #[test]
+    fn cloud_reasoner_missing_key_fails_closed() {
+        // No vault key present -> complete_json returns Err (never a panic, never egress).
+        let r = CloudReasoner::new(CloudProvider::Anthropic, "claude-sonnet-4-6".into(), None);
+        let schema = bossclaw_core::reason::adjudication_schema();
+        let out = r.complete_json("sys", "prompt", &schema);
+        assert!(out.is_err());
+    }
+
+    #[ignore = "live network; needs a real provider key in the vault"]
+    #[test]
+    fn cloud_reasoner_live_roundtrip() {
+        let r = CloudReasoner::new(CloudProvider::Anthropic, "claude-sonnet-4-6".into(), None);
+        let schema = bossclaw_core::reason::adjudication_schema();
+        let out = r
+            .complete_json("Return the chosen id.", "candidates: [a]. text: a", &schema)
+            .unwrap();
+        assert!(out.get("match").is_some());
     }
 }
