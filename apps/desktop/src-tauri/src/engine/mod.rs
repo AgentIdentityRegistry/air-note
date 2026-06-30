@@ -1,6 +1,7 @@
 //! The engine spine (SP1): a single live, encrypted `EventLog` wired into the desktop.
 //! See docs/superpowers/specs/2026-06-22-desktop-engine-spine-design.md.
 
+pub mod cloud_reasoner;
 pub mod embed;
 pub mod keystore;
 pub mod ollama_probe;
