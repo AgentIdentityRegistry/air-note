@@ -228,8 +228,8 @@ pub enum CloudProvider {
 /// Vault key names — MUST match the chat-provider names in `llm_stream.rs`
 /// (the reasoner SHARES the chat key; the R1 consent binds its fingerprint so a
 /// rotation/provider-change re-consents). Keep these strings in sync.
-const ANTHROPIC_KEY_NAME: &str = "anthropic_api_key";
-const OPENAI_COMPAT_KEY_NAME: &str = "openai_compat_api_key";
+pub(crate) const ANTHROPIC_KEY_NAME: &str = "anthropic_api_key";
+pub(crate) const OPENAI_COMPAT_KEY_NAME: &str = "openai_compat_api_key";
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 
 /// The desktop-side cloud reasoner (spec §8). Reads the provider key from the

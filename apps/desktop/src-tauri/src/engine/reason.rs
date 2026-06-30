@@ -88,17 +88,25 @@ impl ConfigReasonerProvider {
     }
 
     fn build(config: &ReasonerConfig) -> Arc<dyn Reasoner> {
-        match config.mode {
-            ReasonerMode::Local => {
-                // Exactly as today: model id stays the hardcoded local tag (R8).
-                Arc::new(bossclaw_core::OllamaReasoner::new(REASONER_MODEL_ID))
-            }
-            ReasonerMode::Cloud => Arc::new(CloudReasoner::new(
-                config.provider,
-                config.model.clone(),
-                config.base_url.clone(),
-            )),
+        build_reasoner(config)
+    }
+}
+
+/// The ONE reasoner builder (Local→Ollama with the pinned local tag; Cloud→`CloudReasoner`).
+/// `ConfigReasonerProvider::build` and the R5 enable-with-test-key flow (`engine/mod.rs`'s
+/// `enable_cloud_reasoner`) both go through this, so a one-shot probe reasoner is byte-for-byte
+/// what the scheduler would later build. Consumed by Task 9 (provider) + Task 12 (enable flow).
+pub(crate) fn build_reasoner(config: &ReasonerConfig) -> Arc<dyn Reasoner> {
+    match config.mode {
+        ReasonerMode::Local => {
+            // Exactly as today: model id stays the hardcoded local tag (R8).
+            Arc::new(bossclaw_core::OllamaReasoner::new(REASONER_MODEL_ID))
         }
+        ReasonerMode::Cloud => Arc::new(CloudReasoner::new(
+            config.provider,
+            config.model.clone(),
+            config.base_url.clone(),
+        )),
     }
 }
 

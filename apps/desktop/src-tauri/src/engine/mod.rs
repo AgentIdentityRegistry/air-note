@@ -946,6 +946,164 @@ impl EngineHandle {
             .await
             .unwrap_or(false)
     }
+
+    // ---- Cloud reasoner (Milestone D Phase 2a, spec R1/R5/R8) ----
+    // Consumed by Task 12b (IPC commands) + Task 10 (scheduler). The `#[allow(dead_code)]`
+    // on each reflects that this file has no in-crate caller until those tasks wire main.rs.
+
+    /// The persisted reasoner config, or the fail-SAFE Local default on ANY error (R8 — a
+    /// missing/garbage/unreadable record NEVER flips the brain to cloud egress). Gated read.
+    /// Consumed by Task 12b (`reasoner_config` command) + Task 10 (scheduler mode read).
+    #[allow(dead_code)] // Consumed by Task 12b/T10.
+    pub async fn reasoner_config_or_default(&self, onboarded: bool) -> reason::ReasonerConfig {
+        let log = match self.get_or_open(onboarded).await {
+            Ok(l) => l,
+            Err(_) => return reason::ReasonerConfig::default(),
+        };
+        let raw = spawn_blocking(move || log.reasoner_config_json().ok().flatten())
+            .await
+            .unwrap_or(None);
+        parse_reasoner_config(raw)
+    }
+
+    /// Fingerprint of the vault key the given config's provider WOULD use, or `None` when no
+    /// non-empty key is stored. Binds the R1 consent to the exact key in the vault, so a
+    /// rotation/provider-change makes readiness fail until re-consent. Sync (cached vault read).
+    /// Consumed by Task 12b + the R5 enable flow below.
+    #[allow(dead_code)] // Consumed by Task 12b + enable_cloud_reasoner.
+    fn current_key_fingerprint(&self, config: &reason::ReasonerConfig) -> Option<String> {
+        let key_name = match config.provider {
+            cloud_reasoner::CloudProvider::Anthropic => cloud_reasoner::ANTHROPIC_KEY_NAME,
+            cloud_reasoner::CloudProvider::OpenAiCompat => cloud_reasoner::OPENAI_COMPAT_KEY_NAME,
+        };
+        match crate::vault::secret_get_cached(key_name) {
+            Ok(Some(k)) if !k.trim().is_empty() => Some(key_fingerprint(&k)),
+            _ => None,
+        }
+    }
+
+    /// The CLOUD readiness gate, fail-closed to false on ANY error. Reads config + signed
+    /// consent + the current vault key fp and defers to `reason::reasoner_ready`. NOTE: this
+    /// passes `local_probe_ready = false`, so for a Local config it returns false — LOCAL
+    /// readiness stays the scheduler's Ollama probe (Task 10); this method exists to answer
+    /// "is the consented CLOUD provider ready right now?" (spec R1). Gated read.
+    /// Consumed by Task 12b (`reasoner_ready` command).
+    #[allow(dead_code)] // Consumed by Task 12b.
+    pub async fn reasoner_ready_or_false(&self, onboarded: bool) -> bool {
+        let log = match self.get_or_open(onboarded).await {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        let (raw_config, consent) = spawn_blocking(move || {
+            (
+                log.reasoner_config_json().ok().flatten(),
+                log.cloud_reasoner_consent_json().ok().flatten(),
+            )
+        })
+        .await
+        .unwrap_or((None, None));
+        let config = parse_reasoner_config(raw_config);
+        let fp = self.current_key_fingerprint(&config);
+        reason::reasoner_ready(&config, consent.as_ref(), fp.as_deref(), false)
+    }
+
+    /// Persist the NON-security reasoner config (mode/provider/model/base_url). Does NOT grant
+    /// consent — flipping to cloud still requires `enable_cloud_reasoner`'s tested opt-in (R1).
+    /// Gated + signed (mirrors `set_mandates_enabled`). Consumed by Task 12b (`set_reasoner_config`).
+    #[allow(dead_code)] // Consumed by Task 12b.
+    pub async fn set_reasoner_config(&self, onboarded: bool, config: serde_json::Value) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_reasoner_config(config).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// The R5 "test-key-on-enable" flow: prove the provider key works with ONE trivial probe
+    /// (no memory/file content) BEFORE writing consent, then sign BOTH the config and the
+    /// consent record (binding provider/host/key-fp). A probe failure (bad key, unreachable,
+    /// missing key) returns a classified error and writes NOTHING — there is no path to enable
+    /// cloud on a bad key (spec R5). Gated + signed. Consumed by Task 12b (`enable_cloud_reasoner`).
+    #[allow(dead_code)] // Consumed by Task 12b.
+    pub async fn enable_cloud_reasoner(&self, onboarded: bool, config: serde_json::Value) -> Result<(), EngineOpError> {
+        // Gate first (mirrors the sibling switches): no probe / no write before onboarding.
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+
+        let parsed = parse_reasoner_config(Some(config.clone()));
+        // One-shot reasoner, byte-identical to what the scheduler would later build (R5).
+        let reasoner = reason::build_reasoner(&parsed);
+        let schema = bossclaw_core::reason::adjudication_schema();
+        // Trivial probe: a fixed prompt with NO memory/file bytes. With no key in the vault this
+        // fails fast inside `read_key` BEFORE any network call (the Task 12b IPC-test path).
+        let probe = spawn_blocking(move || {
+            reasoner.complete_json("Reply with the JSON {\"match\":\"ok\"}.", "candidates: [ok]. text: ok", &schema)
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?;
+        // Bad key / unreachable / parse failure -> classified error, DO NOT enable.
+        probe.map_err(|e| EngineOpError::Core(e.to_string()))?;
+
+        // Probe succeeded: build the consent record bound to THIS provider/host/key-fp, then
+        // sign config + consent together. `config_host` is empty-on-unparseable (the readiness
+        // check would then reject) and the fp mirrors `current_key_fingerprint`.
+        let host = reason::config_host(&parsed).unwrap_or_default();
+        let fp = self.current_key_fingerprint(&parsed).unwrap_or_default();
+        let provider_wire = match parsed.provider {
+            cloud_reasoner::CloudProvider::Anthropic => "anthropic",
+            cloud_reasoner::CloudProvider::OpenAiCompat => "openai-compat",
+        };
+        let consent = serde_json::json!({
+            "provider": provider_wire,
+            "base_url_host": host,
+            "key_fingerprint": fp,
+            "consented_at": chrono::Utc::now().to_rfc3339(),
+        });
+        spawn_blocking(move || -> Result<(), EngineOpError> {
+            log.set_reasoner_config(config).map_err(|e| EngineOpError::Core(e.to_string()))?;
+            log.set_cloud_reasoner_consent(consent).map_err(|e| EngineOpError::Core(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+}
+
+/// Map the stored reasoner-config JSON (`{mode, provider, model, base_url}`) to a typed
+/// `ReasonerConfig`. Fail-SAFE per field (R8): `None`, a non-object, or any missing/garbage
+/// field falls back to the Local default for that part — unknown/garbage NEVER flips to cloud.
+/// `mode`: `"cloud"` → Cloud, anything else → Local. `provider`: `"openai-compat"` → OpenAiCompat,
+/// anything else → Anthropic. Consumed by the engine reasoner reads above + their tests.
+fn parse_reasoner_config(raw: Option<serde_json::Value>) -> reason::ReasonerConfig {
+    use reason::{ReasonerConfig, ReasonerMode};
+    let default = ReasonerConfig::default();
+    let Some(obj) = raw.as_ref().and_then(|v| v.as_object()) else {
+        return default;
+    };
+    let mode = match obj.get("mode").and_then(|v| v.as_str()) {
+        Some("cloud") => ReasonerMode::Cloud,
+        _ => ReasonerMode::Local,
+    };
+    let provider = match obj.get("provider").and_then(|v| v.as_str()) {
+        Some("openai-compat") => cloud_reasoner::CloudProvider::OpenAiCompat,
+        _ => cloud_reasoner::CloudProvider::Anthropic,
+    };
+    let model = obj
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or(default.model);
+    // A JSON `null` (or absent / non-string) base_url stays `None`.
+    let base_url = obj.get("base_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+    ReasonerConfig { mode, provider, model, base_url }
+}
+
+/// An 8-hex-char fingerprint of a provider key: the first 4 bytes of its SHA-256, hex-encoded.
+/// The R1 signed consent binds this so a key rotation (different fp) forces re-consent. The
+/// key itself is never stored or logged — only this digest. Consumed by the engine reads above.
+pub(crate) fn key_fingerprint(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(key.as_bytes())[..4])
 }
 
 /// Truncate `s` in place to at most `max` bytes WITHOUT splitting a UTF-8 char (plain
@@ -1014,6 +1172,24 @@ mod tests {
         let v = e.embed(&["hello".to_string()]).unwrap();
         assert_eq!(v[0].len(), 8);
         assert_eq!(e.model_id(), "mock-v1");
+    }
+
+    #[test]
+    fn parse_reasoner_config_defaults_local_on_garbage() {
+        use crate::engine::reason::ReasonerMode;
+        assert!(matches!(parse_reasoner_config(None).mode, ReasonerMode::Local));
+        assert!(matches!(parse_reasoner_config(Some(serde_json::json!("not-an-object"))).mode, ReasonerMode::Local));
+        let c = parse_reasoner_config(Some(serde_json::json!({"mode":"cloud","provider":"anthropic","model":"claude-sonnet-4-6","base_url":null})));
+        assert!(matches!(c.mode, ReasonerMode::Cloud));
+        assert_eq!(c.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn key_fingerprint_is_stable_8_hex() {
+        let fp = key_fingerprint("sk-test-abc");
+        assert_eq!(fp.len(), 8);
+        assert_eq!(fp, key_fingerprint("sk-test-abc")); // deterministic
+        assert_ne!(fp, key_fingerprint("sk-test-xyz")); // different key -> different fp
     }
 
     /// The engine's defense-in-depth loud-gate (`execute_write_inner`) refuses a loud write with a
