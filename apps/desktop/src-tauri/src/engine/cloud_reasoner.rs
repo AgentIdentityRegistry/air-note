@@ -6,6 +6,8 @@
 // Implemented task-by-task in the Phase 2a plan.
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use bossclaw_core::BossclawError;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -20,9 +22,8 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// metadata, or if the set is empty. Used at connect time to close the
 /// DNS-rebind race that a pre-flight host check cannot (spec §8 R2).
 // Exercised by `tests::screen_addrs_rejects_any_blocked` and called from
-// `PinnedResolver::resolve`; the bin target compiles without `cfg(test)`, where
-// `PinnedResolver` is itself dead until the Task 5 client wires it in.
-#[allow(dead_code)]
+// `PinnedResolver::resolve`, which `blocking_client` installs — that reachability
+// keeps this live in the bin target (no `dead_code` allow needed).
 fn screen_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, BoxError> {
     if addrs.is_empty() {
         return Err("cloud reasoner DNS resolved to no addresses".into());
@@ -172,7 +173,6 @@ fn strip_json_fence(s: &str) -> &str {
 /// `is_blocked_ip` before any socket is opened. This is the connect-time pin
 /// that closes the rebind race (`web_access.rs:171` documents the residual gap
 /// this fills); installed on the blocking client built in Task 5.
-#[allow(dead_code)] // Constructed by the Task 5 client builder (Arc::new(PinnedResolver)).
 struct PinnedResolver;
 
 impl Resolve for PinnedResolver {
@@ -194,6 +194,33 @@ impl Resolve for PinnedResolver {
             Ok(iter)
         })
     }
+}
+
+/// Request timeout: parity with OLLAMA_TIMEOUT_SECS (120s). The reasoner holds
+/// the evolve_lock during a tick, so a hung call self-DoSes the tick (spec R6).
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
+const CLOUD_TIMEOUT_SECS: u64 = 120;
+
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
+static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+/// The one hardened blocking client (connection pool + SSRF resolver + no
+/// redirects + timeout), built lazily on first use. First use is always on a
+/// `spawn_blocking` thread, so no async runtime is captured (spec R6).
+#[allow(dead_code)] // Consumed by the Task 6 CloudReasoner when it calls blocking_client.
+pub(crate) fn blocking_client() -> &'static reqwest::blocking::Client {
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .dns_resolver(Arc::new(PinnedResolver))
+            // LLM APIs never legitimately redirect; never forward auth headers across hops.
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(CLOUD_TIMEOUT_SECS))
+            .build()
+            // A client we cannot build means we cannot egress: the safe direction.
+            // Builder failure is effectively unreachable (no proxy/TLS config that
+            // can fail); fall back to a default client only to keep this infallible.
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
 }
 
 #[cfg(test)]
@@ -309,5 +336,21 @@ mod tests {
             "choices": [ { "message": { "content": "sorry, I cannot" } } ]
         });
         assert!(extract_openai_result(&junk).is_err());
+    }
+
+    #[test]
+    fn blocking_client_builds_under_runtime_without_panic() {
+        // Reproduce the engine's call context: a tokio runtime + spawn_blocking.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let built = tokio::task::spawn_blocking(|| {
+                // get_or_init must not panic with "runtime within a runtime".
+                let _client = blocking_client();
+                true
+            })
+            .await
+            .unwrap();
+            assert!(built);
+        });
     }
 }
