@@ -4,9 +4,11 @@
 
 **Goal:** Build the Brain-tab UI that lets a user turn the evolve reasoner from Local (Ollama) to Cloud — a Local|Cloud selector, provider/model/key entry, an explicit blunt consent gate, and a persistent "your memory leaves this device" banner — plus the boot reseed that makes a Cloud choice survive restart.
 
-**Architecture:** The Phase 2a backend is complete and merged (HEAD `1eb4068`): the Rust commands `engine_get_reasoner_config`, `engine_set_reasoner_config`, and `engine_enable_cloud_reasoner` exist and are registered (`main.rs:213-218`); `reasoner_ready` / signed-log consent / SSRF pin all live behind them. 2b is **frontend + two thin wiring tasks**. We add TypeScript bindings, a pure view-model module (unit-tested in isolation, matching `evolveStatus.ts`), three small React components wired by dependency injection (matching the repo's `MainSearch`/`ReviewPanel` test idiom — **no `mockIPC`**), the `MemoryPanel` integration, and the `main.rs` boot reseed of the reasoner-config cell.
+**Architecture:** The Phase 2a backend is complete and merged (main `1eb4068`): the Rust commands `engine_get_reasoner_config`, `engine_set_reasoner_config`, and `engine_enable_cloud_reasoner` exist and are registered (`main.rs:213-218`); `reasoner_ready` / signed-log consent / SSRF pin all live behind them. 2b is **frontend + two thin Rust wiring edits**. We add TypeScript bindings, a pure view-model module (unit-tested in isolation, matching `evolveStatus.ts`), three small React components wired by dependency injection (matching the repo's `MainSearch`/`CommandPalette` test idiom — **no `mockIPC`**), the `MemoryPanel` integration, and the `main.rs` boot reseed of the reasoner-config cell.
 
-**Tech Stack:** React 18 + TypeScript (Vite), Tauri 2 (`@tauri-apps/api/core` `invoke`), vitest + @testing-library/react (jsdom), Rust (tauri commands), `cargo`.
+**Tech Stack:** React 18 + TypeScript (Vite), Tauri 2 (`@tauri-apps/api/core` `invoke`), vitest + @testing-library/react (jsdom), Rust (tauri commands, `tokio`), `cargo`.
+
+**Plan status: Rev 2 — critic + security reviewed, fixes folded in.** Security: **Risk LOW**, 0 Critical/High/Medium — "can 2b egress without consent? **No**" (the egress gate is the scheduler reading the *signed-log* `reasoner_ready`, which only `enable_cloud_reasoner` can satisfy after a test-key probe; the webview cannot forge it). Critic: **SHIP-WITH-FIXES** — design + all backend claims verified; the two compile-blockers it found (async-called-from-sync in Task 1) and the canEnable double-gate are fixed below. See "Review outcomes".
 
 ---
 
@@ -14,105 +16,141 @@
 
 **The two-command distinction (get this right — it is the security model):**
 - `engine_set_reasoner_config(config)` — persists `{mode,provider,model,base_url}` to the signed log. Does **NOT** grant consent and does **NOT** make cloud `ready`. Used to switch **back to Local** (`mode:"local"`), which is always safe.
-- `engine_enable_cloud_reasoner(config)` — the R5 flow: validates, runs **one** trivial test-key probe against the provider, and **only on success** signs the consent record binding `{provider, host, key-fingerprint}`. This is the **only** way cloud becomes `ready`. The consent modal calls this. A bad/expired key makes this reject (and nothing is enabled).
+- `engine_enable_cloud_reasoner(config)` — the R5 flow: validates, runs **one** trivial test-key probe against the provider, and **only on success** signs the consent record binding `{provider, host, key-fingerprint}`. This is the **only** way cloud becomes `ready`. The consent modal calls this. A bad/expired key makes this reject (and nothing is enabled). *(Verified: `enable_cloud_reasoner` at `engine/mod.rs:1045` does `probe…?` before any signed write; the command updates the in-memory cell only after the `?` succeeds.)*
 
-**`ReasonerConfigDto.ready` is authoritative readiness.** The backend's `reasoner_ready_or_false` already returns: Local → Ollama reachable+model present; Cloud → consent record exists AND matches current provider/host/key-fingerprint. The frontend gate for the Evolve buttons becomes `cfg.ready` (replacing `ollamaReady`). `ollamaStatus` stays only for the Local *detail* text.
+**The egress gate is backend, not UI.** The background evolve scheduler computes `reasoner_ready_or_false` from the **signed log** every tick (`scheduler.rs:104-113`) and only runs `evolve_once` when ready. A buggy/malicious webview calling commands directly still cannot egress without a valid signed consent record. The UI's job is to *drive* that backend gate honestly — it is not itself the gate.
 
-**snake_case footgun.** Tauri renames the camelCase *argument name* (`config`) to the snake_case Rust param, but it does **NOT** touch the *keys inside* the object. So the config object's keys MUST be snake_case: `base_url`, never `baseUrl`. (An existing Rust IPC test, `engine_set_reasoner_config_binds_camelcase_and_persists` at `commands/engine.rs:926-956`, pins this.)
+**`ReasonerConfigDto.ready` is authoritative readiness.** `reasoner_ready_or_false` returns: Local → Ollama reachable+model present; Cloud → consent record exists AND matches current provider/host/key-fingerprint. The frontend gate for the Evolve buttons becomes `cfg.ready` (replacing `ollamaReady`); never recompute readiness client-side. `ollamaStatus` stays only for the Local *detail* text.
 
-**Provider string literals.** The DTO documents `provider` as `"anthropic" | "openai-compat"`. Task 2 includes a verification step against the Rust `CloudProvider` (de)serialization (`engine/cloud_reasoner.rs:220-223`, `provider_str` at `engine/reason.rs:126-131`) — use whatever literal those actually emit; this plan assumes `"anthropic"` / `"openai-compat"`.
+**Re-consent is enforced by the backend binding (not the UI).** The consent record binds `provider + host + key-fingerprint`. Changing provider / base_url-host / rotating the key makes `reasoner_ready` mismatch → `ready=false` → cloud silently (and safely) stops. **Model is deliberately NOT part of the binding** — switching model under the same provider/host/key keeps egress to the same consented destination/credential (acceptable; the consent copy names the provider, not a model). The UI must *surface* a re-consent prompt when the user diverges (Low-2 fix in Task 6), but must not rely on a UI flag for safety.
 
-**Color tokens.** The repo enforces zero hardcoded colors (eslint + grep gate). Use only CSS variables that already exist in `styles.css`. This plan uses the tokens observed in `MemoryPanel.tsx`/`ReviewPanel.tsx`: `--error`, `--text-secondary`, `--text-tertiary`, `--surface-soft`, `--border-soft`. Task 4/5 include a step to confirm any token name against `styles.css` before committing.
+**snake_case footgun.** Tauri renames the camelCase *argument name* (`config`) to the snake_case Rust param, but does **NOT** touch the *keys inside* the object. The config object's keys MUST be snake_case: `base_url`, never `baseUrl`. (Pinned by the existing Rust IPC test `engine_set_reasoner_config_binds_camelcase_and_persists` at `commands/engine.rs:926-956`.) Note: the Rust `ReasonerConfigDto` has a stale doc comment mentioning "camelCase" but has **no** `#[serde(rename_all)]` — `base_url` is serialized literally. Trust the code, ignore that comment.
+
+**Provider/mode string literals (VERIFIED).** `provider`: `"anthropic"` / `"openai-compat"`; `mode`: `"local"` / `"cloud"`. These are the exact wire strings the signed-consent reader compares (`reason.rs:165`) and the writer emits — a TS/Rust drift would make `reasoner_ready` silently mismatch after enable. Confirmed against `provider_str` (`engine/reason.rs:126-131`) and `CloudProvider` serde (`engine/cloud_reasoner.rs:220-223`).
+
+**Color tokens (VERIFIED to exist in `styles.css`):** use only `--error`, `--text-secondary`, `--text-tertiary`, `--surface-soft`, `--border-soft`. The repo enforces zero hardcoded colors.
+
+**Tests = DI + pure modules, NOT `mockIPC`.** Zero `mockIPC` usage exists in the repo; the established idiom is prop-injection + `vi.fn()` (see `apps/desktop/src/shell/MainSearch.test.tsx` and `apps/desktop/src/search/CommandPalette.test.tsx`) and pure-logic modules tested directly (`apps/desktop/src/memory/evolveStatus.test.ts`). The consent-modal *component* pattern (inline `Card` + checkbox-gated button) is adapted from `apps/desktop/src/review/ReviewPanel.tsx:224-257` (that component has no test file — cite it only as a UI pattern).
 
 **Build/test commands:**
-- Frontend tests: `npm run test --workspace @bossclaw/desktop` (or `cd apps/desktop && npx vitest run`)
-- Typecheck: `npm run typecheck --workspace @bossclaw/desktop`
-- Lint: `npm run lint`
-- Rust: `cargo test -p bossclaw-core` and `cargo build -p air_agent_desktop` and `cargo clippy --all-targets -- -D warnings`
+- Frontend tests: `cd apps/desktop && npx vitest run` (or `npm run test --workspace @bossclaw/desktop`)
+- Typecheck: `npm run typecheck --workspace @bossclaw/desktop` · Lint: `npm run lint`
+- Rust: `cargo test -p air_agent_desktop`, `cargo build -p air_agent_desktop`, `cargo clippy --all-targets -- -D warnings`
 
-**Deferred (NOT in this plan — explicit, per spec §198-199 + 2a carryovers):** surfacing `EvolveReport.tainted_recall_snippets` to the webview and a live "N file-derived snippets" count in the banner; the Info-1 per-read consent signature re-verify; the `extract_openai_result` `tool_calls` fallback. The blunt consent copy already discloses the worst case, so the live count is a follow-up.
+**Deferred (NOT in this plan — explicit, per spec §198-199 + 2a carryovers):** surfacing `EvolveReport.tainted_recall_snippets` to the webview + a live "N file-derived snippets" count in the banner (the hook is genuinely write-only: defined `evolve.rs:65`, written `log.rs:5913`, no DTO read path); the Info-1 per-read consent signature re-verify; the `extract_openai_result` `tool_calls` fallback. The blunt consent copy already discloses the worst case.
+
+---
+
+## Review outcomes (Rev 2)
+
+- **Security review — Risk LOW.** 0 Critical/High/Medium; 3 Low (UX/clarity), 4 Info. Verified: egress is backend-enforced (scheduler + signed consent); key never returns to the webview (`vault_has` is bool-only, no `vault_get`); bad-key path is fail-closed (cell updated only after the `?`-guarded enable succeeds). Low-1 (banner timing), Low-2 (re-consent UX), Low-3 (client check is cosmetic) — all fixed below.
+- **Critic — SHIP-WITH-FIXES.** Design sound; all 6 backend claims TRUE; all CSS tokens exist; provider literals match; Tasks 2–7 compile. Fixed: **C1** (reseed called an `async fn` from the sync `.setup` → now `block_on` a tested helper), **C2** (Task 1 test was `#[test]` calling async + a nonexistent `test_engine()` → now `#[tokio::test]` using the real `test_vault_and_dir()`/`new_test_handle()` helpers), **M1** (test now exercises the actual cell-mutation wiring, not a pre-existing 2a contract), **M2** (canEnable no longer half-validates HTTPS — backend owns it). Minor file-path/line-number citations corrected.
 
 ---
 
 ## File Structure
 
-- **Modify** `apps/desktop/src-tauri/src/main.rs:65-96` — boot reseed of `reasoner_cfg` from the signed log (the documented TODO).
-- **Modify** `apps/desktop/src-tauri/src/engine/mod.rs` (or `engine/reason.rs`) — add a tested round-trip regression for restart persistence (Task 1).
-- **Modify** `apps/desktop/src/api/engine.ts` — add `ReasonerConfigDto`, `ReasonerConfigInput`, and the three bindings.
+- **Modify** `apps/desktop/src-tauri/src/engine/mod.rs` — add `reseed_reasoner_cell` helper + its `#[tokio::test]` (Task 1).
+- **Modify** `apps/desktop/src-tauri/src/main.rs:65-96` — `block_on` the reseed (the documented TODO).
+- **Modify** `apps/desktop/src/api/engine.ts` — add `ReasonerConfigDto`, `ReasonerConfigInput`, `ReasonerMode`, `CloudProvider`, and the three bindings.
 - **Create** `apps/desktop/src/api/engine.reasoner.test.ts` — binding payload-shape test (snake_case guard).
-- **Create** `apps/desktop/src/memory/reasonerView.ts` — pure view-model (labels, defaults, copy, payload builder, vault-key map).
-- **Create** `apps/desktop/src/memory/reasonerView.test.ts` — pure unit tests.
+- **Create** `apps/desktop/src/memory/reasonerView.ts` + `reasonerView.test.ts` — pure view-model.
 - **Create** `apps/desktop/src/memory/CloudEgressBanner.tsx` + `CloudEgressBanner.test.tsx`.
 - **Create** `apps/desktop/src/memory/CloudConsentModal.tsx` + `CloudConsentModal.test.tsx`.
 - **Create** `apps/desktop/src/memory/ReasonerConfigPanel.tsx` + `ReasonerConfigPanel.test.tsx`.
 - **Modify** `apps/desktop/src/memory/MemoryPanel.tsx` — fetch reasoner config, render the panel + banner, mode-aware copy, `cfg.ready` gate.
 
-Each component takes its `api`/data dependencies as **props** so it is testable without IPC; `MemoryPanel` injects the real `api/engine.ts` + `vault.ts` functions.
+Each component takes its `api`/data dependencies as **props** (testable without IPC); `MemoryPanel` injects the real `api/engine.ts` + `vault.ts` functions.
 
 ---
 
 ### Task 1: Boot reseed — a Cloud config survives restart (Rust)
 
-**Files:**
-- Modify: `apps/desktop/src-tauri/src/main.rs:65-96`
-- Test: `apps/desktop/src-tauri/src/engine/mod.rs` (engine unit tests module)
+The net-new behavior is "on boot, copy the signed-log config into the in-memory `reasoner_cfg` cell that the provider closure reads each tick." We extract that into a tested `async` helper (`reseed_reasoner_cell`) so the *wiring* — not just the pre-existing readback — is covered, and `block_on` it from the synchronous `.setup` closure.
 
-- [ ] **Step 1: Write the failing test** (in the `#[cfg(test)] mod tests` of `engine/mod.rs`; mirror the existing 2a reasoner tests — find one with `rg "fn reasoner_" apps/desktop/src-tauri/src/engine/mod.rs` and copy its harness for building a temp `EngineHandle`)
+**Files:**
+- Modify: `apps/desktop/src-tauri/src/engine/mod.rs` (add the helper near the other reasoner methods; add the test to the existing `#[cfg(test)] mod tests`)
+- Modify: `apps/desktop/src-tauri/src/main.rs:65-96`
+
+- [ ] **Step 1: Write the failing test** — append to the `#[cfg(test)] mod tests` in `engine/mod.rs`. Use the existing harness helpers `test_vault_and_dir()` (`mod.rs:1202`) and `new_test_handle()` (`mod.rs:1207`). All `EngineHandle` reasoner methods are `async`, so this is a `#[tokio::test]`:
 
 ```rust
-#[test]
-fn signed_cloud_config_is_what_boot_reseed_reads_back() {
-    // Restart persistence contract (Phase 2b): a Cloud config signed in a prior
-    // session must be exactly what main.rs reseeds the reasoner cell with on boot.
-    let h = test_engine(); // existing helper: builds an EngineHandle on a temp dir
-    let onboarded = true;
+#[tokio::test]
+async fn reseed_reasoner_cell_loads_signed_cloud_config_into_the_cell() {
+    // Restart-persistence WIRING (Phase 2b): on boot, reseed_reasoner_cell must copy
+    // the signed-log config into the in-memory cell the provider closure reads.
+    let (vault, dir) = test_vault_and_dir();
+    let h = new_test_handle(vault, &dir);
+    let cell = std::sync::Mutex::new(crate::engine::reason::ReasonerConfig::default());
+    assert_eq!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Local);
 
-    // Default before any signed config = Local.
-    assert_eq!(h.reasoner_config_or_default(onboarded).mode, ReasonerMode::Local);
-
-    // Sign a cloud config (no consent needed for set_reasoner_config).
-    let cfg = serde_json::json!({
+    // Sign a cloud config (set_reasoner_config grants NO consent — fine for this test).
+    h.set_reasoner_config(true, serde_json::json!({
         "mode": "cloud", "provider": "anthropic",
         "model": "claude-sonnet-4-6", "base_url": null
-    });
-    h.set_reasoner_config(onboarded, cfg).expect("set");
+    })).await.expect("set cloud config");
 
-    // The boot reseed reads this back verbatim.
-    let seeded = h.reasoner_config_or_default(onboarded);
-    assert_eq!(seeded.mode, ReasonerMode::Cloud);
-    assert_eq!(seeded.model, "claude-sonnet-4-6");
+    // The boot reseed copies it into the cell.
+    super::reseed_reasoner_cell(&h, &cell, true).await;
+
+    let got = cell.lock().unwrap().clone();
+    assert_eq!(got.mode, crate::engine::reason::ReasonerMode::Cloud);
+    assert_eq!(got.model, "claude-sonnet-4-6");
 }
 ```
 
-- [ ] **Step 2: Run test to verify it passes-or-fails honestly**
+- [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p air_agent_desktop signed_cloud_config_is_what_boot_reseed_reads_back -- --nocapture`
-Expected: PASS if `set_reasoner_config`/`reasoner_config_or_default` signatures match; if it FAILS to compile, fix the test's call shape against the real signatures (`engine/mod.rs:978-987`) — do **not** change production code to fit a wrong test. (This test guards the contract the reseed depends on; the wiring itself is Step 3.)
+Run: `cargo test -p air_agent_desktop reseed_reasoner_cell_loads_signed_cloud_config_into_the_cell 2>&1 | tail -15`
+Expected: FAIL to compile — `cannot find function reseed_reasoner_cell in module super` (helper not added yet). (If the harness helper names differ, align with the real ones at `mod.rs:1200-1213`.)
 
-- [ ] **Step 3: Wire the reseed in `main.rs`** — insert immediately after the engine block closes (after the `};` at `main.rs:96`, before the scheduler spawn at `:101`):
+- [ ] **Step 3: Add the helper** at module scope in `engine/mod.rs` (alongside the other `#[cfg(unix)]` engine items, outside the `impl EngineHandle`):
 
 ```rust
-            // Phase 2b: re-seed the reasoner-config cell from the signed log so a
-            // Cloud config chosen in a previous session survives restart (the cell
-            // otherwise starts at the Local default each boot — see TODO above).
-            #[cfg(unix)]
-            {
-                let onboarded = identity_store.is_onboarded();
-                let seeded = engine.reasoner_config_or_default(onboarded);
-                if let Ok(mut cell) = reasoner_cfg.lock() {
-                    *cell = seeded;
-                }
-            }
+/// Phase 2b boot reseed: copy the persisted (signed-log) reasoner config into the
+/// in-memory cell the provider closure reads each tick, so a Cloud choice survives
+/// restart. `async` because it reads the engine's signed log; `main.rs` `block_on`s it.
+/// Fail-safe: a read with no signed config (or `onboarded=false`) yields the Local default.
+#[cfg(unix)]
+pub(crate) async fn reseed_reasoner_cell(
+    engine: &EngineHandle,
+    cell: &std::sync::Mutex<reason::ReasonerConfig>,
+    onboarded: bool,
+) {
+    let seeded = engine.reasoner_config_or_default(onboarded).await;
+    if let Ok(mut guard) = cell.lock() {
+        *guard = seeded;
+    }
+}
 ```
 
-- [ ] **Step 4: Update the now-stale TODO comment** at `main.rs:65-69` — replace "is deferred to Phase 2b" with "is done just below (Phase 2b)". Keep the rest of the comment.
+- [ ] **Step 4: Run test to verify it passes**
 
-- [ ] **Step 5: Build + test**
+Run: `cargo test -p air_agent_desktop reseed_reasoner_cell_loads_signed_cloud_config_into_the_cell 2>&1 | grep "test result:"`
+Expected: PASS (1 passed).
+
+- [ ] **Step 5: Wire it into `main.rs`** — insert immediately after the engine block closes (after the `};` at `main.rs:96`, before the scheduler spawn at `:101`). `.setup` is synchronous, so `block_on` the async helper (a single bounded local SQLite read; the webview does not exist yet, so the cell lock is uncontended — no race):
+
+```rust
+            // Phase 2b: re-seed the reasoner-config cell from the signed log so a Cloud
+            // config chosen in a previous session survives restart. `.setup` is sync, so
+            // block on the async read (one local SQLite read, before the webview exists).
+            #[cfg(unix)]
+            tauri::async_runtime::block_on(crate::engine::reseed_reasoner_cell(
+                &engine,
+                &reasoner_cfg,
+                identity_store.is_onboarded(),
+            ));
+```
+
+- [ ] **Step 6: Update the now-stale TODO comment** at `main.rs:65-69` — replace the sentence "re-seeding it from the persisted signed log after onboarding (so a Cloud config survives restart) is deferred to Phase 2b" with "re-seeding it from the persisted signed log on boot (so a Cloud config survives restart) is done just below (Phase 2b)". Keep the rest.
+
+- [ ] **Step 7: Build + reasoner tests**
 
 Run: `cargo build -p air_agent_desktop 2>&1 | tail -5` then `cargo test -p air_agent_desktop reasoner 2>&1 | grep "test result:"`
 Expected: build OK; reasoner tests PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add apps/desktop/src-tauri/src/main.rs apps/desktop/src-tauri/src/engine/mod.rs
@@ -129,7 +167,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - Modify: `apps/desktop/src/api/engine.ts` (append after `:46`, near the other evolve bindings)
 - Test: `apps/desktop/src/api/engine.reasoner.test.ts`
 
-- [ ] **Step 1: Verify the provider literals** — `rg "openai" apps/desktop/src-tauri/src/engine/cloud_reasoner.rs apps/desktop/src-tauri/src/engine/reason.rs`. Confirm the serialized provider strings (`"anthropic"`, `"openai-compat"`) and mode strings (`"local"`, `"cloud"`). Use the real literals in the types below if they differ.
+- [ ] **Step 1: Confirm the literals** — `rg -n "openai|anthropic" apps/desktop/src-tauri/src/engine/cloud_reasoner.rs apps/desktop/src-tauri/src/engine/reason.rs`. Confirm provider `"anthropic"`/`"openai-compat"` and mode `"local"`/`"cloud"`. (The Rust `ReasonerConfigDto` doc comment mentions "camelCase" but has no `#[serde(rename_all)]` — `base_url` is literal; ignore the stale comment.)
 
 - [ ] **Step 2: Write the failing test**
 
@@ -171,7 +209,7 @@ describe("reasoner bindings", () => {
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `cd apps/desktop && npx vitest run src/api/engine.reasoner.test.ts`
-Expected: FAIL — `getReasonerConfig is not a function` (bindings not added yet).
+Expected: FAIL — `getReasonerConfig is not a function`.
 
 - [ ] **Step 4: Add the types + bindings** to `apps/desktop/src/api/engine.ts`:
 
@@ -185,7 +223,7 @@ export type ReasonerConfigDto = {
   base_url: string | null;
   ready: boolean;
 };
-/** The write payload — snake_case value keys (Tauri does not rename inner object keys). No `ready` (output-only). */
+/** Write payload — snake_case value keys (Tauri does not rename inner object keys). No `ready` (output-only). */
 export type ReasonerConfigInput = {
   mode: ReasonerMode;
   provider: CloudProvider;
@@ -387,7 +425,7 @@ describe("CloudEgressBanner", () => {
 Run: `cd apps/desktop && npx vitest run src/memory/CloudEgressBanner.test.tsx`
 Expected: FAIL — cannot find module `./CloudEgressBanner`.
 
-- [ ] **Step 3: Write the component** `apps/desktop/src/memory/CloudEgressBanner.tsx`:
+- [ ] **Step 3: Write the component** `apps/desktop/src/memory/CloudEgressBanner.tsx` (non-dismissible by construction — no dismiss handler exists):
 
 ```tsx
 import type { ReasonerConfigDto } from "../api/engine";
@@ -411,7 +449,7 @@ export function CloudEgressBanner({ cfg }: { cfg: ReasonerConfigDto | null }) {
 }
 ```
 
-- [ ] **Step 4: Confirm color tokens exist** — `rg -- "--error|--surface-soft" apps/desktop/src/styles.css | head`. If a token name differs, use the real one. Then run the test:
+- [ ] **Step 4: Run test to verify it passes** (tokens `--error`/`--surface-soft` are confirmed present in `styles.css`)
 
 Run: `cd apps/desktop && npx vitest run src/memory/CloudEgressBanner.test.tsx`
 Expected: PASS (2 tests).
@@ -487,7 +525,7 @@ import type { CloudProvider } from "../api/engine";
 /**
  * One-time, blunt consent gate before cloud egress is enabled. `onConfirm` performs
  * the test-key probe + signs the consent record (engine_enable_cloud_reasoner). On
- * failure it surfaces the already-classified error and does NOT enable.
+ * failure it surfaces the already-classified error and does NOT enable / close.
  */
 export function CloudConsentModal({
   provider, onConfirm, onCancel,
@@ -556,6 +594,8 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - Create: `apps/desktop/src/memory/ReasonerConfigPanel.tsx`
 - Test: `apps/desktop/src/memory/ReasonerConfigPanel.test.tsx`
 
+Key behaviors (review-shaped): the **only** egress-enabling call is `onEnableCloud` via the consent modal; `onChanged` is awaited so the banner is present the instant the modal closes (Low-1); a re-consent note shows when the form's provider/base_url diverges from the consented config (Low-2); the client base_url check is cosmetic — the backend (`validate_reasoner_config` + pinned resolver) is the real SSRF gate and surfaces precise rejections (Low-3/M2).
+
 - [ ] **Step 1: Write the failing test**
 
 ```tsx
@@ -574,7 +614,7 @@ function deps(over: Partial<Parameters<typeof ReasonerConfigPanel>[0]> = {}) {
     onEnableCloud: vi.fn().mockResolvedValue(undefined),
     onVaultSet: vi.fn().mockResolvedValue(undefined),
     onVaultHas: vi.fn().mockResolvedValue(false),
-    onChanged: vi.fn(),
+    onChanged: vi.fn().mockResolvedValue(undefined),
     ...over,
   };
 }
@@ -597,11 +637,20 @@ describe("ReasonerConfigPanel", () => {
     expect(d.onVaultHas).toHaveBeenCalledWith("anthropic_api_key");
   });
 
-  it("Enable opens consent; confirming sends the snake_case payload to enableCloud", async () => {
+  it("re-checks vaultHas for the new provider when the provider changes", async () => {
+    const onVaultHas = vi.fn().mockResolvedValue(false);
+    render(<ReasonerConfigPanel {...deps({ onVaultHas })} />);
+    fireEvent.click(screen.getByRole("button", { name: /^cloud$/i }));
+    await screen.findByLabelText(/provider/i);
+    onVaultHas.mockClear();
+    fireEvent.change(screen.getByLabelText(/provider/i), { target: { value: "openai-compat" } });
+    await waitFor(() => expect(onVaultHas).toHaveBeenCalledWith("openai_compat_api_key"));
+  });
+
+  it("Enable opens consent; confirming sends the snake_case payload then awaits refresh", async () => {
     const d = deps({ onVaultHas: vi.fn().mockResolvedValue(true) });
     render(<ReasonerConfigPanel {...d} />);
     fireEvent.click(screen.getByRole("button", { name: /^cloud$/i }));
-    // key already saved (vaultHas=true) → Enable is available
     fireEvent.click(await screen.findByRole("button", { name: /^enable cloud/i }));
     fireEvent.click(await screen.findByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: /enable cloud reasoner/i }));
@@ -632,9 +681,7 @@ Expected: FAIL — cannot find module `./ReasonerConfigPanel`.
 import { useEffect, useState } from "react";
 import { Button } from "../components/Button";
 import { CloudConsentModal } from "./CloudConsentModal";
-import {
-  buildConfigInput, defaultModelFor, vaultKeyFor, providerLabel,
-} from "./reasonerView";
+import { buildConfigInput, defaultModelFor, vaultKeyFor, providerLabel } from "./reasonerView";
 import type { ReasonerConfigDto, ReasonerConfigInput, CloudProvider } from "../api/engine";
 import type { ProviderVaultKey } from "../vault";
 
@@ -644,13 +691,12 @@ type Props = {
   onEnableCloud: (input: ReasonerConfigInput) => Promise<void>;
   onVaultSet: (key: ProviderVaultKey, value: string) => Promise<void>;
   onVaultHas: (key: ProviderVaultKey) => Promise<boolean>;
-  onChanged: () => void;
+  onChanged: () => Promise<void>; // awaited so the banner/gate reflect the new cfg immediately
 };
 
 export function ReasonerConfigPanel(props: Props) {
   const { cfg, onSetConfig, onEnableCloud, onVaultSet, onVaultHas, onChanged } = props;
 
-  // UI mode (which panel is shown). Initialized from the saved config.
   const [selectedMode, setSelectedMode] = useState<"local" | "cloud">(cfg.mode);
   const [provider, setProvider] = useState<CloudProvider>(cfg.provider);
   const [model, setModel] = useState(cfg.model || defaultModelFor(cfg.provider));
@@ -661,7 +707,7 @@ export function ReasonerConfigPanel(props: Props) {
   const [error, setError] = useState<string | null>(null);
   const [showConsent, setShowConsent] = useState(false);
 
-  // Reflect whether a key is stored for the current provider.
+  // Reflect whether a key is stored for the CURRENT provider (re-runs on provider change).
   useEffect(() => {
     let alive = true;
     void onVaultHas(vaultKeyFor(provider)).then((has) => { if (alive) setKeySaved(has); });
@@ -674,14 +720,14 @@ export function ReasonerConfigPanel(props: Props) {
       setBusy(true); setError(null);
       try {
         await onSetConfig({ mode: "local", provider, model: model.trim(), base_url: null });
-        onChanged();
+        await onChanged();
       } catch (e) { setError(String(e)); } finally { setBusy(false); }
     }
   };
 
   const onChangeProvider = (p: CloudProvider) => {
     setProvider(p);
-    setModel(defaultModelFor(p));
+    setModel(defaultModelFor(p)); // note: overwrites a hand-typed model on provider switch (acceptable)
   };
 
   const onSaveKey = async () => {
@@ -696,13 +742,23 @@ export function ReasonerConfigPanel(props: Props) {
   const formInput = (): ReasonerConfigInput =>
     buildConfigInput({ mode: "cloud", provider, model, baseUrl });
 
+  // Client gate is COSMETIC. The real SSRF/HTTPS enforcement is the backend
+  // validate_reasoner_config + the connect-time pinned resolver, which also surface
+  // the precise rejection through the consent modal's error.
   const canEnable = keySaved && model.trim() !== "" &&
-    (provider !== "openai-compat" || baseUrl.trim().startsWith("https://"));
+    (provider !== "openai-compat" || baseUrl.trim() !== "");
+
+  // Low-2: if cloud is enabled and the form diverges from the CONSENTED provider/host,
+  // the backend will fail-close (consent binding mismatch). Tell the user to re-consent.
+  const consentedBaseUrl = cfg.base_url ?? null;
+  const formBaseUrl = formInput().base_url;
+  const needsReconsent = cfg.mode === "cloud" && cfg.ready &&
+    (provider !== cfg.provider || formBaseUrl !== consentedBaseUrl);
 
   const onConfirmConsent = async () => {
     await onEnableCloud(formInput());
+    await onChanged();          // settle cfg.ready BEFORE closing so the banner shows immediately
     setShowConsent(false);
-    onChanged();
   };
 
   return (
@@ -720,11 +776,7 @@ export function ReasonerConfigPanel(props: Props) {
         <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
           <label style={{ fontSize: 13 }}>
             Provider
-            <select
-              value={provider}
-              onChange={(e) => onChangeProvider(e.target.value as CloudProvider)}
-              style={{ marginLeft: 8 }}
-            >
+            <select value={provider} onChange={(e) => onChangeProvider(e.target.value as CloudProvider)} style={{ marginLeft: 8 }}>
               <option value="anthropic">Anthropic</option>
               <option value="openai-compat">OpenAI-compatible</option>
             </select>
@@ -751,6 +803,12 @@ export function ReasonerConfigPanel(props: Props) {
             {keySaved ? <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>key saved ✓</span> : null}
           </div>
 
+          {needsReconsent ? (
+            <p style={{ fontSize: 13, color: "var(--error)" }}>
+              You changed the provider or base URL — click Enable Cloud to re-consent before cloud resumes.
+            </p>
+          ) : null}
+
           <div>
             <Button variant="primary" disabled={busy || !canEnable} onClick={() => setShowConsent(true)}>
               Enable Cloud ({providerLabel(provider)})
@@ -772,13 +830,13 @@ export function ReasonerConfigPanel(props: Props) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd apps/desktop && npx vitest run src/memory/ReasonerConfigPanel.test.tsx`
-Expected: PASS (4 tests). If a query fails on label association, ensure inputs are wrapped by their `<label>` (they are) — testing-library matches nested label text.
+Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add apps/desktop/src/memory/ReasonerConfigPanel.tsx apps/desktop/src/memory/ReasonerConfigPanel.test.tsx
-git commit -m "feat(reasoner-ui): Local|Cloud selector + provider/model/key form + enable flow (spec 2b §4)
+git commit -m "feat(reasoner-ui): Local|Cloud selector + form + enable flow (await refresh, re-consent note) (spec 2b §4)
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```
@@ -790,7 +848,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 **Files:**
 - Modify: `apps/desktop/src/memory/MemoryPanel.tsx`
 
-- [ ] **Step 1: Add imports** — extend the `api/engine` import (`:4-7`) with the reasoner bindings + DTO, add `vault` + the new components + view helpers:
+- [ ] **Step 1: Add imports** — extend the `api/engine` import (`:4-7`) with the reasoner bindings + DTO; add `vault` + the new components + view helpers:
 
 ```tsx
 import {
@@ -810,7 +868,7 @@ import { searchBlurb, modeBlurb } from "./reasonerView";
   const [reasonerCfg, setReasonerCfg] = useState<ReasonerConfigDto | null>(null);
 ```
 
-and extend `refreshStatus` (`:32-41`) to fetch all three together:
+and extend `refreshStatus` (`:32-41`) to fetch all three together (it already returns `Promise<void>`, which `ReasonerConfigPanel.onChanged` will await):
 
 ```tsx
   const refreshStatus = async () => {
@@ -833,7 +891,7 @@ and extend `refreshStatus` (`:32-41`) to fetch all three together:
   const isCloud = reasonerCfg?.mode === "cloud";
 ```
 
-Update the two Evolve buttons (`:187`, `:191`) to gate on `reasonerReady` instead of `ollamaReady`:
+Update the two Evolve buttons (in the `:183-194` button `<div>`) to gate on `reasonerReady` instead of `ollamaReady`:
 
 ```tsx
           <Button variant="secondary" onClick={onToggleEvolve} disabled={!status || toggling || !reasonerReady}>
@@ -844,9 +902,9 @@ Update the two Evolve buttons (`:187`, `:191`) to gate on `reasonerReady` instea
           </Button>
 ```
 
-- [ ] **Step 4: Make the two copy strings mode-aware + render the panel + banner.**
+- [ ] **Step 4: Mode-aware copy + render panel + banner.**
 
-Header blurb `:108-110` → mode-aware (`reasonerCfg` may be null on first paint → default to Local copy):
+Header blurb `:108-110` → mode-aware (`reasonerCfg` may be null on first paint → default Local copy):
 
 ```tsx
       <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
@@ -854,7 +912,7 @@ Header blurb `:108-110` → mode-aware (`reasonerCfg` may be null on first paint
       </p>
 ```
 
-Add the banner right under the header `<p>`:
+Add the banner directly under that header `<p>`:
 
 ```tsx
       <CloudEgressBanner cfg={reasonerCfg} />
@@ -868,7 +926,7 @@ Evolve blurb `:158-160` → mode-aware:
         </p>
 ```
 
-Render the config panel after the Evolve blurb (before the status line), injecting the real api/vault functions:
+Render the config panel after the Evolve blurb (before the status line), injecting the real api/vault functions (`onChanged` returns the `refreshStatus` promise so the panel can await it — Low-1):
 
 ```tsx
         {reasonerCfg ? (
@@ -878,17 +936,17 @@ Render the config panel after the Evolve blurb (before the status line), injecti
             onEnableCloud={enableCloudReasoner}
             onVaultSet={vaultSet}
             onVaultHas={vaultHas}
-            onChanged={() => void refreshStatus()}
+            onChanged={refreshStatus}
           />
         ) : null}
 ```
 
-- [ ] **Step 5: Gate the Local-only detail text by mode** — the "Local model: …" line (`:166-175`) and the `ollama pull` install hint (`:177-181`) should render only when `!isCloud` (in Cloud mode they're irrelevant). Wrap both in `{!isCloud && ( … )}`.
+- [ ] **Step 5: Gate the Local-only detail by mode** — the "Local model: …" line (`:166-175`) and the `ollama pull` install hint (`:177-181`) are irrelevant in Cloud mode. Wrap each block's render in `{!isCloud && ( … )}` (keep the existing inner `{!ollamaReady && ollama != null ? …}` ternary intact inside the install-hint block).
 
 - [ ] **Step 6: Typecheck + run the full frontend suite**
 
 Run: `npm run typecheck --workspace @bossclaw/desktop && cd apps/desktop && npx vitest run`
-Expected: typecheck clean; all tests PASS (existing + the new reasoner tests).
+Expected: typecheck clean; all tests PASS (existing + new reasoner tests).
 
 - [ ] **Step 7: Commit**
 
@@ -905,9 +963,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: All automated gates**
-
-Run each; all must pass:
+- [ ] **Step 1: All automated gates** — each must pass:
 ```bash
 npm run typecheck --workspace @bossclaw/desktop
 npm run lint
@@ -917,23 +973,24 @@ cargo clippy --all-targets -- -D warnings 2>&1 | tail -5
 cargo test -p air_agent_desktop reasoner 2>&1 | grep "test result:"
 ```
 
-- [ ] **Step 2: Token-purity grep** (the repo gate)
+- [ ] **Step 2: Token-purity grep** (repo gate)
 
 Run: `rg -n "#[0-9a-fA-F]{3,8}|rgb\(|rgba\(" apps/desktop/src/memory/*.tsx`
 Expected: no hardcoded colors in the new components.
 
-- [ ] **Step 3: Manual GUI QA** (`npm run dev`, signed dev build per `scripts/dev-build-signed.sh` if keychain prompts) — record results:
-  - [ ] Default state: Brain tab shows **Local** selected, no egress banner, copy reads "Everything stays on your machine".
+- [ ] **Step 3: Manual GUI QA** (`npm run dev`; if keychain prompts, use `scripts/dev-build-signed.sh`) — record results:
+  - [ ] Default: Brain tab shows **Local** selected, no egress banner, copy reads "Everything stays on your machine".
   - [ ] Select Cloud → form appears; provider dropdown + model prefilled; Enable disabled until a key is saved.
-  - [ ] Save an Anthropic key → "key saved ✓"; Enable becomes available.
-  - [ ] Click Enable → consent modal with the blunt copy; Enable button disabled until the box is checked.
+  - [ ] Save an Anthropic key → "key saved ✓"; Enable available.
+  - [ ] Click Enable → consent modal with the blunt copy; button disabled until the box is checked.
   - [ ] Confirm with a **bad** key → classified error shown, modal stays, **no banner** (fail-closed).
-  - [ ] Confirm with a **good** key → modal closes, **persistent banner** appears, Evolve buttons enabled.
+  - [ ] Confirm with a **good** key → modal closes, **persistent banner** appears immediately, Evolve buttons enabled.
+  - [ ] Change provider while enabled → "re-consent" note appears, banner drops (fail-closed).
   - [ ] Quit + relaunch → still Cloud + banner (the Task-1 reseed).
   - [ ] Switch back to Local → banner disappears, no re-consent needed.
   - [ ] Light + dark mode both legible.
 
-- [ ] **Step 4: Live round-trip (the deferred 2a QA, now actionable)** — run the `#[ignore]`d `cloud_reasoner_live_roundtrip` with a real key:
+- [ ] **Step 4: Live round-trip** (the deferred 2a QA, now actionable) — run the `#[ignore]`d `cloud_reasoner_live_roundtrip` with a real key:
 
 Run: `cargo test -p air_agent_desktop cloud_reasoner_live_roundtrip -- --ignored --nocapture`
 Expected: a real extraction round-trips (confirms the socket/header path end-to-end).
@@ -942,17 +999,17 @@ Expected: a real extraction round-trips (confirms the socket/header path end-to-
 
 ## Review / CI / PR sequencing (after Task 8)
 
-Per the locked milestone process (this is an egress-**enabling** UI — both reviews are mandatory):
-1. **Whole-impl review** (`superpowers:code-reviewer` over the full 2b diff) — focus: the two-command distinction is honored (consent only via `enableCloudReasoner`), the `cfg.ready` gate, no key ever rendered, mode-aware copy is honest.
-2. **Dedicated security review** (`oh-my-claudecode:security-reviewer`) — focus: can the webview reach a cloud-egressing state WITHOUT the consent modal / a successful test-key? Is the banner truly tied to `cloudActive` (mode+ready)? Does switching provider/key force re-consent (key-fp binding)?
-3. Fix-loop → push branch `milestone-d2b-cloud-reasoner-ui` → PR → CI green (all platforms + `cargo-audit`) → Peter merge.
-4. GBrain: write the 2b handoff, re-point `air/session-start-protocol` (fresh fetch), append any lessons, re-run the Step 0 audit.
+Egress-**enabling** UI → both reviews mandatory:
+1. **Whole-impl review** (`superpowers:code-reviewer` over the full 2b diff) — the two-command distinction (consent only via `enableCloudReasoner`), the `cfg.ready` gate, no key rendered, honest mode-aware copy, the Low-1/Low-2 fixes landed.
+2. **Dedicated security review** (`oh-my-claudecode:security-reviewer`) — re-confirm against the implemented code what the plan-review confirmed against the plan: no UI path reaches cloud-on without consent + a passing test-key; banner bound to `cloudActive`; provider/key change forces re-consent.
+3. Fix-loop → push `milestone-d2b-cloud-reasoner-ui` → PR → CI green (all platforms + `cargo-audit`) → Peter merge.
+4. GBrain: write the 2b handoff, re-point `air/session-start-protocol` (fresh fetch), append lessons, re-run the Step 0 audit.
 
 ---
 
 ## Deferred (explicitly out of scope for 2b)
 
-- Surface `EvolveReport.tainted_recall_snippets` through `EvolveReportDto` (Rust + TS) and show a live "N file-derived snippets sent" count in/near the banner (spec §198-199; the hook is wired write-only at `evolve.rs:65` / `log.rs:5913`). Blunt consent copy already discloses the worst case.
+- Surface `EvolveReport.tainted_recall_snippets` (Rust+TS) + a live "N file-derived snippets sent" count near the banner (spec §198-199; hook is write-only at `evolve.rs:65` / `log.rs:5913`). Blunt consent copy meets the R4 disclosure floor.
 - Info-1 per-read consent signature re-verify on the readiness path.
 - `extract_openai_result` `tool_calls` fallback.
 - Gemini provider (later fast-follow behind the same seam).
@@ -961,18 +1018,19 @@ Per the locked milestone process (this is an egress-**enabling** UI — both rev
 
 ## Self-Review (against spec §4 + §8 carryovers)
 
-- **§4 Local|Cloud selector (default Local):** Task 6 (`ReasonerConfigPanel`, selector initialized from `cfg.mode`). ✅
-- **§4 Cloud sub-panel (provider dropdown / model / base_url / key via vaultSet + vaultHas "saved ✓"):** Task 6. ✅
-- **§4 explicit consent gate → sets consent (R1/R5 via `engine_enable_cloud_reasoner`):** Task 5 + Task 6 wiring. ✅
-- **§4 persistent banner while active:** Task 4 (`CloudEgressBanner`, gated on `cloudActive`). ✅
+- **§4 Local|Cloud selector (default Local):** Task 6. ✅
+- **§4 cloud sub-panel (provider/model/base_url/key via vaultSet + vaultHas "saved ✓"):** Task 6. ✅
+- **§4 explicit consent gate → R1/R5 via `engine_enable_cloud_reasoner`:** Tasks 5 + 6. ✅
+- **§4 persistent banner while active:** Task 4 (`cloudActive` gate). ✅
 - **§4 copy changes (`:109`, `:159`) → mode-aware:** Task 7 (`searchBlurb`/`modeBlurb`). ✅
-- **§4 `ollamaReady` gate → `reasonerReady`:** Task 7 (`cfg.ready`). ✅
-- **§4 pure logic extracted + vitest-tested; panel = DI tests:** Tasks 3–6. ✅ (DI instead of `mockIPC` — matches repo convention and spec line 98's "pure logic" intent.)
+- **§4 `ollamaReady` → `reasonerReady` (`cfg.ready`):** Task 7. ✅
+- **§4 pure logic extracted + tested; panel DI-tested (no mockIPC):** Tasks 3–6. ✅
 - **R1 signed consent only via enable:** consent modal calls `enableCloudReasoner`, never `setReasonerConfig`. ✅
-- **R4 honest consent copy:** `consentBody` includes "passwords, keys, or personal data" + "leaves this device". ✅
-- **R4 silent-bad-key:** caught by the enable-time test-key probe (backend) surfaced as the modal error (Task 5). ✅
-- **2a carryover — cell→log restart-reseed:** Task 1. ✅
-- **2a carryover — snake_case config keys:** `buildConfigInput` + the Task 2 binding test. ✅
-- **R8 default-local egresses nothing:** unchanged — default `cfg.mode` is local; cloud only via the consent gate. ✅
+- **R1 re-consent binding surfaced:** Task 6 `needsReconsent` note (Low-2). ✅
+- **R4 honest consent copy:** `consentBody` ("passwords, keys, or personal data" + "leaves this device"). ✅
+- **R4 silent-bad-key caught:** enable-time test-key probe surfaced as the modal error (Task 5). ✅
+- **2a carryover — cell→log restart-reseed:** Task 1 (tested `reseed_reasoner_cell` + `block_on` wiring). ✅
+- **2a carryover — snake_case config keys:** `buildConfigInput` + Task 2 binding test. ✅
+- **R8 default-local egresses nothing:** unchanged — default mode local; cloud only via the consent gate; reseed is fail-safe Local when no signed config / not onboarded. ✅
 
-**Placeholder scan:** none — every step has runnable code/commands. **Type consistency:** `ReasonerConfigInput`/`ReasonerConfigDto`/`CloudProvider`/`ReasonerMode` are defined once in Task 2 and used unchanged in Tasks 3–7; `vaultKeyFor` returns `ProviderVaultKey`; the config payload keys are snake_case everywhere.
+**Placeholder scan:** none — every step has runnable code/commands. **Type consistency:** `ReasonerConfigInput`/`ReasonerConfigDto`/`CloudProvider`/`ReasonerMode` defined once (Task 2), used unchanged; `vaultKeyFor` returns `ProviderVaultKey`; payload keys snake_case throughout; `onChanged: () => Promise<void>` consistent between Task 6 (awaited) and Task 7 (passes `refreshStatus`). **Compile-safety (Rust):** Task 1 uses the real harness (`test_vault_and_dir`/`new_test_handle`), `#[tokio::test] async` + `.await`, and `block_on` for the sync-`.setup` call site.
