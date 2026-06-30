@@ -195,6 +195,19 @@ const PROPOSALS_ENABLED_KEY: &str = "proposals_enabled";
 /// ONLY the autonomous mandate-driven `write_proposal` synthesis.
 const MANDATES_ENABLED_KEY: &str = "mandates_enabled";
 
+/// Content-key for the non-security reasoner config (mode/provider/model/base_url),
+/// written by [`EventLog::set_reasoner_config`] and read by
+/// [`EventLog::reasoner_config_json`] (Milestone D spec R1). A signed `config`
+/// event, not a webview-writable file — egress-adjacent config stays tamper-evident.
+const REASONER_CONFIG_KEY: &str = "reasoner_config";
+
+/// Content-key for the signed cloud-enable CONSENT record binding
+/// {provider, base_url_host, key_fingerprint, consented_at}, written by
+/// [`EventLog::set_cloud_reasoner_consent`] and read by
+/// [`EventLog::cloud_reasoner_consent_json`] (Milestone D spec R1/R5). Its
+/// presence is what authorizes cloud egress, so it MUST be a signed event.
+const CLOUD_REASONER_CONSENT_KEY: &str = "cloud_reasoner_consent";
+
 /// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
 /// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
 /// reference a compile-checked variant instead of a stringly-typed key that could drift on a
@@ -207,6 +220,10 @@ pub enum ConfigFlag {
     Proposals,
     /// The M6c mandate-proposer on/off switch ([`MANDATES_ENABLED_KEY`]).
     Mandates,
+    /// The non-security reasoner config record ([`REASONER_CONFIG_KEY`]).
+    ReasonerConfig,
+    /// The signed cloud-enable consent record ([`CLOUD_REASONER_CONSENT_KEY`]).
+    CloudReasonerConsent,
 }
 
 impl ConfigFlag {
@@ -216,6 +233,8 @@ impl ConfigFlag {
             ConfigFlag::Evolve => EVOLVE_ENABLED_KEY,
             ConfigFlag::Proposals => PROPOSALS_ENABLED_KEY,
             ConfigFlag::Mandates => MANDATES_ENABLED_KEY,
+            ConfigFlag::ReasonerConfig => REASONER_CONFIG_KEY,
+            ConfigFlag::CloudReasonerConsent => CLOUD_REASONER_CONSENT_KEY,
         }
     }
 }
@@ -5044,6 +5063,66 @@ impl EventLog {
         Ok(())
     }
 
+    /// Persist the non-security reasoner config (mode/provider/model/base_url)
+    /// as a signed `config` event (spec R1). CLONES the
+    /// [`EventLog::set_evolve_enabled`] mechanism exactly — Ed25519-signed +
+    /// hash-chained (so a forged/replayed write is tamper-evident via
+    /// `verify_chain`), the only writer of [`REASONER_CONFIG_KEY`]. Webview writes
+    /// route through a command, not a file — egress-adjacent config stays
+    /// tamper-evident. Carries no model fields, so it never disturbs
+    /// [`EventLog::active_model`].
+    pub fn set_reasoner_config(&self, config: serde_json::Value) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(REASONER_CONFIG_KEY.to_string(), config);
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
+    /// Persist the signed cloud-enable consent record, binding
+    /// {provider, base_url_host, key_fingerprint, consented_at}, as a signed
+    /// `config` event (spec R1/R5). CLONES the [`EventLog::set_evolve_enabled`]
+    /// mechanism exactly — Ed25519-signed + hash-chained (tamper-evident via
+    /// `verify_chain`), the only writer of [`CLOUD_REASONER_CONSENT_KEY`]. Its
+    /// presence is what authorizes egress, so it MUST be a signed event; written
+    /// ONLY by the enable flow after the R5 test-key call succeeds (Task 12).
+    /// Carries no model fields, so it never disturbs [`EventLog::active_model`].
+    pub fn set_cloud_reasoner_consent(&self, record: serde_json::Value) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(CLOUD_REASONER_CONSENT_KEY.to_string(), record);
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
     /// Whether the evolve loop is enabled (spec §8 off-switch / Rev 2 F2-sec(a)).
     ///
     /// STICKY / fail-closed semantics: config events are scanned newest-first and
@@ -5069,6 +5148,42 @@ impl EventLog {
             }
         }
         Ok(true) // flag never set → default open
+    }
+
+    /// The newest signed `reasoner_config` value, or `None` if never set
+    /// (default: Local reasoner, no cloud — spec R1). STICKY: the first `config`
+    /// event (newest-first) carrying the key wins.
+    pub fn reasoner_config_json(&self) -> Result<Option<serde_json::Value>, BossclawError> {
+        self.latest_config_value(REASONER_CONFIG_KEY)
+    }
+
+    /// The newest signed cloud-enable consent record, or `None` if never set
+    /// (default-CLOSED: no egress — spec R1/R5). STICKY: the first `config` event
+    /// (newest-first) carrying the key wins. Unlike [`EventLog::evolve_enabled`]
+    /// (default-OPEN), absence here means egress is FORBIDDEN.
+    pub fn cloud_reasoner_consent_json(&self) -> Result<Option<serde_json::Value>, BossclawError> {
+        self.latest_config_value(CLOUD_REASONER_CONSENT_KEY)
+    }
+
+    /// Shared scan returning the newest `config` event's value under `key`, or
+    /// `None` when no `config` event carries it (default-CLOSED). CLONES the
+    /// locking + SQL idiom of [`EventLog::evolve_enabled`] exactly — config events
+    /// scanned newest-first, deserialized, first hit wins (sticky). Backs both
+    /// [`EventLog::reasoner_config_json`] and [`EventLog::cloud_reasoner_consent_json`].
+    fn latest_config_value(&self, key: &str) -> Result<Option<serde_json::Value>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events WHERE event_type = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([CONFIG_EVENT_TYPE], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let ev: Event = serde_json::from_str(&row?)?;
+            if let Some(v) = ev.content.get(key) {
+                return Ok(Some(v.clone())); // newest config carrying the key wins → sticky
+            }
+        }
+        Ok(None) // key never set → default closed
     }
 
     /// Set the M6b reconciliation-proposer on/off switch by appending a control
@@ -6934,6 +7049,40 @@ mod tests {
         // Idempotent re-set with the same model keeps it discoverable.
         log.set_active_model("minishlab/potion-base-8M", 256).unwrap();
         assert_eq!(log.active_model().unwrap().unwrap().active_model_id, "minishlab/potion-base-8M");
+    }
+
+    /// Task 7 (spec R1): the cloud-reasoner CONFIG and the cloud-enable CONSENT
+    /// are SIGNED `config` events in the tamper-evident log (cloning the evolve
+    /// off-switch mechanism), NOT a webview-writable file. Both readers
+    /// default-CLOSED (`None`) when never set, the newest write is sticky, and
+    /// the whole chain still verifies (every event is Ed25519-signed).
+    #[test]
+    fn reasoner_config_and_consent_roundtrip_signed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path()); // same signed-EventLog helper the config tests use
+
+        // Defaults: absent -> None (fail-closed).
+        assert!(log.reasoner_config_json().unwrap().is_none());
+        assert!(log.cloud_reasoner_consent_json().unwrap().is_none());
+
+        // Write non-security config.
+        let cfg = serde_json::json!({
+            "mode": "cloud", "provider": "anthropic",
+            "model": "claude-sonnet-4-6", "base_url": null
+        });
+        log.set_reasoner_config(cfg.clone()).unwrap();
+        assert_eq!(log.reasoner_config_json().unwrap().unwrap(), cfg);
+
+        // Write the signed consent record.
+        let consent = serde_json::json!({
+            "provider": "anthropic", "base_url_host": "api.anthropic.com",
+            "key_fingerprint": "deadbeef", "consented_at": "2026-06-30T00:00:00Z"
+        });
+        log.set_cloud_reasoner_consent(consent.clone()).unwrap();
+        assert_eq!(log.cloud_reasoner_consent_json().unwrap().unwrap(), consent);
+
+        // Newest write wins (sticky) and the whole chain still verifies (signed).
+        log.verify_chain().unwrap();
     }
 
     /// F2 security gate (parent §5.11): the private `append_graph_event` defaults
