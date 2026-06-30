@@ -533,24 +533,28 @@ impl EngineHandle {
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?;
-        self.record_tick(t0.elapsed().as_millis(), &result);
+        // The spec-R4 backstop needs to know whether this was a CLOUD tick and whether the
+        // queue had work, so an Ok-but-0-processed cloud tick (a silent bad/expired key) is
+        // recorded as a visible error rather than no-oping forever.
+        let cloud_mode = matches!(
+            self.reasoner_config_or_default(onboarded).await.mode,
+            crate::engine::reason::ReasonerMode::Cloud
+        );
+        let queue_depth = self.queue_depth_or_zero(onboarded).await;
+        self.record_tick(t0.elapsed().as_millis(), &result, cloud_mode, queue_depth);
         result
     }
 
-    /// Record one tick's telemetry. The lock is poison-RECOVERED (a panicked tick must not
-    /// wedge the status read path), `last_tick_ms` is always set, and on error `error_count`
-    /// is bumped and `last_error` stored TRUNCATED to ~512 bytes — engine error strings can
-    /// embed paths / reasoner output and flow to the webview DTO, so the cap is a
-    /// security-relevant bound (the Group A review flagged it).
-    fn record_tick(&self, ms: u128, result: &Result<bossclaw_core::EvolveReport, EngineOpError>) {
-        let mut tel = self.evolve_tel.lock().unwrap_or_else(|p| p.into_inner());
-        tel.last_tick_ms = Some(ms);
-        if let Err(e) = result {
-            tel.error_count += 1;
-            let mut s = e.to_string();
-            truncate_on_char_boundary(&mut s, 512);
-            tel.last_error = Some(s);
-        }
+    /// Record one tick's telemetry. Thin wrapper over the pure [`record_tick_into`] so the
+    /// recorder (including the spec-R4 cloud-0-item backstop) is unit-testable without a handle.
+    fn record_tick(
+        &self,
+        ms: u128,
+        result: &Result<bossclaw_core::EvolveReport, EngineOpError>,
+        cloud_mode: bool,
+        queue_depth: usize,
+    ) {
+        record_tick_into(&self.evolve_tel, ms, result, cloud_mode, queue_depth);
     }
 
     /// Evolve status: the engine's live `{queue_depth, enabled}` plus a clone of the
@@ -1097,6 +1101,41 @@ pub(crate) fn parse_reasoner_config(raw: Option<serde_json::Value>) -> reason::R
 pub(crate) fn key_fingerprint(key: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(&Sha256::digest(key.as_bytes())[..4])
+}
+
+/// Pure tick recorder. The lock is poison-RECOVERED (a panicked tick must not wedge the status
+/// read path), `last_tick_ms` is always set, and on `Err` `error_count` is bumped and
+/// `last_error` stored TRUNCATED to ~512 bytes — engine error strings can embed paths /
+/// reasoner output and flow to the webview DTO, so the cap is a security-relevant bound (the
+/// Group A review flagged it). It ALSO synthesizes a `last_error` when a CLOUD tick returns
+/// Ok-but-processed-zero while the queue had work — a bad or expired key otherwise no-ops
+/// silently every tick (spec R4). A local 0-item tick, or any tick over an empty queue, is
+/// normal idle and records no synthetic error.
+fn record_tick_into(
+    tel: &std::sync::Mutex<EvolveTelemetry>,
+    ms: u128,
+    result: &Result<bossclaw_core::EvolveReport, EngineOpError>,
+    cloud_mode: bool,
+    queue_depth: usize,
+) {
+    let mut tel = tel.lock().unwrap_or_else(|p| p.into_inner());
+    tel.last_tick_ms = Some(ms);
+    match result {
+        Err(e) => {
+            tel.error_count += 1;
+            let mut s = e.to_string();
+            truncate_on_char_boundary(&mut s, 512);
+            tel.last_error = Some(s);
+        }
+        Ok(report) if cloud_mode && report.memories_processed == 0 && queue_depth > 0 => {
+            tel.error_count += 1;
+            tel.last_error = Some(
+                "cloud reasoner processed 0 of a non-empty queue (check the provider key/endpoint)"
+                    .to_string(),
+            );
+        }
+        Ok(_) => {}
+    }
 }
 
 /// Truncate `s` in place to at most `max` bytes WITHOUT splitting a UTF-8 char (plain
@@ -1942,11 +1981,27 @@ mod tests {
         // Force an error through record_tick and assert the bump + length cap directly
         // (the engine error path is exercised end-to-end by the live-Ollama test).
         let huge = "x".repeat(2000);
-        handle.record_tick(7, &Err(EngineOpError::Core(huge)));
+        handle.record_tick(7, &Err(EngineOpError::Core(huge)), false, 0);
         let (_s, tel2) = handle.evolve_status(true).await.unwrap();
         assert_eq!(tel2.error_count, 1, "the forced error bumped error_count");
         let last = tel2.last_error.expect("last_error stored");
         assert!(last.len() <= 512, "last_error is capped to ~512 bytes (was {})", last.len());
+    }
+
+    /// Spec R4 backstop: a CLOUD tick that returns Ok but processed 0 items while the queue
+    /// had work is a silent bad/expired key — synthesize a `last_error` so it is visible.
+    /// A local 0-item tick (or an empty queue) is normal idle, never a synthetic error.
+    #[test]
+    fn cloud_zero_item_tick_records_backstop_error() {
+        use bossclaw_core::EvolveReport;
+        let tel = std::sync::Mutex::new(EvolveTelemetry::default());
+        // Ok report, 0 processed, CLOUD tick, queue had work -> last_error set.
+        record_tick_into(&tel, 5, &Ok(EvolveReport { memories_processed: 0, ..Default::default() }), true, 3);
+        assert!(tel.lock().unwrap().last_error.is_some());
+        // Local 0-item tick (or empty queue) -> no synthetic error.
+        let tel2 = std::sync::Mutex::new(EvolveTelemetry::default());
+        record_tick_into(&tel2, 5, &Ok(EvolveReport { memories_processed: 0, ..Default::default() }), false, 3);
+        assert!(tel2.lock().unwrap().last_error.is_none());
     }
 
     /// Task 7 (toggle): `set_evolve_enabled` flips the sticky engine flag through the gate.

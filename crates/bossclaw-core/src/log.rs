@@ -5897,6 +5897,20 @@ impl EventLog {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Count file-derived (`is_external`) snippets in this memory's recall payload
+            // so Phase 2b can disclose "N file-derived snippets sent to the cloud" (spec R4).
+            // Read-only: loading + classifying recalled events never alters evolve's behavior.
+            let tainted_this_memory = recalled
+                .iter()
+                .filter(|id| {
+                    self.event_by_id(id)
+                        .ok()
+                        .flatten()
+                        .map(|ev| crate::ingest::is_external(&ev))
+                        .unwrap_or(false)
+                })
+                .count();
+            report.tainted_recall_snippets += tainted_this_memory;
             let recalled_texts = self.texts_for_ids(&recalled)?;
             let read_set: Vec<String> = {
                 let mut v = vec![mem_id.clone()];
