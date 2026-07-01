@@ -99,6 +99,7 @@ export function ReasonerConfigPanel(props: Props) {
             <select value={provider} onChange={(e) => onChangeProvider(e.target.value as CloudProvider)} style={{ marginLeft: 8 }}>
               <option value="anthropic">Anthropic</option>
               <option value="openai-compat">OpenAI-compatible</option>
+              <option value="gemini">Gemini</option>
             </select>
           </label>
 

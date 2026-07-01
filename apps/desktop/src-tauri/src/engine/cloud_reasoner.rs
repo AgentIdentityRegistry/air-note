@@ -162,6 +162,51 @@ fn strip_json_fence(s: &str) -> &str {
     t.trim().strip_suffix("```").unwrap_or(t).trim()
 }
 
+/// Build the Gemini `:generateContent` body. `fallback=false` uses `responseSchema` (strict);
+/// `fallback=true` drops it and folds the schema into the system instruction (some engine schemas
+/// use features Gemini's `responseSchema` subset rejects). `responseMimeType: application/json`
+/// both ways. No `temperature` (parity with the other arms). The model rides in the URL path, not
+/// the body. Spec §8 R7 + §3.1.
+pub(crate) fn build_gemini_request(system: &str, prompt: &str, schema: &Value, fallback: bool) -> Value {
+    let (system_text, generation_config) = if fallback {
+        (
+            format!(
+                "{system}\n\nRespond with a single JSON object that conforms to this JSON schema:\n{schema}"
+            ),
+            json!({ "responseMimeType": "application/json" }),
+        )
+    } else {
+        (
+            system.to_string(),
+            json!({ "responseMimeType": "application/json", "responseSchema": schema }),
+        )
+    };
+    json!({
+        "systemInstruction": { "parts": [ { "text": system_text } ] },
+        "contents": [ { "role": "user", "parts": [ { "text": prompt } ] } ],
+        "generationConfig": generation_config
+    })
+}
+
+/// Pull `candidates[0].content.parts[0].text` and parse it as JSON, tolerating a ```json fence.
+/// Parse failure -> `BossclawError::Reasoner` (retryable no-op).
+pub(crate) fn extract_gemini_result(resp: &Value) -> Result<Value, BossclawError> {
+    let text = resp
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|m| m.get("parts"))
+        .and_then(Value::as_array)
+        .and_then(|p| p.first())
+        .and_then(|p| p.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BossclawError::Reasoner("gemini response missing candidate text".into()))?;
+    let trimmed = strip_json_fence(text);
+    serde_json::from_str(trimmed)
+        .map_err(|e| BossclawError::Reasoner(format!("gemini content not valid JSON: {e}")))
+}
+
 /// A `reqwest` DNS resolver that screens every resolved address through
 /// `is_blocked_ip` before any socket is opened. This is the connect-time pin
 /// that closes the rebind race (`web_access.rs:171` documents the residual gap
@@ -220,6 +265,7 @@ pub(crate) fn blocking_client() -> Option<&'static reqwest::blocking::Client> {
 pub enum CloudProvider {
     Anthropic,
     OpenAiCompat,
+    Gemini,
 }
 
 /// Vault key names — MUST match the chat-provider names in `llm_stream.rs`
@@ -228,6 +274,11 @@ pub enum CloudProvider {
 pub(crate) const ANTHROPIC_KEY_NAME: &str = "anthropic_api_key";
 pub(crate) const OPENAI_COMPAT_KEY_NAME: &str = "openai_compat_api_key";
 pub(crate) const ANTHROPIC_HOST: &str = "api.anthropic.com";
+/// Gemini shares the chat-side Google key (`llm_stream.rs` `GOOGLE_KEY_NAME`) and, like Anthropic,
+/// a PINNED host (base_url is ignored). The key rides in the `x-goog-api-key` HEADER — NEVER the
+/// URL query (`llm_stream.rs` uses `?key=`; the reasoner must not copy that: spec R2 + no secrets in URLs).
+pub(crate) const GEMINI_HOST: &str = "generativelanguage.googleapis.com";
+pub(crate) const GEMINI_KEY_NAME: &str = "google_api_key";
 
 /// The desktop-side cloud reasoner (spec §8). Reads the provider key from the
 /// vault AT CALL TIME (header-only, never stored on the struct, never logged),
@@ -256,6 +307,7 @@ impl CloudReasoner {
         let prefix = match provider {
             CloudProvider::Anthropic => "anthropic",
             CloudProvider::OpenAiCompat => "openai-compat",
+            CloudProvider::Gemini => "gemini",
         };
         let model_id = format!("{prefix}:{model}");
         Self {
@@ -287,6 +339,7 @@ impl CloudReasoner {
         match self.provider {
             CloudProvider::Anthropic => ANTHROPIC_KEY_NAME,
             CloudProvider::OpenAiCompat => OPENAI_COMPAT_KEY_NAME,
+            CloudProvider::Gemini => GEMINI_KEY_NAME,
         }
     }
 
@@ -389,6 +442,53 @@ impl CloudReasoner {
         }
         extract_openai_result(&payload)
     }
+
+    fn gemini_complete(
+        &self,
+        key: &str,
+        system: &str,
+        prompt: &str,
+        schema: &Value,
+    ) -> Result<Value, BossclawError> {
+        let client = blocking_client()
+            .ok_or_else(|| BossclawError::Reasoner("cloud reasoner client unavailable".into()))?;
+        // Gemini is pinned to the literal host; the model rides in the URL PATH and the key in the
+        // `x-goog-api-key` HEADER — never the URL query (spec R2 + no secrets in URLs). base_url ignored.
+        let endpoint =
+            format!("https://{GEMINI_HOST}/v1beta/models/{}:generateContent", self.model);
+
+        let send = |fallback: bool| -> Result<(reqwest::StatusCode, Value), BossclawError> {
+            let body = build_gemini_request(system, prompt, schema, fallback);
+            let resp = client
+                .post(&endpoint)
+                .header("x-goog-api-key", key)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| BossclawError::Reasoner(format!("gemini transport: {e}")))?;
+            let status = resp.status();
+            if status.is_success() {
+                let v: Value = resp
+                    .json()
+                    .map_err(|e| BossclawError::Reasoner(format!("gemini response not JSON: {e}")))?;
+                Ok((status, v))
+            } else {
+                Ok((status, Value::Null)) // body dropped (R3)
+            }
+        };
+
+        // Primary responseSchema; on 400/404/422 retry once without it (schema-subset reject).
+        let (status, payload) = send(false)?;
+        let (status, payload) = if matches!(status.as_u16(), 400 | 404 | 422) {
+            send(true)?
+        } else {
+            (status, payload)
+        };
+        if !status.is_success() {
+            return Err(classify_cloud_error(status.as_u16()));
+        }
+        extract_gemini_result(&payload)
+    }
 }
 
 impl Reasoner for CloudReasoner {
@@ -397,6 +497,7 @@ impl Reasoner for CloudReasoner {
         match self.provider {
             CloudProvider::Anthropic => self.anthropic_complete(&key, system, prompt, schema),
             CloudProvider::OpenAiCompat => self.openai_complete(&key, system, prompt, schema),
+            CloudProvider::Gemini => self.gemini_complete(&key, system, prompt, schema),
         }
     }
 
@@ -521,6 +622,43 @@ mod tests {
     }
 
     #[test]
+    fn gemini_request_variants_and_tolerant_extract() {
+        let schema = bossclaw_core::reason::extraction_schema();
+
+        // Primary: responseMimeType json + responseSchema verbatim; system + user parts; no temperature.
+        let primary = build_gemini_request("SYS", "PROMPT", &schema, false);
+        assert_eq!(primary["systemInstruction"]["parts"][0]["text"], "SYS");
+        assert_eq!(primary["contents"][0]["role"], "user");
+        assert_eq!(primary["contents"][0]["parts"][0]["text"], "PROMPT");
+        assert_eq!(primary["generationConfig"]["responseMimeType"], "application/json");
+        assert_eq!(primary["generationConfig"]["responseSchema"], schema);
+        assert!(primary["generationConfig"].get("temperature").is_none());
+
+        // Fallback: NO responseSchema; schema folded into the system instruction text.
+        let fallback = build_gemini_request("SYS", "PROMPT", &schema, true);
+        assert_eq!(fallback["generationConfig"]["responseMimeType"], "application/json");
+        assert!(fallback["generationConfig"].get("responseSchema").is_none());
+        assert!(fallback["systemInstruction"]["parts"][0]["text"].as_str().unwrap().contains("schema"));
+
+        // Clean JSON in the candidate part.
+        let clean = serde_json::json!({
+            "candidates": [ { "content": { "parts": [ { "text": "{\"match\":\"x\"}" } ] } } ]
+        });
+        assert_eq!(extract_gemini_result(&clean).unwrap()["match"], "x");
+
+        // Fenced content -> stripped + parsed (reuses strip_json_fence).
+        let fenced = serde_json::json!({
+            "candidates": [ { "content": { "parts": [ { "text": "```json\n{\"match\":\"y\"}\n```" } ] } } ]
+        });
+        assert_eq!(extract_gemini_result(&fenced).unwrap()["match"], "y");
+
+        // No candidates / non-JSON -> Err, not panic.
+        assert!(extract_gemini_result(&serde_json::json!({ "candidates": [] })).is_err());
+        let junk = serde_json::json!({ "candidates": [ { "content": { "parts": [ { "text": "nope" } ] } } ] });
+        assert!(extract_gemini_result(&junk).is_err());
+    }
+
+    #[test]
     fn blocking_client_builds_under_runtime_without_panic() {
         // Reproduce the engine's call context: a tokio runtime + spawn_blocking.
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -546,6 +684,8 @@ mod tests {
             Some("https://api.example.com".into()),
         );
         assert_eq!(o.model_id(), "openai-compat:gpt-5-mini");
+        let g = CloudReasoner::new(CloudProvider::Gemini, "gemini-2.5-flash".into(), None);
+        assert_eq!(g.model_id(), "gemini:gemini-2.5-flash");
     }
 
     #[test]

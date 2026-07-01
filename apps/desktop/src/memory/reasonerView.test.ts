@@ -12,14 +12,17 @@ describe("reasonerView", () => {
   it("labels providers", () => {
     expect(providerLabel("anthropic")).toBe("Anthropic");
     expect(providerLabel("openai-compat")).toBe("OpenAI-compatible");
+    expect(providerLabel("gemini")).toBe("Gemini");
   });
   it("supplies a default model per provider", () => {
     expect(defaultModelFor("anthropic")).toBe("claude-sonnet-4-6");
     expect(defaultModelFor("openai-compat")).toBe("gpt-5-mini");
+    expect(defaultModelFor("gemini")).toBe("gemini-2.5-flash");
   });
   it("maps a provider to its vault key", () => {
     expect(vaultKeyFor("anthropic")).toBe("anthropic_api_key");
     expect(vaultKeyFor("openai-compat")).toBe("openai_compat_api_key");
+    expect(vaultKeyFor("gemini")).toBe("google_api_key");
   });
   it("cloudActive only when mode is cloud AND ready", () => {
     expect(cloudActive(cloudReady)).toBe(true);
