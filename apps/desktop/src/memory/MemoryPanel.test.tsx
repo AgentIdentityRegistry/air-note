@@ -35,7 +35,7 @@ function primeState({ mode, ready, ollamaReady }: Scenario) {
     reachable: ollamaReady, model_present: ollamaReady, model_tag: "qwen2.5:7b-instruct",
   });
   vi.mocked(evolveStatus).mockResolvedValue({
-    enabled: true, queue_depth: 0, last_tick_ms: null, error_count: 0, last_error: null,
+    enabled: true, queue_depth: 0, last_tick_ms: null, error_count: 0, last_error: null, last_tainted_snippets: null,
   });
 }
 
