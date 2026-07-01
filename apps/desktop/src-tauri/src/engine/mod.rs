@@ -998,6 +998,7 @@ impl EngineHandle {
         let key_name = match config.provider {
             cloud_reasoner::CloudProvider::Anthropic => cloud_reasoner::ANTHROPIC_KEY_NAME,
             cloud_reasoner::CloudProvider::OpenAiCompat => cloud_reasoner::OPENAI_COMPAT_KEY_NAME,
+            cloud_reasoner::CloudProvider::Gemini => cloud_reasoner::GEMINI_KEY_NAME,
         };
         match crate::vault::secret_get_cached(key_name) {
             Ok(Some(k)) if !k.trim().is_empty() => Some(key_fingerprint(&k)),
@@ -1104,6 +1105,7 @@ pub(crate) fn parse_reasoner_config(raw: Option<serde_json::Value>) -> reason::R
     };
     let provider = match obj.get("provider").and_then(|v| v.as_str()) {
         Some("openai-compat") => cloud_reasoner::CloudProvider::OpenAiCompat,
+        Some("gemini") => cloud_reasoner::CloudProvider::Gemini,
         _ => cloud_reasoner::CloudProvider::Anthropic,
     };
     let model = obj

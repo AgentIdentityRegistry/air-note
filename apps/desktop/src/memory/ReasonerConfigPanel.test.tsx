@@ -66,4 +66,13 @@ describe("ReasonerConfigPanel", () => {
     await waitFor(() => expect(d.onSetConfig).toHaveBeenCalledWith(expect.objectContaining({ mode: "local" })));
     expect(d.onChanged).toHaveBeenCalled();
   });
+
+  it("offers Gemini as a provider and hides base URL for it (pinned host)", async () => {
+    render(<ReasonerConfigPanel {...deps()} />);
+    fireEvent.click(screen.getByRole("button", { name: /^cloud$/i }));
+    const select = await screen.findByLabelText(/provider/i);
+    expect(screen.getByRole("option", { name: "Gemini" })).toBeInTheDocument();
+    fireEvent.change(select, { target: { value: "gemini" } });
+    expect(screen.queryByLabelText(/base url/i)).not.toBeInTheDocument();
+  });
 });

@@ -37,6 +37,7 @@ pub fn config_fingerprint(c: &ReasonerConfig) -> String {
     let provider = match c.provider {
         CloudProvider::Anthropic => "anthropic",
         CloudProvider::OpenAiCompat => "openai-compat",
+        CloudProvider::Gemini => "gemini",
     };
     format!("{mode}|{provider}|{}|{}", c.model, c.base_url.as_deref().unwrap_or(""))
 }
@@ -127,6 +128,7 @@ pub(crate) fn provider_str(p: CloudProvider) -> &'static str {
     match p {
         CloudProvider::Anthropic => "anthropic",
         CloudProvider::OpenAiCompat => "openai-compat",
+        CloudProvider::Gemini => "gemini",
     }
 }
 
@@ -136,6 +138,7 @@ pub(crate) fn provider_str(p: CloudProvider) -> &'static str {
 pub fn config_host(config: &ReasonerConfig) -> Option<String> {
     match config.provider {
         CloudProvider::Anthropic => Some(crate::engine::cloud_reasoner::ANTHROPIC_HOST.to_string()),
+        CloudProvider::Gemini => Some(crate::engine::cloud_reasoner::GEMINI_HOST.to_string()),
         CloudProvider::OpenAiCompat => reqwest::Url::parse(config.base_url.as_deref()?)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string())),

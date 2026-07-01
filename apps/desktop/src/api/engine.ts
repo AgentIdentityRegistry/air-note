@@ -47,7 +47,7 @@ export const evolveNow = (): Promise<EvolveReportDto> => invoke<EvolveReportDto>
 export const ollamaStatus = (): Promise<OllamaStatusDto> => invoke<OllamaStatusDto>("engine_ollama_status");
 
 export type ReasonerMode = "local" | "cloud";
-export type CloudProvider = "anthropic" | "openai-compat";
+export type CloudProvider = "anthropic" | "openai-compat" | "gemini";
 export type ReasonerConfigDto = {
   mode: ReasonerMode;
   provider: CloudProvider;
