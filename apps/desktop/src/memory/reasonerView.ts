@@ -2,13 +2,13 @@ import type { ReasonerConfigDto, ReasonerConfigInput, ReasonerMode, CloudProvide
 import type { ProviderVaultKey } from "../vault";
 
 export const providerLabel = (p: CloudProvider): string =>
-  p === "anthropic" ? "Anthropic" : "OpenAI-compatible";
+  p === "anthropic" ? "Anthropic" : p === "gemini" ? "Gemini" : "OpenAI-compatible";
 
 export const defaultModelFor = (p: CloudProvider): string =>
-  p === "anthropic" ? "claude-sonnet-4-6" : "gpt-5-mini";
+  p === "anthropic" ? "claude-sonnet-4-6" : p === "gemini" ? "gemini-2.5-flash" : "gpt-5-mini";
 
 export const vaultKeyFor = (p: CloudProvider): ProviderVaultKey =>
-  p === "anthropic" ? "anthropic_api_key" : "openai_compat_api_key";
+  p === "anthropic" ? "anthropic_api_key" : p === "gemini" ? "google_api_key" : "openai_compat_api_key";
 
 /** Cloud is actively egressing only when the saved mode is cloud AND the backend reports ready. */
 export const cloudActive = (cfg: ReasonerConfigDto): boolean => cfg.mode === "cloud" && cfg.ready;
