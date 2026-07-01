@@ -18,6 +18,7 @@ export type EvolveStatusDto = {
   last_tick_ms: number | null;
   error_count: number;
   last_error: string | null;
+  last_tainted_snippets: number | null;
 };
 export type EvolveReportDto = {
   entities_minted: number;

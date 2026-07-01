@@ -237,6 +237,10 @@ pub struct EvolveTelemetry {
     pub last_tick_ms: Option<u128>,
     pub error_count: usize,
     pub last_error: Option<String>,
+    /// File-derived (`is_external`) snippet count sent by the most recent CLOUD tick
+    /// (spec R4 egress transparency). `None` until a cloud tick runs this session; set
+    /// ONLY on cloud ticks so the banner never reports snippets that stayed on-device.
+    pub last_tainted_snippets: Option<usize>,
 }
 
 /// The single chokepoint for engine access. Holds one lazily-opened `Arc<EventLog>`
@@ -1151,6 +1155,14 @@ fn record_tick_into(
 ) {
     let mut tel = tel.lock().unwrap_or_else(|p| p.into_inner());
     tel.last_tick_ms = Some(ms);
+    // Egress transparency (spec R4): tie the disclosed count to actual cloud egress — a cloud
+    // tick's report carries the file-derived snippet count it sent; a local tick never egressed,
+    // so its (harmlessly computed) count is NOT surfaced to the banner.
+    if cloud_mode {
+        if let Ok(report) = result {
+            tel.last_tainted_snippets = Some(report.tainted_recall_snippets);
+        }
+    }
     match result {
         Err(e) => {
             tel.error_count += 1;
@@ -2080,6 +2092,26 @@ mod tests {
         let tel2 = std::sync::Mutex::new(EvolveTelemetry::default());
         record_tick_into(&tel2, 5, &Ok(EvolveReport { memories_processed: 0, ..Default::default() }), false, 3);
         assert!(tel2.lock().unwrap().last_error.is_none());
+    }
+
+    /// Egress transparency (spec R4): a CLOUD tick records its file-derived snippet count into
+    /// telemetry; a LOCAL tick (which never egressed) leaves it `None` — so the banner only ever
+    /// reports snippets that actually left the device.
+    #[test]
+    fn cloud_tick_records_tainted_recall_count_local_tick_does_not() {
+        use bossclaw_core::EvolveReport;
+        // A cloud tick that sent 3 file-derived snippets -> telemetry captures the count.
+        let tel = std::sync::Mutex::new(EvolveTelemetry::default());
+        record_tick_into(&tel, 5, &Ok(EvolveReport { tainted_recall_snippets: 3, ..Default::default() }), true, 1);
+        assert_eq!(tel.lock().unwrap().last_tainted_snippets, Some(3));
+        // A local tick leaves it None even with tainted snippets in the in-scope recall set.
+        let tel2 = std::sync::Mutex::new(EvolveTelemetry::default());
+        record_tick_into(&tel2, 5, &Ok(EvolveReport { tainted_recall_snippets: 7, ..Default::default() }), false, 1);
+        assert_eq!(tel2.lock().unwrap().last_tainted_snippets, None);
+        // An errored cloud tick has no report -> count stays None (nothing to disclose).
+        let tel3 = std::sync::Mutex::new(EvolveTelemetry::default());
+        record_tick_into(&tel3, 5, &Err(EngineOpError::Core("boom".into())), true, 1);
+        assert_eq!(tel3.lock().unwrap().last_tainted_snippets, None);
     }
 
     /// Task 7 (toggle): `set_evolve_enabled` flips the sticky engine flag through the gate.

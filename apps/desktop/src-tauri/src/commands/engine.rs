@@ -209,6 +209,9 @@ pub struct EvolveStatusDto {
     pub last_tick_ms: Option<u128>,
     pub error_count: usize,
     pub last_error: Option<String>,
+    /// File-derived (`is_external`) snippet count the most recent CLOUD tick sent off-box, or
+    /// `null` until a cloud tick runs this session. Drives the egress banner's disclosure (R4).
+    pub last_tainted_snippets: Option<usize>,
 }
 impl EvolveStatusDto {
     /// Merge the engine status with the handle telemetry: `enabled`/`queue_depth` come from
@@ -221,6 +224,7 @@ impl EvolveStatusDto {
             last_tick_ms: t.last_tick_ms,
             error_count: t.error_count,
             last_error: t.last_error.clone(),
+            last_tainted_snippets: t.last_tainted_snippets,
         }
     }
 }
@@ -344,6 +348,7 @@ pub async fn engine_evolve_status(state: State<'_, AppState>) -> Result<EvolveSt
             last_tick_ms: None,
             error_count: 0,
             last_error: None,
+            last_tainted_snippets: None,
         }),
     }
 }
@@ -638,6 +643,7 @@ mod tests {
             last_tick_ms: Some(120),
             error_count: 2,
             last_error: Some("boom".into()),
+            last_tainted_snippets: Some(2),
         };
         let dto = EvolveStatusDto::from_parts(&st, &tel);
         assert_eq!(dto.queue_depth, 4);
@@ -645,6 +651,7 @@ mod tests {
         assert_eq!(dto.last_tick_ms, Some(120), "telemetry wins over the engine stub");
         assert_eq!(dto.error_count, 2);
         assert_eq!(dto.last_error.as_deref(), Some("boom"));
+        assert_eq!(dto.last_tainted_snippets, Some(2), "the file-derived egress count passes through");
     }
 
     #[test]
