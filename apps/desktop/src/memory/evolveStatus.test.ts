@@ -10,6 +10,7 @@ describe("formatEvolve", () => {
       last_tick_ms: 120,
       error_count: 0,
       last_error: null,
+      last_tainted_snippets: null,
     };
     expect(formatEvolve(s)).toBe("On · 3 queued · last tick 120ms · 0 errors");
   });
@@ -21,6 +22,7 @@ describe("formatEvolve", () => {
       last_tick_ms: null,
       error_count: 0,
       last_error: null,
+      last_tainted_snippets: null,
     };
     expect(formatEvolve(s)).toBe("Off · 0 queued · last tick — · 0 errors");
   });
@@ -32,6 +34,7 @@ describe("formatEvolve", () => {
       last_tick_ms: 9,
       error_count: 2,
       last_error: "boom",
+      last_tainted_snippets: null,
     };
     expect(formatEvolve(s)).toBe("On · 1 queued · last tick 9ms · 2 errors");
   });

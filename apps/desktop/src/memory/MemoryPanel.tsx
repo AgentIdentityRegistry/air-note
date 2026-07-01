@@ -120,7 +120,7 @@ export function MemoryPanel() {
       <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
         {searchBlurb(reasonerCfg?.mode ?? "local", reasonerCfg?.provider ?? "anthropic")}
       </p>
-      <CloudEgressBanner cfg={reasonerCfg} />
+      <CloudEgressBanner cfg={reasonerCfg} taintedSnippets={status?.last_tainted_snippets ?? null} />
 
       <div style={{ display: "flex", gap: 8, margin: "12px 0" }}>
         <input

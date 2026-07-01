@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   providerLabel, defaultModelFor, vaultKeyFor, cloudActive,
-  bannerText, modeBlurb, searchBlurb, consentBody, buildConfigInput,
+  bannerText, modeBlurb, searchBlurb, consentBody, buildConfigInput, taintedNotice,
 } from "./reasonerView";
 import type { ReasonerConfigDto } from "../api/engine";
 
@@ -45,5 +45,11 @@ describe("reasonerView", () => {
       .toEqual({ mode: "cloud", provider: "anthropic", model: "m", base_url: null });
     expect(buildConfigInput({ mode: "cloud", provider: "openai-compat", model: "m", baseUrl: " https://h " }))
       .toEqual({ mode: "cloud", provider: "openai-compat", model: "m", base_url: "https://h" });
+  });
+  it("taintedNotice discloses the file-derived egress count, omitting until a cloud tick runs", () => {
+    expect(taintedNotice(null)).toBeNull();
+    expect(taintedNotice(0)).toBe("Last sync included no content from your ingested files.");
+    expect(taintedNotice(1)).toBe("Last sync included 1 snippet from your ingested files.");
+    expect(taintedNotice(3)).toBe("Last sync included 3 snippets from your ingested files.");
   });
 });

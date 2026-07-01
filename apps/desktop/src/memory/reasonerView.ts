@@ -16,6 +16,14 @@ export const cloudActive = (cfg: ReasonerConfigDto): boolean => cfg.mode === "cl
 export const bannerText = (cfg: ReasonerConfigDto): string =>
   `Brain model: Cloud · ${providerLabel(cfg.provider)} — context leaves this device`;
 
+/** Egress disclosure for the banner: how many file-derived snippets the last CLOUD tick sent
+ *  off-box. `null` (no cloud tick yet this session) omits the line so the banner never guesses. */
+export const taintedNotice = (count: number | null): string | null => {
+  if (count === null) return null;
+  if (count === 0) return "Last sync included no content from your ingested files.";
+  return `Last sync included ${count} snippet${count === 1 ? "" : "s"} from your ingested files.`;
+};
+
 export const modeBlurb = (mode: ReasonerMode, provider: CloudProvider): string =>
   mode === "cloud"
     ? `Cloud mode sends your brain's working context — built from your memories and ingested files — to ${providerLabel(provider)}. Your memory leaves this device.`

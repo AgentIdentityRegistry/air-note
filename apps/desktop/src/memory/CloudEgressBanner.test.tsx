@@ -19,4 +19,14 @@ describe("CloudEgressBanner", () => {
     rerender(<CloudEgressBanner cfg={null} />);
     expect(container).toBeEmptyDOMElement();
   });
+  it("discloses the file-derived snippet count when a cloud tick has run", () => {
+    render(<CloudEgressBanner cfg={cfg} taintedSnippets={3} />);
+    expect(screen.getByText(/context leaves this device/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 snippets from your ingested files/i)).toBeInTheDocument();
+  });
+  it("omits the count line until a cloud tick runs (null), keeping the egress warning", () => {
+    render(<CloudEgressBanner cfg={cfg} taintedSnippets={null} />);
+    expect(screen.getByText(/context leaves this device/i)).toBeInTheDocument();
+    expect(screen.queryByText(/ingested files/i)).not.toBeInTheDocument();
+  });
 });
