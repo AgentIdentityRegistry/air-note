@@ -108,8 +108,11 @@ export function MemoryPanel() {
   };
 
   const ollamaReady = !!ollama?.reachable && !!ollama?.model_present;
-  const reasonerReady = !!reasonerCfg?.ready;
   const isCloud = reasonerCfg?.mode === "cloud";
+  // Evolve readiness is mode-aware (spec §2b): Local trusts the Ollama probe; Cloud trusts the
+  // signed-consent gate (cfg.ready is false for Local by design). Gating on cfg.ready alone left
+  // the default Local mode's Evolve controls permanently disabled.
+  const reasonerReady = isCloud ? !!reasonerCfg?.ready : ollamaReady;
 
   return (
     <Card>
