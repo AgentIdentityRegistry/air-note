@@ -59,6 +59,8 @@ pub(crate) fn classify_cloud_error(status: u16) -> BossclawError {
 /// extraction batch (spec §8 R7). Small values truncate the JSON tail.
 pub(crate) const ANTHROPIC_MAX_TOKENS: u32 = 4096;
 pub(crate) const ANTHROPIC_TOOL_NAME: &str = "emit_result";
+/// Forced-function name for the OpenAI-compat `tool_calls` fallback (§3.1 rung 3).
+pub(crate) const OPENAI_TOOL_NAME: &str = "emit_result";
 
 /// Build the Anthropic `/v1/messages` body that FORCES one structured tool call
 /// whose input_schema is the engine schema. No `temperature`/`thinking`
@@ -160,6 +162,94 @@ fn strip_json_fence(s: &str) -> &str {
         .or_else(|| t.strip_prefix("```"))
         .unwrap_or(t);
     t.trim().strip_suffix("```").unwrap_or(t).trim()
+}
+
+/// Build the OpenAI-compat `/v1/chat/completions` body for the `tool_calls`
+/// fallback (rung 3): FORCE one function call whose `parameters` are the engine
+/// schema, mirroring the Anthropic forced-tool arm. Some self-hosted compat
+/// servers (llama.cpp, vLLM, LocalAI) reject both `response_format` modes but
+/// support function-calling. No `response_format`/`temperature` (parity). §3.1.
+pub(crate) fn build_openai_tool_request(model: &str, system: &str, prompt: &str, schema: &Value) -> Value {
+    json!({
+        "model": model,
+        "stream": false,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": prompt }
+        ],
+        "tools": [ {
+            "type": "function",
+            "function": {
+                "name": OPENAI_TOOL_NAME,
+                "description": "Return the structured result for this request.",
+                "parameters": schema
+            }
+        } ],
+        "tool_choice": { "type": "function", "function": { "name": OPENAI_TOOL_NAME } }
+    })
+}
+
+/// Pull the forced tool call's stringified `arguments` out of an OpenAI-compat
+/// response and parse it as JSON, tolerating a ```json fence. Missing tool_call
+/// or parse failure -> `BossclawError::Reasoner` (retryable no-op tick).
+pub(crate) fn extract_openai_tool_result(resp: &Value) -> Result<Value, BossclawError> {
+    let arguments = resp
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(Value::as_array)
+        .and_then(|t| t.first())
+        .and_then(|t| t.get("function"))
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| BossclawError::Reasoner("openai response missing tool_call arguments".into()))?;
+    let trimmed = strip_json_fence(arguments);
+    serde_json::from_str(trimmed)
+        .map_err(|e| BossclawError::Reasoner(format!("openai tool_call arguments not valid JSON: {e}")))
+}
+
+/// The OpenAI-compat structured-output fallback ladder (spec §3.1), factored out
+/// so it is unit-testable with no network. `send` posts a request body and returns
+/// `(http_status, payload)` — `payload` is `Value::Null` on a non-2xx (body dropped,
+/// R3). Rungs, tried in order: (1) native `json_schema`, (2) `json_object` + schema
+/// in the system text, (3) a FORCED function/tool call. Each rung falls through to
+/// the next ONLY on 400/404/422 (a schema/endpoint reject); any other non-2xx is
+/// classified immediately (no point re-sending an auth/rate/5xx failure). The
+/// winning payload is parsed by the extractor matching the rung that produced it.
+pub(crate) fn openai_fallback_ladder<F>(
+    model: &str,
+    system: &str,
+    prompt: &str,
+    schema: &Value,
+    send: F,
+) -> Result<Value, BossclawError>
+where
+    F: Fn(&Value) -> Result<(u16, Value), BossclawError>,
+{
+    let is_success = |s: u16| (200..300).contains(&s);
+    let is_retryable = |s: u16| matches!(s, 400 | 404 | 422);
+
+    // Rungs 1 + 2: response_format json_schema, then json_object. Both parse the
+    // assistant message content. Fall through only on a retryable schema reject.
+    for fallback in [false, true] {
+        let (status, payload) = send(&build_openai_request(model, system, prompt, schema, fallback))?;
+        if is_success(status) {
+            return extract_openai_result(&payload);
+        }
+        if !is_retryable(status) {
+            return Err(classify_cloud_error(status));
+        }
+    }
+
+    // Rung 3: forced tool call (compat servers that reject both response_format modes).
+    let (status, payload) = send(&build_openai_tool_request(model, system, prompt, schema))?;
+    if is_success(status) {
+        extract_openai_tool_result(&payload)
+    } else {
+        Err(classify_cloud_error(status))
+    }
 }
 
 /// Build the Gemini `:generateContent` body. `fallback=false` uses `responseSchema` (strict);
@@ -409,13 +499,14 @@ impl CloudReasoner {
             .ok_or_else(|| BossclawError::Reasoner("openai-compat base_url missing".into()))?;
         let endpoint = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
 
-        let send = |fallback: bool| -> Result<(reqwest::StatusCode, Value), BossclawError> {
-            let body = build_openai_request(&self.model, system, prompt, schema, fallback);
+        // Post one body; return (status, payload) with the body dropped on non-2xx
+        // (R3). The fallback ladder decides which rung to try and how to extract.
+        let send = |body: &Value| -> Result<(u16, Value), BossclawError> {
             let resp = client
                 .post(&endpoint)
                 .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .json(&body)
+                .json(body)
                 .send()
                 .map_err(|e| BossclawError::Reasoner(format!("openai transport: {e}")))?;
             let status = resp.status();
@@ -423,24 +514,13 @@ impl CloudReasoner {
                 let v: Value = resp
                     .json()
                     .map_err(|e| BossclawError::Reasoner(format!("openai response not JSON: {e}")))?;
-                Ok((status, v))
+                Ok((status.as_u16(), v))
             } else {
-                // Drain body for status only; classified later. Body dropped (R3).
-                Ok((status, Value::Null))
+                Ok((status.as_u16(), Value::Null)) // body dropped (R3)
             }
         };
 
-        // Primary json_schema; on 400/404/422 retry once with json_object (R7).
-        let (status, payload) = send(false)?;
-        let (status, payload) = if matches!(status.as_u16(), 400 | 404 | 422) {
-            send(true)?
-        } else {
-            (status, payload)
-        };
-        if !status.is_success() {
-            return Err(classify_cloud_error(status.as_u16()));
-        }
-        extract_openai_result(&payload)
+        openai_fallback_ladder(&self.model, system, prompt, schema, send)
     }
 
     fn gemini_complete(
@@ -619,6 +699,115 @@ mod tests {
             "choices": [ { "message": { "content": "sorry, I cannot" } } ]
         });
         assert!(extract_openai_result(&junk).is_err());
+    }
+
+    #[test]
+    fn openai_tool_request_and_extract_roundtrip() {
+        let schema = bossclaw_core::reason::extraction_schema();
+
+        // Tool-call variant (fallback rung 3): forces ONE function call whose
+        // parameters ARE the engine schema; no response_format, no temperature
+        // (parity with the Anthropic forced-tool arm).
+        let body = build_openai_tool_request("local-model", "SYS", "PROMPT", &schema);
+        assert_eq!(body["model"], "local-model");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "SYS");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "PROMPT");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], OPENAI_TOOL_NAME);
+        assert_eq!(body["tools"][0]["function"]["parameters"], schema);
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], OPENAI_TOOL_NAME);
+        assert!(body.get("response_format").is_none());
+        assert!(body.get("temperature").is_none());
+
+        // Extract the forced tool call's stringified `arguments`.
+        let clean = serde_json::json!({
+            "choices": [ { "message": { "tool_calls": [
+                { "type": "function", "function": { "name": OPENAI_TOOL_NAME, "arguments": "{\"match\":\"z\"}" } }
+            ] } } ]
+        });
+        assert_eq!(extract_openai_tool_result(&clean).unwrap()["match"], "z");
+
+        // Fenced arguments -> stripped + parsed (reuses strip_json_fence).
+        let fenced = serde_json::json!({
+            "choices": [ { "message": { "tool_calls": [
+                { "function": { "name": OPENAI_TOOL_NAME, "arguments": "```json\n{\"match\":\"q\"}\n```" } }
+            ] } } ]
+        });
+        assert_eq!(extract_openai_tool_result(&fenced).unwrap()["match"], "q");
+
+        // No tool_calls at all -> Err, not panic.
+        let none = serde_json::json!({ "choices": [ { "message": { "content": "no tools" } } ] });
+        assert!(extract_openai_tool_result(&none).is_err());
+
+        // tool_calls present but empty array -> Err, not panic (.first() is None).
+        let empty = serde_json::json!({ "choices": [ { "message": { "tool_calls": [] } } ] });
+        assert!(extract_openai_tool_result(&empty).is_err());
+
+        // tool_calls present but arguments not valid JSON -> Err, not panic.
+        let junk = serde_json::json!({
+            "choices": [ { "message": { "tool_calls": [ { "function": { "arguments": "nope" } } ] } } ]
+        });
+        assert!(extract_openai_tool_result(&junk).is_err());
+    }
+
+    #[test]
+    fn openai_fallback_ladder_walks_schema_object_then_tool() {
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        let schema = bossclaw_core::reason::adjudication_schema();
+
+        // Drive the ladder with a scripted sequence of (status, payload) responses,
+        // recording which rung's body was sent each time — no network.
+        let run = |responses: Vec<(u16, Value)>| -> (Result<Value, BossclawError>, Vec<&'static str>) {
+            let queue = RefCell::new(VecDeque::from(responses));
+            let modes: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+            let out = openai_fallback_ladder("m", "SYS", "PROMPT", &schema, |body| {
+                let mode = if body.get("tools").is_some() {
+                    "tool"
+                } else if body["response_format"]["type"] == "json_object" {
+                    "object"
+                } else {
+                    "schema"
+                };
+                modes.borrow_mut().push(mode);
+                Ok(queue.borrow_mut().pop_front().expect("sender called more times than scripted"))
+            });
+            (out, modes.into_inner())
+        };
+        let content = |s: &str| serde_json::json!({ "choices": [ { "message": { "content": s } } ] });
+        let tool = |s: &str| serde_json::json!({
+            "choices": [ { "message": { "tool_calls": [
+                { "function": { "name": OPENAI_TOOL_NAME, "arguments": s } }
+            ] } } ]
+        });
+
+        // Rung 1 (json_schema) succeeds -> one call, parsed from message.content.
+        let (out, modes) = run(vec![(200, content("{\"match\":\"a\"}"))]);
+        assert_eq!(out.unwrap()["match"], "a");
+        assert_eq!(modes, vec!["schema"]);
+
+        // Rung 1 retryable (400) -> rung 2 (json_object) succeeds.
+        let (out, modes) = run(vec![(400, Value::Null), (200, content("{\"match\":\"b\"}"))]);
+        assert_eq!(out.unwrap()["match"], "b");
+        assert_eq!(modes, vec!["schema", "object"]);
+
+        // Rungs 1+2 retryable -> rung 3 (tool_calls) succeeds, parsed via the tool extractor.
+        let (out, modes) = run(vec![(400, Value::Null), (422, Value::Null), (200, tool("{\"match\":\"c\"}"))]);
+        assert_eq!(out.unwrap()["match"], "c");
+        assert_eq!(modes, vec!["schema", "object", "tool"]);
+
+        // Non-retryable status on rung 1 -> classified immediately, NO fallback.
+        let (out, modes) = run(vec![(401, Value::Null)]);
+        assert!(out.unwrap_err().to_string().contains("auth_rejected"));
+        assert_eq!(modes, vec!["schema"]);
+
+        // Every rung returns a retryable error -> the final rung is classified as Err.
+        let (out, modes) = run(vec![(400, Value::Null), (404, Value::Null), (422, Value::Null)]);
+        assert!(out.is_err());
+        assert_eq!(modes, vec!["schema", "object", "tool"]);
     }
 
     #[test]
