@@ -113,8 +113,11 @@ mod unix_main {
         };
 
         // (4) Build ONE EngineHandle: shared vault (same service as the app) → keystore + embedder +
-        // config-driven reasoner. The reasoner cell is shared with the provider closure (mode flips
-        // take effect without a restart) and reseeded from the signed log just below.
+        // config-driven reasoner. The reasoner cell is shared between the provider closure (read
+        // each tick) and the engine itself (`with_reasoner_cell`): the engine REFRESHES it after
+        // every successful `SetReasonerConfig`/`EnableCloudReasoner` persist, so a mode flip —
+        // including a Cloud→Local revocation — takes effect on the next tick without a daemon
+        // restart (the M1a Task 6 review fix; boot additionally reseeds it just below).
         let engine_vault = vault::engine_vault();
         let reasoner_cfg = Arc::new(Mutex::new(ReasonerConfig::default()));
         let embedder = Arc::new(bossclawd::engine::embed::ResourceModel2Vec::new(model_dir));
@@ -124,12 +127,10 @@ mod unix_main {
                 cell.lock().unwrap_or_else(|p| p.into_inner()).clone()
             }))
         };
-        let engine = Arc::new(EngineHandle::new(
-            engine_vault,
-            data_dir.clone(),
-            embedder,
-            reasoner_provider,
-        ));
+        let engine = Arc::new(
+            EngineHandle::new(engine_vault, data_dir.clone(), embedder, reasoner_provider)
+                .with_reasoner_cell(reasoner_cfg.clone()),
+        );
 
         // (5) Reseed the reasoner config from the signed log (onboarded-gated), so a Cloud choice
         // survives restart. Onboarding is the daemon-local "<data_dir>/identity.json parses" check —

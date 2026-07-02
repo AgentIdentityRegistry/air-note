@@ -269,6 +269,23 @@ pub struct EngineHandle {
     /// The evolve status read path (a `std::sync::Mutex`, poison-recovered on read).
     /// Written by `record_tick` + read by `evolve_status` (SP3 Task 7).
     evolve_tel: std::sync::Mutex<EvolveTelemetry>,
+    /// The shared reasoner-config cell the daemon's `ConfigReasonerProvider` closure reads on
+    /// every evolve tick (attached by `main.rs` via [`Self::with_reasoner_cell`]; `None` in unit
+    /// tests that don't care). Held HERE so BOTH config-writing ops (`set_reasoner_config`,
+    /// `enable_cloud_reasoner`) refresh it write-through-style after a successful persist — the
+    /// daemon-side replacement for the pre-M1a app-side write-through, and what makes a mode flip
+    /// (including a Cloud→Local REVOCATION) take effect on the next tick without a daemon
+    /// restart. Boot additionally reseeds it from the signed log (`reseed_reasoner_cell`).
+    /// Living inside the engine (not the dispatch layer) means EVERY client surface — the app
+    /// today, Claude Code in M1b — gets the write-through; no transport can persist a config the
+    /// running provider won't see.
+    reasoner_cell: Option<Arc<std::sync::Mutex<reason::ReasonerConfig>>>,
+    /// TEST-ONLY probe-reasoner override for `enable_cloud_reasoner`'s R5 probe. ALWAYS `None` in
+    /// production — the only setter is the `#[cfg(test)]` builder below, so no production path
+    /// can bypass `build_reasoner`. Exists so the hermetic suite can drive the full
+    /// probe→persist→cell-write-through path with a `ScriptedReasoner` (mirroring
+    /// `CloudReasoner`'s `#[cfg(test)]` key seam — the reviewed 2a pattern for egress-free tests).
+    probe_reasoner_for_test: Option<Arc<dyn bossclaw_core::Reasoner>>,
 }
 
 impl EngineHandle {
@@ -288,7 +305,29 @@ impl EngineHandle {
             evolve_lock: Mutex::new(()),
             indexed: Mutex::new(false),
             evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
+            reasoner_cell: None,
+            probe_reasoner_for_test: None,
         }
+    }
+
+    /// Attach the shared reasoner-config cell (see the field docs): after this, every successful
+    /// `set_reasoner_config`/`enable_cloud_reasoner` persist ALSO refreshes the cell, so the
+    /// provider closure picks the change up on the next tick — no restart, no revocation latency.
+    /// Builder-style, called once at daemon boot; the write-through is a no-op when unattached.
+    pub fn with_reasoner_cell(mut self, cell: Arc<std::sync::Mutex<reason::ReasonerConfig>>) -> Self {
+        self.reasoner_cell = Some(cell);
+        self
+    }
+
+    /// TEST-ONLY: override the one-shot reasoner `enable_cloud_reasoner` probes with (see the
+    /// field docs). Compiled out of production and out of the `test-helpers` feature.
+    #[cfg(test)]
+    pub(crate) fn with_probe_reasoner_for_test(
+        mut self,
+        reasoner: Arc<dyn bossclaw_core::Reasoner>,
+    ) -> Self {
+        self.probe_reasoner_for_test = Some(reasoner);
+        self
     }
 
     /// Open-or-get the single `EventLog`. The onboarding gate is enforced HERE (returns
@@ -1041,13 +1080,18 @@ impl EngineHandle {
     /// Persist the NON-security reasoner config (mode/provider/model/base_url). Does NOT grant
     /// consent — flipping to cloud still requires `enable_cloud_reasoner`'s tested opt-in (R1).
     /// Gated + signed (mirrors `set_mandates_enabled`). Consumed by `engine_set_reasoner_config`.
+    /// On success, ALSO refreshes the attached provider cell (see [`Self::refresh_reasoner_cell`])
+    /// so the flip — including a Cloud→Local revocation — takes effect without a daemon restart.
     pub async fn set_reasoner_config(&self, onboarded: bool, config: serde_json::Value) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let parsed = parse_reasoner_config(Some(config.clone()));
         spawn_blocking(move || {
             log.set_reasoner_config(config).map_err(|e| EngineOpError::Core(e.to_string()))
         })
         .await
-        .map_err(|e| EngineOpError::Join(e.to_string()))?
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        self.refresh_reasoner_cell(parsed);
+        Ok(())
     }
 
     /// The R5 "test-key-on-enable" flow: prove the provider key works with ONE trivial probe
@@ -1060,8 +1104,13 @@ impl EngineHandle {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
 
         let parsed = parse_reasoner_config(Some(config.clone()));
-        // One-shot reasoner, byte-identical to what the scheduler would later build (R5).
-        let reasoner = reason::build_reasoner(&parsed);
+        // One-shot reasoner, byte-identical to what the scheduler would later build (R5). The
+        // `probe_reasoner_for_test` override is ALWAYS `None` outside `cfg(test)` (no production
+        // setter exists), so production takes the `build_reasoner` arm unconditionally.
+        let reasoner = self
+            .probe_reasoner_for_test
+            .clone()
+            .unwrap_or_else(|| reason::build_reasoner(&parsed));
         let schema = bossclaw_core::reason::adjudication_schema();
         // Trivial probe: a fixed prompt with NO memory/file bytes. With no key in the vault this
         // fails fast inside `read_key` BEFORE any network call (the Task 12b IPC-test path).
@@ -1092,7 +1141,23 @@ impl EngineHandle {
             Ok(())
         })
         .await
-        .map_err(|e| EngineOpError::Join(e.to_string()))?
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        // Probe + persist both succeeded → refresh the provider cell so the evolve loop egresses
+        // to cloud from the NEXT tick (mirrors `set_reasoner_config`; never reached on failure).
+        self.refresh_reasoner_cell(parsed);
+        Ok(())
+    }
+
+    /// Write-through: copy `parsed` into the attached reasoner-config cell (no-op when detached).
+    /// Called by the two config-writing ops AFTER a successful signed-log persist — never on a
+    /// failed persist or probe, so the running provider can only ever read a config that is
+    /// actually on file. Poison-recovered like every other cell access. This is the daemon-side
+    /// replacement for the pre-M1a app-side write-through (the M1a Task 6 review fix: without it,
+    /// a Cloud→Local flip kept the CLOUD reasoner in use until restart).
+    fn refresh_reasoner_cell(&self, parsed: reason::ReasonerConfig) {
+        if let Some(cell) = &self.reasoner_cell {
+            *cell.lock().unwrap_or_else(|p| p.into_inner()) = parsed;
+        }
     }
 }
 
@@ -2646,6 +2711,88 @@ mod tests {
         assert!(
             matches!(cfg.mode, crate::engine::reason::ReasonerMode::Local),
             "the Local flip persisted through the same signed log the scheduler reads per tick"
+        );
+    }
+
+    // ---- M1a Task 6 review fix: config write-through to the PROVIDER CELL ----
+    //
+    // The sibling test above proves the scheduler's per-tick GATE reads the flip from the signed
+    // log — but the reasoner INSTANCE comes from the `ConfigReasonerProvider` closure, which reads
+    // the in-memory CELL. Pre-M1a the APP wrote every config change through to that cell;
+    // post-extraction the daemon persisted to the log but only reseeded the cell at BOOT — so a
+    // Cloud→Local flip could keep the CLOUD reasoner in use until restart (a revocation-latency
+    // hole; the consent record stays on file so readiness stays true). These tests pin the fix:
+    // BOTH config-writing ops refresh the attached cell immediately after a successful persist.
+
+    #[tokio::test]
+    async fn set_reasoner_config_refreshes_the_provider_cell_without_restart() {
+        let (vault, dir) = test_vault_and_dir();
+        let cell = Arc::new(std::sync::Mutex::new(crate::engine::reason::ReasonerConfig::default()));
+        let h = new_test_handle(vault, &dir).with_reasoner_cell(cell.clone());
+
+        // A cloud-shaped persist: the cell the provider closure reads must flip to Cloud
+        // immediately — no daemon restart, no boot reseed.
+        h.set_reasoner_config(true, serde_json::json!({
+            "mode": "cloud", "provider": "anthropic",
+            "model": "claude-sonnet-4-6", "base_url": null
+        })).await.expect("persist cloud config");
+        assert!(
+            matches!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Cloud),
+            "the cell reads Cloud right after the persist (no restart)"
+        );
+
+        // Flip BACK to Local: the revocation must reach the cell immediately — this is the exact
+        // hole the review found (a stale cell kept the CLOUD reasoner in use until restart).
+        h.set_reasoner_config(true, serde_json::json!({
+            "mode": "local", "provider": "anthropic", "model": "", "base_url": null
+        })).await.expect("persist local config");
+        assert!(
+            matches!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Local),
+            "Cloud→Local revocation is effective in the cell without a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_cloud_reasoner_success_refreshes_the_provider_cell() {
+        let (vault, dir) = test_vault_and_dir();
+        let cell = Arc::new(std::sync::Mutex::new(crate::engine::reason::ReasonerConfig::default()));
+        // Script the EXACT fixed probe turn `enable_cloud_reasoner` sends (a canned prompt with
+        // no memory/file bytes), so the R5 probe succeeds HERMETICALLY — no key, no egress. The
+        // returned JSON is discarded by the enable flow (only Ok/Err matters).
+        let probe = bossclaw_core::ScriptedReasoner::new("scripted-probe").with_response(
+            "Reply with the JSON {\"match\":\"ok\"}.",
+            "candidates: [ok]. text: ok",
+            serde_json::json!({ "match": "ok" }),
+        );
+        let h = new_test_handle(vault, &dir)
+            .with_reasoner_cell(cell.clone())
+            .with_probe_reasoner_for_test(Arc::new(probe));
+
+        h.enable_cloud_reasoner(true, serde_json::json!({
+            "mode": "cloud", "provider": "anthropic",
+            "model": "claude-sonnet-4-6", "base_url": null
+        })).await.expect("probe succeeds → config + consent persist");
+        assert!(
+            matches!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Cloud),
+            "the cell reads Cloud right after a successful enable (no restart)"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_cloud_reasoner_probe_failure_leaves_the_provider_cell_unchanged() {
+        let (vault, dir) = test_vault_and_dir(); // seeds the provider-key cache EMPTY
+        let cell = Arc::new(std::sync::Mutex::new(crate::engine::reason::ReasonerConfig::default()));
+        // NO probe override: the real builder makes a CloudReasoner whose `read_key` finds no key
+        // in the (empty-seeded) cache and fails fast — hermetic, no network, nothing persisted.
+        let h = new_test_handle(vault, &dir).with_reasoner_cell(cell.clone());
+
+        h.enable_cloud_reasoner(true, serde_json::json!({
+            "mode": "cloud", "provider": "anthropic",
+            "model": "claude-sonnet-4-6", "base_url": null
+        })).await.expect_err("no provider key → the R5 probe fails closed");
+        assert!(
+            matches!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Local),
+            "a failed enable must never touch the cell (fail-closed write-through)"
         );
     }
 }
