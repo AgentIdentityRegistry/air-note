@@ -13,10 +13,12 @@
 //! # Error mapping (pre-resolved by the proto design)
 //! - `EngineError::NotOnboarded` (surfaced as `EngineOpError::Open(NotOnboarded)`) → [`Response::NotOnboarded`].
 //! - `EngineOpError::Busy(op)` → [`Response::Busy`] carrying the op name.
-//! - everything else → [`Response::Err`] with the error's Display string. The copied engine's error
-//!   Display impls are already user-facing-safe (no DEK/key material, no other-user paths — an
-//!   `EngineOpError` embeds only the op name, an engine message, or a path the caller itself supplied),
-//!   matching the app's existing `map_err(|e| e.to_string())`.
+//! - everything else → [`Response::Err`] carrying the TYPED kind + the variant's INNER message —
+//!   NEVER `e.to_string()`. Display prefixes ("engine error: ", "memory model unavailable: ", …)
+//!   are applied exactly once, app-side, after the client rebuilds the typed variant; shipping a
+//!   pre-rendered string would double-prefix every error (the Task 5 string-parity regression).
+//!   The inner messages are already user-facing-safe (no DEK/key material, no other-user paths —
+//!   they embed only the op name, an engine message, or a path the caller itself supplied).
 
 use std::sync::Arc;
 
@@ -25,7 +27,10 @@ use bossclawd_proto::types::{
     EvolveTelemetryWire, MandateSummaryWire, MandateWriteSummaryWire, PreviewDataWire,
     ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
 };
-use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, HitWire, Request, Response, PROTO_VERSION};
+use bossclawd_proto::{
+    read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response,
+    PROTO_VERSION,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::engine::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
@@ -54,9 +59,13 @@ where
     let first = read_frame(&mut read).await?;
     let Ok(hello) = serde_json::from_slice::<Hello>(&first) else {
         // Not a Hello frame (garbage or a Request sent first) → refuse without dispatching.
-        // Best-effort error frame so the client sees a reason, then close.
-        let _ = write_frame(&mut write, &encode(&Response::Err("expected Hello handshake".into())))
-            .await;
+        // Best-effort error frame so the client sees a reason, then close. Protocol-level faults
+        // have no typed engine variant → the generic `Core` kind.
+        let _ = write_frame(
+            &mut write,
+            &encode(&protocol_err("expected Hello handshake".into())),
+        )
+        .await;
         return Ok(());
     };
     if hello.proto_version != PROTO_VERSION {
@@ -64,7 +73,7 @@ where
         // "engine unavailable" rather than mis-deserializing a later frame against the wrong schema.
         let _ = write_frame(
             &mut write,
-            &encode(&Response::Err(format!(
+            &encode(&protocol_err(format!(
                 "protocol version mismatch: daemon {PROTO_VERSION}, client {}",
                 hello.proto_version
             ))),
@@ -91,7 +100,7 @@ where
         // A malformed Request frame must NOT panic or kill the daemon: reply Err and keep serving.
         let response = match serde_json::from_slice::<Request>(&frame) {
             Ok(req) => dispatch(&engine, req).await,
-            Err(e) => Response::Err(format!("malformed request frame: {e}")),
+            Err(e) => protocol_err(format!("malformed request frame: {e}")),
         };
         // A write error means the peer went away mid-reply → end the connection.
         if write_frame(&mut write, &encode(&response)).await.is_err() {
@@ -100,12 +109,19 @@ where
     }
 }
 
+/// A daemon protocol-level fault (bad handshake, malformed frame, encode failure) as a `Response`.
+/// These have no typed engine variant, so they ride the generic `Core` kind — the client renders
+/// them under Core's "engine error: " prefix, which is apt for a daemon-side fault.
+fn protocol_err(message: String) -> Response {
+    Response::Err { kind: OpErrorKindWire::Core, message }
+}
+
 /// Serialize a `Response` to frame bytes. `Response` is a plain serde enum of owned data, so
 /// `to_vec` cannot realistically fail; on the impossible error we fall back to an `Err` frame
 /// rather than `unwrap` (never panic on the serve path).
 fn encode(resp: &Response) -> Vec<u8> {
     serde_json::to_vec(resp).unwrap_or_else(|_| {
-        serde_json::to_vec(&Response::Err("response serialization failed".into()))
+        serde_json::to_vec(&protocol_err("response serialization failed".into()))
             .unwrap_or_default()
     })
 }
@@ -217,8 +233,9 @@ async fn dispatch(engine: &Arc<EngineHandle>, req: Request) -> Response {
         // ── Teardown (identity reset). Returns `EngineError`, not `EngineOpError`. ──
         Request::Teardown => match engine.teardown().await {
             Ok(()) => Response::Ok,
-            // Teardown never returns NotOnboarded (it deletes unconditionally); any error is Err.
-            Err(e) => Response::Err(e.to_string()),
+            // Teardown never returns NotOnboarded (it deletes unconditionally); errors map through
+            // the shared `EngineError` chokepoint below.
+            Err(e) => engine_error_response(e),
         },
 
         // ── Reasoner config (Milestone D). ──
@@ -263,14 +280,47 @@ fn unit_result(result: Result<(), EngineOpError>) -> Response {
 /// The single error-mapping chokepoint (pre-resolved by the proto design):
 /// - `Open(NotOnboarded)` → `Response::NotOnboarded` (a signal, not a fault — the UI shows onboarding);
 /// - `Busy(op)` → `Response::Busy(op)` (a serialized ingest/evolve is already running);
-/// - anything else → `Response::Err(e.to_string())`, which for these engine errors is already
-///   user-facing-safe (no key material, no other-user paths).
-fn op_error_response(e: EngineOpError) -> Response {
-    match e {
-        EngineOpError::Open(EngineError::NotOnboarded) => Response::NotOnboarded,
-        EngineOpError::Busy(op) => Response::Busy(op.to_string()),
-        other => Response::Err(other.to_string()),
-    }
+/// - `Open(other)` → the shared [`engine_error_response`] `EngineError` mapping;
+/// - every other variant → its own [`OpErrorKindWire`] carrying the INNER message — never
+///   `e.to_string()`, so the client rebuilds the exact typed variant and Display prefixes are
+///   applied exactly once, app-side (the string-parity contract).
+///
+/// Exhaustive on purpose (no `_` wildcard): a new `EngineOpError` variant must force a deliberate
+/// kind mapping here at compile time rather than silently collapsing into a generic string.
+///
+/// `pub` so the desktop client's string-parity regression test can drive the REAL daemon-side
+/// mapping (typed error → wire encode/decode → client mapping → Display) without a socket.
+pub fn op_error_response(e: EngineOpError) -> Response {
+    let (kind, message) = match e {
+        EngineOpError::Open(open) => return engine_error_response(open),
+        EngineOpError::Busy(op) => return Response::Busy(op.to_string()),
+        EngineOpError::Core(m) => (OpErrorKindWire::Core, m),
+        EngineOpError::Embedder(m) => (OpErrorKindWire::Embedder, m),
+        EngineOpError::Reasoner(m) => (OpErrorKindWire::Reasoner, m),
+        EngineOpError::Stale(m) => (OpErrorKindWire::Stale, m),
+        EngineOpError::Revoked(m) => (OpErrorKindWire::Revoked, m),
+        EngineOpError::NeedsLoudConfirm(m) => (OpErrorKindWire::NeedsLoudConfirm, m),
+        EngineOpError::Rejected(m) => (OpErrorKindWire::Rejected, m),
+        EngineOpError::Join(m) => (OpErrorKindWire::Join, m),
+    };
+    Response::Err { kind, message }
+}
+
+/// The `EngineError` mapping — shared by the op path (via `EngineOpError::Open`) and teardown's
+/// `Result<(), EngineError>`. Same typed-kind contract as [`op_error_response`]; exhaustive for the
+/// same reason. `pub` for the same parity-test reason.
+pub fn engine_error_response(e: EngineError) -> Response {
+    let (kind, message) = match e {
+        // A signal, not a fault (teardown itself never produces it, but the op-path `Open` gate does).
+        EngineError::NotOnboarded => return Response::NotOnboarded,
+        // Unit-shaped: no inner message to carry.
+        EngineError::KeystoreInconsistent => (OpErrorKindWire::KeystoreInconsistent, String::new()),
+        EngineError::KeystoreDbMismatch(m) => (OpErrorKindWire::KeystoreDbMismatch, m),
+        EngineError::Vault(m) => (OpErrorKindWire::Vault, m),
+        // `EngineError::Join` and `EngineOpError::Join` render identically, so the kind is shared.
+        EngineError::Join(m) => (OpErrorKindWire::Join, m),
+    };
+    Response::Err { kind, message }
 }
 
 // ── Family-1 mirrors have `From`; the conversions above use `.into()`. ──

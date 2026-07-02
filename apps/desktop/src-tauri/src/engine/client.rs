@@ -13,9 +13,11 @@
 //!   same shape the in-process `get_or_open` gate produces, so callers/tests are unchanged;
 //! - [`Response::Busy`]`(s)` → [`EngineOpError::Busy`]`(&'static str)` via a match on the daemon's
 //!   op literal (`"ingest"`/`"evolve"`), defaulting UNKNOWN strings to `"ingest"` (documented below);
-//! - [`Response::Err`]`(s)` → [`EngineOpError::Core`]`(s)` — matching the in-process engine's generic
-//!   `Core` bucket (the daemon already stringified typed engine errors like `Rejected`/`Stale` into
-//!   the `Err` string; the desktop currently surfaces those as strings anyway, so `Core` is faithful);
+//! - [`Response::Err`]` { kind, message }` → the EXACT typed variant the daemon's engine produced
+//!   (`Stale`/`Revoked`/`NeedsLoudConfirm`/`Rejected`/… — see [`op_error_from_wire`]). The wire
+//!   carries the variant's INNER message, so the app-side Display renders byte-for-byte what the
+//!   in-process engine rendered — no double prefix, no typed → `Core` collapse. Guarded by the
+//!   string-parity tests below (the Task 6 regression bar);
 //! - a transport failure ([`Transport::request`] returned `Err`) → that [`EngineOpError::Unavailable`]
 //!   verbatim (the daemon is down).
 //!
@@ -48,7 +50,7 @@ use bossclawd_proto::types::{
     EngineStateWire, EngineStatusWire, MandateSummaryWire, MandateWriteSummaryWire, PreviewDataWire,
     ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
 };
-use bossclawd_proto::{HitWire, Request, Response};
+use bossclawd_proto::{HitWire, OpErrorKindWire, Request, Response};
 
 use super::cloud_reasoner::CloudProvider;
 use super::reason::{ReasonerConfig, ReasonerMode};
@@ -335,14 +337,14 @@ impl<T: Transport> EngineClient<T> {
 
     // ── Teardown (identity reset). Returns `EngineError`, not `EngineOpError`. ──
 
-    /// Mirrors `EngineHandle::teardown`. Its return is `Result<(), EngineError>`; a transport failure
-    /// or any daemon error maps to `EngineError::Vault(..)` (the engine's generic I/O error variant),
-    /// matching how a real teardown I/O failure surfaces today.
+    /// Mirrors `EngineHandle::teardown`. Its return is `Result<(), EngineError>`; a daemon error is
+    /// rebuilt into its exact typed `EngineError` variant (see [`teardown_error_from_response`]); a
+    /// transport failure maps to `EngineError::Vault(..)` (the engine's generic I/O error variant —
+    /// "daemon down" has no in-process analogue).
     pub async fn teardown(&self) -> Result<(), EngineError> {
         match self.transport.request(Request::Teardown).await {
             Ok(Response::Ok) => Ok(()),
-            Ok(Response::Err(m)) => Err(EngineError::Vault(m)),
-            Ok(other) => Err(EngineError::Vault(format!("unexpected response to teardown: {other:?}"))),
+            Ok(other) => Err(teardown_error_from_response(other)),
             Err(e) => Err(EngineError::Vault(e.to_string())),
         }
     }
@@ -393,9 +395,9 @@ impl<T: Transport> EngineClient<T> {
     /// the `Unavailable` through verbatim.
     async fn request(&self, req: Request) -> Result<Response, EngineOpError> {
         match self.transport.request(req).await? {
-            Response::NotOnboarded => Err(op_error_from_response(Response::NotOnboarded)),
-            Response::Busy(s) => Err(op_error_from_response(Response::Busy(s))),
-            Response::Err(s) => Err(op_error_from_response(Response::Err(s))),
+            resp @ (Response::NotOnboarded | Response::Busy(_) | Response::Err { .. }) => {
+                Err(op_error_from_response(resp))
+            }
             ok => Ok(ok),
         }
     }
@@ -421,8 +423,39 @@ fn op_error_from_response(resp: Response) -> EngineOpError {
         // and their tests see the identical typed error they do against the in-process engine.
         Response::NotOnboarded => EngineOpError::Open(EngineError::NotOnboarded),
         Response::Busy(s) => EngineOpError::Busy(busy_op_from_str(&s)),
-        Response::Err(s) => EngineOpError::Core(s),
+        Response::Err { kind, message } => op_error_from_wire(kind, message),
         other => EngineOpError::Core(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// Rebuild the EXACT typed error from the wire kind + inner message — the inverse of the daemon's
+/// `op_error_response`/`engine_error_response`. This is what keeps app-side Display strings
+/// byte-identical to the in-process engine's (the string-parity contract): the wire never carries a
+/// pre-rendered Display string, so each prefix is applied exactly once, here, by the rebuilt
+/// variant's own `Display`.
+///
+/// The three `EngineError` kinds wrap into `Open(..)` — on the op path that is exactly where they
+/// came from (`EngineOpError::Open` open-failures), and `Open`'s Display is a passthrough, so
+/// parity holds. `Join` maps to `EngineOpError::Join`: the op-path producer may have been either
+/// `EngineOpError::Join` or `Open(EngineError::Join)`, but both render "engine task error: …", so
+/// one arm serves both losslessly (string-wise).
+fn op_error_from_wire(kind: OpErrorKindWire, message: String) -> EngineOpError {
+    match kind {
+        OpErrorKindWire::Core => EngineOpError::Core(message),
+        OpErrorKindWire::Embedder => EngineOpError::Embedder(message),
+        OpErrorKindWire::Reasoner => EngineOpError::Reasoner(message),
+        OpErrorKindWire::Stale => EngineOpError::Stale(message),
+        OpErrorKindWire::Revoked => EngineOpError::Revoked(message),
+        OpErrorKindWire::NeedsLoudConfirm => EngineOpError::NeedsLoudConfirm(message),
+        OpErrorKindWire::Rejected => EngineOpError::Rejected(message),
+        OpErrorKindWire::Join => EngineOpError::Join(message),
+        OpErrorKindWire::Vault => EngineOpError::Open(EngineError::Vault(message)),
+        OpErrorKindWire::KeystoreInconsistent => {
+            EngineOpError::Open(EngineError::KeystoreInconsistent)
+        }
+        OpErrorKindWire::KeystoreDbMismatch => {
+            EngineOpError::Open(EngineError::KeystoreDbMismatch(message))
+        }
     }
 }
 
@@ -430,6 +463,25 @@ fn op_error_from_response(resp: Response) -> EngineOpError {
 /// vs daemon dispatch-table mismatch). Surface it as `Core` rather than panicking.
 fn unexpected(resp: Response) -> EngineOpError {
     EngineOpError::Core(format!("unexpected daemon response: {resp:?}"))
+}
+
+/// Teardown's response→error mapping (`EngineError`, not `EngineOpError`) — the inverse of the
+/// daemon's `engine_error_response`. Factored out of `teardown` so the string-parity test can drive
+/// it directly. Teardown's engine surface only produces the four `EngineError` kinds (+ the
+/// NotOnboarded signal, unreachable from teardown itself); an op-shaped kind arriving here is
+/// protocol drift and folds into `Vault` (the engine's generic I/O variant) carrying the message.
+fn teardown_error_from_response(resp: Response) -> EngineError {
+    match resp {
+        Response::NotOnboarded => EngineError::NotOnboarded,
+        Response::Err { kind, message } => match kind {
+            OpErrorKindWire::Vault => EngineError::Vault(message),
+            OpErrorKindWire::KeystoreInconsistent => EngineError::KeystoreInconsistent,
+            OpErrorKindWire::KeystoreDbMismatch => EngineError::KeystoreDbMismatch(message),
+            OpErrorKindWire::Join => EngineError::Join(message),
+            _ => EngineError::Vault(message),
+        },
+        other => EngineError::Vault(format!("unexpected response to teardown: {other:?}")),
+    }
 }
 
 /// Map the daemon's `Busy` op literal back to the engine's `&'static str`. The engine only ever
@@ -803,13 +855,14 @@ mod tests {
         assert!(matches!(err, EngineOpError::Busy("ingest")), "got {err:?}");
     }
 
-    // ── Err mapping: a `Response::Err(s)` maps to `EngineOpError::Core(s)`. ──
+    // ── Err mapping: a Core-kind `Response::Err` maps to `EngineOpError::Core` with the INNER
+    //    message (the full per-kind matrix is covered by the string-parity tests above). ──
 
     struct ErrTransport;
     #[async_trait::async_trait]
     impl Transport for ErrTransport {
         async fn request(&self, _req: Request) -> Result<Response, EngineOpError> {
-            Ok(Response::Err("engine boom".to_string()))
+            Ok(Response::Err { kind: OpErrorKindWire::Core, message: "engine boom".to_string() })
         }
     }
 
@@ -820,6 +873,73 @@ mod tests {
         match err {
             EngineOpError::Core(m) => assert_eq!(m, "engine boom"),
             other => panic!("expected Core, got {other:?}"),
+        }
+    }
+
+    // ── String-parity regression guard (the Task 6 acceptance bar): every typed error the daemon
+    //    can produce must cross the wire and Display EXACTLY as the in-process engine displayed it.
+    //    Drives the REAL daemon-side mapping (`op_error_response`/`engine_error_response`), the real
+    //    wire encode/decode, and the real client mapping — no socket needed. A double prefix (e.g.
+    //    "engine error: engine error: …") or a lost typed variant fails here.
+
+    #[test]
+    fn typed_op_errors_survive_the_wire_string_parity() {
+        use bossclawd::engine::{EngineError as DaemonEngineError, EngineOpError as DaemonOpError};
+        let cases: Vec<DaemonOpError> = vec![
+            DaemonOpError::Core("boom".into()),
+            DaemonOpError::Embedder("model missing".into()),
+            DaemonOpError::Reasoner("provider build failed".into()),
+            DaemonOpError::Stale("file changed since propose".into()),
+            DaemonOpError::Revoked("write grant revoked".into()),
+            DaemonOpError::NeedsLoudConfirm("secret-shaped change".into()),
+            DaemonOpError::Rejected("recipe too long".into()),
+            DaemonOpError::Join("task panicked".into()),
+            DaemonOpError::Busy("ingest"),
+            DaemonOpError::Busy("evolve"),
+            DaemonOpError::Open(DaemonEngineError::NotOnboarded),
+            DaemonOpError::Open(DaemonEngineError::KeystoreInconsistent),
+            DaemonOpError::Open(DaemonEngineError::KeystoreDbMismatch("wrong dek".into())),
+            DaemonOpError::Open(DaemonEngineError::Vault("keychain io".into())),
+            DaemonOpError::Open(DaemonEngineError::Join("open join failed".into())),
+        ];
+        for e in cases {
+            // The in-process string TODAY (the daemon engine is a verbatim copy of the desktop's,
+            // so this is exactly what the UI showed before the daemon existed).
+            let expected = e.to_string();
+            // Daemon-side mapping → wire bytes → client-side Response → typed EngineOpError.
+            let resp = bossclawd::server::op_error_response(e);
+            let bytes = serde_json::to_vec(&resp).expect("encode response");
+            let back: Response = serde_json::from_slice(&bytes).expect("decode response");
+            let mapped = op_error_from_response(back);
+            assert_eq!(
+                mapped.to_string(),
+                expected,
+                "typed error must survive the wire byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn teardown_engine_errors_survive_the_wire_string_parity() {
+        use bossclawd::engine::EngineError as DaemonEngineError;
+        let cases: Vec<DaemonEngineError> = vec![
+            DaemonEngineError::Vault("keychain io".into()),
+            DaemonEngineError::KeystoreInconsistent,
+            DaemonEngineError::KeystoreDbMismatch("wrong dek".into()),
+            DaemonEngineError::Join("teardown join failed".into()),
+            DaemonEngineError::NotOnboarded,
+        ];
+        for e in cases {
+            let expected = e.to_string();
+            let resp = bossclawd::server::engine_error_response(e);
+            let bytes = serde_json::to_vec(&resp).expect("encode response");
+            let back: Response = serde_json::from_slice(&bytes).expect("decode response");
+            let mapped = teardown_error_from_response(back);
+            assert_eq!(
+                mapped.to_string(),
+                expected,
+                "teardown error must survive the wire byte-for-byte"
+            );
         }
     }
 
@@ -885,10 +1005,11 @@ mod tests {
 
     #[tokio::test]
     async fn mandate_family_rejected_maps_typed() {
-        // A mandate whose target is NOT write-granted is refused by the engine's grant-time guard.
-        // The daemon maps that guard's typed error to `Response::Err`, which the client surfaces as
-        // `Core` — a typed error, never a hang. (The full `AddMandate → MandateSummary` happy path is
-        // covered by the daemon's own roundtrip suite.)
+        // A mandate whose target is NOT write-granted is refused by the engine's grant-time guard as
+        // the TYPED `Rejected` — and the typed wire (`OpErrorKindWire::Rejected`) carries it across
+        // intact, so the New-mandate form can still style it as a validation error, exactly as with
+        // the in-process engine. (The full `AddMandate → MandateSummary` happy path is covered by
+        // the daemon's own roundtrip suite.)
         let daemon = TestDaemon::spawn().await;
         let scope = tempfile::tempdir().unwrap();
         let client = daemon.client();
@@ -901,7 +1022,7 @@ mod tests {
         ))
         .await
         .expect_err("ungranted target → error");
-        assert!(matches!(err, EngineOpError::Core(_)), "got {err:?}");
+        assert!(matches!(err, EngineOpError::Rejected(_)), "got {err:?}");
     }
 
     #[tokio::test]

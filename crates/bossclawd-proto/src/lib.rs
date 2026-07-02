@@ -154,8 +154,10 @@ pub enum Request {
 /// - [`Response::Busy`] mirrors `EngineOpError::Busy` (a serialized ingest/evolve
 ///   is already in flight) — the UI shows "already running", not a fault. It carries
 ///   the op name (`"ingest"` / `"evolve"`) the core error names.
-/// - [`Response::Err`] is every other error, as its display string (the daemon
-///   stringifies `EngineOpError`/`EngineError`, matching today's `map_err(|e| e.to_string())`).
+/// - [`Response::Err`] is every other error, as its TYPED kind + the INNER message
+///   (never a pre-rendered Display string — the client reconstructs the exact typed
+///   `EngineOpError`/`EngineError` variant so the app-side Display strings are
+///   byte-identical to the in-process engine's; see [`OpErrorKindWire`]).
 ///
 /// Externally tagged (serde default).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -208,8 +210,49 @@ pub enum Response {
     /// A serialized op is already in flight (mirrors `EngineOpError::Busy`). Carries
     /// the op name (`"ingest"` / `"evolve"`).
     Busy(String),
-    /// Any other error, as its display string.
-    Err(String),
+    /// Any other error: the TYPED kind plus the variant's INNER message (never a
+    /// pre-rendered Display string — Display prefixes are applied exactly once,
+    /// app-side, after the client rebuilds the typed variant). `message` is empty
+    /// for the unit-shaped `KeystoreInconsistent` kind.
+    Err { kind: OpErrorKindWire, message: String },
+}
+
+/// The typed kind of a [`Response::Err`] payload — one arm per typed error variant that can cross
+/// the wire, so the client can rebuild the EXACT `EngineOpError`/`EngineError` variant and app-side
+/// Display strings stay byte-identical to the in-process engine's (no double-prefixing, no typed →
+/// `Core` collapse). `NotOnboarded` and `Busy` are NOT here — they stay dedicated [`Response`]
+/// signals, as today.
+///
+/// Kept in `lib.rs` (protocol-shaped, not a core-type mirror). The first eight arms mirror the
+/// engine's `EngineOpError`; the last three mirror the `EngineError` surface that crosses the wire
+/// (op-path open failures via `EngineOpError::Open`, and teardown's `Result<(), EngineError>`).
+/// `Join` is shared: `EngineOpError::Join` and `EngineError::Join` render identically
+/// ("engine task error: …"), so one kind serves both.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpErrorKindWire {
+    /// `EngineOpError::Core` — also the daemon's protocol-level faults (malformed frame, handshake
+    /// refusal), which have no in-process analogue and render fine under Core's generic prefix.
+    Core,
+    /// `EngineOpError::Embedder`.
+    Embedder,
+    /// `EngineOpError::Reasoner`.
+    Reasoner,
+    /// `EngineOpError::Stale`.
+    Stale,
+    /// `EngineOpError::Revoked`.
+    Revoked,
+    /// `EngineOpError::NeedsLoudConfirm`.
+    NeedsLoudConfirm,
+    /// `EngineOpError::Rejected`.
+    Rejected,
+    /// `EngineOpError::Join` / `EngineError::Join` (identical Display; see above).
+    Join,
+    /// `EngineError::Vault`.
+    Vault,
+    /// `EngineError::KeystoreInconsistent` (unit-shaped: `message` rides empty).
+    KeystoreInconsistent,
+    /// `EngineError::KeystoreDbMismatch`.
+    KeystoreDbMismatch,
 }
 
 /// A recall [`HitMirror`] paired with its hydrated snippet text, mirroring the
@@ -486,12 +529,47 @@ mod protocol_tests {
             Response::ReasonerReady(true),
             Response::NotOnboarded,
             Response::Busy("ingest".to_string()),
-            Response::Err("something went wrong".to_string()),
+            Response::Err {
+                kind: OpErrorKindWire::Core,
+                message: "something went wrong".to_string(),
+            },
         ];
         for resp in responses {
             let bytes = serde_json::to_vec(&resp).unwrap();
             let back: Response = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(resp, back, "response round-trips: {resp:?}");
+        }
+    }
+
+    /// Every [`OpErrorKindWire`] arm round-trips inside a `Response::Err` payload — the typed-error
+    /// contract the desktop's string-parity test builds on (a kind that didn't survive serde would
+    /// silently collapse a typed error).
+    #[test]
+    fn op_error_kind_wire_roundtrips_every_arm() {
+        let kinds = [
+            OpErrorKindWire::Core,
+            OpErrorKindWire::Embedder,
+            OpErrorKindWire::Reasoner,
+            OpErrorKindWire::Stale,
+            OpErrorKindWire::Revoked,
+            OpErrorKindWire::NeedsLoudConfirm,
+            OpErrorKindWire::Rejected,
+            OpErrorKindWire::Join,
+            OpErrorKindWire::Vault,
+            OpErrorKindWire::KeystoreInconsistent,
+            OpErrorKindWire::KeystoreDbMismatch,
+        ];
+        for kind in kinds {
+            // KeystoreInconsistent is unit-shaped (empty message); every other kind carries one.
+            let message = if kind == OpErrorKindWire::KeystoreInconsistent {
+                String::new()
+            } else {
+                format!("inner message for {kind:?}")
+            };
+            let resp = Response::Err { kind, message };
+            let bytes = serde_json::to_vec(&resp).unwrap();
+            let back: Response = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(resp, back, "Err payload round-trips for {kind:?}");
         }
     }
 
