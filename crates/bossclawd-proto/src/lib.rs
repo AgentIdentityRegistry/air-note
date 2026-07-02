@@ -36,6 +36,14 @@ pub const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Write one length-prefixed frame: a big-endian [`u32`] length followed by
 /// `payload`.
 ///
+/// # Cancellation safety
+///
+/// This function is **not** cancellation-safe: it makes multiple `write_all`
+/// calls, so if the returned future is dropped mid-call (e.g. raced against a
+/// timeout in a `tokio::select!`) the stream may be left at an arbitrary
+/// mid-frame offset. Such a stream MUST NOT be reused for further framed I/O —
+/// drop it and reconnect instead.
+///
 /// # Errors
 ///
 /// Returns [`io::ErrorKind::InvalidInput`] if `payload` is longer than
@@ -65,6 +73,14 @@ where
 
 /// Read one length-prefixed frame written by [`write_frame`], returning its
 /// payload bytes.
+///
+/// # Cancellation safety
+///
+/// This function is **not** cancellation-safe: it uses `read_exact`, so if the
+/// returned future is dropped mid-call (e.g. raced against a timeout in a
+/// `tokio::select!`) already-consumed prefix or body bytes are lost and the
+/// stream is left at an arbitrary mid-frame offset. Such a stream MUST NOT be
+/// reused for further framed I/O — drop it and reconnect instead.
 ///
 /// # Errors
 ///
