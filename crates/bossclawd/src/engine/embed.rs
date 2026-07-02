@@ -1,15 +1,18 @@
-//! The SP2 embedder seam: a provider that yields the real `Model2Vec` (loaded
+// Copied from apps/desktop/src-tauri/src/engine/embed.rs (M1a Task 4); the in-app original is removed in Task 6.
+// The model dir is supplied to `ResourceModel2Vec::new` by the caller — in the daemon it comes
+// from `BOSSCLAWD_MODEL_DIR` / the install path (NOT a Tauri `resource_dir`); this module is unchanged.
+
+//! The embedder seam: a provider that yields the real `Model2Vec` (loaded
 //! from the bundled model resource, lazily + cached) in production and a
-//! `MockEmbedder` in tests. See docs/superpowers/specs/2026-06-22-desktop-engine-ingest-design.md.
+//! `MockEmbedder` in tests.
 
 use crate::engine::EngineOpError;
 use bossclaw_core::{Embedder, Model2Vec};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// The single source of truth for the active embedding model id. Both this
-/// crate's ingest (SP2) and the future recall-open (SP3) construct `Model2Vec`
-/// with THIS id, so the vectors SP2 writes and the index SP3 rebuilds match.
+/// The single source of truth for the active embedding model id. Ingest and recall-open
+/// construct `Model2Vec` with THIS id, so the vectors written and the index rebuilt match.
 pub const MODEL_ID: &str = "minishlab/potion-base-8M";
 
 /// Builds (and caches) the embedder. Called on first ingest, never at startup.

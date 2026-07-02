@@ -1,0 +1,13 @@
+# Local-dev Keychain quiet-mode (macOS only).
+#
+# Every `cargo test` / `cargo run` binary is launched through codesign-run.sh, which
+# co-signs it with the stable `ai.air-agent.desktop` identity so it matches the
+# Keychain ACL on the engine secrets — one "Always Allow", then no more password
+# prompts (and no more hung keychain tests) across rebuilds. See scripts/codesign-run.sh.
+#
+# Guarded to macOS: on Linux/CI this block is inert. The script itself also fails
+# open (no cert → runs unsigned), so it never breaks a build for anyone.
+#
+# Invoke cargo from the repo root so the relative runner path resolves.
+[target.'cfg(target_os = "macos")']
+runner = "scripts/codesign-run.sh"

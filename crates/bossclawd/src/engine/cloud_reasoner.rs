@@ -1,9 +1,12 @@
-//! Desktop-side cloud reasoner (Anthropic + OpenAI-compat). The brain's first
+// Copied from apps/desktop/src-tauri/src/engine/cloud_reasoner.rs (M1a Task 4); the in-app original is removed in Task 6.
+// SECURITY: the fail-closed, host-pinned, body-scrubbing, SSRF-screened egress path is copied VERBATIM.
+// The ONLY change is the SSRF-screen import: `crate::web_access::is_blocked_ip` → `crate::net_guard::is_blocked_ip`
+// (the daemon copied that helper into `net_guard.rs`). Do NOT weaken any of the R1–R8 controls.
+
+//! Desktop-side cloud reasoner (Anthropic + OpenAI-compat + Gemini). The brain's first
 //! deliberate network egress: off-by-default, fail-closed, host-pinned, signed
 //! consent. Lives here (not bossclaw-core) because the engine crate's CI jail
-//! forbids `reqwest`. See docs/superpowers/specs/2026-06-30-milestone-d2-cloud-reasoner-design.md §8.
-
-// Implemented task-by-task in the Phase 2a plan.
+//! forbids `reqwest`.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
@@ -13,7 +16,7 @@ use bossclaw_core::{BossclawError, Reasoner};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::{json, Value};
 
-use crate::web_access::is_blocked_ip;
+use crate::net_guard::is_blocked_ip;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -21,10 +24,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// destination; errors if any is internal/loopback/link-local/private/CGNAT/
 /// metadata, or if the set is empty. Used at connect time to close the
 /// DNS-rebind race that a pre-flight host check cannot (spec §8 R2).
-// Exercised by `tests::screen_addrs_rejects_any_blocked` and called from
-// `PinnedResolver::resolve` → `blocking_client` → the `CloudReasoner` arms. No
-// per-helper `dead_code` allow: the allow on `impl CloudReasoner` transitively
-// keeps this whole egress subgraph live until Task 9 wires a non-test caller.
 fn screen_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, BoxError> {
     if addrs.is_empty() {
         return Err("cloud reasoner DNS resolved to no addresses".into());
@@ -299,8 +298,7 @@ pub(crate) fn extract_gemini_result(resp: &Value) -> Result<Value, BossclawError
 
 /// A `reqwest` DNS resolver that screens every resolved address through
 /// `is_blocked_ip` before any socket is opened. This is the connect-time pin
-/// that closes the rebind race (`web_access.rs:171` documents the residual gap
-/// this fills); installed on the blocking client built in Task 5.
+/// that closes the rebind race; installed on the blocking client.
 struct PinnedResolver;
 
 impl Resolve for PinnedResolver {
@@ -332,8 +330,8 @@ const CLOUD_TIMEOUT_SECS: u64 = 120;
 /// redirects + timeout), built lazily on first use. First use is always on a
 /// `spawn_blocking` thread, so no async runtime is captured (spec R6).
 /// Returns `None` if the client cannot be built — fail-closed: no hardened
-/// client means no egress (Task 6 maps `None` to a retryable no-op tick),
-/// never a silent fall-back to an un-pinned, redirect-following default client.
+/// client means no egress, never a silent fall-back to an un-pinned, redirect-
+/// following default client.
 pub(crate) fn blocking_client() -> Option<&'static reqwest::blocking::Client> {
     static CLIENT: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
     CLIENT
@@ -366,7 +364,7 @@ pub(crate) const OPENAI_COMPAT_KEY_NAME: &str = "openai_compat_api_key";
 pub(crate) const ANTHROPIC_HOST: &str = "api.anthropic.com";
 /// Gemini shares the chat-side Google key (`llm_stream.rs` `GOOGLE_KEY_NAME`) and, like Anthropic,
 /// a PINNED host (base_url is ignored). The key rides in the `x-goog-api-key` HEADER — NEVER the
-/// URL query (`llm_stream.rs` uses `?key=`; the reasoner must not copy that: spec R2 + no secrets in URLs).
+/// URL query (spec R2 + no secrets in URLs).
 pub(crate) const GEMINI_HOST: &str = "generativelanguage.googleapis.com";
 pub(crate) const GEMINI_KEY_NAME: &str = "google_api_key";
 
@@ -374,20 +372,16 @@ pub(crate) const GEMINI_KEY_NAME: &str = "google_api_key";
 /// vault AT CALL TIME (header-only, never stored on the struct, never logged),
 /// connects via the hardened blocking client, and returns parsed structured
 /// JSON — or a body-scrubbed `BossclawError::Reasoner` (a retryable no-op tick).
-// `new` is reached via `build_reasoner` (the `ConfigReasonerProvider` + the R5 enable probe),
-// so the whole graph — this struct, its methods, and the request/extract/client helpers they
-// transitively reach — is live in the bin target.
 pub struct CloudReasoner {
     provider: CloudProvider,
     model: String,
-    /// OpenAI-compat only; already HTTPS-normalized + host-screened at config-set (Task 12).
+    /// OpenAI-compat only; already HTTPS-normalized + host-screened at config-set.
     base_url: Option<String>,
     model_id: String,
     /// TEST-ONLY key seam (compiled OUT of production via `#[cfg(test)]`, so it can
     /// never be a vault bypass that ships): `None` = read the real vault; `Some(None)`
     /// = force "no key" (deterministic fail-closed, no keychain touch, no network);
-    /// `Some(Some(k))` = force this key. Exercised by the R5 missing-key test so it is
-    /// network-free even on a dev machine that DOES have a configured provider key.
+    /// `Some(Some(k))` = force this key.
     #[cfg(test)]
     test_key_override: Option<Option<String>>,
 }
@@ -896,13 +890,11 @@ mod tests {
 
     // Live end-to-end egress check against the real provider. Env-fed (NOT the
     // vault) via the `#[cfg(test)]` key seam so it runs from the CLI/CI without a
-    // keychain-approval hang — the vault read itself is covered by the signed app
-    // (Milestone C/D GUI QA) + `cloud_reasoner_missing_key_fails_closed`; the
-    // never-otherwise-exercised part is the live HTTP request/response roundtrip
-    // through the production request-builder, hardened SSRF client, and extractor.
+    // keychain-approval hang — the never-otherwise-exercised part is the live HTTP
+    // request/response roundtrip through the production request-builder, hardened
+    // SSRF client, and extractor.
     // Run: AIR_LIVE_ANTHROPIC_KEY=sk-... \
-    //   cargo test -p bossclaw_desktop cloud_reasoner_live_roundtrip -- --ignored --nocapture
-    // Optional AIR_LIVE_ANTHROPIC_MODEL overrides the default (a cheap Haiku model).
+    //   cargo test -p bossclawd cloud_reasoner_live_roundtrip -- --ignored --nocapture
     #[ignore = "live network; needs AIR_LIVE_ANTHROPIC_KEY env var"]
     #[test]
     fn cloud_reasoner_live_roundtrip() {

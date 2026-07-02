@@ -570,12 +570,10 @@ pub async fn engine_set_reasoner_config(
 ) -> Result<(), String> {
     validate_reasoner_config(&config)?;
     let onboarded = state.identity_store.is_onboarded();
-    state.engine.set_reasoner_config(onboarded, config.clone()).await.map_err(|e| e.to_string())?;
-    // Write-through cache: update the cell the `ConfigReasonerProvider` closure reads.
-    if let Ok(mut cell) = state.reasoner_cfg.lock() {
-        *cell = crate::engine::parse_reasoner_config(Some(config));
-    }
-    Ok(())
+    // The daemon owns the reasoner-config cell now, so persisting through the client is the whole
+    // job — the daemon refreshes the cell its provider closure reads. (The former app-side
+    // write-through cache went away with `AppState.reasoner_cfg` in the M1a split.)
+    state.engine.set_reasoner_config(onboarded, config).await.map_err(|e| e.to_string())
 }
 
 /// The R5 "test-key-on-enable" opt-in to cloud: validate network-free, then the engine proves the
@@ -588,11 +586,9 @@ pub async fn engine_enable_cloud_reasoner(
 ) -> Result<(), String> {
     validate_reasoner_config(&config)?;
     let onboarded = state.identity_store.is_onboarded();
-    state.engine.enable_cloud_reasoner(onboarded, config.clone()).await.map_err(|e| e.to_string())?;
-    if let Ok(mut cell) = state.reasoner_cfg.lock() {
-        *cell = crate::engine::parse_reasoner_config(Some(config));
-    }
-    Ok(())
+    // As with `set_reasoner_config`, the daemon owns the cell the evolve loop reads, so enabling
+    // through the client is the whole job (no app-side write-through cell to refresh anymore).
+    state.engine.enable_cloud_reasoner(onboarded, config).await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -702,19 +698,15 @@ mod tests {
             username: None,
             created_at: "2026-06-23T00:00:00Z".to_string(),
         }).unwrap();
-        let engine = Arc::new(crate::engine::EngineHandle::new(
-            vault, dir.path().to_path_buf(),
-            Arc::new(crate::engine::embed::MockEmbedderProvider::new(8)),
-            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
-        ));
         // AppState carries air_client + inbox too (the desktop's real wiring, main.rs); use the
-        // in-repo doubles so the managed state matches the real struct shape.
+        // in-repo doubles so the managed state matches the real struct shape. `engine` is now the
+        // daemon-backed FACADE over an in-process `DuplexTransport` (its own hermetic engine home) —
+        // the command's assertions are unchanged; only how the engine is built is (Task 6).
         let state = AppState {
             air_client: Arc::new(crate::air::MockAirClient::new()),
             identity_store,
             inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
-            engine,
-            reasoner_cfg: Arc::new(Mutex::new(crate::engine::reason::ReasonerConfig::default())),
+            engine: duplex_engine(&dir),
         };
 
         // Grant the `main` window permission to invoke `engine_undo_apply`, so the request ROUTES
@@ -776,17 +768,11 @@ mod tests {
             username: None,
             created_at: "2026-06-23T00:00:00Z".to_string(),
         }).unwrap();
-        let engine = Arc::new(crate::engine::EngineHandle::new(
-            vault, dir.path().to_path_buf(),
-            Arc::new(crate::engine::embed::MockEmbedderProvider::new(8)),
-            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
-        ));
         let state = AppState {
             air_client: Arc::new(crate::air::MockAirClient::new()),
             identity_store,
             inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
-            engine,
-            reasoner_cfg: Arc::new(Mutex::new(crate::engine::reason::ReasonerConfig::default())),
+            engine: duplex_engine(&dir),
         };
 
         // ACL: a mock app has NO capability grant, so without this the request is rejected with
@@ -851,9 +837,10 @@ mod tests {
     // `cloud_reasoner_missing_key_fails_closed`). A multi-second runtime would mean a real network
     // call leaked in — these all complete near-instantly.
 
-    /// An onboarded test `AppState` over a temp-dir engine with mock embedder/reasoner + an
-    /// in-memory vault (so `is_onboarded()` is true and the signed log opens), plus a fresh
-    /// default-Local `reasoner_cfg` cell. Returns the temp dir so the caller keeps it alive.
+    /// An onboarded test `AppState` whose engine is the daemon-backed facade over an in-process
+    /// `DuplexTransport` (hermetic `test_engine`). The app-side `IdentityStore` (in-memory vault)
+    /// makes `is_onboarded()` true; the daemon opens its own fresh (default-Local) brain on demand.
+    /// Returns the temp dir so the caller keeps it alive (it roots both the identity + daemon homes).
     fn onboarded_reasoner_state() -> (AppState, tempfile::TempDir) {
         use crate::air::identity::{IdentityMetadata, IdentityStore};
         use crate::air::types::Did;
@@ -867,19 +854,27 @@ mod tests {
             username: None,
             created_at: "2026-06-23T00:00:00Z".to_string(),
         }).unwrap();
-        let engine = Arc::new(crate::engine::EngineHandle::new(
-            vault, dir.path().to_path_buf(),
-            Arc::new(crate::engine::embed::MockEmbedderProvider::new(8)),
-            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
-        ));
+        let engine = duplex_engine(&dir);
         let state = AppState {
             air_client: Arc::new(crate::air::MockAirClient::new()),
             identity_store,
             inbox: Arc::new(crate::inbox::manager::InboxManager::new()),
             engine,
-            reasoner_cfg: Arc::new(Mutex::new(crate::engine::reason::ReasonerConfig::default())),
         };
         (state, dir)
+    }
+
+    /// Build the daemon-backed [`crate::engine::Engine`] facade over an in-process `DuplexTransport`
+    /// (Task 6). The transport spins the REAL daemon dispatch on a hermetic `test_engine` rooted at a
+    /// fresh subdir of `dir` (kept separate from the app's identity slots there), so command tests
+    /// exercise the true request → daemon → response path with UNCHANGED assertions — no socket, no
+    /// keychain. `dir` must outlive the returned engine (the caller keeps its `TempDir`).
+    fn duplex_engine(dir: &tempfile::TempDir) -> Arc<crate::engine::Engine> {
+        use crate::engine::transport::{DuplexTransport, Transport};
+        let home = dir.path().join("bossclawd-home");
+        std::fs::create_dir_all(&home).expect("daemon home dir");
+        let transport: Arc<dyn Transport> = Arc::new(DuplexTransport::new(home));
+        Arc::new(crate::engine::Engine::new(transport))
     }
 
     /// Build a mock app whose `main` window may invoke each of `cmds` (Remote-origin ACL grant, as

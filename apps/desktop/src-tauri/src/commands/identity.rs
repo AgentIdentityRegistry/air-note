@@ -10,14 +10,12 @@ pub struct AppState {
     pub air_client: Arc<dyn AirClient>,
     pub identity_store: IdentityStore,
     pub inbox: std::sync::Arc<crate::inbox::manager::InboxManager>,
-    // Engine spine is Unix-only until M7 (bossclaw-core doesn't build on Windows yet).
+    // Engine spine is Unix-only until M7 (bossclaw-core doesn't build on Windows yet). Since the
+    // M1a daemon split, this is the `Engine` FACADE over a `bossclawd` transport (not the old
+    // in-process `EngineHandle`); the reasoner config cell now lives in the daemon, so the former
+    // `reasoner_cfg` write-through cache is gone.
     #[cfg(unix)]
-    pub engine: std::sync::Arc<crate::engine::EngineHandle>,
-    // Shared cell the `ConfigReasonerProvider` closure reads (write-through cache): the
-    // reasoner-config commands update it so the evolve loop picks up mode changes without a
-    // restart (Milestone D Phase 2a). Unix-gated like `engine` since the reasoner lives there.
-    #[cfg(unix)]
-    pub reasoner_cfg: std::sync::Arc<std::sync::Mutex<crate::engine::reason::ReasonerConfig>>,
+    pub engine: std::sync::Arc<crate::engine::Engine>,
 }
 
 #[tauri::command]
@@ -210,6 +208,34 @@ pub async fn claim_username(
     Ok(meta)
 }
 
+/// Decide whether a teardown result should FAIL `reset_identity`, given that the identity store was
+/// already cleared. Pure + `#[cfg(unix)]` (teardown only exists on Unix), so the degraded-mode
+/// policy is unit-tested without constructing `AppState`.
+///
+/// Post-daemon-split, teardown reaches the brain over a Unix socket, so it has a NEW failure mode:
+/// the daemon being DOWN. That is NOT fatal for a reset — the identity is already gone, and a
+/// re-onboard mints a FRESH key, so any orphaned `brain.db` is unreachable (it decrypts only under
+/// the old, now-discarded DEK) and gets cleaned by a later teardown once the daemon is up. So an
+/// [`EngineError::Unavailable`] is swallowed (logged, then treated as success). Every OTHER teardown
+/// error — notably a real `KeystoreDbMismatch`/`Vault` keystore fault — STILL surfaces, so the UI
+/// can prompt a retry. Pre-migration teardown was in-process and effectively always ran; this keeps
+/// reset succeeding in exactly the case ("no reachable brain to tear down") where it used to.
+#[cfg(unix)]
+fn reset_teardown_result(teardown: Result<(), crate::engine::EngineError>) -> Result<(), String> {
+    match teardown {
+        Ok(()) => Ok(()),
+        Err(crate::engine::EngineError::Unavailable(reason)) => {
+            // Identity is already cleared and the brain is unreachable — non-fatal. Log so a
+            // persistent daemon outage is still visible in stderr, but let the reset succeed.
+            eprintln!(
+                "reset_identity: identity cleared; skipped engine teardown (memory service unavailable: {reason})"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 #[tauri::command]
 pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
     // Clear identity first, then tear the engine down so a re-onboard starts on a clean
@@ -219,8 +245,10 @@ pub async fn reset_identity(state: State<'_, AppState>) -> Result<(), String> {
     // reachable by a NEW identity (the onboarding gate + fresh-key mint prevent that).
     state.identity_store.clear()?;
     // On Windows there is no engine, so reset only clears the identity slots above.
+    // On Unix, a DOWN daemon (Unavailable) is non-fatal now that the identity is already
+    // cleared — see `reset_teardown_result` — but a real keystore fault still surfaces.
     #[cfg(unix)]
-    state.engine.teardown().await.map_err(|e| e.to_string())?;
+    reset_teardown_result(state.engine.teardown().await)?;
     Ok(())
 }
 
@@ -324,31 +352,90 @@ mod username_tests {
 }
 
 // The engine half of reset is Unix-only, so this test (which exercises it) is too.
+//
+// M1a Task 6 note: this was a WHITE-BOX unit test of the in-process `EngineHandle` — it opened the
+// engine, tore it down, and inspected the engine's OWN keychain slot + `brain.db` on disk. Those
+// internals moved into the `bossclawd` daemon (Task 4 copied this exact assertion set as
+// `crates/bossclawd/src/engine/mod.rs::teardown_removes_keys_db_and_resets_cell` — DEK slot gone,
+// brain.db gone, cell reset). What the APP still owns is the reset BEHAVIOR through the daemon
+// FACADE, so this test now drives the `Engine` facade over an in-process `DuplexTransport` (the
+// daemon's real dispatch, hermetic engine): a first open creates `brain.db` in the daemon home,
+// `teardown` removes it, and a not-onboarded status stays `NotOnboarded`. The engine-vault DEK
+// assertion is the daemon's copied test's job (its vault is in-memory + daemon-side, not reachable
+// from the app), so it does not appear here.
 #[cfg(all(test, unix))]
 mod tests {
-    use crate::engine::{embed, EngineHandle, EngineState};
-    use crate::secrets::SecretsVault;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use super::reset_teardown_result;
+    use crate::engine::transport::{DuplexTransport, Transport};
+    use crate::engine::{Engine, EngineError, EngineState};
+    use std::sync::Arc;
 
-    struct TestVault { store: Mutex<HashMap<String, String>> }
-    impl TestVault { fn new() -> Arc<Self> { Arc::new(Self { store: Mutex::new(HashMap::new()) }) } }
-    impl SecretsVault for TestVault {
-        fn set(&self, k: &str, v: &str) -> Result<(), String> { self.store.lock().unwrap().insert(k.into(), v.into()); Ok(()) }
-        fn get(&self, k: &str) -> Result<Option<String>, String> { Ok(self.store.lock().unwrap().get(k).cloned()) }
-        fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
+    // ── Fix 1 (Med1): the degraded-mode reset policy — a DOWN daemon is non-fatal, a real keystore
+    //    fault still surfaces. Drives the exact decision `reset_identity` runs after `clear()`. ──
+
+    #[test]
+    fn reset_ignores_unavailable_teardown() {
+        // The daemon is down: teardown reports Unavailable AFTER the identity was cleared. Because
+        // there is no reachable brain to tear down (and a re-onboard mints a fresh key), the reset
+        // must SUCCEED — not surface an error to the UI.
+        let out = reset_teardown_result(Err(EngineError::Unavailable("connect failed: ENOENT".into())));
+        assert!(out.is_ok(), "a down-daemon teardown is non-fatal once identity is cleared: {out:?}");
+    }
+
+    #[test]
+    fn reset_still_surfaces_real_keystore_faults() {
+        // A genuine keystore/DB mismatch (or Vault) is NOT the daemon being down — it means the
+        // brain is present but wrong, so the reset must STILL surface it (retry-safe error), exactly
+        // as before the daemon split. The surfaced string is the engine's own Display (parity).
+        let mismatch = EngineError::KeystoreDbMismatch("wrong dek".into());
+        let expected = mismatch.to_string();
+        let out = reset_teardown_result(Err(mismatch));
+        assert_eq!(out, Err(expected), "a real keystore fault must still fail the reset");
+
+        // Vault (keychain I/O) is likewise a real fault → still surfaces.
+        assert!(reset_teardown_result(Err(EngineError::Vault("keychain io".into()))).is_err());
+    }
+
+    #[test]
+    fn reset_ok_teardown_is_ok() {
+        // The happy path (daemon up, teardown succeeded) is of course success.
+        assert!(reset_teardown_result(Ok(())).is_ok());
+    }
+
+    // End-to-end through the facade: with NO daemon (a dead socket), `teardown()` maps the transport
+    // failure to `EngineError::Unavailable`, which `reset_teardown_result` then swallows to Ok — so
+    // the engine half of a reset succeeds even when the memory service is down. Hermetic: a
+    // `SocketTransport` pointed at a never-bound socket opens NO store (pure wire plumbing).
+    #[tokio::test]
+    async fn reset_teardown_is_non_fatal_when_daemon_is_down() {
+        use crate::engine::transport::SocketTransport;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bossclawd.sock"); // never bound — nobody is listening.
+        let engine = Engine::new(Arc::new(SocketTransport::new(sock)));
+
+        // teardown against a down daemon → Unavailable (the app-side degraded-mode signal) ...
+        let td = engine.teardown().await;
+        assert!(matches!(td, Err(EngineError::Unavailable(_))), "daemon down → Unavailable: {td:?}");
+        // ... which the reset policy treats as non-fatal (identity already cleared).
+        assert!(reset_teardown_result(td).is_ok(), "engine half of reset succeeds with daemon down");
     }
 
     #[tokio::test]
     async fn reset_tears_down_the_engine() {
         let dir = tempfile::tempdir().unwrap();
-        let vault = TestVault::new();
-        let engine = Arc::new(EngineHandle::new(vault.clone(), dir.path().to_path_buf(), Arc::new(embed::MockEmbedderProvider::new(8)), Arc::new(crate::engine::reason::MockReasonerProvider::new("m"))));
-        engine.get_or_open(true).await.unwrap();
-        // Simulate the engine half of reset_identity:
+        // The daemon's engine home (inspectable, so the brain.db lifecycle can be asserted).
+        let home = dir.path().join("bossclawd-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let transport: Arc<dyn Transport> = Arc::new(DuplexTransport::new(home.clone()));
+        let engine = Arc::new(Engine::new(transport));
+
+        // First open (any onboarded op) creates brain.db under the daemon home.
+        engine.status(true).await;
+        assert!(home.join("brain.db").exists());
+
+        // Simulate the engine half of reset_identity through the facade:
         engine.teardown().await.unwrap();
-        assert!(vault.get("air-agent.engine.dek").unwrap().is_none());
-        assert!(!dir.path().join("brain.db").exists());
+        assert!(!home.join("brain.db").exists());
         assert!(matches!(engine.status(false).await.state, EngineState::NotOnboarded));
     }
 }

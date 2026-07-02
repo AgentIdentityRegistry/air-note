@@ -1,0 +1,37 @@
+[Unit]
+# systemd USER unit template for the bossclawd memory daemon (M1a Task 8).
+#
+# This is a TEMPLATE, not a ready-to-enable unit. `scripts/install-bossclawd.sh`
+# substitutes the AT-DELIMITED tokens (below) with the ABSOLUTE paths resolved on
+# the target machine at install time (systemd --user gives no PATH, so ExecStart
+# must be absolute). A committed unit with hard-coded dev paths would be wrong on
+# every other machine, so the real paths are never checked in.
+#
+# WHY --user (per-user), NOT a system unit:
+#   The daemon reads the engine secret from the user's Secret Service / keyring,
+#   which only exists inside the user's login session. A system-level unit runs
+#   outside that session and cannot reach it. So this is a `systemctl --user`
+#   unit, installed under ~/.config/systemd/user, running as the logged-in user.
+#
+# Restart=always: relaunch on crash — the Linux equivalent of launchd KeepAlive,
+# so the documented "kill the daemon -> it comes back" smoke passes here too.
+#
+# Paths kept consistent with crates/bossclawd/src/main.rs and
+# apps/desktop/src-tauri/src/engine/daemon.rs (socket + data dir left at the shared
+# default <app_data_dir>/bossclawd.sock; only BOSSCLAWD_MODEL_DIR is set).
+Description=AIR Agent bossclawd memory daemon
+Documentation=https://github.com/AgentIdentityRegistry/air-note
+
+[Service]
+Type=simple
+# Quote both: systemd does its own word-splitting, so an unquoted path containing a
+# SPACE would silently truncate. Double quotes group the token (systemd.service(5));
+# prior art: agent-bridge-mcp/src/service.mjs. The systemd-smoke CI renders this with
+# a spaced path and asserts the daemon starts, guarding the quoting from regressing.
+ExecStart="@BOSSCLAWD_BIN@"
+Environment="BOSSCLAWD_MODEL_DIR=@BOSSCLAWD_MODEL_DIR@"
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

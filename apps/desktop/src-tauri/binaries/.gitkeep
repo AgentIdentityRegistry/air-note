@@ -1,0 +1,10 @@
+# Keeps the binaries/ directory in a fresh checkout so the externalBin path
+# ("binaries/bossclawd" in tauri.bundle.conf.json) resolves at bundle time. The
+# actual target-triple-suffixed sidecar (bossclawd-<triple>) is a build artifact
+# staged by scripts/dev-build-signed.sh (and by release CI) — never committed.
+#
+# externalBin lives in the BUNDLE-ONLY config (tauri.bundle.conf.json), not the
+# base tauri.conf.json: tauri_build checks externalBin existence on EVERY compile,
+# so a base-config externalBin would break plain `cargo build`/`test`/`clippy` on a
+# fresh checkout. It is merged only at bundle time via `--config`. See
+# scripts/install-bossclawd.sh for the co-signing requirement.

@@ -1,3 +1,5 @@
+// Copied from apps/desktop/src-tauri/src/engine/keystore.rs (M1a Task 4); the in-app original is removed in Task 6.
+
 //! Mints / loads / deletes the engine's two secrets (brain Ed25519 key + DEK) via the
 //! per-key `SecretsVault` — the same backend `IdentityStore` uses. Returns key material
 //! in `Zeroizing` so it is wiped from memory on drop.
@@ -10,8 +12,11 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// Keychain slot for the engine's Ed25519 signing key (distinct from the identity key).
+/// MUST match the app's `keystore.rs` value EXACTLY (the vault-key seam): the app and the
+/// daemon read/write the SAME slot.
 const SIGNING_KEY_SLOT: &str = "air-agent.engine.signing_key";
-/// Keychain slot for the 32-byte SQLCipher data-encryption key.
+/// Keychain slot for the 32-byte SQLCipher data-encryption key. MUST match the app's
+/// `keystore.rs` value EXACTLY (the vault-key seam).
 const DEK_SLOT: &str = "air-agent.engine.dek";
 
 /// The unlocked engine key material. DEK is zeroized on drop.

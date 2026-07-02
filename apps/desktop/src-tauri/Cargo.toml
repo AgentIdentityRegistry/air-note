@@ -36,6 +36,10 @@ uuid = { version = "1", features = ["v4"] }
 # `#[cfg(unix)]`. `zeroize` is used only by the engine keystore, so it rides in the same section.
 [target.'cfg(unix)'.dependencies]
 bossclaw-core = { path = "../../../crates/bossclaw-core", features = ["ollama"] }
+# M1a Task 5: the daemon wire protocol (frame codec + Request/Response + Hello handshake + wire
+# mirrors). Unix-only alongside the engine — the daemon transport is a Unix-socket protocol, and the
+# `SocketTransport`/`EngineClient` live under `engine/` which is already `#[cfg(unix)]`-gated.
+bossclawd-proto = { path = "../../../crates/bossclawd-proto" }
 zeroize = "1"
 
 # Single-instance guard (CF2): exactly one desktop process, so the in-process POLICY_LOCK is the
@@ -52,6 +56,13 @@ keyring = "2.3"
 [dev-dependencies]
 tempfile = "3"
 tauri = { version = "2", features = ["test"] }
+
+# M1a Task 5: the real daemon (with its `test-helpers` feature) so the transport/client tests can
+# spin a live `bossclawd` accept loop on a temp Unix socket — hermetic (in-memory vault + mock
+# providers, NEVER the OS keychain). Unix-only: `bossclawd` is a Unix-socket daemon that pulls
+# bossclaw-core (bundled-SQLCipher + rustix), so it must not enter the Windows dev-dep tree.
+[target.'cfg(unix)'.dev-dependencies]
+bossclawd = { path = "../../../crates/bossclawd", features = ["test-helpers"] }
 
 [features]
 default = ["custom-protocol"]

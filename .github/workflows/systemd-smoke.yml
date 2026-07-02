@@ -114,3 +114,101 @@ jobs:
           [ "$state" != "active" ] || { echo "unit still active after uninstall" >&2; exit 1; }
           [ ! -f "$HOME/.config/systemd/user/air-msg-daemon.service" ] || { echo "unit file still present" >&2; exit 1; }
           echo "uninstalled cleanly (state: $state)"
+
+  # M1a Task 8: the SAME repeatable real-systemd smoke, for the bossclawd installer
+  # (scripts/install-bossclawd.sh + resources/bossclawd.service.in). It guards the two
+  # landmines the review flagged on the bossclawd unit:
+  #   1. ExecStart + Environment= quoting — the model dir deliberately contains a SPACE;
+  #      an unquoted assignment truncates it and the daemon never starts.
+  #   2. Restart=always — the daemon is killed and must come back with a new MainPID.
+  # It uses a tiny STUB binary in place of the real daemon (the real bossclawd needs the
+  # engine + a login keyring, out of scope for this quoting/restart smoke), copied to a
+  # path WITH A SPACE so the ExecStart quoting is exercised too.
+  bossclawd-user-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start a user systemd session for the runner
+        run: |
+          sudo loginctl enable-linger "$(whoami)"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+
+      - name: Wait for the user manager to answer
+        run: |
+          for i in $(seq 1 30); do
+            systemctl --user list-units >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "user systemd never came up" >&2; exit 1
+
+      - name: Stage a stub daemon + model dir in paths WITH SPACES
+        run: |
+          # Binary path with a space -> proves ExecStart quoting. The stub records its
+          # BOSSCLAWD_MODEL_DIR to a marker file (proving Environment= quoting), then
+          # sleeps so systemd sees a live Type=simple service.
+          BIN_DIR="$RUNNER_TEMP/air bin"
+          MODEL_DIR="$RUNNER_TEMP/air models/potion-base-8M"
+          mkdir -p "$BIN_DIR" "$MODEL_DIR"
+          BIN="$BIN_DIR/bossclawd"
+          cat > "$BIN" <<'SH'
+          #!/usr/bin/env bash
+          printf '%s' "${BOSSCLAWD_MODEL_DIR:-<unset>}" > "$RUNNER_TEMP/model-dir-seen"
+          exec sleep 3600
+          SH
+          chmod +x "$BIN"
+          echo "STUB_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "STUB_MODEL_DIR=$MODEL_DIR" >> "$GITHUB_ENV"
+
+      - name: install (renders bossclawd.service.in with spaced paths, enables --now)
+        run: scripts/install-bossclawd.sh install --bin "$STUB_BIN" --model-dir "$STUB_MODEL_DIR"
+
+      - name: Assert unit active
+        run: |
+          for i in $(seq 1 15); do
+            state="$(systemctl --user is-active bossclawd.service || true)"
+            [ "$state" = "active" ] && exit 0
+            sleep 1
+          done
+          echo "unit never became active (last: $state)" >&2
+          journalctl --user -u bossclawd.service --no-pager | tail -30 >&2
+          exit 1
+
+      - name: Assert the stub saw the SPACED model dir (Environment= quoting proof)
+        run: |
+          for i in $(seq 1 15); do
+            [ -f "$RUNNER_TEMP/model-dir-seen" ] && break
+            sleep 1
+          done
+          seen="$(cat "$RUNNER_TEMP/model-dir-seen" 2>/dev/null || echo '<missing>')"
+          echo "BOSSCLAWD_MODEL_DIR seen by daemon: $seen"
+          [ "$seen" = "$STUB_MODEL_DIR" ] || { echo "model dir wrong (quoting broke): got [$seen] want [$STUB_MODEL_DIR]" >&2; exit 1; }
+
+      - name: Restart=always — kill the daemon, expect a new MainPID
+        run: |
+          old="$(systemctl --user show -p MainPID --value bossclawd.service)"
+          [ "$old" != "0" ] || { echo "no MainPID" >&2; exit 1; }
+          kill "$old"
+          for i in $(seq 1 15); do
+            sleep 1
+            new="$(systemctl --user show -p MainPID --value bossclawd.service)"
+            if [ "$new" != "0" ] && [ "$new" != "$old" ]; then
+              echo "relaunched: $old -> $new"; exit 0
+            fi
+          done
+          echo "daemon was not relaunched (old=$old new=$new)" >&2
+          journalctl --user -u bossclawd.service --no-pager | tail -30 >&2
+          exit 1
+
+      - name: Journal evidence
+        if: always()
+        run: journalctl --user -u bossclawd.service --no-pager | tail -25 || true
+
+      - name: uninstall (disable --now + unit removed)
+        run: |
+          scripts/install-bossclawd.sh uninstall
+          state="$(systemctl --user is-active bossclawd.service || true)"
+          [ "$state" != "active" ] || { echo "unit still active after uninstall" >&2; exit 1; }
+          [ ! -f "$HOME/.config/systemd/user/bossclawd.service" ] || { echo "unit file still present" >&2; exit 1; }
+          echo "uninstalled cleanly (state: $state)"

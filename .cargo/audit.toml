@@ -1,9 +1,12 @@
 # cargo-audit allowlist — read by the `cargo-audit` CI job (.github/workflows/build.yml),
-# which runs `cargo audit --deny warnings`. Every ID below is an UNMAINTAINED/UNSOUND
-# *informational* advisory on a TRANSITIVE dependency we do not directly control — there are
-# ZERO vulnerabilities in this list. It is the explicit, reviewed record of known ecosystem
-# debt: a new advisory NOT listed here (a real vulnerability, or a newly-unmaintained crate)
-# fails CI, so this stays meaningful. Revisit when the gtk-rs / Tauri stack moves to GTK4.
+# which runs `cargo audit --deny warnings`. Almost every ID below is an UNMAINTAINED/UNSOUND
+# *informational* advisory on a TRANSITIVE dependency we do not directly control. The sole
+# exception is the "reachability-reviewed vulnerabilities" block at the end (added 2026-07-02):
+# real advisories that are NOT attacker-reachable in this app AND have no upstream fix in reach,
+# each with an explicit justification + a revisit trigger. It is the explicit, reviewed record
+# of known ecosystem debt: a new advisory NOT listed here (an unlisted vulnerability, or a
+# newly-unmaintained crate) fails CI, so this stays meaningful. Revisit when the gtk-rs / Tauri
+# stack moves to GTK4.
 #
 # Attribution verified via `cargo tree -i <crate> [--target x86_64-unknown-linux-gnu]`
 # on 2026-06-24 (Tauri 2.11.2). None of these are direct dependencies.
@@ -40,4 +43,16 @@ ignore = [
     "RUSTSEC-2024-0388", # derivative — via keyring -> zbus -> secret-service (Linux keychain)
     "RUSTSEC-2024-0436", # paste — via tokenizers (HF) -> macro_rules_attribute
     "RUSTSEC-2025-0141", # bincode 1.x — via hnsw_rs (vector index); 2.x would change the on-disk index format
+
+    # --- Reachability-reviewed vulnerabilities (added 2026-07-02) ---
+    # NOT informational: these are real advisories. Kept only because they are BOTH
+    # (a) not attacker-reachable in this app AND (b) unfixable from here right now.
+    # quick-xml 0.39.4 arrives ONLY via tauri 2.11.2 -> plist 1.9.0 -> quick-xml (verified
+    # `cargo tree -i quick-xml`). Both are denial-of-service on parsing MALICIOUS XML; plist
+    # uses quick-xml to parse the app's OWN developer-authored Info.plist at build/bundle time
+    # (and single-instance startup), never untrusted runtime input — so the DoS is unreachable.
+    # The fix is quick-xml >=0.41, but plist 1.9.0 semver-pins "0.39", so it is not reachable
+    # until Tauri bumps plist. REVISIT when Tauri/plist ship a quick-xml 0.41+ line.
+    "RUSTSEC-2026-0194", # quick-xml <0.41 — quadratic dup-attribute check (DoS); via tauri->plist
+    "RUSTSEC-2026-0195", # quick-xml <0.41 — unbounded namespace alloc (DoS); via tauri->plist
 ]

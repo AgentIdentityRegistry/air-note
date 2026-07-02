@@ -37,3 +37,11 @@ NEXT-SESSION.md
 # checkout); ignore only the fetched model blobs.
 /apps/desktop/src-tauri/resources/models/potion-base-8M/*
 !/apps/desktop/src-tauri/resources/models/potion-base-8M/README.md
+
+# M1a Task 8: the bossclawd sidecar for Tauri externalBin is a BUILD ARTIFACT
+# (staged from `cargo build -p bossclawd` with the target-triple suffix Tauri
+# requires; externalBin is declared in the bundle-only tauri.bundle.conf.json).
+# Never committed; the dir is kept (via .gitkeep) so the externalBin path exists
+# in a fresh checkout.
+/apps/desktop/src-tauri/binaries/*
+!/apps/desktop/src-tauri/binaries/.gitkeep
