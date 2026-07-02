@@ -219,22 +219,23 @@ pub struct ApplyResult {
 /// method mirrors the old `EngineHandle` signature 1:1 and simply forwards to the client, so the
 /// command bodies + their tests are unchanged (only how `AppState.engine` is BUILT changed).
 ///
-/// # Why a boxed transport (documented choice)
-/// `EngineClient<T: Transport>` is generic, but `AppState` is a concrete (non-generic) struct that
-/// both `main.rs` (Socket) and the command tests (Duplex) construct. Rather than make `AppState`
-/// generic (which would ripple through every command signature and Tauri's `State<AppState>`), the
-/// facade holds `EngineClient<Arc<dyn Transport>>` — a single concrete type. A blanket
-/// `impl Transport for Arc<dyn Transport>` (in `transport.rs`) makes that legal; the extra dynamic
-/// dispatch is negligible next to a socket round trip.
+/// # Why a trait-object transport (documented choice)
+/// `EngineClient<T: Transport + ?Sized>` is generic, but `AppState` is a concrete (non-generic)
+/// struct that both `main.rs` (Socket) and the command tests (Duplex) construct. Rather than make
+/// `AppState` generic (which would ripple through every command signature and Tauri's
+/// `State<AppState>`), the facade holds `EngineClient<dyn Transport>` — a single concrete type over
+/// the client's own `Arc<dyn Transport>` (one `Arc`, no re-wrapping). The dynamic dispatch is
+/// negligible next to a socket round trip.
 pub struct Engine {
-    client: EngineClient<Arc<dyn Transport>>,
+    client: EngineClient<dyn Transport>,
 }
 
 impl Engine {
     /// Build the facade over `transport`. Production passes an `Arc<SocketTransport>`; the command
-    /// tests pass an `Arc<DuplexTransport>`. Both coerce to `Arc<dyn Transport>`.
+    /// tests pass an `Arc<DuplexTransport>`. Both coerce to `Arc<dyn Transport>`, handed to the
+    /// client as-is (single `Arc` — no double-wrap).
     pub fn new(transport: Arc<dyn Transport>) -> Self {
-        Self { client: EngineClient::new(Arc::new(transport)) }
+        Self { client: EngineClient::new(transport) }
     }
 
     // ── Status (infallible, mirrors the old `EngineHandle::status`). ──

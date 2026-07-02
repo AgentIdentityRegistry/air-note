@@ -59,11 +59,15 @@ use super::{
 /// A daemon-backed drop-in for today's in-process `EngineHandle`. Generic over the [`Transport`] so
 /// the ops can be unit-tested with a fake transport (and driven live with [`super::transport::SocketTransport`]).
 /// Stateless beyond the transport — all engine state lives in `bossclawd`.
-pub struct EngineClient<T: Transport> {
+///
+/// `T: ?Sized` so `EngineClient<dyn Transport>` is a valid, SINGLE concrete type: the [`super::Engine`]
+/// facade holds exactly that, letting the (non-generic) `AppState` pick its transport at construction
+/// with one `Arc<dyn Transport>` — no double-`Arc`, no blanket impl.
+pub struct EngineClient<T: Transport + ?Sized> {
     transport: Arc<T>,
 }
 
-impl<T: Transport> EngineClient<T> {
+impl<T: Transport + ?Sized> EngineClient<T> {
     /// Wrap a transport.
     pub fn new(transport: Arc<T>) -> Self {
         Self { transport }

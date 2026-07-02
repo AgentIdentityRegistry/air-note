@@ -63,19 +63,6 @@ pub trait Transport: Send + Sync {
     async fn request(&self, req: Request) -> Result<Response, EngineOpError>;
 }
 
-/// Blanket impl so an `Arc<dyn Transport>` is itself a `Transport`. This is what lets
-/// [`super::Engine`] be a SINGLE non-generic type (`EngineClient<Arc<dyn Transport>>`) while still
-/// choosing its concrete transport at construction — [`SocketTransport`] in production, the test
-/// duplex in the command tests. `AppState` therefore needs no generic parameter (documented choice
-/// in `engine/mod.rs`). Dynamic dispatch over the (already async, already `Mutex`-serialized) round
-/// trip is negligible next to a socket write/read.
-#[async_trait]
-impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
-    async fn request(&self, req: Request) -> Result<Response, EngineOpError> {
-        (**self).request(req).await
-    }
-}
-
 /// A [`Transport`] over a persistent Unix-domain socket to `bossclawd`. Holds the connection behind
 /// an async `Mutex` (single in-flight request; see the module docs) and lazily connects on first
 /// use, performing the `Hello` handshake. See the module docs for the reconnect/timeout contract.
