@@ -105,6 +105,21 @@ pub fn secret_cache_clear() -> Result<(), String> {
     Ok(())
 }
 
+/// TEST-ONLY: pre-seed the in-process provider-key cache so `secret_get_cached` (via
+/// `ensure_loaded_blob`) short-circuits to this map and NEVER hits the OS keychain. Hermetic tests
+/// (e.g. the desktop transport/client suite) MUST call this before any op that reads a provider-key
+/// fingerprint (`GetReasonerReady` → `current_key_fingerprint`), otherwise the first read blocks on a
+/// keychain-ACL prompt that hangs CI forever (a hard project lesson). Pass an empty map to model
+/// "no provider keys stored" (the common fixture); a non-empty map models a stored key.
+///
+/// Behind `test-helpers` (the same feature that exposes `spawn_for_test`/`test_engine`) so no
+/// keychain-bypass path can reach production.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn seed_secret_cache_for_test(values: HashMap<String, String>) {
+    let mut cache = SECRET_CACHE.write().expect("seed test secret cache");
+    *cache = Some(values);
+}
+
 /// Build the daemon's engine keystore vault over the SHARED service name
 /// (`ai.air-agent.desktop`) — the same slot the app's `EngineKeystore` uses, so both
 /// read the identical DEK/signing key (proven silent by the Task 0.5 keychain gate when
