@@ -3,27 +3,79 @@ name = "bossclawd"
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-description = "bossclawd: the local Unix-socket memory daemon for AIR Agent — single-owner arbitration (M1a)."
+description = "bossclawd: the local Unix-socket memory daemon for AIR Agent — single-owner arbitration + engine host (M1a)."
 repository = "https://github.com/AgentIdentityRegistry/air-note"
 
 [lib]
-# A lib target so Task 4 can add `src/main.rs` (accept-loop/engine) later without
-# restructuring: the daemon binary will depend on this crate's `lock` module.
+# A lib target so the daemon binary (`src/main.rs`) and the integration tests
+# (`tests/roundtrip.rs`) can both reach the accept-loop/engine code. Integration
+# tests can't see `#[cfg(test)]` items of the bin, so the test-spawn helper lives
+# in the LIB (`server::spawn_for_test`) behind `#[doc(hidden)] pub` (M1a Task 4).
 path = "src/lib.rs"
+
+[[bin]]
+name = "bossclawd"
+path = "src/main.rs"
+
+# The daemon runs a real tokio runtime (no Tauri `async_runtime` caveat), so it
+# needs the full feature set the copied engine modules use: rt-multi-thread +
+# macros (the `#[tokio::main]`/`#[tokio::test]` attrs + `spawn`), net (UnixListener),
+# io-util (frame codec), time (scheduler interval), fs/sync are pulled in by "full".
+[dependencies]
+bossclawd-proto = { path = "../bossclawd-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 
 # `nix` provides the signal-0 PID-liveness probe (`kill(pid, None)`) as SAFE,
 # I/O-safe syscall bindings, so this crate keeps `#![forbid(unsafe_code)]` (no
 # hand-rolled `libc::kill`, which would require `unsafe`). Version `0.30` matches
 # what the workspace lockfile already resolves (transitively via hnsw_rs → mmap-rs).
-# Unix-only: the lock module is `#[cfg(unix)]`-gated (Unix-socket + POSIX signals),
-# so a non-unix target never resolves this dependency.
+# Unix-only: the lock module + engine host are `#[cfg(unix)]`-gated (Unix-socket +
+# POSIX signals + bossclaw-core), so a non-unix target never resolves these.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal", "process"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `signal`+`process` for the PID-liveness probe (lock.rs); `fs` for `umask` (socket 0600 bind in main.rs).
+nix = { version = "0.30", features = ["signal", "process", "fs"] }
 thiserror = "1"
+# Memory/actuator engine — the daemon becomes the single owner. `features=["ollama"]`
+# mirrors the desktop crate so the copied engine modules build byte-identically.
+bossclaw-core = { path = "../bossclaw-core", features = ["ollama"] }
+# Engine keystore + copied reasoner/embedder support. Versions pinned to the exact
+# strings the desktop crate uses (`apps/desktop/src-tauri/Cargo.toml`) so no second
+# major of any of these enters the tree.
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+rand_core = { version = "0.6", features = ["std"] }
+zeroize = "1"
+hex = "0.4"
+sha2 = "0.10"
+chrono = "0.4"
+# The copied cloud reasoner is the brain's deliberate network egress; it uses the
+# blocking client + a custom SSRF-screening DNS resolver.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"] }
+
+# Keychain access for the engine DEK/signing key + the shared provider-key blob.
+# SAME service name (`ai.air-agent.desktop`) + SAME blob location as the app so the
+# daemon and app share one store (the vault-key seam rule). Feature split mirrors
+# the desktop crate exactly.
+[target.'cfg(all(unix, target_os = "linux"))'.dependencies]
+keyring = { version = "2.3", features = ["linux-secret-service", "linux-keyutils"] }
+
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+keyring = "2.3"
+
+[features]
+# Exposes `server::spawn_for_test` / `test_engine` + their in-memory vault/mock providers to the
+# integration test (`tests/roundtrip.rs`), which links the lib compiled WITHOUT `#[cfg(test)]`, so
+# it can't see `#[cfg(test)]` items. The integration test enables this via a build-time cfg on the
+# test binary (see `tests/roundtrip.rs`), and `cargo test` turns it on for this crate's test build.
+test-helpers = []
 
 [dev-dependencies]
+# Self dev-dependency with `test-helpers` on: this is the idiomatic way to make a lib feature
+# available to integration tests. `tests/roundtrip.rs` links THIS (feature-enabled) build of the
+# crate, so `spawn_for_test`/`test_engine` are visible; the plain `bossclawd` lib/bin the daemon
+# ships still compiles WITHOUT `test-helpers`, so no mock/test code reaches production.
+bossclawd = { path = ".", features = ["test-helpers"] }
 # Hermetic filesystem tests: matches the workspace convention (bossclaw-core's
 # fs tests use `tempfile::tempdir()`).
 tempfile = "3"
