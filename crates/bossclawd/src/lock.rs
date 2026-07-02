@@ -21,6 +21,21 @@
 //! remove the socket: in the daemon the socket is owned by the accept-loop
 //! (Task 4), which unbinds it on its own shutdown; the lock only reclaims a
 //! *stale* socket left by a dead owner.
+//!
+//! # The lock file is ADVISORY — the socket bind is the true mutex
+//! Check-then-write is not atomic: two daemons started simultaneously can BOTH
+//! pass checks (1)–(2) and both write a lock file. The authoritative
+//! single-owner gate is the socket bind itself — Task 4 must treat a
+//! `UnixListener::bind` failure (`EADDRINUSE`) as the final arbiter (the loser
+//! of the race dies at bind), and `acquire_or_refuse` as the fast-path advisory
+//! check that keeps the common cases (stale leftovers, an already-running
+//! daemon) loud and correct.
+//!
+//! # Deliberate divergence from the mjs
+//! We refuse on ANY live PID in the lock file, including our own (the mjs
+//! allows re-entrant self-acquire via its `holder.pid !== pid` check). Safe
+//! because a genuine second daemon always has a different PID, and bossclawd
+//! never re-acquires within one process.
 
 #[cfg(unix)]
 mod imp {
@@ -59,6 +74,11 @@ mod imp {
     }
 
     /// The contents of a lock file: who holds it, and since when.
+    ///
+    /// The mjs `Holder` also carries a `name` field (which of several consumer
+    /// roles — watch/channel-server/bridge — holds the lock). It is dropped
+    /// here INTENTIONALLY: bossclawd is single-role, so a name would be a
+    /// constant. Do not "fix" it back in.
     #[derive(Debug, Serialize, Deserialize)]
     struct Holder {
         pid: i32,
@@ -67,6 +87,7 @@ mod imp {
 
     /// An RAII guard proving this process holds the lock. Dropping it removes the
     /// lock file iff this process still owns it. Best-effort on drop (never panics).
+    #[must_use = "dropping the guard releases the lock immediately"]
     #[derive(Debug)]
     pub struct LockGuard {
         lock_path: PathBuf,
@@ -102,6 +123,11 @@ mod imp {
 
     /// Is a process alive? Signal 0 probes existence without killing it.
     /// `EPERM` means the process exists but is not ours (still "alive").
+    ///
+    /// CAVEAT: a recorded PID may have been RECYCLED to an unrelated live
+    /// process since the old owner died, so this can yield a spurious
+    /// `LivePid` refusal. The socket check is the reliable liveness signal;
+    /// this is a best-effort secondary probe (same limitation as the mjs).
     pub fn is_pid_alive(pid: i32) -> bool {
         if pid <= 0 {
             return false;
@@ -168,7 +194,7 @@ mod imp {
     fn write_lock_file(lock_path: &Path, pid: i32) -> io::Result<()> {
         let holder = Holder {
             pid,
-            since: now_iso8601(),
+            since: now_epoch_secs(),
         };
         let json = serde_json::to_vec(&holder).map_err(io::Error::from)?;
         fs::write(lock_path, &json)?;
@@ -176,10 +202,10 @@ mod imp {
         Ok(())
     }
 
-    /// A dependency-light ISO-8601-ish UTC timestamp for the `since` field.
-    /// Purely informational (the mjs stores `new Date().toISOString()`); the
-    /// arbitration logic never parses it, so we avoid pulling `chrono` here.
-    fn now_iso8601() -> String {
+    /// A dependency-light UTC timestamp (raw epoch seconds) for the `since`
+    /// field. Purely informational (the mjs stores `new Date().toISOString()`);
+    /// the arbitration logic never parses it, so we avoid pulling `chrono` here.
+    fn now_epoch_secs() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
