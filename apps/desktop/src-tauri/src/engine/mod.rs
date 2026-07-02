@@ -49,6 +49,13 @@ pub enum EngineError {
     Vault(String),
     /// A background task failed to join.
     Join(String),
+    /// The daemon (bossclawd) is unreachable — the transport failed to connect/handshake, or a
+    /// request errored and the reconnect+retry also failed. Mirrors [`EngineOpError::Unavailable`]
+    /// for teardown's distinct error type: "the brain is DOWN" has no in-process analogue, so it is
+    /// kept SEPARATE from `Vault` (a real keystore/keychain fault) — `reset_identity` treats a
+    /// down-daemon teardown as non-fatal (identity is already cleared) while STILL surfacing `Vault`.
+    /// Constructed only by `client.rs`'s `teardown` from a transport failure.
+    Unavailable(String),
 }
 
 impl fmt::Display for EngineError {
@@ -59,6 +66,7 @@ impl fmt::Display for EngineError {
             EngineError::KeystoreDbMismatch(e) => write!(f, "engine keystore/DB mismatch: {e}"),
             EngineError::Vault(e) => write!(f, "engine keychain error: {e}"),
             EngineError::Join(e) => write!(f, "engine task error: {e}"),
+            EngineError::Unavailable(e) => write!(f, "memory service unavailable: {e}"),
         }
     }
 }

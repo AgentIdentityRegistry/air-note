@@ -78,7 +78,15 @@ impl<T: Transport + ?Sized> EngineClient<T> {
     /// Mirrors `EngineHandle::status`: never errors. A transport failure becomes a
     /// `KeystoreDbMismatch` status (the engine's own "can't open" state), so the UI shows a fault
     /// state rather than crashing — the closest in-process analogue to "daemon down".
+    ///
+    /// `onboarded == false` short-circuits to [`not_onboarded_status`] WITHOUT a transport call,
+    /// matching the in-process `get_or_open` gate (which returns `NotOnboarded` before opening the
+    /// engine). This makes a not-onboarded user with a DOWN daemon see the clean `NotOnboarded`
+    /// state — not the `KeystoreDbMismatch` fault a transport failure would otherwise yield.
     pub async fn status(&self, onboarded: bool) -> EngineStatus {
+        if !onboarded {
+            return not_onboarded_status();
+        }
         match self.transport.request(Request::Status { onboarded }).await {
             Ok(Response::Status(w)) => status_from_wire(w),
             // NotOnboarded can also arrive as a status (state=NotOnboarded) — but if the daemon ever
@@ -339,13 +347,14 @@ impl<T: Transport + ?Sized> EngineClient<T> {
 
     /// Mirrors `EngineHandle::teardown`. Its return is `Result<(), EngineError>`; a daemon error is
     /// rebuilt into its exact typed `EngineError` variant (see [`teardown_error_from_response`]); a
-    /// transport failure maps to `EngineError::Vault(..)` (the engine's generic I/O error variant —
-    /// "daemon down" has no in-process analogue).
+    /// transport failure maps to [`EngineError::Unavailable`] (NOT `Vault`) so `reset_identity` can
+    /// tell "the brain is DOWN" (non-fatal once the identity is cleared) apart from a real keystore
+    /// fault (which must still surface). The transport's own reason is preserved.
     pub async fn teardown(&self) -> Result<(), EngineError> {
         match self.transport.request(Request::Teardown).await {
             Ok(Response::Ok) => Ok(()),
             Ok(other) => Err(teardown_error_from_response(other)),
-            Err(e) => Err(EngineError::Vault(e.to_string())),
+            Err(e) => Err(EngineError::Unavailable(e.to_string())),
         }
     }
 
@@ -792,6 +801,28 @@ mod tests {
             .await
             .expect_err("daemon gone → Err");
         assert!(matches!(err, EngineOpError::Unavailable(_)), "got {err:?}");
+    }
+
+    // ── Fix 2 (Med2): `status(false)` short-circuits to NotOnboarded WITHOUT a transport call. ──
+    // The in-process `get_or_open` gate returns NotOnboarded before opening anything when
+    // onboarded=false; the client must match that EXACTLY — even with NO daemon behind the socket it
+    // returns the clean `NotOnboarded`, never the `KeystoreDbMismatch` fault it uses for a real
+    // transport failure. Driven against a NEVER-bound socket: were the short-circuit removed, the
+    // request would fail transport-side and this would (correctly) fail with `KeystoreDbMismatch`.
+
+    #[tokio::test]
+    async fn status_not_onboarded_short_circuits_without_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bossclawd.sock"); // never bound — nobody is listening.
+        let client: EngineClient<SocketTransport> =
+            EngineClient::new(Arc::new(SocketTransport::new(sock)));
+        // No daemon at all, yet onboarded=false returns the clean NotOnboarded (no transport call).
+        let st = bounded(client.status(false)).await;
+        assert!(
+            matches!(st.state, EngineState::NotOnboarded),
+            "status(false) must short-circuit to NotOnboarded even with no daemon, got {:?}",
+            st.state
+        );
     }
 
     // ── Swallow-behavior parity under an unavailable daemon: `_or_false`/`_or_default` don't error. ──
