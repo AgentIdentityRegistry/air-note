@@ -1237,7 +1237,14 @@ mod tests {
 
     /// A fresh `TestVault` + tempdir (the dir guard must outlive the handle). Mirrors the
     /// inline setup the SP2 tests use; centralised here for the SP3 recall/evolve tests.
+    ///
+    /// ALSO seeds the process-global provider-key cache to EMPTY: any test that reaches a
+    /// provider-key fingerprint read (`reasoner_ready_or_false` → `current_key_fingerprint` →
+    /// `vault::secret_get_cached`, e.g. a cloud-mode `evolve_once`) would otherwise hit the real
+    /// OS keychain and block forever on a keychain-ACL prompt (the documented CI-hang hazard).
+    /// An empty cache means "no provider key stored" — exactly the fixture these tests want.
     fn test_vault_and_dir() -> (Arc<TestVault>, tempfile::TempDir) {
+        crate::vault::seed_secret_cache_for_test(Default::default());
         (TestVault::new(), tempfile::tempdir().unwrap())
     }
 

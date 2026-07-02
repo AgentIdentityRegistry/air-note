@@ -47,7 +47,14 @@ impl Client {
 /// Spin a daemon on a fresh temp socket + temp engine home, returning the tempdir guard (keeps the
 /// socket + home alive) and the socket path. The daemon's socket is UNDER the tempdir so it is
 /// cleaned up with it.
+///
+/// Seeds the process-global provider-key cache to EMPTY first, so ops that read a provider-key
+/// fingerprint (`GetReasonerReady` → `current_key_fingerprint` → `vault::secret_get_cached`) never
+/// hit the real OS keychain — an unseeded first read blocks on a keychain-ACL prompt and hangs the
+/// suite forever (the documented CI-hang hazard). Empty = "no provider key stored", the fixture
+/// every test here wants (readiness stays fail-closed false).
 async fn spawn_daemon() -> (tempfile::TempDir, PathBuf) {
+    bossclawd::vault::seed_secret_cache_for_test(Default::default());
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("bossclawd.sock");
     let home = dir.path().to_path_buf();
