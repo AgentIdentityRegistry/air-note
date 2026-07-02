@@ -1047,4 +1047,55 @@ mod tests {
         // Still not ready (fail-closed R1 — no signed consent).
         assert!(!bounded(client.reasoner_ready_or_false(true)).await);
     }
+
+    // ── M1a Task 7: fail-closed MID-request. The existing `reconnects_after_daemon_drop` and
+    //    `unavailable_when_daemon_gone` kill the daemon BETWEEN calls; this one kills it while a
+    //    request is ON THE WIRE (the daemon received the request frame but dies before replying), so
+    //    the client's in-flight `read_frame` sees EOF. It must surface `Unavailable` within the bound
+    //    — never hang, never panic. Driven with a purpose-built fake daemon (not the mock-provider
+    //    `TestDaemon`, whose ops answer too fast to reliably race a kill against).
+
+    /// A fake daemon that completes the `Hello`/`HelloOk` handshake, READS the first request frame,
+    /// then DROPS the connection WITHOUT replying — the on-wire equivalent of the daemon being killed
+    /// exactly mid-request. It serves ONE connection then stops listening, so the transport's
+    /// reconnect-once also fails (daemon truly gone) → the client maps it to `Unavailable`.
+    async fn spawn_dies_mid_request_daemon() -> (TempDir, std::path::PathBuf) {
+        use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, PROTO_VERSION};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bossclawd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind fake daemon");
+        tokio::spawn(async move {
+            // Serve exactly one connection, then the listener drops (gone for good).
+            let (mut stream, _addr) = listener.accept().await.expect("accept");
+            // Real handshake so the client gets past connect and issues its request.
+            let _hello: Hello =
+                serde_json::from_slice(&read_frame(&mut stream).await.expect("read Hello"))
+                    .expect("parse Hello");
+            let hello_ok = HelloOk { pid: std::process::id(), proto_version: PROTO_VERSION };
+            write_frame(&mut stream, &serde_json::to_vec(&hello_ok).unwrap())
+                .await
+                .expect("send HelloOk");
+            // Receive the request frame (it's now "on the wire", the daemon has it) ...
+            let _req = read_frame(&mut stream).await.expect("read request frame");
+            // ... then die mid-request: drop the connection WITHOUT replying. The client's in-flight
+            // `read_frame` sees EOF; the listener drops at end of task, so the reconnect fails too.
+            drop(stream);
+        });
+        (dir, sock)
+    }
+
+    #[tokio::test]
+    async fn unavailable_when_daemon_dies_mid_request() {
+        let (_dir, sock) = spawn_dies_mid_request_daemon().await;
+        let client: EngineClient<SocketTransport> =
+            EngineClient::new(Arc::new(SocketTransport::new(sock)));
+        // A fallible op whose request the daemon receives then dies before answering. The transport
+        // reconnects once (fails — daemon gone) and maps to Unavailable. Bounded: MUST NOT hang.
+        let err = bounded(client.add_grant(true, std::path::PathBuf::from("/tmp/x")))
+            .await
+            .expect_err("daemon dies mid-request → Err");
+        assert!(matches!(err, EngineOpError::Unavailable(_)), "got {err:?}");
+    }
 }

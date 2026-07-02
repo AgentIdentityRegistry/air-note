@@ -300,3 +300,109 @@ mod duplex {
         }
     }
 }
+
+// ── M1a Task 7: transport-layer invariants (version skew + fail-closed at connect). ──
+//
+// These exercise the REAL `SocketTransport` against hand-rolled listeners over a temp Unix socket
+// (hermetic — no daemon, no keychain, no DB). Every await is bounded by a TEST-side timeout so a
+// hang fails the test rather than wedging CI. The single-owner + version-skew invariants at the
+// DAEMON boundary live in `crates/bossclawd/tests/invariants.rs`; these are the app-side halves.
+#[cfg(test)]
+mod invariants {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::UnixListener;
+
+    /// A generous per-await test bound: a `SocketTransport` call answers fast (or fails fast to
+    /// `Unavailable`), so reaching this is a hang — a test failure, never CI slowness.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Await `fut`, failing the test (not hanging CI) if it exceeds [`TEST_TIMEOUT`].
+    async fn bounded<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::time::timeout(TEST_TIMEOUT, fut).await.expect("transport call must not hang")
+    }
+
+    /// Fail-closed at connect: a `SocketTransport` pointed at a socket path with NO daemon behind it
+    /// surfaces [`EngineOpError::Unavailable`] on `request` — it never hangs, never panics, and (the
+    /// load-bearing guarantee) it opens NO local store. There is no app-side engine/DB anymore
+    /// (post-Task-6): the transport's ONLY job when the daemon is absent is to report unavailable, so
+    /// the app can never silently fall back to its own store. Bounded so a wedged connect fails.
+    #[tokio::test]
+    async fn no_daemon_request_is_unavailable_and_opens_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        // A socket path that was NEVER bound — nobody is listening.
+        let sock = dir.path().join("bossclawd.sock");
+        let transport = SocketTransport::new(sock.clone());
+
+        let err = bounded(transport.request(Request::Status { onboarded: true }))
+            .await
+            .expect_err("no daemon → transport request must Err");
+        assert!(matches!(err, EngineOpError::Unavailable(_)), "got {err:?}");
+
+        // The "opens no store" guarantee, made concrete: a `SocketTransport` is pure wire plumbing —
+        // it holds only a socket path + an (unconnected) stream slot, with no DB/engine handle. The
+        // failed request created NO files under the temp dir (no brain.db, no keystore) — the app
+        // never silently opens its own store when the daemon is down.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a daemon-less transport must open NO local store; found {leftovers:?}"
+        );
+    }
+
+    /// Version skew at the app layer: a `SocketTransport` whose daemon only speaks a DIFFERENT
+    /// protocol version surfaces [`EngineOpError::Unavailable`] (never hangs, never panics, never
+    /// mis-deserializes a later frame). Driven against a hand-rolled fake daemon that answers a
+    /// wrong-version `HelloOk` but is OTHERWISE fully functional (it would happily serve requests) —
+    /// so the version rejection is the SOLE reason for `Unavailable`. This makes the test load-bearing
+    /// on the client's version check: were the check removed, the request would round-trip fine and
+    /// the assertion would (correctly) fail. (The daemon-boundary half — a skewed *client* Hello is
+    /// closed — is `crates/bossclawd/tests/invariants.rs::version_skew_hello_is_closed_without_hello_ok`.)
+    #[tokio::test]
+    async fn version_skew_daemon_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bossclawd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind fake daemon socket");
+
+        // A fake "daemon from the future": accepts connections forever, answers a HelloOk carrying a
+        // version ONE AHEAD of ours (u32 = 1 today, so +1 = 2 — no overflow), then serves every
+        // request with a benign `Response::Ok`. Fully functional EXCEPT the version — so the client's
+        // version check is the only thing standing between a happy round-trip and `Unavailable`. It
+        // keeps serving across the transport's reconnect-once, so a missing check can't accidentally
+        // surface `Unavailable` from a dropped connection instead.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _addr)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    // Handshake with the SKEWED version.
+                    if read_frame(&mut stream).await.is_err() {
+                        return;
+                    }
+                    let skewed = HelloOk { pid: 4242, proto_version: PROTO_VERSION + 1 };
+                    if write_frame(&mut stream, &serde_json::to_vec(&skewed).unwrap()).await.is_err() {
+                        return;
+                    }
+                    // Then serve every request with Ok (proving the daemon is otherwise healthy).
+                    while read_frame(&mut stream).await.is_ok() {
+                        let ok = serde_json::to_vec(&Response::Ok).unwrap();
+                        if write_frame(&mut stream, &ok).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let transport = SocketTransport::new(sock);
+        let err = bounded(transport.request(Request::Status { onboarded: true }))
+            .await
+            .expect_err("version-skewed daemon → Unavailable");
+        assert!(matches!(err, EngineOpError::Unavailable(_)), "got {err:?}");
+
+        server.abort();
+    }
+}
