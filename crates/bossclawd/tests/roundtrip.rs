@@ -62,6 +62,91 @@ async fn spawn_daemon() -> (tempfile::TempDir, PathBuf) {
     (dir, sock_path)
 }
 
+/// Like [`spawn_daemon`], but RETURNS the shared `Arc<EngineHandle>` so a test can seed engine
+/// state (e.g. a write_proposal) directly BEFORE driving ops over the wire. Uses the same public
+/// `test_engine` + production `run_accept_loop` as `spawn_for_test`, over a real 0600 temp socket.
+async fn spawn_daemon_with_engine(
+) -> (tempfile::TempDir, PathBuf, std::sync::Arc<bossclawd::engine::EngineHandle>) {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
+    bossclawd::vault::seed_secret_cache_for_test(Default::default());
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("bossclawd.sock");
+    let engine = std::sync::Arc::new(bossclawd::server::test_engine(dir.path().to_path_buf()));
+    // Bind BEFORE returning so a client connect can't race the bind (same contract as spawn_for_test).
+    let listener = UnixListener::bind(&sock_path).expect("bind test socket");
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod test socket 0600");
+    // The PRODUCTION accept loop, sharing the SAME engine Arc we return — so the proposal a test
+    // seeds through `engine` is the very one the wire `ApplyProposal` resolves.
+    tokio::spawn(bossclawd::server::run_accept_loop(engine.clone(), listener));
+    (dir, sock_path, engine)
+}
+
+/// Seed ONE open, loud-requiring `write_proposal` into `engine`'s brain and return
+/// `(proposal_id, target_path, original_bytes, folder_guard)`. Mirrors the engine's own
+/// `apply_proposal_loud_needs_ack_then_applies` recipe: grant+write-grant a temp folder, ingest a
+/// target file, then append a Tier-B Edit proposal whose new content is a >=32-char unbroken
+/// alphanumeric run (the secret-shaped diff that forces `requires_loud_modal`). The proposed bytes
+/// go in the side table so apply can read them back. The returned `TempDir` keeps the folder alive —
+/// the caller MUST hold it until after the apply, or the target dir is removed before the write.
+async fn seed_loud_proposal(
+    engine: &bossclawd::engine::EngineHandle,
+) -> (String, std::path::PathBuf, Vec<u8>, tempfile::TempDir) {
+    use bossclaw_core::actuator::{WriteOp, WriteProposal};
+    use sha2::{Digest, Sha256};
+
+    let log = engine.get_or_open(true).await.expect("open brain");
+    let folder = tempfile::tempdir().unwrap();
+    log.add_grant(folder.path()).expect("read grant");
+    log.add_write_grant(folder.path()).expect("write grant");
+    let path = folder.path().join("secrets.md");
+    let original = b"placeholder\n".to_vec();
+    std::fs::write(&path, &original).unwrap();
+
+    // Ingest the target so the proposal cites a real lineage event (the file_ingested id).
+    let embedder = bossclaw_core::embed::MockEmbedder::new(8);
+    log.ingest_all(&bossclaw_core::ingest::ParserRouter::native_only(), &embedder).expect("ingest");
+    let canonical = std::fs::canonicalize(&path).unwrap().to_string_lossy().to_string();
+    let file_id = log
+        .current_files()
+        .expect("current_files")
+        .into_iter()
+        .find(|r| r.canonical_path == canonical)
+        .map(|r| r.file_event_id)
+        .expect("ingested file id");
+
+    // A >=32-char unbroken alphanumeric run trips the secret-shaped diff flag → loud.
+    let new_bytes = b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n".to_vec();
+    let hash = hex::encode(Sha256::digest(&new_bytes));
+    let gated = log
+        .propose_write(WriteProposal {
+            target: path.clone(),
+            new_content: new_bytes.clone(),
+            op: WriteOp::Edit,
+            source_event_ids: vec![file_id.clone()],
+            rationale: "fix".to_string(),
+        })
+        .expect("gate the proposal");
+    assert!(gated.verdict.requires_loud_modal, "secret-shaped content forces the loud modal");
+    let vs = serde_json::json!({
+        "requires_loud_modal": gated.verdict.requires_loud_modal,
+        "taint": format!("{:?}", gated.verdict.taint),
+        "allowed": gated.verdict.allowed,
+        "base_content_hash": gated.verdict.base_content_hash,
+    });
+    let pid = log
+        .append_write_proposal(
+            &canonical, "edit", &hash, new_bytes.len() as u64, "fix",
+            &serde_json::json!({"src":"a","relation":"r","dst":"b"}), &vs,
+            std::slice::from_ref(&file_id),
+        )
+        .expect("append write_proposal");
+    log.put_proposal_bytes(&pid, &new_bytes, &hash).expect("store proposal bytes");
+    (pid, path, original, folder)
+}
+
 // ── The specced RED (Step 1): status round-trips over a real socket. ──
 
 #[tokio::test]
@@ -346,4 +431,54 @@ async fn reasoner_config_roundtrip() {
         client.call(Request::GetReasonerReady { onboarded: true }).await,
         Response::ReasonerReady(false)
     ));
+}
+
+// ── Apply-proposal family: the review-apply path (loud-confirm gate + happy path) over the wire. ──
+//
+// Everything else here proves per-family REQUEST plumbing, but `apply_proposal` — the one op with a
+// safety gate (`acknowledged_loud`) — had no wire coverage: the string-parity of `NeedsLoudConfirm`
+// is unit-tested app-side, but no test drove the ACTUAL apply over the daemon. This seeds a REAL
+// loud-requiring proposal into the daemon's engine, then drives apply over a real socket:
+//   • acknowledged_loud=false → the daemon re-gates, sees a loud verdict, and returns the typed
+//     `NeedsLoudConfirm` Err across the wire — and the file is UNCHANGED (no silent write);
+//   • acknowledged_loud=true  → the same proposal applies and returns an `ApplyResult` carrying the
+//     file_written id — and the file now holds the proposed bytes.
+// The ack is the ONLY thing that differs between the two calls, so this is load-bearing on
+// `acknowledged_loud` crossing the wire and reaching the engine's authoritative loud gate.
+#[tokio::test]
+async fn apply_proposal_loud_confirm_roundtrip() {
+    let (_dir, sock, engine) = spawn_daemon_with_engine().await;
+    let (pid, target, original, _folder) = seed_loud_proposal(&engine).await;
+    let mut client = Client::connect(&sock).await;
+
+    // 1) No ack → the daemon refuses with the typed NeedsLoudConfirm, and NOTHING is written.
+    let resp = client
+        .call(Request::ApplyProposal { onboarded: true, id: pid.clone(), acknowledged_loud: false })
+        .await;
+    match resp {
+        Response::Err { kind, .. } => assert_eq!(
+            kind,
+            bossclawd_proto::OpErrorKindWire::NeedsLoudConfirm,
+            "a loud write without ack → NeedsLoudConfirm over the wire",
+        ),
+        other => panic!("expected Err(NeedsLoudConfirm), got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&target).unwrap(), original, "no write happened without the ack");
+
+    // 2) With ack → the SAME proposal applies (a loud refuse fires pre-execute, so the proposal was
+    //    not consumed by call 1 and is still resolvable) and returns an ApplyResult with a file id.
+    let resp = client
+        .call(Request::ApplyProposal { onboarded: true, id: pid, acknowledged_loud: true })
+        .await;
+    match resp {
+        Response::ApplyProposal(r) => {
+            assert!(!r.file_written_id.is_empty(), "apply returns a file_written id");
+        }
+        other => panic!("expected ApplyProposal, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"token=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd\n",
+        "the ack let the loud write through",
+    );
 }

@@ -80,3 +80,11 @@ bossclawd = { path = ".", features = ["test-helpers"] }
 # Hermetic filesystem tests: matches the workspace convention (bossclaw-core's
 # fs tests use `tempfile::tempdir()`).
 tempfile = "3"
+# The apply_proposal roundtrip test (`tests/roundtrip.rs`) seeds a REAL loud-requiring
+# write_proposal into the daemon's engine before driving apply over the wire — that needs
+# `bossclaw-core`'s actuator types + the same content hasher (`hex::encode(Sha256::digest(..))`)
+# the engine records. All three are ALREADY regular dependencies at these exact versions, so
+# exposing them to the integration test adds ZERO new crates to the tree/lockfile.
+bossclaw-core = { path = "../bossclaw-core", features = ["ollama"] }
+hex = "0.4"
+sha2 = "0.10"
