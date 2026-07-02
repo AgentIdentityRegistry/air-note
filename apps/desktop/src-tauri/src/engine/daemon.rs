@@ -105,10 +105,23 @@ pub async fn ensure_started(sock_path: &Path, bin_path: &Path) -> bool {
     }
     // No owner — spawn the installed binary. The daemon's own single-owner arbitration makes this
     // safe even if launchd starts one concurrently (the loser of the bind race steps aside).
+    //
+    // Spawn semantics (documented; at most ONE spawn per app boot):
+    // - stdio: the child INHERITS the app's stdio (`Command`'s default — deliberate). In dev that
+    //   puts the daemon's stderr log in the app's console, which is the useful behavior; an
+    //   installed, service-managed daemon is started by launchd/systemd with the service
+    //   definition's own log routing, not through this path.
+    // - lifetime/reaping: we never kill or supervise the daemon (its life belongs to the service
+    //   manager). But a child we spawned must still be REAPED when it exits — in particular the
+    //   loser of the single-owner bind race exits 0 almost immediately and would otherwise linger
+    //   as a zombie until app exit. A detached waiter thread `wait()`s on it: if the child exits
+    //   it is reaped at once; if the daemon runs for the app's lifetime the thread just stays
+    //   parked in `wait()` (one thread, bounded by the one-spawn-per-boot rule).
     match std::process::Command::new(bin_path).spawn() {
-        Ok(_child) => {
-            // Intentionally NOT awaited/killed: the daemon is a detached, service-managed process.
-            // We only wait (bounded) for it to answer, then hand off to launchd/systemd for its life.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
         Err(e) => {
             eprintln!(
@@ -138,18 +151,35 @@ pub async fn ensure_started(sock_path: &Path, bin_path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    /// A guard that sets an env var for the test's duration and restores it after — env is
-    /// process-global, so tests touching the same var must not run truly concurrently, but each var
-    /// here is unique to its test.
+    /// Serializes every env-touching test: env vars are process-global, and the harness runs tests
+    /// on parallel threads, so an unserialized set/remove of the SAME var would race. Held (via the
+    /// guard below) for the whole test body. Poison-recovered — a panicked test must not wedge the
+    /// remaining env tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A guard that pins an env var for the test's duration — either SET to a value (the override
+    /// fixtures) or REMOVED (the default-case fixtures, so they always run and never silently skip
+    /// when a developer's shell exports the var) — and restores the previous state after. Also
+    /// holds [`ENV_LOCK`] so env tests serialize.
     struct EnvGuard {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
     impl EnvGuard {
         fn set(key: &'static str, val: &str) -> Self {
+            let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let prev = std::env::var_os(key);
             std::env::set_var(key, val);
-            Self { key, prev }
+            Self { key, prev, _serial }
+        }
+        /// Remove `key` for the test's duration: the default-branch fixture. Unlike a conditional
+        /// skip (`if var_os(..).is_none()`), the test body ALWAYS runs.
+        fn remove(key: &'static str) -> Self {
+            let _serial = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev, _serial }
         }
     }
     impl Drop for EnvGuard {
@@ -163,12 +193,11 @@ mod tests {
 
     #[test]
     fn socket_path_defaults_under_app_data_dir() {
-        // No env → `<app_data_dir>/bossclawd.sock`.
-        // (Assumes BOSSCLAWD_SOCKET is unset in the test env; the override case is covered below.)
-        if std::env::var_os(ENV_SOCKET).is_none() {
-            let got = resolve_socket_path(Path::new("/data/ai.air-agent.desktop"));
-            assert_eq!(got, PathBuf::from("/data/ai.air-agent.desktop/bossclawd.sock"));
-        }
+        // No env → `<app_data_dir>/bossclawd.sock`. The guard REMOVES any exported override so
+        // this default-case test always runs (no silent skip).
+        let _g = EnvGuard::remove(ENV_SOCKET);
+        let got = resolve_socket_path(Path::new("/data/ai.air-agent.desktop"));
+        assert_eq!(got, PathBuf::from("/data/ai.air-agent.desktop/bossclawd.sock"));
     }
 
     #[test]
@@ -189,25 +218,23 @@ mod tests {
     fn bin_path_falls_back_to_sibling_when_no_env_and_none_exist() {
         // With no env override and a made-up (non-existent) exe dir, the resolver returns the
         // primary SIBLING candidate (so a later spawn error names a concrete path), never empty.
-        if std::env::var_os(ENV_BIN).is_none() {
-            let exe = Path::new("/nonexistent-dir-xyz/MacOS/air_agent_desktop");
-            let got = resolve_bin_path(exe);
-            assert_eq!(got, PathBuf::from("/nonexistent-dir-xyz/MacOS/bossclawd"));
-        }
+        let _g = EnvGuard::remove(ENV_BIN);
+        let exe = Path::new("/nonexistent-dir-xyz/MacOS/air_agent_desktop");
+        let got = resolve_bin_path(exe);
+        assert_eq!(got, PathBuf::from("/nonexistent-dir-xyz/MacOS/bossclawd"));
     }
 
     #[test]
     fn bin_path_prefers_an_existing_sibling() {
         // A real sibling binary next to the "exe" is preferred over the parent fallback.
-        if std::env::var_os(ENV_BIN).is_none() {
-            let dir = tempfile::tempdir().unwrap();
-            let exe = dir.path().join("air_agent_desktop");
-            std::fs::write(&exe, b"exe").unwrap();
-            let sibling = dir.path().join(BIN_NAME);
-            std::fs::write(&sibling, b"daemon").unwrap();
-            let got = resolve_bin_path(&exe);
-            assert_eq!(got, sibling);
-        }
+        let _g = EnvGuard::remove(ENV_BIN);
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("air_agent_desktop");
+        std::fs::write(&exe, b"exe").unwrap();
+        let sibling = dir.path().join(BIN_NAME);
+        std::fs::write(&sibling, b"daemon").unwrap();
+        let got = resolve_bin_path(&exe);
+        assert_eq!(got, sibling);
     }
 
     #[tokio::test]
