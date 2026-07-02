@@ -729,6 +729,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bossclawd-proto"
+version = "0.0.1"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

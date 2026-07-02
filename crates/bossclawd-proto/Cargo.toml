@@ -1,0 +1,18 @@
+[package]
+name = "bossclawd-proto"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Wire protocol for bossclawd, the local Unix-socket memory daemon: length-prefixed frame codec (M1a)."
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+
+[dependencies]
+# The codec is generic over `AsyncRead`/`AsyncWrite`; it needs only the IO
+# extension traits (`io-util`). No `net`/`rt`/`macros` in the lib itself so the
+# codec stays usable from any tokio runtime configuration.
+tokio = { version = "1", features = ["io-util"] }
+
+[dev-dependencies]
+# Tests drive the codec over `tokio::io::duplex` and need a runtime + the
+# `#[tokio::test]` attribute macro.
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
