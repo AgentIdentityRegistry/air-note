@@ -1,7 +1,7 @@
 # AIR Agent Memory Hub — M1a: `bossclawd` daemon extraction + app migration
 
 **Date:** 2026-07-02
-**Status:** Design approved (brainstorm); pending spec review → implementation plan
+**Status:** Rev 2 — revised after independent architect + critic review (design verdict: SOUND; plan verdict: reworked to address 2 critical + 4 major findings). Pending final review → implementation.
 **Crate under change:** `air_agent_desktop` (`apps/desktop/src-tauri`), `bossclaw-core` (unchanged API), new `bossclawd` binary + shared protocol crate
 
 ## Program context (why this spec exists)
@@ -30,7 +30,7 @@ The problem this creates for the program: an encrypted store must have **exactly
 
 **Goal:** Extract a `bossclawd` daemon that becomes the single owner of the encrypted store (the only process holding the DEK and opening the DB), and migrate the desktop app to reach the engine *through* it. **No new user-facing behavior.**
 
-**Success criterion:** the app behaves exactly as today — proven by its existing engine command tests passing **unchanged** against the daemon-backed client.
+**Success criterion:** the app behaves exactly as today — proven by its existing engine command tests passing against the daemon-backed client **via an in-process transport double** (the tests' assertions are unchanged; only the transport is swapped), plus integration tests over a real socket. (See the corrected acceptance bar in Testing — the naive "unchanged tests over a real socket" was impossible.)
 
 **Non-goals (deferred):**
 - Claude Code MCP server + hooks + history import → **M1b**.
@@ -40,23 +40,29 @@ The problem this creates for the program: an encrypted store must have **exactly
 
 ## Architecture — three units with clean boundaries
 
-### Unit 1 — `bossclawd` (new binary)
+### Unit 1 — `bossclawd` (new **sibling crate** `crates/bossclawd/`, not a `src/bin` of the Tauri crate)
+Rationale for a sibling crate (review-driven): a `bin` inside `air_agent_desktop` drags the whole Tauri/GTK dependency tree into the daemon and gives it no Tauri `resource_dir` for the embedder model. A standalone crate depends only on `bossclaw-core` + the protocol crate + tokio.
 - Wraps the existing `bossclaw-core` engine. **The only process that holds the DEK and opens the encrypted DB.**
-- Serves a **local Unix domain socket**, mode `0600` (user-only), path under the app's data dir (e.g. `~/Library/Application Support/ai.air-agent.desktop/bossclawd.sock`).
-- Preserves the engine's existing single-op serialization (one writer). Rejects a second concurrent mutating op with the existing `Busy` semantics.
-- Runs as an **always-on background service** managed by launchd (macOS) / systemd (Linux), reusing the installer pattern the `air-msg` receiver daemon already shipped (its Phase-4 launchd/systemd installers are the template). Always-on + app-independent is deliberate: M1b's Claude Code needs the librarian even when the desktop app is closed.
-- Holds no plaintext secrets on disk; reads the DEK from the same keychain slot the app uses today.
+- **Hosts the state that lives in the app today** (this is the "not a half-daemon" fix): the single `EngineHandle` (shared across all connections; the existing `ingest_lock`/`evolve_lock` `try_lock`→`Busy` guards stay daemon-side), the **embedder** (`ResourceModel2Vec` — the daemon must locate the bundled model via an install path / env var, since it has no Tauri `resource_dir`), the **reasoner config cell + `ConfigReasonerProvider`**, and the **evolve `scheduler`** + Ollama probe (they need the reasoner, so they move here — the app stops spawning the scheduler).
+- Serves a **local Unix domain socket**, mode `0600` (user-only), under the app's data dir (e.g. `~/Library/Application Support/ai.air-agent.desktop/bossclawd.sock`).
+- **Single-owner arbitration (the actual single-writer guarantee — NOT just an in-process Mutex):** port the repo's proven two-part mechanism — a PID lockfile (`agent-bridge-mcp/src/consumer-lock.mjs`: acquire, `isPidAlive` signal-0 probe, reclaim-stale / refuse-live) + a socket liveness probe (`daemon-ipc.mjs`: *"a PID file can outlive a crashed daemon; ECONNREFUSED cannot lie"*). On startup: `connect()` the socket → if it answers, exit (a live owner exists); else acquire the PID lock, unlink any stale socket, bind. The app's "start if absent" path **probes-then-starts, never spawns unconditionally.** This closes the launchd-vs-app double-start race that would corrupt the SQLCipher DB.
+- **Runs as an always-on background service** (launchd/systemd), **authored fresh in Rust-land** — the in-repo `air-msg` installer is Node.js and is *pattern-only reference*, not literally reusable. Always-on + app-independent is deliberate: M1b's Claude Code needs the librarian even when the desktop app is closed.
+- Holds no plaintext secrets on disk. **Keychain/code-signing (go/no-go, see safety section):** the daemon ships **inside the app bundle, co-signed with the same Developer ID + a shared `keychain-access-groups` entitlement** so it shares the DEK's per-signature ACL. A separately-signed binary may be *denied* the DEK the signed app wrote (the documented `dev-build-signed.sh` / PR #44 hazard). A first spike verifies the daemon reads `air-agent.engine.dek` with no prompt before anything else is built.
 
-### Unit 2 — shared protocol crate (`bossclawd-proto` or a module)
-- Typed request/response enums for the engine surface currently exposed by Tauri commands: status, add/revoke grant, set-writable, list writable/grants/files, run-ingest, list-files, recall, evolve, plus confirm/preview + mandate ops the app already has.
-- One contract both the daemon and the client compile against, so wire formats cannot drift (lesson from prior sessions: stale wire-format comments + TS/Rust key mismatches are dangerous — a shared typed contract removes the class).
-- Framing: length-prefixed JSON over the socket (simplest; mirrors the app's existing DTO-over-IPC style). Bodies are engine data, so the socket being user-only `0600` is the confidentiality boundary.
+### Unit 2 — shared protocol crate `crates/bossclawd-proto/`
+- Typed `Request`/`Response` enums for the engine surface currently exposed by Tauri commands: status, add/revoke grant, set-writable, list writable/grants/files, run-ingest, list-files, recall, evolve, plus confirm/preview + mandate ops the app already has. Plus a `Response::Err(String)` (scrubbed engine-error string) and the onboarding/DEK-absent signal (`NotOnboarded`) must cross the wire.
+- **The payload types must be hand-written MIRROR structs, not re-exports** (review-critical correction): the `bossclaw-core` boundary types (`Grant`, `Mandate`, `FileRecord`, `Hit`, `EvolveReport`, `EvolveStatus`, `IngestReport`, `PendingProposal`, `WriteOp`, …) derive only `Debug/Clone/PartialEq/Eq` — **NOT `Serialize`/`Deserialize`**. So the protocol crate defines its own serde-derived mirror of each, plus `From`/`Into` conversions on both sides. The existing DTOs in `commands/engine.rs` (`GrantDto`, `FileRecordDto`, `IngestReportDto`, the recall-hit DTO) already encode these shapes and are the source of truth for the mirrors.
+- **Version handshake:** a `Hello { proto_version }` / `HelloOk { pid, proto_version }` first frame (mirroring `air-rs` inbox `HelloOk`). Mismatch → the client surfaces "engine unavailable" rather than mis-deserializing. Guards the two-now-separate binaries against version skew after a partial update.
+- One contract both sides compile against, so wire formats cannot drift.
+- Framing: length-prefixed JSON, `MAX_FRAME` = 32 MiB (a ceiling — note: whole-file preview payloads (old+new text) are the largest; they sit below the cap but justify the size).
+- `#![forbid(unsafe_code)]` in this crate + the daemon crate (parity with `bossclaw-core`).
 
 ### Unit 3 — the app's `Engine` becomes a thin socket client
 - Same public methods the app calls today (`run_ingest(onboarded)`, `recall(...)`, `evolve(...)`, grant ops, …). **Internals change from direct engine calls to socket requests.**
-- **Tauri command signatures do not change at all** → the frontend, the DTOs, and the app's existing command tests are untouched.
-- On connect failure / daemon down → map to the app's existing "engine unavailable" `EngineState` (fail-closed; never a second opener, never a silent local fallback).
-- The app ensures the daemon is running (starts/adopts it on launch if not already up), but does not *own* its lifecycle beyond that — the service is launchd/systemd-managed.
+- **Tauri command signatures do not change at all** → the frontend and DTOs are untouched. (The command *tests* need a test transport — see the corrected acceptance bar in Safety/Testing.)
+- **Persistent, reconnecting connection — NOT connect-per-call** (review correction): one `UnixStream` held in the client with reconnect-on-error (reuse the `air-rs` inbox `connect_persistent` + backoff pattern). Concurrent recalls multiplex on it, so use per-request correlation IDs on the framed messages (or a small pool) — pinned down in the plan.
+- Connect failure / daemon down / connection dropped **mid-request** → the app's existing "engine unavailable" `EngineState` (fail-closed; never a second opener, never a silent local fallback, never a hang).
+- The app **probes** the socket on launch and starts the installed service only if the probe shows no live owner (see arbitration above); it does not own the daemon's lifecycle — the service is launchd/systemd-managed.
 
 ## Data flow
 
@@ -64,27 +70,35 @@ UI → Tauri command (unchanged signature) → `Engine` client → length-prefix
 
 ## Safety (the reason M1a goes first)
 
-- **One writer, always.** Only `bossclawd` opens the DB and holds the DEK. The app stops opening the file entirely. This closes the multi-process corruption risk *before* any second client (Code) exists.
-- **Fail-closed.** Daemon unreachable → the app's existing "engine unavailable" state. No silent fallback to opening the DB in-process (that would reintroduce two openers).
-- **Behavior-preserving migration.** The DEK stays in the same keychain slot; `bossclawd` reads it exactly as the app does today. This is "move the DB-opening code from the app into the daemon," not "change how memory works."
-- **Socket confidentiality.** `0600` user-only socket under the app data dir; no network listener (a Unix socket, not TCP). Consistent with the local-first, no-surprise-egress posture of the rest of the app.
+- **One writer, always — enforced, not asserted.** The in-process `Mutex` protects nothing across processes; the guarantee comes from the PID-lock + socket-liveness arbitration (Unit 1): the daemon refuses to start if a live owner answers the socket, reclaims a stale lock/socket otherwise, and the app probes-before-spawn. This closes the launchd-vs-app double-start race that would corrupt the SQLCipher DB.
+- **Fail-closed.** Daemon unreachable, or a connection dropped mid-request → the app's existing "engine unavailable" state. No silent fallback to opening the DB in-process (that would reintroduce two openers); no hang.
+- **Keychain / code-signing (GO/NO-GO, corrected from the naive "same slot" claim).** macOS Keychain items are ACL'd per accessing-binary code-signature. A separately-signed `bossclawd` may be *denied* the DEK the signed `.app` wrote (the documented `dev-build-signed.sh` / PR #44 hazard). Mitigation: ship `bossclawd` **inside the app bundle, co-signed with the same Developer ID + a shared `keychain-access-groups` entitlement** so both share the DEK ACL. **A first spike verifies the daemon reads `air-agent.engine.dek` with no prompt — before any other work.** If that fails, the migration can't preserve behavior and we revisit.
+- **Socket confidentiality.** `0600` user-only socket under the app data dir; no network listener (Unix socket, not TCP). Consistent with the local-first, no-surprise-egress posture.
 
 ## Testing strategy
 
-- **Acceptance bar:** the app's existing engine command tests must pass **unchanged** against the daemon-backed `Engine` client (behavior-preserving proof).
+- **Acceptance bar (corrected — the old "existing tests pass unchanged" was self-contradictory).** The existing command tests build a *real in-process* `EngineHandle` with mock providers over Tauri IPC; they cannot pass against a socket client untouched. So: the `EngineClient` is written over a **transport trait** with two impls — (a) an **in-process transport double** (`tokio::io::duplex` to an in-memory daemon handler) that lets the existing command tests run **behavior-identically with no real socket**, and (b) the real Unix-socket transport used in production + integration tests. "Behavior-preserving" is proven by the command tests passing against transport (a); the socket itself is proven by integration tests against a real `bossclawd` on a temp socket.
 - **New tests:**
-  - Protocol round-trip: each request type serializes → daemon handles → typed response (no network; in-process socket or a fake transport).
-  - **Single-writer:** a second attempt to open the store is refused; concurrent mutating ops return `Busy` as today.
-  - **Fail-closed:** daemon down → client surfaces the "engine unavailable" state, never opens the DB itself.
-  - Installer smoke (launchd/systemd): daemon starts, serves, survives a restart, uninstalls cleanly — reuse the `air-msg` daemon's smoke approach.
-- Gates as usual: `cargo test -p air_agent_desktop`, `cargo clippy -D warnings`, `cargo build` for the new binary, `forbid(unsafe)` preserved.
+  - Protocol round-trip: each `Request` → mirror-type conversion → daemon handler → `Response` → back to core type (no network; duplex transport).
+  - **Version handshake:** mismatched `proto_version` → client surfaces "unavailable", no mis-deserialize.
+  - **Single-owner:** a second `bossclawd` start with a live owner refuses (arbitration); a stale lock/socket is reclaimed; concurrent mutating ops still return `Busy`.
+  - **Fail-closed:** daemon down at connect AND connection dropped mid-request → "engine unavailable", never opens the DB, never hangs.
+  - **Onboarding/DEK-absent** crosses the wire: `NotOnboarded` round-trips.
+  - Installer smoke (launchd/systemd): daemon starts, serves, survives restart, uninstalls cleanly (fresh Rust installer; `air-msg` smoke as pattern reference).
+- Gates: `cargo test -p air_agent_desktop`, `cargo test -p bossclawd-proto`, `cargo test -p bossclawd`, `cargo clippy --all-targets -D warnings`, `cargo build -p bossclawd`, `forbid(unsafe)` in the new crates.
 
-## Open questions / deferred
+## Resolved by the Rev-2 review (were open questions)
+- **App-starts-daemon vs launchd race** → RESOLVED: probe-before-spawn + PID-lock + socket-liveness arbitration (Unit 1). Not left to plan time — it's a named prerequisite task.
+- **Keychain ACL for a separate binary** → RESOLVED as a design constraint: co-signed in-bundle + shared `keychain-access-groups`; gated by a first go/no-go spike.
+- **Serde on boundary types** → RESOLVED: mirror types + conversions in `bossclawd-proto` (core types are not `Serialize`).
+- **Scheduler/embedder/reasoner home** → RESOLVED: they move into `bossclawd` (Unit 1); the app stops spawning the scheduler.
+- **Installer reuse depth** → RESOLVED: authored fresh in Rust; the Node `air-msg` installer is pattern-only.
+- **Daemon crate shape** → RESOLVED: sibling `crates/bossclawd/`, not a `src/bin` of the Tauri crate.
 
-1. **Windows transport** — named pipe (ACL model differs from Unix socket). Deferred; Unix-first (macOS is the daily-driver target). Track for a later milestone.
-2. **App-starts-daemon vs pure launchd** — for M1a the app can spawn/adopt the daemon if it isn't running; the launchd/systemd service is the durable path. Decide the exact hand-off (does the app ever spawn, or only connect?) at plan time; the safe default is "connect; if absent, start the installed service."
-3. **Reuse depth of the `air-msg` daemon infra** — the socket-server + thin-client + installer *pattern* is proven in the repo (Node side for messaging; Rust `air-rs` inbox client). How much Rust infra is literally reusable vs pattern-only is a plan-time investigation.
-4. **Migration granularity** — migrate all engine commands at once, or incrementally per-command behind the seam. Recommend incremental (one command family at a time, tests green at each step).
+## Still open / deferred
+1. **Windows transport** — named pipe (ACL differs). Deferred; Unix-first (macOS is the daily driver).
+2. **Concurrency model on the persistent connection** — per-request correlation IDs vs a small connection pool for concurrent recalls. Pin the exact choice in the plan/implementation; both are viable.
+3. **Migration granularity** — incremental per op-family (recommended: read ops → ingest → recall → evolve → grant mutations, suite green each step).
 
 ## Cross-links
 [[air/forever-companion-architecture]] · [[air/product-roadmap-2026-06]] · [[air/competitive-intel-agent-memory-2026-07]] · [[air/session-handoff-2026-07-02-live-roundtrip-and-tool-calls]] · prior desktop-engine specs: `docs/superpowers/specs/2026-06-22-desktop-engine-spine-design.md`
