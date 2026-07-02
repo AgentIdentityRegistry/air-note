@@ -16,6 +16,19 @@
 //!    own wire struct with fields matching the current desktop struct + its DTO.
 //!    NO `From`/`Into` here — the desktop crate isn't touched until Tasks 5/6, so
 //!    the conversions will live there. Serde round-trip tests only.
+//!
+//! NOTE for future readers: several Family-1 core mirrors (`MandateMirror`,
+//! `PendingProposalMirror`, `MandateWriteRecordMirror`, `WriteOpMirror`) are NOT
+//! referenced by the [`crate::Response`] enum — the wire carries the Family-2
+//! `*Wire` summary projections instead, exactly as today's Tauri DTOs do. Those
+//! mirrors are consumed daemon-internally starting Task 4 (the daemon holds the
+//! core types and converts at its own seams). Do not "clean them up" as dead code.
+//!
+//! Integer widths: `usize`/`u128` ride the wire as-is because the daemon and the
+//! app are ALWAYS the same host, arch, and build (a same-host Unix-socket
+//! protocol — the app installs/spawns its own daemon). A hypothetical width
+//! mismatch would degrade to a serde parse error on the oversized value, never
+//! silent corruption.
 
 use serde::{Deserialize, Serialize};
 
@@ -745,6 +758,16 @@ mod tests {
             let core_again: bossclaw_core::RecallSource = back.into();
             assert_eq!(src, core_again);
         }
+    }
+
+    #[test]
+    fn recall_source_mirror_wire_strings_are_pascal_case() {
+        // INTENTIONAL: the daemon wire uses serde's default PascalCase variant
+        // names; the snake_case `"vector"`/`"keyword"` strings are the DESKTOP
+        // DTO's webview render (`HitDto`), applied after mirror → core conversion.
+        // Pins the repr so an accidental future `rename_all` breaks loudly here.
+        assert_eq!(serde_json::to_string(&RecallSourceMirror::Vector).unwrap(), "\"Vector\"");
+        assert_eq!(serde_json::to_string(&RecallSourceMirror::Keyword).unwrap(), "\"Keyword\"");
     }
 
     #[test]
