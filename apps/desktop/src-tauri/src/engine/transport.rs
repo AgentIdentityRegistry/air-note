@@ -111,6 +111,9 @@ impl SocketTransport {
                 hello_ok.proto_version
             )));
         }
+        // Surface the daemon pid once per (re)connect — `HelloOk` carries it for exactly this
+        // single-owner diagnostic. eprintln! matches the crate's convention (no log facade).
+        eprintln!("engine client: connected to bossclawd (pid {})", hello_ok.pid);
         Ok(stream)
     }
 
