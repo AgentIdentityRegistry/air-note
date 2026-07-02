@@ -11,6 +11,14 @@ repository = "https://github.com/AgentIdentityRegistry/air-note"
 # extension traits (`io-util`). No `net`/`rt`/`macros` in the lib itself so the
 # codec stays usable from any tokio runtime configuration.
 tokio = { version = "1", features = ["io-util"] }
+# Mirror types + Request/Response + handshake derive Serialize/Deserialize; the
+# frame codec carries their JSON encoding (serde_json) as raw payload bytes.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The mirror types convert to/from `bossclaw-core`'s boundary types. Path dep so
+# proto tracks core in-tree. NOT a dep on the desktop Tauri crate (that would be
+# circular — the desktop crate depends on proto).
+bossclaw-core = { path = "../bossclaw-core" }
 
 [dev-dependencies]
 # Tests drive the codec over `tokio::io::duplex` and need a runtime + the

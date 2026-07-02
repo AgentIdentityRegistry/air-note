@@ -732,6 +732,9 @@ dependencies = [
 name = "bossclawd-proto"
 version = "0.0.1"
 dependencies = [
+ "bossclaw-core",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
