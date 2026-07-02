@@ -705,10 +705,24 @@ mod tests {
         assert!(out.is_err());
     }
 
-    #[ignore = "live network; needs a real provider key in the vault"]
+    // Live end-to-end egress check against the real provider. Env-fed (NOT the
+    // vault) via the `#[cfg(test)]` key seam so it runs from the CLI/CI without a
+    // keychain-approval hang — the vault read itself is covered by the signed app
+    // (Milestone C/D GUI QA) + `cloud_reasoner_missing_key_fails_closed`; the
+    // never-otherwise-exercised part is the live HTTP request/response roundtrip
+    // through the production request-builder, hardened SSRF client, and extractor.
+    // Run: AIR_LIVE_ANTHROPIC_KEY=sk-... \
+    //   cargo test -p bossclaw_desktop cloud_reasoner_live_roundtrip -- --ignored --nocapture
+    // Optional AIR_LIVE_ANTHROPIC_MODEL overrides the default (a cheap Haiku model).
+    #[ignore = "live network; needs AIR_LIVE_ANTHROPIC_KEY env var"]
     #[test]
     fn cloud_reasoner_live_roundtrip() {
-        let r = CloudReasoner::new(CloudProvider::Anthropic, "claude-sonnet-4-6".into(), None);
+        let key = std::env::var("AIR_LIVE_ANTHROPIC_KEY")
+            .expect("set AIR_LIVE_ANTHROPIC_KEY to run the live roundtrip");
+        let model = std::env::var("AIR_LIVE_ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string());
+        let r =
+            CloudReasoner::new_with_test_key(CloudProvider::Anthropic, model, None, Some(key));
         let schema = bossclaw_core::reason::adjudication_schema();
         let out = r
             .complete_json("Return the chosen id.", "candidates: [a]. text: a", &schema)
