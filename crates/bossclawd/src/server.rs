@@ -73,7 +73,13 @@ where
         return Ok(());
     }
     let hello_ok = HelloOk { pid: std::process::id(), proto_version: PROTO_VERSION };
-    write_frame(&mut write, &serde_json::to_vec(&hello_ok).unwrap_or_default()).await?;
+    let Ok(hello_ok_bytes) = serde_json::to_vec(&hello_ok) else {
+        // Unreachable in practice (HelloOk is plain owned data), but on the impossible
+        // serialization failure close cleanly rather than send an empty frame the client would
+        // mis-parse — symmetry with `encode`'s never-panic fallback.
+        return Ok(());
+    };
+    write_frame(&mut write, &hello_ok_bytes).await?;
 
     // ── Dispatch loop: one Request → one Response per frame, until the peer closes. ──
     loop {

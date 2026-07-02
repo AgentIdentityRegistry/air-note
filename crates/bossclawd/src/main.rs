@@ -13,6 +13,11 @@
 //! 6. Spawn the evolve scheduler.
 //! 7. Accept loop: per-connection task holding a clone of the shared engine `Arc`.
 
+// The bin is its OWN compilation unit — the lib's `#![forbid(unsafe_code)]` does not cover it,
+// so the attribute is repeated here (Task 9 gate). The umask/uid syscalls go through nix's safe
+// bindings; there is no `unsafe` anywhere in the daemon.
+#![forbid(unsafe_code)]
+
 // The whole daemon is Unix-only (bossclaw-core = bundled SQLCipher + rustix + POSIX sockets/signals).
 // On a non-unix target the bin is an inert stub so `cargo build` on that target still succeeds.
 #[cfg(not(unix))]
@@ -157,7 +162,14 @@ mod unix_main {
         if let Some(dir) = std::env::var_os(ENV_DATA_DIR) {
             return PathBuf::from(dir);
         }
-        app_data_dir().unwrap_or_else(|| PathBuf::from("."))
+        app_data_dir().unwrap_or_else(|| {
+            // Visible in launchd/systemd logs so a degraded environment is diagnosable, not silent.
+            eprintln!(
+                "bossclawd: HOME is unset; falling back to the current directory for data \
+                 (degraded environment — set {ENV_DATA_DIR} to pin the store location)"
+            );
+            PathBuf::from(".")
+        })
     }
 
     /// The app's platform data dir for the AIR Agent bundle id (matches Tauri's `app_data_dir`).
