@@ -76,10 +76,24 @@ fn main() {
                 let bin_path = std::env::current_exe()
                     .map(|exe| crate::engine::daemon::resolve_bin_path(&exe))
                     .unwrap_or_else(|_| std::path::PathBuf::from("bossclawd"));
+                // The embedder model ships in the app bundle at
+                // `<resource_dir>/resources/models/potion-base-8M` (tauri.conf.json bundle.resources).
+                // An app-spawned daemon inherits no BOSSCLAWD_MODEL_DIR, so we pass this path through
+                // its env (see `ensure_started`/`build_daemon_command`); otherwise it would use the
+                // daemon's default `<data_dir>/models/...`, which nothing stages. This is the SAME
+                // resource path the pre-M1a in-process embedder used, now routed via the daemon env,
+                // and the SAME path the launchd/systemd installer templates into its unit.
+                let model_dir = app
+                    .path()
+                    .resource_dir()
+                    .expect("resource dir")
+                    .join("resources/models/potion-base-8M");
                 // `.setup` is sync (no reactor yet), so block on the bounded start attempt. Its
                 // result only affects logging — a `false` still boots the app (client → Unavailable).
                 tauri::async_runtime::block_on(async {
-                    let _up = crate::engine::daemon::ensure_started(&sock_path, &bin_path).await;
+                    let _up =
+                        crate::engine::daemon::ensure_started(&sock_path, &bin_path, &model_dir)
+                            .await;
                 });
                 // The transport lazily connects on first request, so it's fine to build it whether or
                 // not the daemon is up yet — a not-yet-ready daemon just yields `Unavailable` until it

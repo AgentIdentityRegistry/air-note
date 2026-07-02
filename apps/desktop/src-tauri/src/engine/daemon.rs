@@ -92,13 +92,31 @@ pub async fn probe(sock_path: &Path) -> bool {
     matches!(tokio::time::timeout(PROBE_TIMEOUT, attempt).await, Ok(Some(())))
 }
 
+/// Build the `Command` used to spawn the daemon: the binary at `bin_path`, with
+/// `BOSSCLAWD_MODEL_DIR` set to `model_dir`. Pure (no I/O) so the env wiring is unit-tested via
+/// `Command::get_envs()`.
+///
+/// WHY THE ENV IS LOAD-BEARING: an app-spawned daemon (the default, no-installer launch — the app
+/// starts the daemon itself when launchd/systemd hasn't) inherits no `BOSSCLAWD_MODEL_DIR`, so it
+/// would fall back to the daemon's own default `<data_dir>/models/potion-base-8M` (see the daemon's
+/// `resolve_model_dir` in `crates/bossclawd/src/main.rs`) — a path NOTHING stages. The embedder
+/// model only ships inside the app bundle at `<resource_dir>/resources/models/potion-base-8M`, so
+/// the app MUST point the daemon there. This mirrors the pre-M1a in-process embedder, which read the
+/// same resource path directly; it is now routed through the env. The launchd/systemd installer
+/// (Task 8) sets the SAME env in its unit, so BOTH spawn paths agree on the model dir.
+fn build_daemon_command(bin_path: &Path, model_dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(bin_path);
+    cmd.env("BOSSCLAWD_MODEL_DIR", model_dir);
+    cmd
+}
+
 /// Ensure a daemon is answering on `sock_path`, best-effort: probe first, and only if no live owner
-/// answers spawn `bin_path` and wait (bounded by [`STARTUP_WAIT`]) for it to come up. Returns `true`
-/// if a daemon is answering by the time we return (already-up OR successfully started), `false`
-/// otherwise. NEVER blocks longer than the bounded wait, NEVER panics, NEVER errors out to the
-/// caller — a missing daemon must not stop the app from booting (the client's `Unavailable` mapping
-/// covers the degraded UX).
-pub async fn ensure_started(sock_path: &Path, bin_path: &Path) -> bool {
+/// answers spawn `bin_path` (with `model_dir` wired into its env) and wait (bounded by
+/// [`STARTUP_WAIT`]) for it to come up. Returns `true` if a daemon is answering by the time we return
+/// (already-up OR successfully started), `false` otherwise. NEVER blocks longer than the bounded
+/// wait, NEVER panics, NEVER errors out to the caller — a missing daemon must not stop the app from
+/// booting (the client's `Unavailable` mapping covers the degraded UX).
+pub async fn ensure_started(sock_path: &Path, bin_path: &Path, model_dir: &Path) -> bool {
     // Fast path: a live owner (launchd/systemd, or a prior app spawn) already answers.
     if probe(sock_path).await {
         return true;
@@ -107,6 +125,8 @@ pub async fn ensure_started(sock_path: &Path, bin_path: &Path) -> bool {
     // safe even if launchd starts one concurrently (the loser of the bind race steps aside).
     //
     // Spawn semantics (documented; at most ONE spawn per app boot):
+    // - env: `BOSSCLAWD_MODEL_DIR` is set (see `build_daemon_command`) so the app-spawned daemon
+    //   finds the bundled embedder model — the crux of the app-spawn (no-installer) path.
     // - stdio: the child INHERITS the app's stdio (`Command`'s default — deliberate). In dev that
     //   puts the daemon's stderr log in the app's console, which is the useful behavior; an
     //   installed, service-managed daemon is started by launchd/systemd with the service
@@ -117,7 +137,7 @@ pub async fn ensure_started(sock_path: &Path, bin_path: &Path) -> bool {
     //   as a zombie until app exit. A detached waiter thread `wait()`s on it: if the child exits
     //   it is reaped at once; if the daemon runs for the app's lifetime the thread just stays
     //   parked in `wait()` (one thread, bounded by the one-spawn-per-boot rule).
-    match std::process::Command::new(bin_path).spawn() {
+    match build_daemon_command(bin_path, model_dir).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || {
                 let _ = child.wait();
@@ -252,12 +272,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("bossclawd.sock");
         let bin = dir.path().join("does-not-exist-bossclawd");
+        let model_dir = dir.path().join("models/potion-base-8M");
         let got = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            ensure_started(&sock, &bin),
+            ensure_started(&sock, &bin, &model_dir),
         )
         .await
         .expect("ensure_started must not hang");
         assert!(!got, "no owner + missing binary → false");
+    }
+
+    #[test]
+    fn build_daemon_command_sets_model_dir_env() {
+        // The app-spawn path MUST pass BOSSCLAWD_MODEL_DIR through to the daemon so it finds the
+        // bundled embedder model (the app bundle's resources dir); without it the daemon falls back
+        // to a path nothing stages and the embedder fails silently. `Command::get_envs()` exposes
+        // the explicitly-set vars for assertion (value is `Some(os_str)` for a set var).
+        let bin = Path::new("/apps/AIR.app/Contents/MacOS/bossclawd");
+        let model_dir = Path::new("/apps/AIR.app/Contents/Resources/resources/models/potion-base-8M");
+        let cmd = build_daemon_command(bin, model_dir);
+        let found = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("BOSSCLAWD_MODEL_DIR"))
+            .map(|(_, v)| v);
+        assert_eq!(
+            found,
+            Some(Some(model_dir.as_os_str())),
+            "build_daemon_command must set BOSSCLAWD_MODEL_DIR to the resolved model dir"
+        );
     }
 }

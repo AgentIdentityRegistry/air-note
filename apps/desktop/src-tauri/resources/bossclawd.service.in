@@ -24,8 +24,12 @@ Documentation=https://github.com/AgentIdentityRegistry/air-note
 
 [Service]
 Type=simple
-ExecStart=@BOSSCLAWD_BIN@
-Environment=BOSSCLAWD_MODEL_DIR=@BOSSCLAWD_MODEL_DIR@
+# Quote both: systemd does its own word-splitting, so an unquoted path containing a
+# SPACE would silently truncate. Double quotes group the token (systemd.service(5));
+# prior art: agent-bridge-mcp/src/service.mjs. The systemd-smoke CI renders this with
+# a spaced path and asserts the daemon starts, guarding the quoting from regressing.
+ExecStart="@BOSSCLAWD_BIN@"
+Environment="BOSSCLAWD_MODEL_DIR=@BOSSCLAWD_MODEL_DIR@"
 Restart=always
 RestartSec=2
 

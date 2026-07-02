@@ -18,9 +18,17 @@
 # ============================================================================
 #  M1a Task 8: this script ALSO bundles + CO-SIGNS the bossclawd daemon.
 # ============================================================================
-# The daemon ships as a Tauri externalBin sidecar (tauri.conf.json ->
-# bundle.externalBin "binaries/bossclawd"), which Tauri copies to the app's
+# The daemon ships as a Tauri externalBin sidecar which Tauri copies to the app's
 # Contents/MacOS/bossclawd — exactly the sibling-of-exe path daemon.rs resolves.
+#
+# externalBin is BUNDLE-ONLY, kept in a SEPARATE config (tauri.bundle.conf.json),
+# NOT the base tauri.conf.json. Why: tauri_build runs the externalBin existence
+# check on EVERY compile (plain `cargo build`/`test`/`clippy`, not just bundling),
+# so a base-config externalBin would fail every non-bundle build on a fresh
+# checkout / in CI (the sidecar is a gitignored build artifact). Merging it only at
+# bundle time via `--config tauri.bundle.conf.json` keeps plain cargo green while
+# still bundling the sidecar. RELEASE CI MUST pass the same `--config` at bundle.
+#
 # BUT Tauri signs sidecars with only `codesign -s <identity>` (no --identifier
 # override; confirmed in tauri-macos-sign), so the sidecar would get the default
 # per-binary identifier `bossclawd`. The Task 0.5 keychain spike proved that a
@@ -44,7 +52,8 @@ cd "$(dirname "$0")/.."
 # --- 1. Build + stage the bossclawd sidecar for Tauri externalBin -----------
 # Tauri's externalBin requires the binary named with the current target triple
 # (e.g. bossclawd-aarch64-apple-darwin). We build the daemon and copy it to the
-# staging dir the externalBin path points at (apps/desktop/src-tauri/binaries).
+# staging dir the externalBin path (in tauri.bundle.conf.json) points at
+# (apps/desktop/src-tauri/binaries).
 TARGET_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 readonly TARGET_TRIPLE
 readonly SIDECAR_DIR="apps/desktop/src-tauri/binaries"
@@ -56,8 +65,11 @@ mkdir -p "${SIDECAR_DIR}"
 cp -f "target/debug/bossclawd" "${SIDECAR_PATH}"
 echo "Staged sidecar: ${SIDECAR_PATH}"
 
-# --- 2. Build the .app (Tauri bundles the sidecar into Contents/MacOS) -------
-npm run build --workspace @air-agent/desktop -- --debug --bundles app
+# --- 2. Build the .app, merging the bundle-only externalBin config -----------
+# `--config tauri.bundle.conf.json` (path relative to src-tauri, the tauri CLI's
+# cwd) merges externalBin at bundle time only, so Tauri bundles the sidecar into
+# Contents/MacOS/bossclawd. RELEASE CI must pass the same --config.
+npm run build --workspace @air-agent/desktop -- --debug --bundles app --config tauri.bundle.conf.json
 
 APP="target/debug/bundle/macos/AIR Agent.app"
 

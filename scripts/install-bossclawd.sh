@@ -242,8 +242,11 @@ install_macos() {
     "STDERR_LOG=${err_log}")"
   printf '%s' "${rendered}" > "${plist}"
   chmod 0644 "${plist}"
-  # Validate what we just wrote before asking launchd to load it.
-  plutil -lint "${plist}" >/dev/null || die "generated plist failed plutil -lint: ${plist}"
+  # Validate what we just wrote before asking launchd to load it (plutil is a macOS
+  # base tool; guard it for consistency with warn_if_not_cosigned's codesign check).
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "${plist}" >/dev/null || die "generated plist failed plutil -lint: ${plist}"
+  fi
 
   # Idempotent (re)load: bootout any existing instance, then bootstrap fresh.
   # `bootout` on an absent label is a no-op-ish error we swallow; `|| true` keeps
