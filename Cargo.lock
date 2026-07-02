@@ -90,6 +90,8 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bossclaw-core",
+ "bossclawd",
+ "bossclawd-proto",
  "chrono",
  "ed25519-dalek",
  "hex",

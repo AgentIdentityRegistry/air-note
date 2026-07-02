@@ -1,12 +1,14 @@
 //! The engine spine (SP1): a single live, encrypted `EventLog` wired into the desktop.
 //! See docs/superpowers/specs/2026-06-22-desktop-engine-spine-design.md.
 
+pub mod client;
 pub mod cloud_reasoner;
 pub mod embed;
 pub mod keystore;
 pub mod ollama_probe;
 pub mod reason;
 pub mod scheduler;
+pub mod transport;
 
 use crate::engine::keystore::EngineKeystore;
 use crate::secrets::SecretsVault;
@@ -77,6 +79,15 @@ pub enum EngineOpError {
     /// New-mandate form can show *why*. Distinct from `Core` so the UI can style it as a validation
     /// error, not an engine fault.
     Rejected(String),
+    /// The daemon (bossclawd) is unreachable — the persistent socket failed to connect / handshake,
+    /// or a request errored and the single reconnect+retry also failed (M1a Task 5, `SocketTransport`).
+    /// Distinct from `Core` (an engine-side fault): this means the daemon is DOWN / not answering, so
+    /// the UI can show "memory service unavailable" rather than an engine error. Carries a short reason.
+    /// Constructed by the daemon transport (`engine/transport.rs`) + mapped by `engine/client.rs`;
+    /// the app first surfaces it when Task 6 routes commands through the client (unused in the bin
+    /// build until then, like the sibling `Reasoner` future-consumer variant above).
+    #[allow(dead_code)]
+    Unavailable(String),
     Join(String),
 }
 
@@ -92,6 +103,7 @@ impl std::fmt::Display for EngineOpError {
             EngineOpError::Revoked(m) => write!(f, "edits aren't allowed in this folder anymore: {m}"),
             EngineOpError::NeedsLoudConfirm(m) => write!(f, "this change needs an explicit review confirmation: {m}"),
             EngineOpError::Rejected(m) => write!(f, "{m}"),
+            EngineOpError::Unavailable(m) => write!(f, "memory service unavailable: {m}"),
             EngineOpError::Join(m) => write!(f, "engine task error: {m}"),
         }
     }
