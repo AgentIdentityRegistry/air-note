@@ -2593,4 +2593,52 @@ mod tests {
         assert_eq!(got.mode, crate::engine::reason::ReasonerMode::Cloud);
         assert_eq!(got.model, "claude-sonnet-4-6");
     }
+
+    /// DAEMON-ADDED (M1a Task 4 follow-up; egress-security review L-1): revocation continuity.
+    /// A Cloud→Local mode flip via `set_reasoner_config` persists through the SAME signed log
+    /// the scheduler re-reads EVERY tick (`reasoner_config_or_default` — the per-wake read in
+    /// `scheduler::spawn`, scheduler.rs:98), so revocation-by-flip takes effect within one tick:
+    /// the next wake sees Local, probes only Ollama, and builds no cloud arm. Consent is written
+    /// directly to the log (simulating a prior successful R5 enable — a REAL enable needs a live
+    /// provider key + network, which tests never touch) and is intentionally LEFT BEHIND by the
+    /// flip: mode, not consent removal, is what stops the cloud arm.
+    #[tokio::test]
+    async fn mode_flip_to_local_revokes_cloud_within_one_scheduler_read() {
+        let (vault, dir) = test_vault_and_dir();
+        let h = new_test_handle(vault, &dir);
+
+        // A signed Cloud config + a consent record shaped exactly as enable_cloud_reasoner writes.
+        h.set_reasoner_config(true, serde_json::json!({
+            "mode": "cloud", "provider": "anthropic",
+            "model": "claude-sonnet-4-6", "base_url": null
+        })).await.expect("set cloud config");
+        let log = h.get_or_open(true).await.unwrap();
+        log.set_cloud_reasoner_consent(serde_json::json!({
+            "provider": "anthropic",
+            "base_url_host": "api.anthropic.com",
+            "key_fingerprint": "abc123",
+            "consented_at": "2026-07-02T00:00:00Z",
+        })).unwrap();
+        drop(log);
+
+        // Precondition: the scheduler's per-tick read sees the Cloud config.
+        let cfg = h.reasoner_config_or_default(true).await;
+        assert!(
+            matches!(cfg.mode, crate::engine::reason::ReasonerMode::Cloud),
+            "precondition: the signed cloud config is what the per-tick read returns"
+        );
+
+        // The user flips back to Local (revocation-by-flip; the consent record stays behind).
+        h.set_reasoner_config(true, serde_json::json!({
+            "mode": "local", "provider": "anthropic", "model": "", "base_url": null
+        })).await.expect("flip to local");
+
+        // The EXACT per-tick read now returns Local: the very next scheduler wake takes the
+        // Ollama-probe arm and never constructs the cloud reasoner (≤1 tick to take effect).
+        let cfg = h.reasoner_config_or_default(true).await;
+        assert!(
+            matches!(cfg.mode, crate::engine::reason::ReasonerMode::Local),
+            "the Local flip persisted through the same signed log the scheduler reads per tick"
+        );
+    }
 }

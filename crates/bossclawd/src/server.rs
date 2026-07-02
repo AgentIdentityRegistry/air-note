@@ -365,6 +365,64 @@ fn reasoner_config_wire(c: ReasonerConfig) -> ReasonerConfigWire {
     }
 }
 
+// ── Accept loop (shared by main.rs and spawn_for_test) ──────────────────────
+
+/// Accept connections forever on `listener`, serving each on its own task with a clone of the
+/// shared engine. Used by BOTH the production `main.rs` and [`spawn_for_test`], so the roundtrip
+/// tests exercise the exact production accept path — including the peer-uid check below.
+///
+/// # Same-uid trust boundary (egress-security review M-1)
+/// The socket is already `0600`, which excludes other uids at the FS layer; as defense-in-depth
+/// the loop ALSO reads the connecting peer's credentials (`SO_PEERCRED` on Linux /
+/// `LOCAL_PEERCRED` on macOS, via tokio's safe `peer_cred()` binding — no `unsafe`, no platform
+/// `cfg`) and rejects, with a stderr log, any peer whose uid differs from the daemon's effective
+/// uid. Unreadable credentials are rejected fail-closed. This makes the trust boundary explicit
+/// and pre-pays M1b, when non-app clients (Claude Code) first connect. Within the boundary any
+/// same-uid process can invoke every wire op — per-op authorization is deferred to M1b (spec,
+/// Safety section).
+///
+/// Never returns under normal operation: accept errors are transient (e.g. fd exhaustion) and
+/// are logged + survived; a panic in one connection task cannot take the loop down (task
+/// isolation, and `serve_connection` never unwraps wire input).
+pub async fn run_accept_loop(engine: Arc<EngineHandle>, listener: tokio::net::UnixListener) {
+    let our_uid = nix::unistd::geteuid().as_raw();
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                // Peer-uid check BEFORE any frame is read: same effective uid only.
+                match stream.peer_cred() {
+                    Ok(cred) if cred.uid() == our_uid => {}
+                    Ok(cred) => {
+                        eprintln!(
+                            "bossclawd: rejected connection from uid {} (daemon uid {our_uid})",
+                            cred.uid()
+                        );
+                        continue; // stream drops here → connection closed, nothing served
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "bossclawd: rejected connection with unreadable peer credentials: {e}"
+                        );
+                        continue;
+                    }
+                }
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    let (read, write) = stream.into_split();
+                    // Per-connection errors are logged, never fatal to the daemon.
+                    if let Err(e) = serve_connection(engine, read, write).await {
+                        eprintln!("bossclawd: connection ended with I/O error: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                // An accept error is transient; log and keep serving.
+                eprintln!("bossclawd: accept error: {e}");
+            }
+        }
+    }
+}
+
 // ── Test-spawn helper ────────────────────────────────────────────────────────
 // Lives in the LIB (not the bin) behind `#[doc(hidden)] pub` because integration tests
 // (`tests/roundtrip.rs`) cannot see `#[cfg(test)]` items of the bin — they link the lib.
@@ -390,18 +448,10 @@ pub async fn spawn_for_test(sock_path: std::path::PathBuf, home: std::path::Path
     // assert the confidentiality mode over a real socket file.
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
         .expect("chmod test socket 0600");
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _addr)) = listener.accept().await else {
-                return;
-            };
-            let engine = engine.clone();
-            tokio::spawn(async move {
-                let (read, write) = stream.into_split();
-                let _ = serve_connection(engine, read, write).await;
-            });
-        }
-    });
+    // The PRODUCTION accept loop (shared with main.rs), so the roundtrip tests exercise the real
+    // accept path — including the same-uid peer-credential check (the test client connects from
+    // this same process, so it passes the check).
+    tokio::spawn(run_accept_loop(engine, listener));
 }
 
 /// Build a hermetic `EngineHandle` for tests: an in-memory vault + mock embedder + mock reasoner.

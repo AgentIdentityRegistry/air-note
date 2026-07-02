@@ -34,8 +34,9 @@ tokio = { version = "1", features = ["full"] }
 # Unix-only: the lock module + engine host are `#[cfg(unix)]`-gated (Unix-socket +
 # POSIX signals + bossclaw-core), so a non-unix target never resolves these.
 [target.'cfg(unix)'.dependencies]
-# `signal`+`process` for the PID-liveness probe (lock.rs); `fs` for `umask` (socket 0600 bind in main.rs).
-nix = { version = "0.30", features = ["signal", "process", "fs"] }
+# `signal`+`process` for the PID-liveness probe (lock.rs); `fs` for `umask` (socket 0600 bind in
+# main.rs); `user` for `geteuid` (the accept loop's same-uid peer-credential check in server.rs).
+nix = { version = "0.30", features = ["signal", "process", "fs", "user"] }
 thiserror = "1"
 # Memory/actuator engine — the daemon becomes the single owner. `features=["ollama"]`
 # mirrors the desktop crate so the copied engine modules build byte-identically.

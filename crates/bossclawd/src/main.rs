@@ -54,6 +54,14 @@ mod unix_main {
     const APP_DIR_NAME: &str = "ai.air-agent.desktop";
 
     pub fn run() {
+        // Scrubbing panic hook (egress-security review L-2): a panic PAYLOAD can embed engine
+        // state (paths, snippet text, error strings), so log ONLY the panic LOCATION — never the
+        // payload, never a backtrace. Installed before anything else so every later panic
+        // (including in connection/scheduler tasks) is scrubbed in the launchd/systemd log.
+        std::panic::set_hook(Box::new(|info| match info.location() {
+            Some(loc) => eprintln!("bossclawd: panic at {loc} (payload suppressed)"),
+            None => eprintln!("bossclawd: panic at unknown location (payload suppressed)"),
+        }));
         // A real multi-thread runtime (unlike the app's `.setup()` outside a reactor): the scheduler
         // + connection tasks spawn freely, and `spawn_blocking` engine calls get worker threads.
         let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
@@ -133,26 +141,12 @@ mod unix_main {
             std::process::id()
         );
 
-        // (7) Accept loop: one task per connection, each holding a clone of the shared engine Arc.
-        // A panic in one connection task cannot take down the daemon (task isolation).
-        loop {
-            match listener.accept().await {
-                Ok((stream, _addr)) => {
-                    let engine = engine.clone();
-                    tokio::spawn(async move {
-                        let (read, write) = stream.into_split();
-                        // Per-connection errors are logged, never fatal to the daemon.
-                        if let Err(e) = server::serve_connection(engine, read, write).await {
-                            eprintln!("bossclawd: connection ended with I/O error: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    // An accept error is transient (e.g. fd exhaustion); log and keep serving.
-                    eprintln!("bossclawd: accept error: {e}");
-                }
-            }
-        }
+        // (7) Accept loop — the SHARED `server::run_accept_loop` (also used by the test spawn
+        // helper, so the roundtrip tests cover this exact path). One task per connection, each
+        // holding a clone of the shared engine Arc; every peer is same-uid-checked (SO_PEERCRED /
+        // LOCAL_PEERCRED) before any frame is read — defense-in-depth over the 0600 socket.
+        // Never returns in normal operation.
+        server::run_accept_loop(engine, listener).await;
     }
 
     /// Resolve the data dir: `BOSSCLAWD_DATA_DIR` if set, else the app's per-OS data dir for
