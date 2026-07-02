@@ -1,0 +1,29 @@
+[package]
+name = "bossclawd"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "bossclawd: the local Unix-socket memory daemon for AIR Agent — single-owner arbitration (M1a)."
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+
+[lib]
+# A lib target so Task 4 can add `src/main.rs` (accept-loop/engine) later without
+# restructuring: the daemon binary will depend on this crate's `lock` module.
+path = "src/lib.rs"
+
+# `nix` provides the signal-0 PID-liveness probe (`kill(pid, None)`) as SAFE,
+# I/O-safe syscall bindings, so this crate keeps `#![forbid(unsafe_code)]` (no
+# hand-rolled `libc::kill`, which would require `unsafe`). Version `0.30` matches
+# what the workspace lockfile already resolves (transitively via hnsw_rs → mmap-rs).
+# Unix-only: the lock module is `#[cfg(unix)]`-gated (Unix-socket + POSIX signals),
+# so a non-unix target never resolves this dependency.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+# Hermetic filesystem tests: matches the workspace convention (bossclaw-core's
+# fs tests use `tempfile::tempdir()`).
+tempfile = "3"
