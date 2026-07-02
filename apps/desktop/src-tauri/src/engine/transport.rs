@@ -370,10 +370,10 @@ mod invariants {
 
         // A fake "daemon from the future": accepts connections forever, answers a HelloOk carrying a
         // version ONE AHEAD of ours (u32 = 1 today, so +1 = 2 — no overflow), then serves every
-        // request with a benign `Response::Ok`. Fully functional EXCEPT the version — so the client's
-        // version check is the only thing standing between a happy round-trip and `Unavailable`. It
-        // keeps serving across the transport's reconnect-once, so a missing check can't accidentally
-        // surface `Unavailable` from a dropped connection instead.
+        // request with a benign `Response::Ok`. Fully functional EXCEPT the version — so the version
+        // check in `connect` is the SOLE cause of `Unavailable` (its `?` short-circuits the moment the
+        // handshake version mismatches, before any request is written). Were the check removed, this
+        // daemon would happily answer `Ok` and the assertion would (correctly) fail.
         let server = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _addr)) = listener.accept().await else { break };

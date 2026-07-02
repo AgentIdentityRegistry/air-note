@@ -166,11 +166,19 @@ async fn version_skew_hello_is_closed_without_hello_ok() {
     // An immediate EOF (the `Err` arm falls through) is also a correct refusal.
     if let Ok(frame) = bounded(read_frame(&mut stream)).await {
         // If anything came back it must NOT be a valid same-version HelloOk (the skew was refused).
-        // It is the daemon's error frame — a `Response::Err`, never a handshake ok.
         let as_hello_ok: Result<HelloOk, _> = serde_json::from_slice(&frame);
         assert!(
             !as_hello_ok.map(|h| h.proto_version == PROTO_VERSION).unwrap_or(false),
             "a version-skewed Hello must NOT get a matching HelloOk"
+        );
+        // Positively pin the typed-refusal contract production actually sends: the frame IS the
+        // daemon's protocol-error `Response::Err` (not just some non-HelloOk garbage). This is what
+        // `serve_connection`'s version-mismatch branch writes before closing.
+        let refusal: Response = serde_json::from_slice(&frame)
+            .expect("version-skew reply must be a Response");
+        assert!(
+            matches!(refusal, Response::Err { .. }),
+            "version-skew refusal must be a typed Response::Err, got {refusal:?}"
         );
         // The next read must be EOF: the daemon closes after the single error frame (no dispatch).
         let eof = bounded(read_frame(&mut stream)).await;
