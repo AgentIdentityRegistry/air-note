@@ -31,10 +31,10 @@
 
 **Files:** Read `engine/mod.rs`, `commands/engine.rs`, `crates/bossclaw-core/src/lib.rs`; Create `docs/superpowers/plans/m1a-engine-surface.md`.
 
-- [ ] **Step 1:** grep `state.engine.` across `src/` — list every method (signature, mutates?, wrapping Tauri command).
-- [ ] **Step 2:** For each boundary type crossing the wire (`Grant`, `Mandate`, `FileRecord`, `Hit`, `EvolveReport`, `EvolveStatus`, `IngestReport`, `PendingProposal`, `WriteOp`, …) record its fields. **Confirm each derives only `Debug/Clone/PartialEq/Eq` (NOT `Serialize`)** → each needs a mirror. The existing `commands/engine.rs` DTOs (`GrantDto`, `FileRecordDto`, `IngestReportDto`, recall-hit DTO) are the field source-of-truth.
-- [ ] **Step 3:** Record where these live in the app today and must MOVE to the daemon: the DEK/keystore open (`EngineKeystore`, `get_or_open`), the embedder (`ResourceModel2Vec` + its `resource_dir` model path, `main.rs:76-81`), the reasoner cell (`reasoner_cfg`/`reseed_reasoner_cell`, `main.rs:71,101`), the scheduler (`scheduler::spawn`, `main.rs:111`) + Ollama probe.
-- [ ] **Step 4:** Commit the inventory doc.
+- [x] **Step 1:** grep `state.engine.` across `src/` — list every method (signature, mutates?, wrapping Tauri command).
+- [x] **Step 2:** For each boundary type crossing the wire (`Grant`, `Mandate`, `FileRecord`, `Hit`, `EvolveReport`, `EvolveStatus`, `IngestReport`, `PendingProposal`, `WriteOp`, …) record its fields. **Confirm each derives only `Debug/Clone/PartialEq/Eq` (NOT `Serialize`)** → each needs a mirror. The existing `commands/engine.rs` DTOs (`GrantDto`, `FileRecordDto`, `IngestReportDto`, recall-hit DTO) are the field source-of-truth. *(Confirmed; two wrinkles: `IngestReport` has no `Clone`, `Hit` has no `PartialEq` — see inventory.)*
+- [x] **Step 3:** Record where these live in the app today and must MOVE to the daemon: the DEK/keystore open (`EngineKeystore`, `get_or_open`), the embedder (`ResourceModel2Vec` + its `resource_dir` model path, `main.rs:76-81`), the reasoner cell (`reasoner_cfg`/`reseed_reasoner_cell`, `main.rs:71,101`), the scheduler (`scheduler::spawn`, `main.rs:111`) + Ollama probe.
+- [x] **Step 4:** Commit the inventory doc. → `m1a-engine-surface.md`
 
 ---
 
@@ -44,10 +44,10 @@
 
 **Files:** a throwaway `crates/bossclawd/examples/dek_probe.rs` (or a `#[ignore]` test).
 
-- [ ] **Step 1:** Write a minimal program linking `bossclaw-core`/the vault that reads `air-agent.engine.dek` from service `ai.air-agent.desktop` (mirror `keystore.rs` read).
-- [ ] **Step 2:** Build it, **co-signed inside the app bundle with the same Developer ID + a `keychain-access-groups` entitlement shared with the app** (per `dev-build-signed.sh`). Run it after the app has created a brain.
-- [ ] **Step 3:** Confirm it reads the DEK **with no interactive prompt**. Record the result in `m1a-engine-surface.md`.
-- [ ] **GATE:** PASS → proceed. FAIL → STOP, surface to the human; the co-signing/entitlement config must be fixed (or Approach B reconsidered) before Tasks 1+.
+- [x] **Step 1:** Write a minimal program linking `bossclaw-core`/the vault that reads `air-agent.engine.dek` from service `ai.air-agent.desktop` (mirror `keystore.rs` read). *(Standalone get-only probe on the identical `keyring 2.3` call path — the ACL judges the calling binary's signature, not the wrapping crate.)*
+- [x] **Step 2:** Build it, co-signed with the app's identity. *(No `keychain-access-groups` — that entitlement doesn't govern login-keychain ACLs; what matters is the item's trusted-app **designated requirement**: identifier + certificate leaf.)*
+- [x] **Step 3:** Confirm it reads the DEK **with no interactive prompt**. Record the result in `m1a-engine-surface.md`.
+- [x] **GATE: ✅ PASS** — silent 32-byte DEK read when signed `--identifier ai.air-agent.desktop` with the app's cert (same cert with a different identifier PROMPTS — Task 8 must override the identifier when signing the bundled `bossclawd`). Full record: `m1a-engine-surface.md`.
 
 ---
 
