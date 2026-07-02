@@ -10,14 +10,12 @@ pub struct AppState {
     pub air_client: Arc<dyn AirClient>,
     pub identity_store: IdentityStore,
     pub inbox: std::sync::Arc<crate::inbox::manager::InboxManager>,
-    // Engine spine is Unix-only until M7 (bossclaw-core doesn't build on Windows yet).
+    // Engine spine is Unix-only until M7 (bossclaw-core doesn't build on Windows yet). Since the
+    // M1a daemon split, this is the `Engine` FACADE over a `bossclawd` transport (not the old
+    // in-process `EngineHandle`); the reasoner config cell now lives in the daemon, so the former
+    // `reasoner_cfg` write-through cache is gone.
     #[cfg(unix)]
-    pub engine: std::sync::Arc<crate::engine::EngineHandle>,
-    // Shared cell the `ConfigReasonerProvider` closure reads (write-through cache): the
-    // reasoner-config commands update it so the evolve loop picks up mode changes without a
-    // restart (Milestone D Phase 2a). Unix-gated like `engine` since the reasoner lives there.
-    #[cfg(unix)]
-    pub reasoner_cfg: std::sync::Arc<std::sync::Mutex<crate::engine::reason::ReasonerConfig>>,
+    pub engine: std::sync::Arc<crate::engine::Engine>,
 }
 
 #[tauri::command]
@@ -324,31 +322,39 @@ mod username_tests {
 }
 
 // The engine half of reset is Unix-only, so this test (which exercises it) is too.
+//
+// M1a Task 6 note: this was a WHITE-BOX unit test of the in-process `EngineHandle` — it opened the
+// engine, tore it down, and inspected the engine's OWN keychain slot + `brain.db` on disk. Those
+// internals moved into the `bossclawd` daemon (Task 4 copied this exact assertion set as
+// `crates/bossclawd/src/engine/mod.rs::teardown_removes_keys_db_and_resets_cell` — DEK slot gone,
+// brain.db gone, cell reset). What the APP still owns is the reset BEHAVIOR through the daemon
+// FACADE, so this test now drives the `Engine` facade over an in-process `DuplexTransport` (the
+// daemon's real dispatch, hermetic engine): a first open creates `brain.db` in the daemon home,
+// `teardown` removes it, and a not-onboarded status stays `NotOnboarded`. The engine-vault DEK
+// assertion is the daemon's copied test's job (its vault is in-memory + daemon-side, not reachable
+// from the app), so it does not appear here.
 #[cfg(all(test, unix))]
 mod tests {
-    use crate::engine::{embed, EngineHandle, EngineState};
-    use crate::secrets::SecretsVault;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    struct TestVault { store: Mutex<HashMap<String, String>> }
-    impl TestVault { fn new() -> Arc<Self> { Arc::new(Self { store: Mutex::new(HashMap::new()) }) } }
-    impl SecretsVault for TestVault {
-        fn set(&self, k: &str, v: &str) -> Result<(), String> { self.store.lock().unwrap().insert(k.into(), v.into()); Ok(()) }
-        fn get(&self, k: &str) -> Result<Option<String>, String> { Ok(self.store.lock().unwrap().get(k).cloned()) }
-        fn delete(&self, k: &str) -> Result<(), String> { self.store.lock().unwrap().remove(k); Ok(()) }
-    }
+    use crate::engine::transport::{DuplexTransport, Transport};
+    use crate::engine::{Engine, EngineState};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn reset_tears_down_the_engine() {
         let dir = tempfile::tempdir().unwrap();
-        let vault = TestVault::new();
-        let engine = Arc::new(EngineHandle::new(vault.clone(), dir.path().to_path_buf(), Arc::new(embed::MockEmbedderProvider::new(8)), Arc::new(crate::engine::reason::MockReasonerProvider::new("m"))));
-        engine.get_or_open(true).await.unwrap();
-        // Simulate the engine half of reset_identity:
+        // The daemon's engine home (inspectable, so the brain.db lifecycle can be asserted).
+        let home = dir.path().join("bossclawd-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let transport: Arc<dyn Transport> = Arc::new(DuplexTransport::new(home.clone()));
+        let engine = Arc::new(Engine::new(transport));
+
+        // First open (any onboarded op) creates brain.db under the daemon home.
+        engine.status(true).await;
+        assert!(home.join("brain.db").exists());
+
+        // Simulate the engine half of reset_identity through the facade:
         engine.teardown().await.unwrap();
-        assert!(vault.get("air-agent.engine.dek").unwrap().is_none());
-        assert!(!dir.path().join("brain.db").exists());
+        assert!(!home.join("brain.db").exists());
         assert!(matches!(engine.status(false).await.state, EngineState::NotOnboarded));
     }
 }

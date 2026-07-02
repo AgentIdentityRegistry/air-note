@@ -35,13 +35,10 @@
 //! returns the Local default, and `status` returns a `KeystoreDbMismatch`/`NotOnboarded` status —
 //! never an error, never a panic.
 //!
-//! # Staged code (M1a Task 5 → Task 6)
-//! The whole `EngineClient` surface is unused by the running app until Task 6 swaps `AppState` onto
-//! it; until then only this crate's tests exercise it, so the bin build sees the methods + wire
-//! conversions as dead. The `#![allow(dead_code)]` is that intentional, time-boxed gap (removed when
-//! Task 6 wires the app in), matching `engine/transport.rs` and the existing future-consumer
-//! allowances in `engine/mod.rs`.
-#![allow(dead_code)]
+//! # Wired in (M1a Task 6)
+//! The running app now consumes this: `AppState.engine` is the [`super::Engine`] facade, which
+//! delegates every method to an `EngineClient`. The Task-5-era `#![allow(dead_code)]` staging
+//! allowance is therefore gone — the whole surface is live in the bin build.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,8 +49,7 @@ use bossclawd_proto::types::{
 };
 use bossclawd_proto::{HitWire, OpErrorKindWire, Request, Response};
 
-use super::cloud_reasoner::CloudProvider;
-use super::reason::{ReasonerConfig, ReasonerMode};
+use super::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use super::transport::Transport;
 use super::{
     ApplyResult, EngineError, EngineOpError, EngineState, EngineStatus, EvolveTelemetry, HitWithText,

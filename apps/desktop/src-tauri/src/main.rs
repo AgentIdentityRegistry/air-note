@@ -56,59 +56,38 @@ fn main() {
             let data_dir = app.path().app_data_dir().expect("app data dir");
             let _ = air::migrate_identity_metadata(&data_dir, vault::LEGACY_IDENTITY_SERVICE);
 
-            // On Windows there is no engine, so `vault`/`data_dir` are not cloned (cloning then
-            // dropping the clones would warn as unused) — move them straight into IdentityStore.
+            // On Windows there is no engine, so `data_dir` is not cloned (cloning then dropping the
+            // clone would warn as unused) — move it straight into IdentityStore.
             #[cfg(unix)]
-            let identity_store = IdentityStore::new(vault.clone(), data_dir.clone());
+            let identity_store = IdentityStore::new(vault, data_dir.clone());
             #[cfg(not(unix))]
             let identity_store = IdentityStore::new(vault, data_dir);
-            // The shared reasoner-config cell (Milestone D Phase 2a). The provider closure reads
-            // it on every evolve tick; the reasoner-config commands write it through. It starts at
-            // the Local default each boot — re-seeding it from the persisted signed log on boot
-            // (so a Cloud config survives restart) is done just below (Phase 2b). For 2a
-            // cloud is never enabled (no UI), so the cell stays Local, which is correct.
-            #[cfg(unix)]
-            let reasoner_cfg = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::engine::reason::ReasonerConfig::default(),
-            ));
+
+            // ── Memory engine: the `bossclawd` daemon (M1a). The app is a CLIENT — the engine, the
+            // embedder, the reasoner, and the evolve scheduler all live in the daemon now. ──
+            //
+            // Probe-then-start: connect to the daemon socket and, only if no live owner answers,
+            // spawn the installed binary (the daemon's own single-owner arbitration makes an app
+            // spawn racing launchd safe). This NEVER blocks/crashes boot — if the daemon can't be
+            // reached the app still runs and the client surfaces `Unavailable` in the Memory UI.
             #[cfg(unix)]
             let engine = {
-                let resource_dir = app.path().resource_dir().expect("resource dir");
-                // Tauri preserves the declared `resources/` prefix from bundle.resources
-                // (tauri.conf.json) when copying, so the model lands at
-                // `<resource_dir>/resources/models/potion-base-8M`, NOT `<resource_dir>/models/...`.
-                let model_dir = resource_dir.join("resources/models/potion-base-8M");
-                let provider = std::sync::Arc::new(crate::engine::embed::ResourceModel2Vec::new(model_dir));
-                // Config-driven reasoner: reads the shared cell so a mode flip (Local↔Cloud) takes
-                // effect without a restart. Replaces the always-Ollama provider.
-                let reasoner_provider = {
-                    let cell = reasoner_cfg.clone();
-                    std::sync::Arc::new(crate::engine::reason::ConfigReasonerProvider::new(
-                        move || cell.lock().unwrap().clone(),
-                    ))
-                };
-                std::sync::Arc::new(crate::engine::EngineHandle::new(
-                    vault,
-                    data_dir,
-                    provider,
-                    reasoner_provider,
-                ))
+                let sock_path = crate::engine::daemon::resolve_socket_path(&data_dir);
+                let bin_path = std::env::current_exe()
+                    .map(|exe| crate::engine::daemon::resolve_bin_path(&exe))
+                    .unwrap_or_else(|_| std::path::PathBuf::from("bossclawd"));
+                // `.setup` is sync (no reactor yet), so block on the bounded start attempt. Its
+                // result only affects logging — a `false` still boots the app (client → Unavailable).
+                tauri::async_runtime::block_on(async {
+                    let _up = crate::engine::daemon::ensure_started(&sock_path, &bin_path).await;
+                });
+                // The transport lazily connects on first request, so it's fine to build it whether or
+                // not the daemon is up yet — a not-yet-ready daemon just yields `Unavailable` until it
+                // answers (and the transport reconnects transparently once it does).
+                let transport: std::sync::Arc<dyn crate::engine::transport::Transport> =
+                    std::sync::Arc::new(crate::engine::transport::SocketTransport::new(sock_path));
+                std::sync::Arc::new(crate::engine::Engine::new(transport))
             };
-            // Phase 2b: re-seed the reasoner-config cell from the signed log so a Cloud
-            // config chosen in a previous session survives restart. `.setup` is sync, so
-            // block on the async read (one local SQLite read, before the webview exists).
-            #[cfg(unix)]
-            tauri::async_runtime::block_on(crate::engine::reseed_reasoner_cell(
-                &engine,
-                &reasoner_cfg,
-                identity_store.is_onboarded(),
-            ));
-            // Start the background evolve driver (OFF by default — it gates on the sticky
-            // `evolve_enabled` off-switch + a present local Ollama + a non-empty queue each
-            // wake). Spawned via `tauri::async_runtime::spawn` inside the scheduler; the
-            // handle + identity store are cheaply cloned for it.
-            #[cfg(unix)]
-            crate::engine::scheduler::spawn(engine.clone(), identity_store.clone());
 
             // Default to mock for dev; toggle to real AIR via AIR_AGENT_USE_REAL_AIR env var.
             // Settings UI will offer a friendlier toggle in a later task.
@@ -125,8 +104,6 @@ fn main() {
                 inbox: std::sync::Arc::new(crate::inbox::manager::InboxManager::new()),
                 #[cfg(unix)]
                 engine,
-                #[cfg(unix)]
-                reasoner_cfg,
             });
             Ok(())
         })
