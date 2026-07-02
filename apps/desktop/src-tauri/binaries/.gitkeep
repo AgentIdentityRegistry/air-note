@@ -1,0 +1,5 @@
+# Keeps the binaries/ directory in a fresh checkout so tauri.conf.json's
+# externalBin path ("binaries/bossclawd") resolves at bundle time. The actual
+# target-triple-suffixed sidecar (bossclawd-<triple>) is a build artifact staged
+# by scripts/dev-build-signed.sh (and by release CI) — never committed. See
+# scripts/install-bossclawd.sh for the co-signing requirement.

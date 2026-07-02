@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the bossclawd memory daemon (M1a Task 8).
+
+  This is a TEMPLATE, not a ready-to-load plist. `scripts/install-bossclawd.sh`
+  substitutes the AT-DELIMITED tokens (below) with the ABSOLUTE paths resolved on
+  the target machine at install time (launchd/systemd give no user PATH, so every
+  path must be absolute — see main.rs and the air-msg installer note). A committed
+  plist with hard-coded dev paths would be wrong on every other machine, so the
+  real paths are never checked in.
+
+  WHY A LaunchAGENT (per-user), NOT A LaunchDaemon (root):
+    The daemon reads the engine DEK from the user's LOGIN Keychain. A root
+    LaunchDaemon runs outside the user's login session and cannot reach that
+    keychain without a prompt — so this MUST be a per-user LaunchAgent in
+    ~/Library/LaunchAgents, started as the logged-in user. This ties directly to
+    the Task 0.5 co-signing gate: the Keychain ACL trusts (code-signing identifier
+    + certificate leaf), and only the same-user + correctly-signed binary reads
+    the DEK silently.
+
+  RunAtLoad + KeepAlive: start at login and relaunch on crash — this is what makes
+  the documented "kill the daemon -> it comes back" smoke pass.
+
+  Paths (kept consistent with crates/bossclawd/src/main.rs and
+  apps/desktop/src-tauri/src/engine/daemon.rs — do not drift):
+    - @BOSSCLAWD_BIN@       the co-signed daemon binary (Contents/MacOS/bossclawd)
+    - @BOSSCLAWD_MODEL_DIR@ the embedder model dir (the app bundle's
+                            Contents/Resources/resources/models/potion-base-8M,
+                            or a copy staged into the data dir)
+    - @STDOUT_LOG@ / @STDERR_LOG@  under ~/Library/Logs (NEVER /tmp)
+  The socket + data dir are left at the daemon's defaults on purpose (fewer knobs):
+  both the daemon (main.rs resolve_socket_path) and the app (daemon.rs
+  resolve_socket_path) default to <app_data_dir>/bossclawd.sock, so they already
+  agree without an env override. The install script only sets BOSSCLAWD_MODEL_DIR.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@LABEL@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BOSSCLAWD_BIN@</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BOSSCLAWD_MODEL_DIR</key>
+    <string>@BOSSCLAWD_MODEL_DIR@</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>@STDOUT_LOG@</string>
+
+  <key>StandardErrorPath</key>
+  <string>@STDERR_LOG@</string>
+</dict>
+</plist>
