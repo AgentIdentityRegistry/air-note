@@ -115,6 +115,155 @@ pub fn trust_verdict(
     }
 }
 
+use rand::seq::SliceRandom;
+use rand::Rng;
+use std::collections::BTreeSet;
+
+/// A position-level pick (what a blind judge names): A, B, or TIE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PosPick {
+    A,
+    B,
+    Tie,
+}
+
+/// The pairwise-judging seam: ONE trait serves both the LOCAL judge (Ollama) and the CLOUD
+/// auditor (Anthropic) — both are blind, position-swapped pickers. `Ok(None)` = the reply was
+/// ambiguous → the caller records `Uncertain` (never dropped, never fabricated).
+pub trait PairJudge {
+    fn pick(&self, query: &str, answer_a: &str, answer_b: &str) -> anyhow::Result<Option<PosPick>>;
+}
+
+/// The shared judging prompt: both the local judge and the cloud auditor use IT (identical
+/// instructions; only the model differs), constrained to EXACTLY one output token.
+pub fn pairwise_prompt(query: &str, answer_a: &str, answer_b: &str) -> String {
+    format!(
+        "You are comparing two answers to the same question.\n\nQuestion: {query}\n\n\
+         Answer A:\n{answer_a}\n\nAnswer B:\n{answer_b}\n\n\
+         Which answer is better (more correct, more complete, better grounded)? \
+         Reply with exactly one token: A, B, or TIE."
+    )
+}
+
+/// Parse a one-token judge reply. Exact match first (trimmed, case-folded); tokenized-substring
+/// fallback ONLY if exactly one signal token appears among {A, B, TIE}. Anything else → None
+/// (→ `Uncertain`).
+pub fn parse_pick_token(text: &str) -> Option<PosPick> {
+    let t = text.trim().to_uppercase();
+    match t.as_str() {
+        "A" => return Some(PosPick::A),
+        "B" => return Some(PosPick::B),
+        "TIE" => return Some(PosPick::Tie),
+        _ => {}
+    }
+    let tokens: BTreeSet<&str> = t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut found: Vec<PosPick> = Vec::new();
+    if tokens.contains("A") {
+        found.push(PosPick::A);
+    }
+    if tokens.contains("B") {
+        found.push(PosPick::B);
+    }
+    if tokens.contains("TIE") {
+        found.push(PosPick::Tie);
+    }
+    if found.len() == 1 { Some(found[0]) } else { None }
+}
+
+/// The local judge: the SAME Ollama model as the answerer, behind the shared trait.
+pub struct OllamaJudge {
+    pub model: String,
+}
+
+impl PairJudge for OllamaJudge {
+    fn pick(&self, query: &str, answer_a: &str, answer_b: &str) -> anyhow::Result<Option<PosPick>> {
+        let reply = crate::ollama::generate(&self.model, &pairwise_prompt(query, answer_a, answer_b))?;
+        Ok(parse_pick_token(&reply))
+    }
+}
+
+/// Per-pair blind assignment: whether AIR's answer is shown as "A". The judge NEVER sees arm
+/// names — only positions (spec §5 blinding).
+#[derive(Debug, Clone, Copy)]
+pub struct Blind {
+    pub air_is_a: bool,
+}
+
+/// Seeded per-pair coin flip.
+pub fn assign_blind<R: Rng>(rng: &mut R) -> Blind {
+    Blind { air_is_a: rng.gen_bool(0.5) }
+}
+
+/// De-blind a position pick to arm identity. `swapped` = this pick came from the SECOND
+/// (position-swapped) judging call, where A shows what was B.
+pub fn deblind_pick(blind: Blind, pick: PosPick, swapped: bool) -> Verdict {
+    let air_is_a = if swapped { !blind.air_is_a } else { blind.air_is_a };
+    match pick {
+        PosPick::Tie => Verdict::Tie,
+        PosPick::A => {
+            if air_is_a { Verdict::AirWins } else { Verdict::GbrainWins }
+        }
+        PosPick::B => {
+            if air_is_a { Verdict::GbrainWins } else { Verdict::AirWins }
+        }
+    }
+}
+
+/// Resolve the two de-blinded, position-swapped judgments: agree → that verdict; disagree →
+/// `Uncertain` (spec §5).
+pub fn resolve_swap(first: Verdict, swapped: Verdict) -> Verdict {
+    if first == swapped { first } else { Verdict::Uncertain }
+}
+
+/// Judge one pair blind + position-swapped: two `pick` calls (assigned order, then swapped),
+/// each de-blinded; any ambiguous reply OR ordering disagreement → `Uncertain`. Used for BOTH
+/// the local judge and the cloud auditor (identical protocol; only the model differs).
+pub fn judge_pair_blind(
+    judge: &dyn PairJudge,
+    blind: Blind,
+    query: &str,
+    air_answer: &str,
+    gbrain_answer: &str,
+) -> anyhow::Result<Verdict> {
+    let (first_a, first_b) = if blind.air_is_a {
+        (air_answer, gbrain_answer)
+    } else {
+        (gbrain_answer, air_answer)
+    };
+    let Some(p1) = judge.pick(query, first_a, first_b)? else {
+        return Ok(Verdict::Uncertain);
+    };
+    let Some(p2) = judge.pick(query, first_b, first_a)? else {
+        return Ok(Verdict::Uncertain);
+    };
+    Ok(resolve_swap(deblind_pick(blind, p1, false), deblind_pick(blind, p2, true)))
+}
+
+/// Audit-sample floor + fraction (spec §5 Rev 2).
+pub const AUDIT_FLOOR: usize = 30;
+pub const AUDIT_FRACTION: f64 = 0.15;
+
+/// Seeded audit selection: a random `min(open_count, max(AUDIT_FLOOR, ceil(15% of open)))`
+/// sample ∪ ALL uncertain indices (deduped union). A pool smaller than the floor is audited
+/// in full (and the caller sets `audit_n_too_small`).
+pub fn select_audit_indices<R: Rng>(
+    open_count: usize,
+    uncertain: &[usize],
+    rng: &mut R,
+) -> BTreeSet<usize> {
+    let target = AUDIT_FLOOR
+        .max((open_count as f64 * AUDIT_FRACTION).ceil() as usize)
+        .min(open_count);
+    let mut all: Vec<usize> = (0..open_count).collect();
+    all.shuffle(rng);
+    let mut set: BTreeSet<usize> = all.into_iter().take(target).collect();
+    set.extend(uncertain.iter().copied().filter(|i| *i < open_count));
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +304,99 @@ mod tests {
         // Rev 2: open pool < AUDIT_FLOOR → indicative-only flag carried through.
         let t = trust_verdict(&local, &cloud, false, false, true);
         assert!(t.audit_n_too_small);
+    }
+
+    #[test]
+    fn parse_pick_token_exact_then_tokenized_fallback() {
+        // Exact one-token replies (the prompt DEMANDS these) parse first.
+        assert_eq!(parse_pick_token("A"), Some(PosPick::A));
+        assert_eq!(parse_pick_token(" b\n"), Some(PosPick::B));
+        assert_eq!(parse_pick_token("TIE"), Some(PosPick::Tie));
+        assert_eq!(parse_pick_token("tie"), Some(PosPick::Tie));
+        // Tokenized fallback ONLY when exactly one signal token appears.
+        assert_eq!(parse_pick_token("Answer: B"), Some(PosPick::B));
+        assert_eq!(parse_pick_token("The answer is A."), Some(PosPick::A));
+        // Ambiguous → None (recorded Uncertain — never dropped, never fabricated).
+        assert_eq!(parse_pick_token("A or B, hard to say"), None);
+        assert_eq!(parse_pick_token("I cannot decide"), None);
+        // "a" as an article + "tie" → two signals → ambiguous (safe: goes to audit as Uncertain).
+        assert_eq!(parse_pick_token("It's a tie between them"), None);
+    }
+
+    #[test]
+    fn blind_assignment_is_seeded_and_deblinding_is_correct() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
+        let mut rng1 = ChaCha8Rng::seed_from_u64(42);
+        let mut rng2 = ChaCha8Rng::seed_from_u64(42);
+        assert_eq!(assign_blind(&mut rng1).air_is_a, assign_blind(&mut rng2).air_is_a);
+        let air_a = Blind { air_is_a: true };
+        // Unswapped: A holds AIR.
+        assert_eq!(deblind_pick(air_a, PosPick::A, false), Verdict::AirWins);
+        assert_eq!(deblind_pick(air_a, PosPick::B, false), Verdict::GbrainWins);
+        // Swapped: positions exchanged.
+        assert_eq!(deblind_pick(air_a, PosPick::A, true), Verdict::GbrainWins);
+        assert_eq!(deblind_pick(air_a, PosPick::Tie, true), Verdict::Tie);
+        let air_b = Blind { air_is_a: false };
+        assert_eq!(deblind_pick(air_b, PosPick::A, false), Verdict::GbrainWins);
+        assert_eq!(deblind_pick(air_b, PosPick::A, true), Verdict::AirWins);
+    }
+
+    #[test]
+    fn resolve_swap_and_judge_pair_blind() {
+        assert_eq!(resolve_swap(Verdict::AirWins, Verdict::AirWins), Verdict::AirWins);
+        assert_eq!(resolve_swap(Verdict::AirWins, Verdict::GbrainWins), Verdict::Uncertain);
+        assert_eq!(resolve_swap(Verdict::Tie, Verdict::Tie), Verdict::Tie);
+
+        /// A content-based double: prefers the answer containing "GOOD" (blind-compatible — it
+        /// judges CONTENT, not position, so it survives blinding and swapping).
+        struct GoodJudge;
+        impl PairJudge for GoodJudge {
+            fn pick(&self, _q: &str, a: &str, b: &str) -> anyhow::Result<Option<PosPick>> {
+                Ok(match (a.contains("GOOD"), b.contains("GOOD")) {
+                    (true, false) => Some(PosPick::A),
+                    (false, true) => Some(PosPick::B),
+                    _ => Some(PosPick::Tie),
+                })
+            }
+        }
+        /// An ambiguity double: always returns None.
+        struct MumbleJudge;
+        impl PairJudge for MumbleJudge {
+            fn pick(&self, _q: &str, _a: &str, _b: &str) -> anyhow::Result<Option<PosPick>> {
+                Ok(None)
+            }
+        }
+
+        for air_is_a in [true, false] {
+            let blind = Blind { air_is_a };
+            // AIR's answer holds GOOD → AirWins regardless of the blind assignment.
+            let v = judge_pair_blind(&GoodJudge, blind, "q", "GOOD air", "meh gbrain").unwrap();
+            assert_eq!(v, Verdict::AirWins, "air_is_a={air_is_a}");
+            // GBrain's answer holds GOOD → GbrainWins regardless.
+            let v = judge_pair_blind(&GoodJudge, blind, "q", "meh air", "GOOD gbrain").unwrap();
+            assert_eq!(v, Verdict::GbrainWins, "air_is_a={air_is_a}");
+        }
+        // Ambiguous reply on either call → Uncertain.
+        let v = judge_pair_blind(&MumbleJudge, Blind { air_is_a: true }, "q", "x", "y").unwrap();
+        assert_eq!(v, Verdict::Uncertain);
+    }
+
+    #[test]
+    fn audit_selection_floor_union_uncertains_seeded() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
+        // 200 open queries → target max(30, ceil(30)) = 30 random ∪ uncertains {5, 199}.
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let sel = select_audit_indices(200, &[5, 199], &mut rng);
+        assert!(sel.len() >= 30 && sel.len() <= 32, "30 random ∪ 2 uncertains, deduped: {}", sel.len());
+        assert!(sel.contains(&5) && sel.contains(&199), "ALL uncertains included");
+        // Determinism.
+        let mut rng2 = ChaCha8Rng::seed_from_u64(42);
+        assert_eq!(sel, select_audit_indices(200, &[5, 199], &mut rng2));
+        // A pool smaller than the floor → the WHOLE pool.
+        let mut rng3 = ChaCha8Rng::seed_from_u64(42);
+        let all = select_audit_indices(10, &[], &mut rng3);
+        assert_eq!(all.len(), 10);
     }
 }
