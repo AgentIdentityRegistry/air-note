@@ -8,6 +8,10 @@
 //! the flat recon shape. Lines that fail to parse (string-form content, garbage) are skipped;
 //! only content items whose type is exactly "tool_use" become tool calls, so tool-NAME mentions
 //! in text/tool_result content (the 175x naive-grep trap, Probe C) can never be mined.
+//!
+//! Window semantics are per-file: `mine_all` mines files independently, so a resumed session
+//! spanning two files cannot label across the file boundary — an accepted approximation that
+//! can only MISS labels (safe direction), never mint wrong ones.
 
 /// A get_page within this many subsequent tool calls (same session) labels a query.
 pub const LABEL_WINDOW: usize = 5;
@@ -138,7 +142,10 @@ fn label_recent(
             session_positions.push(pos);
         }
     }
-    // Same order, same count: the k-th mined query of a session IS its k-th query tool call.
+    // Both lists are ascending and prefix-aligned (queries are mined in call order):
+    // `query_call_indices` may be LONGER — it also holds not-yet-mined future queries (this
+    // get_page precedes them). Zip truncation drops exactly that tail, so `.rev()` starts at
+    // the true most-recent mined query.
     for (&call_idx, &mined_pos) in query_call_indices.iter().zip(session_positions.iter()).rev() {
         if call_idx < get_page_idx
             && get_page_idx - call_idx <= LABEL_WINDOW
@@ -189,6 +196,26 @@ mod tests {
         assert_eq!(ko.gold_page_id, None, "get_page outside the window is not a label");
         assert!(!queries.iter().any(|q| q.text.contains("mcp__other")));
         assert_eq!(queries.len(), 3, "exactly the 3 real queries; decoy tool-name mentions in text/tool_result never mined");
+    }
+
+    #[test]
+    fn label_window_boundary_at_exactly_five() {
+        // Regression lock on LABEL_WINDOW's `<=`: the get_page sits at flattened tool-call gap
+        // EXACTLY 5 from its query (query idx 0 → four decoy calls → get_page idx 5) and must
+        // still label. If this fails, the window rule has an off-by-one.
+        let jsonl = r#"{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","name":"mcp__gbrain__query","input":{"query":"boundary q"}}]}}
+{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","name":"mcp__other__a","input":{}}]}}
+{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","name":"mcp__other__b","input":{}}]}}
+{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","name":"mcp__other__c","input":{}}]}}
+{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","name":"mcp__other__d","input":{}}]}}
+{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","name":"mcp__gbrain__get_page","input":{"slug":"air/boundary"}}]}}"#;
+        let queries = mine_transcript(jsonl);
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0].gold_page_id.as_deref(),
+            Some("air/boundary"),
+            "gap == LABEL_WINDOW (5) must label — pins the <= in the window rule"
+        );
     }
 
     #[test]

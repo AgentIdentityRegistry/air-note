@@ -39,7 +39,7 @@ impl PageResolver {
                 .strip_prefix(&root_str)
                 .and_then(|s| s.strip_prefix('/'))
                 .ok_or_else(|| anyhow::anyhow!(
-                    "ingested file {} is outside the corpus root {root_str}",
+                    "ingested file {} is not under the corpus root {root_str}",
                     r.canonical_path
                 ))?;
             by_event.insert(r.file_event_id.clone(), page_id_from_rel(rel));
@@ -111,6 +111,20 @@ mod tests {
         assert!(
             PageResolver::from_file_records(&equal, root.path()).is_err(),
             "canonical_path == corpus root must be an error"
+        );
+
+        // Sibling-prefix hazard: root `<tmp>/a` vs a record under `<tmp>/ab/` — a naive string
+        // strip_prefix would silently mint page id "b/x"; the '/' boundary check must ERROR.
+        let base = tempfile::tempdir().unwrap();
+        let root_a = base.path().join("a");
+        let sib_ab = base.path().join("ab");
+        std::fs::create_dir(&root_a).unwrap();
+        std::fs::create_dir(&sib_ab).unwrap();
+        let canon_ab = std::fs::canonicalize(&sib_ab).unwrap();
+        let sib_records = vec![record(&canon_ab, "x.md", "ev-sib")];
+        assert!(
+            PageResolver::from_file_records(&sib_records, &root_a).is_err(),
+            "sibling-prefix path (root /a vs /ab) must be an error, not page id b/x"
         );
     }
 }
