@@ -55,7 +55,9 @@ pub struct ExamplePair {
     pub gbrain_context: String,
 }
 
-/// The full report model (markdown + raw JSON).
+/// The full report model (markdown + raw JSON). Serialized verbatim into `scores.json` —
+/// untruncated contexts + the full corpus manifest quote brain content, so `scores.json` is
+/// exactly as private as `report.md`; never share or commit it.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportModel {
     pub trust: TrustVerdict,
@@ -77,11 +79,16 @@ pub struct ReportModel {
 
 /// Canonicalize the nearest EXISTING ancestor of `p`, rejoining the non-existing tail — so a
 /// symlinked or not-yet-created reports dir resolves to its REAL location before the guard
-/// compares (Rev 2, finding 7).
+/// compares (Rev 2, finding 7). Callers MUST pass an absolute `p` (see the exhaustion branches).
 fn canonicalize_nearest_existing(p: &Path) -> PathBuf {
     let mut existing = p;
     loop {
         if existing.as_os_str().is_empty() {
+            // Walk exhausted with nothing canonicalizable. Returning the input is safe ONLY
+            // because `p` is guaranteed absolute (ensure_outside_repo absolutizes first): an
+            // absolute path that cannot be canonicalized at any level still compares correctly
+            // component-wise against the absolute forbidden root. A RELATIVE input here would
+            // fail-open — it can never `starts_with` an absolute root.
             return p.to_path_buf();
         }
         if let Ok(canon) = std::fs::canonicalize(existing) {
@@ -90,21 +97,35 @@ fn canonicalize_nearest_existing(p: &Path) -> PathBuf {
         }
         match existing.parent() {
             Some(parent) => existing = parent,
+            // No parent left (filesystem root). Same justification as above: safe only because
+            // `p` is absolute, so the prefix check still compares absolute-vs-absolute.
             None => return p.to_path_buf(),
         }
     }
 }
 
 /// Refuse any reports dir under the WORKSPACE (nearest `.git` ancestor of `repo_root`) —
-/// reports quote brain content and the repo is public. Symlink- and nonexistent-path-resistant.
+/// reports quote brain content and the repo is public. Symlink- and nonexistent-path-resistant
+/// at CHECK time; TOCTOU is out of scope (single-user dev tool — a symlink swapped in between
+/// this check and the write is not defended against).
 pub fn ensure_outside_repo(reports_dir: &Path, repo_root: &Path) -> anyhow::Result<()> {
+    // A relative path resolves against CWD — which may BE the repo. Absolutize first so the
+    // prefix check always compares absolute-vs-absolute; if the CWD is unavailable, FAIL CLOSED
+    // (a privacy guard must never fall back to "allow").
+    let reports_dir: PathBuf = if reports_dir.is_relative() {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot resolve CWD to absolutize reports dir: {e}"))?
+            .join(reports_dir)
+    } else {
+        reports_dir.to_path_buf()
+    };
     let repo_canon = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let forbidden = repo_canon
         .ancestors()
         .find(|p| p.join(".git").exists())
         .map(|p| p.to_path_buf())
         .unwrap_or(repo_canon);
-    let resolved = canonicalize_nearest_existing(reports_dir);
+    let resolved = canonicalize_nearest_existing(&reports_dir);
     if resolved.starts_with(&forbidden) {
         anyhow::bail!(
             "refusing to write reports inside the repo ({resolved:?} is under {forbidden:?}); \
@@ -248,9 +269,12 @@ pub fn render_markdown(r: &ReportModel) -> String {
     // 8. Examples.
     s.push_str("\n### Examples (wins/losses with context diffs)\n");
     for ex in &r.examples {
+        // Mined queries can be multi-line (would garble the list item) and long — collapse
+        // newlines to spaces, then truncate like the contexts.
+        let query = truncate_for_example(&ex.query.replace(['\n', '\r'], " "));
         s.push_str(&format!(
             "- **{}** — winner: {}\n  - AIR ctx: {}\n  - GBrain ctx: {}\n",
-            ex.query,
+            query,
             ex.winner,
             truncate_for_example(&ex.air_context),
             truncate_for_example(&ex.gbrain_context),
@@ -260,6 +284,9 @@ pub fn render_markdown(r: &ReportModel) -> String {
 }
 
 /// Write markdown + raw JSON into `reports_dir/<timestamp>/` AFTER the guard. Returns the dir.
+/// `scores.json` quotes brain content VERBATIM (untruncated contexts + the full corpus manifest)
+/// — it is exactly as private as `report.md`; never share or commit either. Refuses to overwrite
+/// an existing report (the numbers roadmap decisions read).
 pub fn write_report(
     reports_dir: &Path,
     repo_root: &Path,
@@ -267,6 +294,13 @@ pub fn write_report(
 ) -> anyhow::Result<PathBuf> {
     ensure_outside_repo(reports_dir, repo_root)?;
     let out_dir = reports_dir.join(r.corpus.snapshot_unix_secs.to_string());
+    if out_dir.join("report.md").exists() {
+        anyhow::bail!(
+            "report already exists at {} — refusing to overwrite prior results \
+             (re-run to get a fresh snapshot timestamp, or move the old report)",
+            out_dir.display()
+        );
+    }
     std::fs::create_dir_all(&out_dir)?;
     std::fs::write(out_dir.join("report.md"), render_markdown(r))?;
     std::fs::write(out_dir.join("scores.json"), serde_json::to_vec_pretty(r)?)?;
@@ -334,6 +368,33 @@ mod tests {
             .to_path_buf()
     }
 
+    /// `set_current_dir` is process-global and cargo runs tests multi-threaded. No other test in
+    /// this crate reads the CWD (they all pass absolute paths, and `canonicalize` of an absolute
+    /// path never consults the CWD), so serializing just the CWD-mutating test with this lock is
+    /// enough — it prevents two CWD-mutating tests from ever interleaving.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the saved CWD on drop, so a panicking assertion can't leak the changed CWD into
+    /// the rest of the process.
+    struct RestoreCwd(std::path::PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn relative_reports_dir_cannot_bypass_the_guard() {
+        let _serial = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Run from inside the workspace (tests do): a bare relative dir name must NOT pass —
+        // create_dir_all would resolve it against the CWD and write brain content into the repo.
+        let _restore = RestoreCwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(workspace_root()).unwrap();
+        let verdict = ensure_outside_repo(Path::new("nonexistent-probe-reports"), repo_root);
+        assert!(verdict.is_err(), "relative path resolved against the repo CWD must be refused");
+    }
+
     #[test]
     fn refuses_repo_workspace_and_symlinked_paths() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")); // crates/memharness
@@ -397,5 +458,37 @@ mod tests {
         report.segments[0].label = "synthetic·en·known-item".into();
         let md3 = render_markdown(&report);
         assert!(md3.contains("No open queries this run"), "no-opens wording, not a failure claim: {md3}");
+
+        // --local-only wording: audit incomplete WITH an open segment present (so the no-opens
+        // branch above doesn't shadow it) and local_only set.
+        report.segments[0].label = "real·en·open".into();
+        report.local_only = true;
+        let md4 = render_markdown(&report);
+        assert!(md4.contains("No audit this run (--local-only)"), "local-only wording: {md4}");
+
+        // API-failure wording: same incomplete audit, but NOT local-only → UNAVAILABLE.
+        report.local_only = false;
+        let md5 = render_markdown(&report);
+        assert!(md5.contains("Trust verdict UNAVAILABLE"), "API-failure wording: {md5}");
+    }
+
+    #[test]
+    fn write_report_writes_once_then_refuses_overwrite() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tmp = tempfile::tempdir().unwrap();
+        let reports_dir = tmp.path().join("reports");
+        let model = ReportModel::sample_for_test();
+
+        // Happy path: both files land in reports_dir/<timestamp>/ and scores.json is valid JSON.
+        let out_dir = write_report(&reports_dir, repo_root, &model).unwrap();
+        assert!(out_dir.join("report.md").exists(), "report.md written");
+        let raw = std::fs::read(out_dir.join("scores.json")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&raw).expect("scores.json parses as JSON");
+        assert!(parsed.get("trust").is_some(), "raw scores carry the trust verdict");
+
+        // Same model → same snapshot timestamp → must refuse to clobber the prior report.
+        let err = write_report(&reports_dir, repo_root, &model).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "overwrite refused: {err}");
     }
 }
