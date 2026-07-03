@@ -705,7 +705,12 @@ mod tests {
         /// connect fails (ENOENT) rather than attaching to a dead listener.
         fn kill(&mut self) {
             if let Some(rt) = self.rt.take() {
-                rt.shutdown.notify_waiters();
+                // notify_one, NOT notify_waiters: notify_one banks a permit when no waiter is
+                // registered yet, so a kill racing the daemon thread's first `notified()` poll
+                // (`start_runtime` returns at the bind handshake, before the thread reaches
+                // `select!`) can never be lost (notify_waiters stores no permit and would wedge
+                // join()). Same fix as memharness's TestDaemon (crates/memharness/src/daemon.rs).
+                rt.shutdown.notify_one();
                 rt.thread.join().expect("daemon thread joins");
             }
             let _ = std::fs::remove_file(&self.sock);
@@ -735,7 +740,8 @@ mod tests {
         /// across tests).
         fn drop(&mut self) {
             if let Some(rt) = self.rt.take() {
-                rt.shutdown.notify_waiters();
+                // notify_one for the same lost-wakeup reason as `kill()` above.
+                rt.shutdown.notify_one();
                 let _ = rt.thread.join();
             }
         }
@@ -801,6 +807,32 @@ mod tests {
             .await
             .expect_err("daemon gone → Err");
         assert!(matches!(err, EngineOpError::Unavailable(_)), "got {err:?}");
+    }
+
+    // ── Clean-shutdown contract for BOTH notify sites, at the tightest spawn→shutdown timing (no
+    // client op in between, so shutdown lands right after the bind handshake). This is the window
+    // the `notify_one` fix protects: `notify_one` banks a permit if the daemon thread hasn't yet
+    // registered its `notified()` waiter, so neither `kill()` (explicit) nor `Drop` (implicit) can
+    // lose the signal and wedge `join()`. `bounded` turns any regression into a test failure within
+    // TEST_TIMEOUT rather than a hung CI job. NOTE: the race is scheduler-timed and not
+    // deterministically reproducible here — the standing guard is the `notify_one` fix + its
+    // comment; this test proves the shutdown path stays clean and non-hanging. ──
+
+    #[tokio::test]
+    async fn shutdown_after_spawn_completes_cleanly() {
+        // Explicit kill(): notify + join must complete, and the socket is removed.
+        let mut killed = TestDaemon::spawn().await;
+        let sock = killed.sock.clone();
+        bounded(tokio::task::spawn_blocking(move || killed.kill()))
+            .await
+            .expect("kill+join completes");
+        assert!(!sock.exists(), "kill() removes the socket");
+
+        // Implicit Drop (no kill()): dropping must also notify + join without wedging.
+        let dropped = TestDaemon::spawn().await;
+        bounded(tokio::task::spawn_blocking(move || drop(dropped)))
+            .await
+            .expect("Drop's notify + join completes");
     }
 
     // ── Fix 2 (Med2): `status(false)` short-circuits to NotOnboarded WITHOUT a transport call. ──
