@@ -28,6 +28,7 @@ fn category(v: Verdict) -> usize {
 
 /// Raw agreement fraction between equal-length verdict vectors.
 pub fn raw_agreement(a: &[Verdict], b: &[Verdict]) -> f64 {
+    debug_assert_eq!(a.len(), b.len(), "verdict vectors must be paired");
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
     }
@@ -43,6 +44,7 @@ pub fn raw_agreement(a: &[Verdict], b: &[Verdict]) -> f64 {
 /// should know 1.0 in that case means 'vacuous chance-correction', not 'strong beyond-chance
 /// agreement'.
 pub fn cohens_kappa(a: &[Verdict], b: &[Verdict]) -> f64 {
+    debug_assert_eq!(a.len(), b.len(), "verdict vectors must be paired");
     let n = a.len();
     if n == 0 || n != b.len() {
         return 0.0;
@@ -145,9 +147,13 @@ pub fn pairwise_prompt(query: &str, answer_a: &str, answer_b: &str) -> String {
     )
 }
 
-/// Parse a one-token judge reply. Exact match first (trimmed, case-folded); tokenized-substring
-/// fallback ONLY if exactly one signal token appears among {A, B, TIE}. Anything else → None
-/// (→ `Uncertain`).
+/// Parse a one-token judge reply. Exact match first (trimmed, case-folded); tokenized fallback
+/// ONLY if exactly one signal appears among {A, B, TIE} with no ambiguity blockers. Anything
+/// else → None (→ `Uncertain`).
+///
+/// Fallback case rule: single-letter signals must be UPPERCASE — lowercase 'a'/'b' are English
+/// articles/pronoun fragments ("It's a draw"), never picks; their presence anywhere marks the
+/// reply conversational → ambiguous → None. TIE is case-insensitive (no English-word collision).
 pub fn parse_pick_token(text: &str) -> Option<PosPick> {
     let t = text.trim().to_uppercase();
     match t.as_str() {
@@ -156,21 +162,28 @@ pub fn parse_pick_token(text: &str) -> Option<PosPick> {
         "TIE" => return Some(PosPick::Tie),
         _ => {}
     }
-    let tokens: BTreeSet<&str> = t
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut found: Vec<PosPick> = Vec::new();
-    if tokens.contains("A") {
-        found.push(PosPick::A);
+    // Tokenize the ORIGINAL text: case carries meaning here (uppercase = pick, lowercase = prose).
+    let (mut has_a, mut has_b, mut has_tie, mut blocked) = (false, false, false, false);
+    for token in text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()) {
+        match token {
+            "A" => has_a = true,
+            "B" => has_b = true,
+            "a" | "b" => blocked = true,
+            _ if token.eq_ignore_ascii_case("tie") => has_tie = true,
+            _ => {}
+        }
     }
-    if tokens.contains("B") {
-        found.push(PosPick::B);
+    let signals = [has_a, has_b, has_tie].iter().filter(|s| **s).count();
+    if blocked || signals != 1 {
+        return None;
     }
-    if tokens.contains("TIE") {
-        found.push(PosPick::Tie);
+    if has_a {
+        Some(PosPick::A)
+    } else if has_b {
+        Some(PosPick::B)
+    } else {
+        Some(PosPick::Tie)
     }
-    if found.len() == 1 { Some(found[0]) } else { None }
 }
 
 /// The local judge: the SAME Ollama model as the answerer, behind the shared trait.
@@ -254,6 +267,10 @@ pub fn select_audit_indices<R: Rng>(
     uncertain: &[usize],
     rng: &mut R,
 ) -> BTreeSet<usize> {
+    debug_assert!(
+        uncertain.iter().all(|i| *i < open_count),
+        "uncertain indices must lie in the open pool"
+    );
     let target = AUDIT_FLOOR
         .max((open_count as f64 * AUDIT_FRACTION).ceil() as usize)
         .min(open_count);
@@ -319,8 +336,13 @@ mod tests {
         // Ambiguous → None (recorded Uncertain — never dropped, never fabricated).
         assert_eq!(parse_pick_token("A or B, hard to say"), None);
         assert_eq!(parse_pick_token("I cannot decide"), None);
-        // "a" as an article + "tie" → two signals → ambiguous (safe: goes to audit as Uncertain).
+        // "a" as an article + "tie" → article blocker wins → ambiguous (safe: audited as Uncertain).
         assert_eq!(parse_pick_token("It's a tie between them"), None);
+        // The English article "a" must NEVER be a decisive pick (review Fix 2 regressions).
+        assert_eq!(parse_pick_token("It's a draw"), None);
+        assert_eq!(parse_pick_token("It's a toss-up"), None);
+        // Uppercase single letter with punctuation stays decisive via the fallback.
+        assert_eq!(parse_pick_token("B."), Some(PosPick::B));
     }
 
     #[test]

@@ -61,7 +61,16 @@ pub fn extract_text(body: &str) -> anyhow::Result<String> {
 struct MessagesReq<'a> {
     model: &'a str,
     max_tokens: u32,
+    thinking: Thinking,
     messages: Vec<ReqMessage<'a>>,
+}
+/// Sonnet 5 enables ADAPTIVE thinking when this field is omitted, and max_tokens covers
+/// thinking + text COMBINED — an unprompted thinking block would eat the 4/8-token budget
+/// and return no text block, deterministically blanking the trust verdict. Explicitly off.
+#[derive(serde::Serialize)]
+struct Thinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 #[derive(serde::Serialize)]
 struct ReqMessage<'a> {
@@ -69,31 +78,53 @@ struct ReqMessage<'a> {
     content: &'a str,
 }
 
-/// One Messages POST → the reply text. HTTP/parse failures are errors (the caller records
-/// "audit incomplete"; a fabricated verdict is never produced). Anthropic puts the real cause
-/// (invalid key, retired model id) in the JSON error body, so non-2xx responses quote it.
+/// Statuses Anthropic documents as retryable: rate limit (429), server errors (500/502/503),
+/// and overloaded (529). Everything else (auth, bad request, retired model) fails fast.
+const RETRYABLE_STATUSES: [u16; 5] = [429, 500, 502, 503, 529];
+/// Sleeps between retry attempts (the caller is sync); indexed by completed-attempt count.
+const RETRY_BACKOFF_SECS: [u64; 2] = [2, 4];
+
+/// One Messages POST → the reply text, retried up to `RETRY_BACKOFF_SECS.len()` times on
+/// retryable statuses. The request is idempotent and Anthropic documents 429/5xx/529 as
+/// retryable, so a bounded retry keeps one transient blip from blanking the trust verdict of a
+/// 2h run — while persistent failure still errors out (the caller records "audit incomplete"
+/// and stops egress; a fabricated verdict is never produced). Transport errors and other
+/// statuses fail fast. Anthropic puts the real cause (invalid key, retired model id) in the
+/// JSON error body, so non-2xx responses quote it.
 fn post_message(api_key: &str, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
-    let body = agent()
-        .post(ANTHROPIC_URL)
-        .set("x-api-key", api_key)
-        .set("anthropic-version", ANTHROPIC_VERSION)
-        .set("content-type", "application/json")
-        .send_json(MessagesReq {
-            model: AUDIT_MODEL,
-            max_tokens,
-            messages: vec![ReqMessage { role: "user", content: prompt }],
-        })
-        .map_err(|e| match e {
-            ureq::Error::Status(code, resp) => {
+    let mut attempts = 0;
+    loop {
+        let result = agent()
+            .post(ANTHROPIC_URL)
+            .set("x-api-key", api_key)
+            .set("anthropic-version", ANTHROPIC_VERSION)
+            .set("content-type", "application/json")
+            .send_json(MessagesReq {
+                model: AUDIT_MODEL,
+                max_tokens,
+                thinking: Thinking { kind: "disabled" },
+                messages: vec![ReqMessage { role: "user", content: prompt }],
+            });
+        match result {
+            Ok(resp) => {
+                let body =
+                    resp.into_string().context("reading anthropic messages response")?;
+                return extract_text(&body);
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let retryable = RETRYABLE_STATUSES.contains(&code);
+                if retryable && attempts < RETRY_BACKOFF_SECS.len() {
+                    std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS[attempts]));
+                    attempts += 1;
+                    continue;
+                }
                 let body = resp.into_string().unwrap_or_default();
                 let body: String = body.chars().take(ERROR_BODY_MAX_CHARS).collect();
-                anyhow::anyhow!("Anthropic Messages call failed: status {code}: {body}")
+                anyhow::bail!("Anthropic Messages call failed: status {code}: {body}");
             }
-            other => anyhow::anyhow!("Anthropic Messages call failed: {other}"),
-        })?
-        .into_string()
-        .context("reading anthropic messages response")?;
-    extract_text(&body)
+            Err(other) => anyhow::bail!("Anthropic Messages call failed: {other}"),
+        }
+    }
 }
 
 /// Fail-fast preflight (Rev 2, finding 6): ONE tiny call with the pinned model BEFORE the
@@ -118,6 +149,9 @@ pub struct AnthropicAuditor {
 
 impl PairJudge for AnthropicAuditor {
     fn pick(&self, query: &str, answer_a: &str, answer_b: &str) -> anyhow::Result<Option<PosPick>> {
+        // max_tokens 8: a truncated negation ("Answer B is worse than…") could still parse
+        // decisively; Sonnet-tier one-token compliance makes that rare, and the parser's
+        // ambiguity rules (uppercase-only signals, article blockers) are the main guard.
         let reply = post_message(&self.api_key, &pairwise_prompt(query, answer_a, answer_b), 8)?;
         Ok(parse_pick_token(&reply))
     }
@@ -134,6 +168,20 @@ mod tests {
         assert_eq!(extract_text(body).unwrap(), "A");
         assert!(extract_text(r#"{"content":[]}"#).is_err(), "no text block = error");
         assert!(extract_text("not json").is_err());
+    }
+
+    #[test]
+    fn messages_request_disables_thinking() {
+        // Guards the adaptive-thinking trap: omitting `thinking` lets Sonnet 5 spend the whole
+        // 4/8-token budget on a thinking block → no text block → audit_incomplete.
+        let req = MessagesReq {
+            model: AUDIT_MODEL,
+            max_tokens: 8,
+            thinking: Thinking { kind: "disabled" },
+            messages: vec![ReqMessage { role: "user", content: "hi" }],
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["thinking"]["type"], "disabled");
     }
 
     #[test]
