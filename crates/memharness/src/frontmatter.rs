@@ -5,7 +5,8 @@
 /// Strip a leading YAML frontmatter block: the file MUST begin (byte 0) with a `---` line,
 /// and the block ends at the next line that is exactly `---`. Returns the remainder after that
 /// closing fence's newline. No opening fence at byte 0 or no closing fence → input unchanged
-/// (a lone `---` / horizontal rule is NOT frontmatter).
+/// (a lone `---` / horizontal rule is NOT frontmatter). LF-only: CRLF fences are not recognized
+/// (fail-safe: input returned unchanged).
 pub fn strip_frontmatter(input: &str) -> &str {
     let after_open = match input.strip_prefix("---\n") {
         Some(rest) => rest,
@@ -27,7 +28,7 @@ pub fn strip_frontmatter(input: &str) -> &str {
             if at_line_start && abs + 3 == after_open.len() {
                 return ""; // closing fence at EOF with no trailing newline
             }
-            return input;
+            search_from = abs + 3;
         } else {
             return input;
         }
@@ -75,6 +76,12 @@ mod tests {
         assert_eq!(strip_frontmatter(input), input);
         let unclosed = "---\ntitle: x\nnever closes\n";
         assert_eq!(strip_frontmatter(unclosed), unclosed);
+    }
+
+    #[test]
+    fn closing_fence_at_eof_without_trailing_newline() {
+        assert_eq!(strip_frontmatter("---\ntitle: x\n---"), "");
+        assert_eq!(strip_frontmatter("---\ntitle: a---b\n---"), "", "mid-line dashes must not stop the scan");
     }
 
     #[test]
