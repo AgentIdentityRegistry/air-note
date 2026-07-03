@@ -1,0 +1,11 @@
+{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"mcp__gbrain__query","input":{"query":"who is Aria Novak"}}]}}
+{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"mcp__gbrain__get_page","input":{"slug":"people/aria-novak"}}]}}
+{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"text","text":"deferred tools: mcp__gbrain__query, mcp__gbrain__search, mcp__gbrain__recall"},{"type":"tool_use","name":"mcp__gbrain__search","input":{"query":"memory strategy phase 0"}}]}}
+{"type":"user","sessionId":"s1","message":{"content":[{"type":"tool_result","content":"result text mentioning mcp__gbrain__query"}]}}
+{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"mcp__other__thing","input":{"x":1}}]}}
+{"type":"assistant","sessionId":"s2","message":{"content":[{"type":"tool_use","name":"mcp__gbrain__query","input":{"query":"who is Aria Novak"}}]}}
+{"type":"assistant","sessionId":"s2","message":{"content":[{"type":"tool_use","name":"mcp__gbrain__query","input":{"query":"메모리 전략"}}]}}
+{"type":"assistant","sessionId":"s2","message":{"content":[{"type":"tool_use","name":"mcp__other__a","input":{}},{"type":"tool_use","name":"mcp__other__b","input":{}},{"type":"tool_use","name":"mcp__other__c","input":{}}]}}
+{"type":"assistant","sessionId":"s2","message":{"content":[{"type":"tool_use","name":"mcp__other__d","input":{}},{"type":"tool_use","name":"mcp__other__e","input":{}}]}}
+{"type":"assistant","sessionId":"s2","message":{"content":[{"type":"tool_use","name":"mcp__gbrain__get_page","input":{"slug":"air/memory-strategy"}}]}}
+{"type":"user","sessionId":"s2","message":{"content":"plain string content lines are skipped"}}

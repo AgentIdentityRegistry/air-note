@@ -176,6 +176,12 @@ tool-NAME listings (deferred-tool reminders, tool defs) on non-invocation lines.
 on tool_use records — `"name":"mcp__gbrain__query|search|recall"` — and extract the adjacent
 `input.query` field; the Task 21 fixture must include a decoy tool-name-listing line to lock this in.
 
+- **Shape reconciliation (Task 21, 2026-07-03):** real lines nest tool calls under
+  `message.content[]` (`type=="tool_use"`, `name`, `input`) keyed by line-level `sessionId` —
+  NOT the flat recon shape. `mine.rs` parses the nested shape (two-layer: line → flattened
+  tool calls; string-form `content` lines skip cleanly); the committed fixture uses the real
+  nested shape with decoy tool-name mentions in text/tool_result items.
+
 ---
 
 ## Probe D — Anthropic audit preflight (Rev 2)
