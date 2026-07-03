@@ -38,12 +38,16 @@ pub fn mean_reciprocal_rank(ranks: &[GoldRank]) -> f64 {
 
 /// Percentile bootstrap CI for the mean at confidence `conf`, `iters` resamples from a SEEDED
 /// rng (determinism, spec §8). Empty data → (0.0, 0.0).
+/// Inputs must be finite; NaN values would otherwise be scored arbitrarily. `conf` must lie in
+/// (0,1) — outside it the percentile bounds invert.
 pub fn bootstrap_ci_mean<R: Rng>(
     data: &[f64],
     iters: usize,
     conf: f64,
     rng: &mut R,
 ) -> (f64, f64) {
+    debug_assert!(data.iter().all(|v| v.is_finite()), "bootstrap inputs must be finite");
+    debug_assert!(conf > 0.0 && conf < 1.0, "conf must be in (0,1)");
     if data.is_empty() || iters == 0 {
         return (0.0, 0.0);
     }
@@ -83,8 +87,16 @@ pub struct WilcoxonResult {
 /// Wilcoxon signed-rank on paired `(air[i], gbrain[i])`: rank |non-zero diffs| (average ranks
 /// for ties), sum ranks by sign, two-sided p via the normal approximation with tie correction
 /// (−Σ(t³−t)/2 in the variance) + continuity correction.
+/// Inputs must be finite; NaN pairs would otherwise be scored arbitrarily.
+///
+/// # Panics
+/// Panics when `air` and `gbrain` differ in length (the samples are PAIRED).
 pub fn wilcoxon_signed_rank(air: &[f64], gbrain: &[f64]) -> WilcoxonResult {
     assert_eq!(air.len(), gbrain.len(), "paired samples must be equal length");
+    debug_assert!(
+        air.iter().chain(gbrain.iter()).all(|v| v.is_finite()),
+        "wilcoxon inputs must be finite"
+    );
     let diffs: Vec<f64> = air
         .iter()
         .zip(gbrain.iter())
@@ -234,6 +246,31 @@ mod tests {
         assert_eq!(res_b.n_nonzero, 8);
         assert!((res_b.w_statistic - 13.5).abs() < 1e-9);
         assert!((res_b.p_value - 0.529651).abs() < 1e-4, "p={}", res_b.p_value);
+    }
+
+    #[test]
+    fn small_n_approx_boundary_at_25_nonzero_diffs() {
+        // The false side of `small_n_approx` (n_nonzero == 25, the first "reliable" size):
+        // 25 pairs, air each exactly 1.0 higher → 25 nonzero diffs.
+        let gbrain: Vec<f64> = (0..25).map(|i| i as f64).collect();
+        let air: Vec<f64> = gbrain.iter().map(|g| g + 1.0).collect();
+        let res = wilcoxon_signed_rank(&air, &gbrain);
+        assert_eq!(res.n_nonzero, 25);
+        assert!(!res.small_n_approx, "n=25 → approximation considered reliable");
+        // One below the boundary → flagged.
+        let res24 = wilcoxon_signed_rank(&air[..24], &gbrain[..24]);
+        assert_eq!(res24.n_nonzero, 24);
+        assert!(res24.small_n_approx, "n=24 < 25 → approximation flagged");
+    }
+
+    #[test]
+    fn bootstrap_zero_iters_returns_zero_bounds() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha8Rng;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        // iters == 0 with NON-empty data → the guard returns (0,0) instead of indexing an
+        // empty means vector.
+        assert_eq!(bootstrap_ci_mean(&[1.0], 0, 0.95, &mut rng), (0.0, 0.0));
     }
 
     #[test]
