@@ -6,6 +6,7 @@ pub mod corpus;
 pub mod daemon;
 pub mod frontmatter;
 pub mod ollama;
+pub mod resolve;
 // Module lines are added by their tasks, keeping every intermediate commit compiling:
 // pub mod frontmatter;  (Task 4)     pub mod corpus;   (Task 8)
 // pub mod ollama;       (Task 12)    pub mod daemon;   (Task 16)
