@@ -2,12 +2,21 @@
 //! PROBE-PINNED, spec §2 Rev 2), skip dot-entries, record a sha256 manifest. The
 //! `~/brain`-relative path stem is the arm-independent page identity (spec §5).
 
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::Context;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
+
+use crate::frontmatter::strip_frontmatter;
+
 /// Probe-A-pinned (Rev 2): strip frontmatter ONLY if GBrain strips it before chunking; if
 /// GBrain indexes frontmatter, both systems must index it. Default assumes GBrain strips —
 /// Task 1 confirms and the implementer flips this if reality differs.
 pub const STRIP_FRONTMATTER: bool = true;
-
-use serde::Serialize;
 
 /// One manifest entry: page id + sha256 of the bytes actually indexed + byte count.
 #[derive(Debug, Clone, Serialize)]
@@ -26,29 +35,35 @@ pub struct CorpusManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
-/// `~/brain`-relative path ("air/foo.md") → page id ("air/foo").
+/// `~/brain`-relative path ("air/foo.md") → page id ("air/foo"). The ".md" suffix is stripped
+/// case-insensitively, and the id is NFC-normalized so filesystem-provided names (which may
+/// arrive NFD, e.g. from HFS+) join GBrain's NFC slugs instead of failing silently.
 pub fn page_id_from_rel(rel: &str) -> String {
-    rel.strip_suffix(".md").unwrap_or(rel).to_string()
+    strip_md_suffix(rel).nfc().collect()
 }
 
 /// GBrain slug → the SAME page id space (Probe A pins slugs as stem form; a stray ".md" is
 /// tolerated so a match is never missed on a formatting quirk).
 pub fn page_id_from_gbrain_slug(slug: &str) -> String {
-    slug.strip_suffix(".md").unwrap_or(slug).to_string()
+    page_id_from_rel(slug)
 }
 
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use sha2::{Digest, Sha256};
-
-use crate::frontmatter::strip_frontmatter;
+/// Strip a trailing ".md" of any ASCII case ("x.md", "x.MD", "x.Md" → "x"). A matched suffix is
+/// pure ASCII, so the 3-byte cut is always a char boundary.
+fn strip_md_suffix(rel: &str) -> &str {
+    let n = rel.len();
+    if n >= 3 && rel.as_bytes()[n - 3..].eq_ignore_ascii_case(b".md") {
+        &rel[..n - 3]
+    } else {
+        rel
+    }
+}
 
 /// Lowercase hex of a digest (avoids pulling `hex` for one call site).
 pub fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(&mut s, "{b:02x}");
     }
     s
 }
@@ -57,6 +72,8 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 /// (`strip` is the probe-pinned `STRIP_FRONTMATTER`), skipping any entry whose name starts with
 /// '.' (files AND dirs), recording a sha256 manifest of the bytes ACTUALLY indexed. Sorted for
 /// reproducible manifests.
+///
+/// `dst` must be an empty/fresh directory — stale files are not detected or manifested.
 pub fn prepare_corpus(src: &Path, dst: &Path, strip: bool) -> anyhow::Result<CorpusManifest> {
     let mut rels: Vec<PathBuf> = Vec::new();
     collect_md(src, src, &mut rels)?;
@@ -65,37 +82,67 @@ pub fn prepare_corpus(src: &Path, dst: &Path, strip: bool) -> anyhow::Result<Cor
     let mut entries = Vec::with_capacity(rels.len());
     let mut total_bytes = 0u64;
     for rel in &rels {
-        let raw = std::fs::read_to_string(src.join(rel))?;
+        let src_path = src.join(rel);
+        let raw = std::fs::read_to_string(&src_path)
+            .with_context(|| format!("reading {}", src_path.display()))?;
         let text = if strip { strip_frontmatter(&raw).to_string() } else { raw };
         let out_path = dst.join(rel);
         if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
-        std::fs::write(&out_path, text.as_bytes())?;
+        std::fs::write(&out_path, text.as_bytes())
+            .with_context(|| format!("writing {}", out_path.display()))?;
         let sha256 = hex_lower(&Sha256::digest(text.as_bytes()));
         let bytes = text.len() as u64;
         total_bytes += bytes;
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         entries.push(ManifestEntry { page_id: page_id_from_rel(&rel_str), sha256, bytes });
     }
-    let snapshot_unix_secs =
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let snapshot_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .expect("system clock before 1970");
     Ok(CorpusManifest { snapshot_unix_secs, file_count: entries.len(), total_bytes, entries })
 }
 
-/// Depth-first collect of `*.md` RELATIVE paths, skipping dot-entries at every level.
+/// Depth-first collect of `*.md` RELATIVE paths (extension matched case-insensitively), skipping
+/// dot-entries at every level. Symlinks are skipped, never followed — no link cycles, and no
+/// file outside `root` can be indexed under a root-relative id.
 fn collect_md(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    let iter =
+        std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))?;
+    for entry in iter {
+        let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
+        // file_type() does NOT follow symlinks — dispatch on the link itself, not its target.
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type of {}", entry.path().display()))?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_md(root, &path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+        {
+            // A walked path not under `root` means the id would be wrong AND `dst.join(rel)`
+            // with an absolute `rel` would discard `dst` — fail hard toward safety.
+            let rel = path.strip_prefix(root).map_err(|e| {
+                anyhow::anyhow!(
+                    "path {} escaped corpus root {}: {e}",
+                    path.display(),
+                    root.display()
+                )
+            })?;
+            out.push(rel.to_path_buf());
         }
     }
     Ok(())
@@ -148,6 +195,69 @@ mod tests {
         assert!(!dst.path().join("air/notes.txt").exists());
         use sha2::{Digest, Sha256};
         assert_eq!(manifest.entries[0].sha256, hex_lower(&Sha256::digest(b"# Foo\nbody\n")));
+    }
+
+    #[test]
+    fn page_id_normalizes_unicode_to_nfc() {
+        use unicode_normalization::UnicodeNormalization;
+        // Construct the NFD form programmatically so this source file stays NFC-clean.
+        let nfd: String = "concepts/투자일임업.md".nfd().collect();
+        let nfc = "concepts/투자일임업";
+        assert_ne!(nfd, format!("{nfc}.md"), "fixture must actually be decomposed");
+        assert_eq!(page_id_from_rel(&nfd), nfc);
+        assert_eq!(page_id_from_gbrain_slug(nfc), page_id_from_rel(&nfd));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_skipped_never_followed() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("real")).unwrap();
+        fs::write(src.path().join("real/note.md"), "# real\n").unwrap();
+        // A tree OUTSIDE the corpus root, reachable only via symlinks: one dir link, one file link.
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("evil.md"), "# outside\n").unwrap();
+        symlink(outside.path(), src.path().join("linkdir")).unwrap();
+        symlink(outside.path().join("evil.md"), src.path().join("linkfile.md")).unwrap();
+
+        let manifest = prepare_corpus(src.path(), dst.path(), true).unwrap();
+
+        assert_eq!(manifest.file_count, 1);
+        assert_eq!(manifest.entries[0].page_id, "real/note");
+    }
+
+    #[test]
+    fn manifest_is_sorted_and_skips_nested_dot_dirs() {
+        use std::fs;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("b.md"), "b\n").unwrap();
+        fs::write(src.path().join("a.md"), "a\n").unwrap();
+        fs::create_dir_all(src.path().join("air/.trash")).unwrap();
+        fs::write(src.path().join("air/.trash/x.md"), "x\n").unwrap();
+        fs::write(src.path().join("air/z.md"), "z\n").unwrap();
+
+        let manifest = prepare_corpus(src.path(), dst.path(), false).unwrap();
+
+        let ids: Vec<&str> = manifest.entries.iter().map(|e| e.page_id.as_str()).collect();
+        assert_eq!(ids, ["a", "air/z", "b"], "manifest order must be exactly sorted");
+        assert!(!dst.path().join("air/.trash").exists());
+    }
+
+    #[test]
+    fn uppercase_md_extension_is_collected() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("NOTES.MD"), "# notes\n").unwrap();
+
+        let manifest = prepare_corpus(src.path(), dst.path(), false).unwrap();
+
+        assert_eq!(manifest.file_count, 1);
+        // Page id keeps the original case minus the suffix (stripped case-insensitively).
+        assert_eq!(manifest.entries[0].page_id, "NOTES");
     }
 
     #[test]

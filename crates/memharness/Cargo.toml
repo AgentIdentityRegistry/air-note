@@ -36,6 +36,9 @@ rand = "0.8"
 rand_chacha = "0.3"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# Already in Cargo.lock via the workspace (0.1.25) — zero new crate versions. Needed so page
+# ids join across NFD/NFC filename forms (HFS+ or other tools may hand us NFD names).
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

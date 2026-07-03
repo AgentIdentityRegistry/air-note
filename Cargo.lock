@@ -3654,6 +3654,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "unicode-normalization",
  "ureq 2.12.1",
 ]
 
