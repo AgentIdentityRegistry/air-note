@@ -510,18 +510,26 @@ pub async fn spawn_for_test(sock_path: std::path::PathBuf, home: std::path::Path
     tokio::spawn(run_accept_loop(engine, listener));
 }
 
-/// Build a hermetic `EngineHandle` for tests: an in-memory vault + mock embedder + mock reasoner.
-/// Uses `bossclaw_core::MockEmbedder`/`ScriptedReasoner` (both public, non-cfg-gated in core) so
-/// the integration test — which can't reach the lib's `#[cfg(test)]` mock providers — still gets a
+/// Build a hermetic `EngineHandle` for tests: in-memory vault + mock embedder + mock reasoner.
+/// Uses `bossclaw_core::MockEmbedder`/`ScriptedReasoner` (public, non-cfg-gated in core) so the
+/// integration test — which can't reach the lib's `#[cfg(test)]` mock providers — still gets a
 /// keychain-free engine.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn test_engine(home: std::path::PathBuf) -> EngineHandle {
-    EngineHandle::new(
-        Arc::new(TestVault::default()),
-        home,
-        Arc::new(TestEmbedderProvider),
-        Arc::new(TestReasonerProvider),
-    )
+    test_engine_with_embedder(home, Arc::new(TestEmbedderProvider))
+}
+
+/// Like [`test_engine`] but with a CALLER-SUPPLIED embedder provider. Added for `memharness`
+/// (memory-strategy Phase 0): the harness must measure the REAL production embedder
+/// (`engine::embed::ResourceModel2Vec`), not the dim-8 mock — while keeping the in-memory
+/// vault (keychain-free) and the scripted reasoner (no evolve, no reasoner egress). Behind
+/// `test-helpers` like its sibling; never reaches production builds.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn test_engine_with_embedder(
+    home: std::path::PathBuf,
+    embedder: Arc<dyn crate::engine::embed::EmbedderProvider>,
+) -> EngineHandle {
+    EngineHandle::new(Arc::new(TestVault::default()), home, embedder, Arc::new(TestReasonerProvider))
 }
 
 /// An in-memory `SecretsVault` for tests — NEVER touches the OS keychain.

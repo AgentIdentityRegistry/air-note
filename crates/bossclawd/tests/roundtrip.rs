@@ -482,3 +482,53 @@ async fn apply_proposal_loud_confirm_roundtrip() {
         "the ack let the loud write through",
     );
 }
+
+// ── test-helpers seam: a caller-supplied embedder provider reaches the engine (memharness
+//    Phase 0 needs to inject the PRODUCTION ResourceModel2Vec; this proves the seam with a
+//    distinguishable custom mock). ──
+
+/// A custom provider with a non-default dimension, so passing it through is observable.
+struct WideMockEmbedderProvider;
+impl bossclawd::engine::embed::EmbedderProvider for WideMockEmbedderProvider {
+    fn embedder(
+        &self,
+    ) -> Result<std::sync::Arc<dyn bossclaw_core::Embedder>, bossclawd::engine::EngineOpError> {
+        Ok(std::sync::Arc::new(bossclaw_core::MockEmbedder::new(16)))
+    }
+}
+
+#[tokio::test]
+async fn custom_embedder_provider_reaches_recall_over_the_wire() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
+    bossclawd::vault::seed_secret_cache_for_test(Default::default());
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("bossclawd.sock");
+    let engine = std::sync::Arc::new(bossclawd::server::test_engine_with_embedder(
+        dir.path().to_path_buf(),
+        std::sync::Arc::new(WideMockEmbedderProvider),
+    ));
+    let listener = UnixListener::bind(&sock_path).expect("bind test socket");
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    tokio::spawn(bossclawd::server::run_accept_loop(engine, listener));
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("a.txt"), "ferris the crab loves rust").unwrap();
+    let mut client = Client::connect(&sock_path).await;
+    assert!(matches!(
+        client.call(Request::AddGrant { onboarded: true, path: src.path().to_path_buf() }).await,
+        Response::Ok
+    ));
+    assert!(matches!(
+        client.call(Request::RunIngest { onboarded: true }).await,
+        Response::RunIngest(_)
+    ));
+    match client.call(Request::Recall { onboarded: true, query: "ferris crab".into(), k: 5 }).await {
+        Response::Recall(hits) => {
+            assert!(hits.iter().any(|h| h.text.contains("ferris")),
+                "recall works with the injected provider");
+        }
+        other => panic!("expected Recall, got {other:?}"),
+    }
+}
