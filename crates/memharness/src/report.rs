@@ -85,9 +85,10 @@ fn canonicalize_nearest_existing(p: &Path) -> PathBuf {
     loop {
         if existing.as_os_str().is_empty() {
             // Walk exhausted with nothing canonicalizable. Returning the input is safe ONLY
-            // because `p` is guaranteed absolute (ensure_outside_repo absolutizes first): an
-            // absolute path that cannot be canonicalized at any level still compares correctly
-            // component-wise against the absolute forbidden root. A RELATIVE input here would
+            // because `p` is guaranteed absolute (ensure_outside_repo absolutizes first) AND
+            // the caller rejects unresolved `..` components after this returns — a lexical
+            // `..` in the tail would otherwise defeat the component-wise prefix check while
+            // the filesystem still resolves it at write time. A RELATIVE input here would
             // fail-open — it can never `starts_with` an absolute root.
             return p.to_path_buf();
         }
@@ -98,7 +99,7 @@ fn canonicalize_nearest_existing(p: &Path) -> PathBuf {
         match existing.parent() {
             Some(parent) => existing = parent,
             // No parent left (filesystem root). Same justification as above: safe only because
-            // `p` is absolute, so the prefix check still compares absolute-vs-absolute.
+            // `p` is absolute AND the caller rejects unresolved `..` components afterwards.
             None => return p.to_path_buf(),
         }
     }
@@ -126,6 +127,17 @@ pub fn ensure_outside_repo(reports_dir: &Path, repo_root: &Path) -> anyhow::Resu
         .map(|p| p.to_path_buf())
         .unwrap_or(repo_canon);
     let resolved = canonicalize_nearest_existing(&reports_dir);
+    // canonicalize output never contains `..` — a ParentDir here means the tail could not be
+    // resolved and would be re-interpreted by the FILESYSTEM at write time (mkdir resolves
+    // `..` through the created prefix), so the lexical prefix check below is unsound for it.
+    // FAIL CLOSED. (This also turns the symmetric over-block — `..` after an existing repo
+    // prefix that actually escapes — into an explicit refusal instead of a silent one.)
+    if resolved.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        anyhow::bail!(
+            "reports dir {resolved:?} contains an unresolved `..` after a nonexistent component — \
+             refusing (cannot prove it stays outside the repo)"
+        );
+    }
     if resolved.starts_with(&forbidden) {
         anyhow::bail!(
             "refusing to write reports inside the repo ({resolved:?} is under {forbidden:?}); \
@@ -393,6 +405,24 @@ mod tests {
         std::env::set_current_dir(workspace_root()).unwrap();
         let verdict = ensure_outside_repo(Path::new("nonexistent-probe-reports"), repo_root);
         assert!(verdict.is_err(), "relative path resolved against the repo CWD must be refused");
+    }
+
+    #[test]
+    fn dotdot_after_nonexistent_component_cannot_bypass_the_guard() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ws = workspace_root();
+        // Absolute path: nonexistent component, then `..` hopping into the workspace.
+        let sneaky = ws
+            .parent()
+            .unwrap()
+            .join("nonexistent-xyz/../")
+            .join(ws.file_name().unwrap())
+            .join("leak-reports");
+        assert!(sneaky.is_absolute());
+        assert!(
+            ensure_outside_repo(&sneaky, repo_root).is_err(),
+            "lexical `..` tail must be refused: {sneaky:?}"
+        );
     }
 
     #[test]
