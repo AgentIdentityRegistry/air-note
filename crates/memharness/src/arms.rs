@@ -243,6 +243,35 @@ struct GbrainStats {
     page_count: usize,
 }
 
+/// LOUD gbrain preflight: one `gbrain call get_stats '{}'` through the same deadline helper,
+/// ERRORING on any failure — a missing binary or locked DB fails in seconds, before any
+/// expensive work (the ~1h synth stage). Returns the indexed page count so the caller can run
+/// the early drift check. Contrast `gbrain_version_and_count`, which stays QUIET (None) for
+/// the report — this one is the fail-fast gate. Live-only (subprocess); the parse it shares
+/// (`GbrainStats`) is unit-covered via `gbrain_version_and_count`'s fixture-pinned shape.
+pub fn gbrain_preflight() -> anyhow::Result<usize> {
+    let mut cmd = std::process::Command::new("gbrain");
+    cmd.arg("call").arg("get_stats").arg("{}").env("GBRAIN_SOURCE", "default");
+    let out = output_with_deadline(
+        &mut cmd,
+        std::time::Duration::from_secs(GBRAIN_CALL_TIMEOUT_SECS),
+    )
+    .map_err(|e| anyhow::anyhow!("gbrain preflight failed: {e} (is `gbrain` on PATH?)"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "gbrain preflight (`gbrain call get_stats`) exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let stats: GbrainStats = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+        .map_err(|e| anyhow::anyhow!(
+            "gbrain get_stats output did not parse ({e}) — format may have changed \
+             (re-check Probe A)"
+        ))?;
+    Ok(stats.page_count)
+}
+
 /// `gbrain --version` + indexed page count for the drift check (spec §2 Rev 2). Count via
 /// `gbrain call get_stats '{}'` (Probe-A-pinned field `page_count`; live value 895 on
 /// 2026-07-03); any failure → None — honest "drift unknown", never a guess.

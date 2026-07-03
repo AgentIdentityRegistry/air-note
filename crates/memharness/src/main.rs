@@ -5,11 +5,13 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
+use memharness::arms::{AirRetriever, Answerer, GbrainRetriever, RetrievedHit};
 use memharness::corpus::CorpusManifest;
 use memharness::frontmatter::Lang;
-use memharness::judge::PairJudge;
+use memharness::judge::{PairJudge, PosPick};
 use memharness::run::{cases_from, QueryCase, QuerySource, RunConfig};
 use memharness::synth::{PageRef, QueryGenerator};
 
@@ -87,6 +89,10 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         memharness::anthropic::preflight(&key)?; // one-token call — a bad key/model dies HERE
         Some(key)
     };
+    // Loud gbrain preflight (review follow-up): a missing binary or locked DB fails in ~5s
+    // here, not after the ~1h synth stage. The count also feeds the EARLY drift bail below.
+    let gbrain_pages = memharness::arms::gbrain_preflight()?;
+    eprintln!("memharness: gbrain preflight OK — {gbrain_pages} pages indexed");
 
     // ── Daemon with the REAL embedder (spec §1 Rev 2 — never the mock on the live path). ──
     let mut daemon = memharness::daemon::HarnessDaemon::spawn_real()?;
@@ -103,6 +109,21 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         anyhow::bail!("corpus at {corpus_src:?} contains no .md pages");
     }
     eprintln!("memharness: corpus prepared — {} pages, {} bytes", manifest.file_count, manifest.total_bytes);
+    // Early drift bail (review follow-up): additive INSURANCE — the end-of-run measurement
+    // still lands in the report; this refuses to SPEND the run budget on a result already
+    // known to be INVALID. (Structural baseline today: 867 harness pages vs 895 indexed
+    // ≈ 3.2% — under the threshold, but with <2% headroom.)
+    let drift = (gbrain_pages as f64 - manifest.file_count as f64).abs()
+        / manifest.file_count.max(1) as f64;
+    if drift > memharness::report::DRIFT_INVALID_FRACTION {
+        anyhow::bail!(
+            "corpus drift {:.1}% > {:.0}% — the run would render INVALID; re-sync GBrain (or \
+             investigate exclusion asymmetry: dot-entries/symlinks/non-md are skipped by the \
+             harness) before spending the run budget",
+            drift * 100.0,
+            memharness::report::DRIFT_INVALID_FRACTION * 100.0
+        );
+    }
 
     // ── Ingest over the wire + build the event→page bridge (spec §5 Rev 2). ──
     let stage = std::time::Instant::now();
@@ -122,11 +143,16 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let cases = build_query_cases(&args, &manifest, &corpus_home)?;
     eprintln!("memharness: {} query cases built", cases.len());
 
-    // ── Seams. ──
-    let mut air = memharness::arms::LiveAirArm::new(rt, client, resolver);
-    let gbrain = memharness::arms::GbrainCli { mode: None };
-    let answerer = memharness::arms::OllamaAnswerer { model: args.model.clone() };
-    let judge = memharness::judge::OllamaJudge { model: args.model.clone() };
+    // ── Seams (wrapped in the live-only visibility decorators below). ──
+    let mut air = HeartbeatAir {
+        inner: memharness::arms::LiveAirArm::new(rt, client, resolver),
+        done: 0,
+        total: cases.len(),
+        started: std::time::Instant::now(),
+    };
+    let gbrain = GbrainWithContext(memharness::arms::GbrainCli { mode: None });
+    let answerer = AnswererWithContext(memharness::arms::OllamaAnswerer { model: args.model.clone() });
+    let judge = JudgeWithContext(memharness::judge::OllamaJudge { model: args.model.clone() });
     let auditor = api_key.map(|api_key| memharness::anthropic::AnthropicAuditor { api_key });
     let cfg = RunConfig { k: args.k, seed: args.seed, local_only: args.local_only };
 
@@ -172,6 +198,87 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Live-only seam decorators (review follow-up). run.rs stays byte-pinned; these wrap the
+// live seams HERE so a ~2h run is observable (query N/M heartbeat) and a mid-run failure
+// names its position/query. They add VISIBILITY, not recovery — fail-loud is preserved:
+// every error still propagates, just with context attached. ──
+
+/// Heartbeat cadence: print on the first AIR call and every Nth after.
+const HEARTBEAT_EVERY: usize = 25;
+
+/// Query-preview length for error context (chars, not bytes — KO-safe).
+const QUERY_PREVIEW_CHARS: usize = 120;
+
+/// Char-boundary-safe query preview for error messages.
+fn query_preview(q: &str) -> String {
+    if q.chars().count() > QUERY_PREVIEW_CHARS {
+        let cut: String = q.chars().take(QUERY_PREVIEW_CHARS).collect();
+        format!("{cut}…")
+    } else {
+        q.to_string()
+    }
+}
+
+/// AIR-arm decorator: progress heartbeat + positional error context. The AIR arm leads every
+/// per-query iteration in `run_queries`, so its call count IS the run's progress counter.
+struct HeartbeatAir {
+    inner: memharness::arms::LiveAirArm,
+    done: usize,
+    total: usize,
+    started: std::time::Instant,
+}
+
+impl AirRetriever for HeartbeatAir {
+    fn retrieve(&mut self, query: &str, k: usize) -> anyhow::Result<Vec<RetrievedHit>> {
+        self.done += 1;
+        if self.done == 1 || self.done.is_multiple_of(HEARTBEAT_EVERY) {
+            eprintln!(
+                "memharness: query {}/{} ({:.0}s elapsed)",
+                self.done,
+                self.total,
+                self.started.elapsed().as_secs_f64()
+            );
+        }
+        self.inner
+            .retrieve(query, k)
+            .with_context(|| format!("AIR retrieval failed on query {}/{}", self.done, self.total))
+    }
+}
+
+/// GBrain-arm decorator: error context naming the query (no counting).
+struct GbrainWithContext(memharness::arms::GbrainCli);
+
+impl GbrainRetriever for GbrainWithContext {
+    fn retrieve(&self, query: &str, k: usize) -> anyhow::Result<Vec<RetrievedHit>> {
+        self.0
+            .retrieve(query, k)
+            .with_context(|| format!("GBrain retrieval failed on query: {}", query_preview(query)))
+    }
+}
+
+/// Answerer decorator: error context naming the query (no counting).
+struct AnswererWithContext(memharness::arms::OllamaAnswerer);
+
+impl Answerer for AnswererWithContext {
+    fn answer(&self, query: &str, context: &str) -> anyhow::Result<String> {
+        self.0
+            .answer(query, context)
+            .with_context(|| format!("answerer failed on query: {}", query_preview(query)))
+    }
+}
+
+/// Local-judge decorator: error context naming the query (no counting). The cloud auditor is
+/// NOT wrapped — `run_queries` already names the failing pair index on audit errors.
+struct JudgeWithContext(memharness::judge::OllamaJudge);
+
+impl PairJudge for JudgeWithContext {
+    fn pick(&self, query: &str, answer_a: &str, answer_b: &str) -> anyhow::Result<Option<PosPick>> {
+        self.0
+            .pick(query, answer_a, answer_b)
+            .with_context(|| format!("local judge failed on query: {}", query_preview(query)))
+    }
+}
+
 /// Mined real queries (every transcript under ~/.claude/projects) + seeded stratified
 /// synthetic generation over the prepared corpus.
 fn build_query_cases(
@@ -191,6 +298,12 @@ fn build_query_cases(
     eprintln!("memharness: {} transcript files read", docs.len());
     let mined = memharness::mine::mine_all(docs.iter().map(String::as_str));
     eprintln!("memharness: {} real queries after dedup", mined.len());
+    if mined.is_empty() {
+        eprintln!(
+            "memharness: WARNING — zero real queries mined; transcript shape may have drifted \
+             (re-check Probe C); proceeding synth-only"
+        );
+    }
     log_stage_secs("transcript mining", stage);
 
     // Synthetic: language per page from its prepared text; seeded stratified selection.
@@ -201,6 +314,9 @@ fn build_query_cases(
         .entries
         .iter()
         .map(|e| {
+            // Path reconstruction from the NFC-normalized page id relies on APFS being
+            // case/normalization-insensitive; a read failure defaults to En silently
+            // (acceptable: macOS-only dev tool).
             let text = std::fs::read_to_string(corpus_home.join(format!("{}.md", e.page_id)))
                 .unwrap_or_default();
             let lang = match memharness::frontmatter::detect_lang(&text) {
