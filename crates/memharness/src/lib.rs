@@ -5,6 +5,7 @@ pub mod client;
 pub mod corpus;
 pub mod daemon;
 pub mod frontmatter;
+pub mod judge;
 pub mod mine;
 pub mod ollama;
 pub mod resolve;
