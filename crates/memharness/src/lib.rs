@@ -2,6 +2,7 @@
 //! tests. DEV-ONLY (see Cargo.toml header); never ships.
 #![forbid(unsafe_code)]
 pub mod anthropic;
+pub mod arms;
 pub mod client;
 pub mod corpus;
 pub mod daemon;
