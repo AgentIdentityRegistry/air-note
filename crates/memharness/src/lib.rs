@@ -1,6 +1,7 @@
 //! memharness library surface — shared by the binary (`main.rs`) and the hermetic integration
 //! tests. DEV-ONLY (see Cargo.toml header); never ships.
 #![forbid(unsafe_code)]
+pub mod client;
 pub mod corpus;
 pub mod daemon;
 pub mod frontmatter;
