@@ -37,7 +37,7 @@ impl PageResolver {
             let rel = r
                 .canonical_path
                 .strip_prefix(&root_str)
-                .map(|s| s.trim_start_matches('/'))
+                .and_then(|s| s.strip_prefix('/'))
                 .ok_or_else(|| anyhow::anyhow!(
                     "ingested file {} is outside the corpus root {root_str}",
                     r.canonical_path
@@ -97,5 +97,20 @@ mod tests {
         let canon_other = std::fs::canonicalize(other.path()).unwrap();
         let records = vec![record(&canon_other, "x.md", "ev1")];
         assert!(PageResolver::from_file_records(&records, root.path()).is_err());
+
+        // Degenerate equal-path case: a record whose canonical_path EQUALS the canonicalized
+        // root itself has no '/' boundary after the prefix (it is not a file UNDER the root)
+        // and must fail loud instead of minting a page id from an empty rel path.
+        let canon_root = std::fs::canonicalize(root.path()).unwrap();
+        let equal = vec![FileRecordMirror {
+            canonical_path: canon_root.to_string_lossy().to_string(),
+            file_event_id: "ev-root".to_string(),
+            content_hash: "h".to_string(),
+            grant_root: canon_root.to_string_lossy().to_string(),
+        }];
+        assert!(
+            PageResolver::from_file_records(&equal, root.path()).is_err(),
+            "canonical_path == corpus root must be an error"
+        );
     }
 }

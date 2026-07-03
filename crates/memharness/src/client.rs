@@ -53,6 +53,7 @@ impl WireClient {
     pub async fn add_grant(&mut self, path: &Path) -> anyhow::Result<()> {
         match self.call(Request::AddGrant { onboarded: true, path: path.to_path_buf() }).await? {
             Response::Ok => Ok(()),
+            Response::Err { kind, message } => anyhow::bail!("AddGrant failed: {kind:?}: {message}"),
             other => anyhow::bail!("AddGrant → unexpected {other:?}"),
         }
     }
@@ -61,6 +62,7 @@ impl WireClient {
     pub async fn run_ingest(&mut self) -> anyhow::Result<IngestReportMirror> {
         match self.call(Request::RunIngest { onboarded: true }).await? {
             Response::RunIngest(r) => Ok(r),
+            Response::Err { kind, message } => anyhow::bail!("RunIngest failed: {kind:?}: {message}"),
             other => anyhow::bail!("RunIngest → unexpected {other:?}"),
         }
     }
@@ -70,6 +72,7 @@ impl WireClient {
     pub async fn list_files(&mut self) -> anyhow::Result<Vec<FileRecordMirror>> {
         match self.call(Request::ListFiles { onboarded: true }).await? {
             Response::ListFiles(files) => Ok(files),
+            Response::Err { kind, message } => anyhow::bail!("ListFiles failed: {kind:?}: {message}"),
             other => anyhow::bail!("ListFiles → unexpected {other:?}"),
         }
     }
@@ -78,6 +81,7 @@ impl WireClient {
     pub async fn recall(&mut self, query: &str, k: usize) -> anyhow::Result<Vec<HitWire>> {
         match self.call(Request::Recall { onboarded: true, query: query.to_string(), k }).await? {
             Response::Recall(hits) => Ok(hits),
+            Response::Err { kind, message } => anyhow::bail!("Recall failed: {kind:?}: {message}"),
             other => anyhow::bail!("Recall → unexpected {other:?}"),
         }
     }
