@@ -12,6 +12,7 @@ pub mod mine;
 pub mod ollama;
 pub mod resolve;
 pub mod stats;
+pub mod synth;
 // Module lines are added by their tasks, keeping every intermediate commit compiling:
 // pub mod frontmatter;  (Task 4)     pub mod corpus;   (Task 8)
 // pub mod ollama;       (Task 12)    pub mod daemon;   (Task 16)
