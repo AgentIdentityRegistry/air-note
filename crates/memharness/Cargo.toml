@@ -39,6 +39,7 @@ anyhow = "1"
 # Already in Cargo.lock via the workspace (0.1.25) — zero new crate versions. Needed so page
 # ids join across NFD/NFC filename forms (HFS+ or other tools may hand us NFD names).
 unicode-normalization = "0.1"
-
-[dev-dependencies]
+# A NORMAL dependency (not dev) for the same reason as `test-helpers` above: the live run needs
+# it at RUNTIME — `HarnessDaemon` holds the per-run temp home + socket in a `tempfile::TempDir`.
+# Already in Cargo.lock via the workspace — zero new crate versions.
 tempfile = "3"

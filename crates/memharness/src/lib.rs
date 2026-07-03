@@ -2,6 +2,7 @@
 //! tests. DEV-ONLY (see Cargo.toml header); never ships.
 #![forbid(unsafe_code)]
 pub mod corpus;
+pub mod daemon;
 pub mod frontmatter;
 pub mod ollama;
 // Module lines are added by their tasks, keeping every intermediate commit compiling:
