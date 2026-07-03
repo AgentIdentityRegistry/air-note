@@ -113,7 +113,9 @@ impl HarnessDaemon {
                         return;
                     }
                 };
-                // Pin 0600 (owner-only), matching production bind_socket_0600.
+                // Pin 0600 (owner-only), matching production bind_socket_0600. The brief
+                // bind→chmod window is contained: the tempdir parent is 0700 (tempfile on
+                // Unix), so no other user can traverse to the socket in the meantime.
                 if let Err(e) = std::fs::set_permissions(
                     &sock_buf,
                     std::fs::Permissions::from_mode(0o600),
@@ -135,7 +137,7 @@ impl HarnessDaemon {
             });
             // Runtime dropped at end of scope → all daemon tasks gone.
         });
-        bound_rx.recv().map_err(|_| anyhow::anyhow!("daemon thread died before binding"))??;
+        bound_rx.recv().map_err(|_| anyhow::anyhow!("daemon thread died during startup"))??;
         Ok(DaemonRuntime { shutdown, thread })
     }
 
@@ -150,11 +152,16 @@ impl HarnessDaemon {
     }
 
     /// Fully kill the daemon: notify shutdown, join the thread (drops the runtime + every
-    /// connection task), remove the socket file.
+    /// connection task), remove the socket file. Idempotent (`rt.take()`).
     pub fn kill(&mut self) {
         if let Some(rt) = self.rt.take() {
-            rt.shutdown.notify_waiters();
-            let _ = rt.thread.join();
+            // notify_one, NOT notify_waiters: notify_one banks a permit when no waiter is
+            // registered yet, so a kill racing the daemon thread's first `notified()` poll
+            // can never be lost (notify_waiters stores no permit and would wedge join()).
+            rt.shutdown.notify_one();
+            if rt.thread.join().is_err() {
+                eprintln!("memharness: daemon thread panicked (its runtime is still torn down)");
+            }
         }
         let _ = std::fs::remove_file(&self.sock);
     }
@@ -162,10 +169,7 @@ impl HarnessDaemon {
 
 impl Drop for HarnessDaemon {
     fn drop(&mut self) {
-        if let Some(rt) = self.rt.take() {
-            rt.shutdown.notify_waiters();
-            let _ = rt.thread.join();
-        }
+        self.kill();
     }
 }
 

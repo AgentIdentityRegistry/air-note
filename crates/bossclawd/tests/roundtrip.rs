@@ -485,14 +485,19 @@ async fn apply_proposal_loud_confirm_roundtrip() {
 
 // ── test-helpers seam: a caller-supplied embedder provider reaches the engine (memharness
 //    Phase 0 needs to inject the PRODUCTION ResourceModel2Vec; this proves the seam with a
-//    distinguishable custom mock). ──
+//    call-count spy provider the engine is observed consulting). ──
 
-/// A custom provider with a non-default dimension, so passing it through is observable.
-struct WideMockEmbedderProvider;
+/// A custom provider with a call-count spy: `embedder()` bumps the shared counter, so the test
+/// can PROVE the engine consulted the injected provider — a seam that silently dropped the
+/// parameter and fell back to the default provider would leave the counter at 0 and fail.
+struct WideMockEmbedderProvider {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 impl bossclawd::engine::embed::EmbedderProvider for WideMockEmbedderProvider {
     fn embedder(
         &self,
     ) -> Result<std::sync::Arc<dyn bossclaw_core::Embedder>, bossclawd::engine::EngineOpError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(std::sync::Arc::new(bossclaw_core::MockEmbedder::new(16)))
     }
 }
@@ -505,9 +510,10 @@ async fn custom_embedder_provider_reaches_recall_over_the_wire() {
     bossclawd::vault::seed_secret_cache_for_test(Default::default());
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("bossclawd.sock");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let engine = std::sync::Arc::new(bossclawd::server::test_engine_with_embedder(
         dir.path().to_path_buf(),
-        std::sync::Arc::new(WideMockEmbedderProvider),
+        std::sync::Arc::new(WideMockEmbedderProvider { calls: calls.clone() }),
     ));
     let listener = UnixListener::bind(&sock_path).expect("bind test socket");
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -524,6 +530,10 @@ async fn custom_embedder_provider_reaches_recall_over_the_wire() {
         client.call(Request::RunIngest { onboarded: true }).await,
         Response::RunIngest(_)
     ));
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the INJECTED provider must be the one the engine consulted"
+    );
     match client.call(Request::Recall { onboarded: true, query: "ferris crab".into(), k: 5 }).await {
         Response::Recall(hits) => {
             assert!(hits.iter().any(|h| h.text.contains("ferris")),
