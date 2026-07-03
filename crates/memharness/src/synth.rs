@@ -1,6 +1,9 @@
-//! Synthetic known-item queries: 1–2 per SAMPLED page, stratified across top-level category
-//! dirs AND language, source page = gold (spec §3). Page SELECTION is seeded + deterministic;
-//! generation is a trait seam (tests never need Ollama).
+//! Synthetic known-item queries: 1–2 per SAMPLED page, stratified by top-level category dir
+//! (seeded round-robin); language is carried per-page and measured POST-HOC as report
+//! segments — KO coverage depends on the categories picked, so the run reports per-language
+//! sample counts (an underpowered KO segment is visible, never silent). Source page = gold
+//! (spec §3). Page SELECTION is seeded + deterministic; generation is a trait seam (tests
+//! never need Ollama).
 
 use std::collections::BTreeMap;
 
@@ -22,13 +25,20 @@ pub struct SynthQuery {
     pub lang: String,
 }
 
+/// Bucket key for page ids with no '/' — ONE shared bucket, so a handful of root-level
+/// index/meta pages don't each become a guaranteed round-1 singleton pick.
+const ROOT_BUCKET: &str = "(root)";
+
 /// Deterministically select up to `total` pages, stratified by top-level category dir:
 /// round-robin one page per category (seeded shuffle within each) until `total` — every
 /// category with pages is represented before any gets a second pick.
 pub fn stratified_sample<R: Rng>(pages: &[PageRef], total: usize, rng: &mut R) -> Vec<PageRef> {
     let mut buckets: BTreeMap<String, Vec<PageRef>> = BTreeMap::new();
     for p in pages {
-        let cat = p.page_id.split('/').next().unwrap_or("").to_string();
+        let cat = match p.page_id.split_once('/') {
+            Some((cat, _)) => cat.to_string(),
+            None => ROOT_BUCKET.to_string(),
+        };
         buckets.entry(cat).or_default().push(p.clone());
     }
     for v in buckets.values_mut() {
@@ -65,6 +75,11 @@ pub trait QueryGenerator {
     fn generate_queries(&self, page: &PageRef, page_text: &str) -> anyhow::Result<Vec<SynthQuery>>;
 }
 
+/// Char cap on the page excerpt fed to the query generator — keeps 7B prompts bounded.
+/// Semantically unrelated to `arms::PER_SNIPPET_CHAR_CAP` (a retrieval-packing cap) — do
+/// NOT alias them.
+const GENERATOR_EXCERPT_CHAR_CAP: usize = 4000;
+
 /// Live generator: asks the local model for ONE specific question the page answers, in the
 /// page's language (Korean pages get Korean queries, spec §3).
 pub struct OllamaQueryGenerator {
@@ -78,7 +93,7 @@ impl QueryGenerator for OllamaQueryGenerator {
         } else {
             "Write the question in English."
         };
-        let excerpt: String = page_text.chars().take(4000).collect();
+        let excerpt: String = page_text.chars().take(GENERATOR_EXCERPT_CHAR_CAP).collect();
         let prompt = format!(
             "Read the note below. Write ONE specific question that this note (and ideally only \
              this note) answers. {lang_instr} Output only the question.\n\nNote:\n{excerpt}\n"
@@ -103,17 +118,24 @@ mod tests {
             ("air/a", "en"), ("air/b", "en"), ("air/c", "en"),
             ("people/d", "en"), ("people/e", "en"),
             ("ko/f", "ko"),
+            ("claude", "en"), ("concepts", "en"), // no '/' — must SHARE one "(root)" bucket
         ]
         .into_iter()
         .map(|(id, l)| PageRef { page_id: id.into(), lang: l.into() })
         .collect();
         let mut r1 = ChaCha8Rng::seed_from_u64(42);
         let mut r2 = ChaCha8Rng::seed_from_u64(42);
+        // total = number of buckets {air, people, ko, (root)} → round 1 picks one per bucket.
         let sel1 = stratified_sample(&pages, 4, &mut r1);
         assert_eq!(sel1, stratified_sample(&pages, 4, &mut r2), "seeded → deterministic");
-        let cats: std::collections::HashSet<_> =
-            sel1.iter().map(|p| p.page_id.split('/').next().unwrap()).collect();
+        let cats: std::collections::HashSet<_> = sel1
+            .iter()
+            .filter_map(|p| p.page_id.split_once('/').map(|(cat, _)| cat))
+            .collect();
         assert!(cats.contains("air") && cats.contains("people") && cats.contains("ko"),
             "every category represented before any gets a second pick");
+        let root_picks = sel1.iter().filter(|p| !p.page_id.contains('/')).count();
+        assert_eq!(root_picks, 1,
+            "root-level pages share ONE bucket — exactly one round-1 pick, never two");
     }
 }

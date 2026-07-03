@@ -102,6 +102,12 @@ secondary = `mode:"balanced"`. Spec §4's "balanced (reranker OFF) = daily drive
 flagged in the Task 1 commit; report headline arm is labeled `gbrain-default (configured)` with the
 recorded fingerprint.
 
+- **Drift-count pin (Task 36, 2026-07-03):** indexed-page count for the drift check comes from
+  `GBRAIN_SOURCE=default gbrain call get_stats '{}'` → JSON field `page_count` (live capture
+  2026-07-03: `{"page_count": 895, "chunk_count": 2843, …}`). Any spawn/status/parse failure →
+  `None` → the report renders "drift unknown", never a guess. The plan's Task-36 sketch
+  (`gbrain stats` + text scraping) does not exist as a surface — reconciled like the query op.
+
 ---
 
 ## Probe B — Ollama HTTP surface

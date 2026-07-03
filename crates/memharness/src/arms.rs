@@ -76,8 +76,9 @@ pub trait GbrainRetriever {
 /// LIVE AIR arm: wire recall → PageResolver (FAIL-LOUD on an unmapped hit — the no-evolve
 /// invariant, see resolve.rs; NO event-id fallback).
 pub struct LiveAirArm {
-    rt: tokio::runtime::Runtime,
+    // Field order = drop order: `client` must drop (deregistering its stream) while `rt` lives.
     client: crate::client::WireClient,
+    rt: tokio::runtime::Runtime,
     resolver: PageResolver,
 }
 
@@ -125,19 +126,83 @@ pub struct GbrainCli {
     pub mode: Option<&'static str>,
 }
 
+/// Overall deadline for one gbrain CLI invocation. Same discipline as
+/// ollama::OLLAMA_TIMEOUT_SECS / anthropic::ANTHROPIC_TIMEOUT_SECS: a wedged child
+/// (locked PGlite, hung reranker egress) costs at most this, never the whole 2h run.
+const GBRAIN_CALL_TIMEOUT_SECS: u64 = 120;
+
+/// How often `output_with_deadline` polls `try_wait()` for child exit.
+const DEADLINE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Drain one child pipe to completion on its own thread — avoids the classic pipe-buffer
+/// deadlock where a full unread pipe blocks the child (and thus `try_wait`) forever.
+fn drain_pipe<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        // Best-effort: when the child is killed the pipe closes and we keep what arrived.
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// std-only `output()` with a deadline: spawn with piped stdout/stderr (stdin null),
+/// drain both pipes on reader threads (avoids pipe-buffer deadlock), poll try_wait()
+/// every 100ms; on deadline expiry kill() + reap and error loud. Zero new deps.
+fn output_with_deadline(
+    cmd: &mut std::process::Command,
+    deadline: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout_reader = drain_pipe(child.stdout.take().expect("stdout was piped"));
+    let stderr_reader = drain_pipe(child.stderr.take().expect("stderr was piped"));
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("stdout reader thread panicked"))?;
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("stderr reader thread panicked"))?;
+            return Ok(std::process::Output { status, stdout, stderr });
+        }
+        if started.elapsed() > deadline {
+            // Kill + reap best-effort (the child may exit in the race); the bail is the signal.
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("`gbrain` call exceeded {deadline:?} — killed (wedged CLI/DB?)");
+        }
+        std::thread::sleep(DEADLINE_POLL_INTERVAL);
+    }
+}
+
+/// Build the `gbrain call query` op JSON (pure, unit-tested): numeric `limit`, and `mode`
+/// ONLY when the arm overrides it — the primary arm sends none so the configured mode applies.
+fn build_query_op(query: &str, k: usize, mode: Option<&str>) -> String {
+    let mut op = serde_json::json!({ "query": query, "limit": k });
+    if let Some(mode) = mode {
+        op["mode"] = serde_json::Value::String(mode.to_string());
+    }
+    op.to_string()
+}
+
 impl GbrainRetriever for GbrainCli {
     fn retrieve(&self, query: &str, k: usize) -> anyhow::Result<Vec<RetrievedHit>> {
-        let mut op = serde_json::json!({ "query": query, "limit": k });
-        if let Some(mode) = self.mode {
-            op["mode"] = serde_json::Value::String(mode.to_string());
-        }
-        let out = std::process::Command::new("gbrain")
-            .arg("call")
+        let mut cmd = std::process::Command::new("gbrain");
+        cmd.arg("call")
             .arg("query")
-            .arg(op.to_string())
-            .env("GBRAIN_SOURCE", "default")
-            .output()
-            .map_err(|e| anyhow::anyhow!("failed to spawn `gbrain call query`: {e}"))?;
+            .arg(build_query_op(query, k, self.mode))
+            .env("GBRAIN_SOURCE", "default");
+        let out = output_with_deadline(
+            &mut cmd,
+            std::time::Duration::from_secs(GBRAIN_CALL_TIMEOUT_SECS),
+        )
+        .map_err(|e| anyhow::anyhow!("`gbrain call query` failed: {e}"))?;
         if !out.status.success() {
             anyhow::bail!(
                 "`gbrain call query` exited {}: {}",
@@ -149,11 +214,13 @@ impl GbrainRetriever for GbrainCli {
     }
 }
 
+/// Tolerate UNKNOWN keys (serde's struct default), never MISSING ones — deliberately NO
+/// `#[serde(default)]`: if gbrain renamed `slug`, every hit would silently become page_id ""
+/// and GBrain would score 0.0 across the board (the mirror image of the Rev-2 finding-2
+/// fabricated-baseline CRIT). A missing field errors into the "re-check Probe A" bail below.
 #[derive(serde::Deserialize)]
 struct GbrainHit {
-    #[serde(default)]
     slug: String,
-    #[serde(default)]
     chunk_text: String,
 }
 
@@ -180,19 +247,17 @@ struct GbrainStats {
 /// `gbrain call get_stats '{}'` (Probe-A-pinned field `page_count`; live value 895 on
 /// 2026-07-03); any failure → None — honest "drift unknown", never a guess.
 pub fn gbrain_version_and_count() -> (String, Option<usize>) {
-    let version = std::process::Command::new("gbrain")
-        .arg("--version")
-        .output()
+    let deadline = std::time::Duration::from_secs(GBRAIN_CALL_TIMEOUT_SECS);
+    let mut version_cmd = std::process::Command::new("gbrain");
+    version_cmd.arg("--version");
+    let version = output_with_deadline(&mut version_cmd, deadline)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let count = std::process::Command::new("gbrain")
-        .arg("call")
-        .arg("get_stats")
-        .arg("{}")
-        .env("GBRAIN_SOURCE", "default")
-        .output()
+    let mut stats_cmd = std::process::Command::new("gbrain");
+    stats_cmd.arg("call").arg("get_stats").arg("{}").env("GBRAIN_SOURCE", "default");
+    let count = output_with_deadline(&mut stats_cmd, deadline)
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| {
@@ -247,6 +312,49 @@ mod tests {
         assert!(parse_gbrain_output("[]").unwrap().is_empty());
         // Invalid JSON is a RUN ERROR — never silently scored.
         assert!(parse_gbrain_output("gbrain: something went wrong").is_err());
+        // A hit MISSING `slug` is a RUN ERROR too: a renamed field must fail loud, never
+        // collapse every hit to page_id "" and score GBrain 0.0 across the board.
+        assert!(parse_gbrain_output(r#"[{"chunk_text": "slugless hit"}]"#).is_err());
+    }
+
+    #[test]
+    fn build_query_op_pins_shape_per_arm() {
+        let primary: serde_json::Value =
+            serde_json::from_str(&build_query_op("에어란 무엇인가?", 8, None)).unwrap();
+        assert_eq!(primary["query"], "에어란 무엇인가?");
+        assert_eq!(primary["limit"], 8, "numeric limit, not a string");
+        assert!(
+            primary.get("mode").is_none(),
+            "primary arm sends NO mode key — the configured mode applies"
+        );
+
+        let reference: serde_json::Value =
+            serde_json::from_str(&build_query_op("q", 5, Some("balanced"))).unwrap();
+        assert_eq!(reference["mode"], "balanced", "secondary arm pins the reference mode");
+        assert_eq!(reference["limit"], 5);
+        assert_eq!(reference["query"], "q");
+    }
+
+    #[test]
+    fn output_with_deadline_kills_wedged_children() {
+        // Well-behaved child: completes under the deadline, stdout captured.
+        let mut ok_cmd = std::process::Command::new("sh");
+        ok_cmd.arg("-c").arg("echo hi");
+        let out = output_with_deadline(&mut ok_cmd, std::time::Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+
+        // Wedged child: killed at the deadline, loud error, FAST — never the child's 30s.
+        let mut wedged_cmd = std::process::Command::new("sh");
+        wedged_cmd.arg("-c").arg("sleep 30");
+        let started = std::time::Instant::now();
+        let err = output_with_deadline(&mut wedged_cmd, std::time::Duration::from_millis(300))
+            .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must error near the deadline, not the child's sleep"
+        );
+        assert!(err.to_string().contains("killed"), "error names the kill: {err}");
     }
 
     #[test]
