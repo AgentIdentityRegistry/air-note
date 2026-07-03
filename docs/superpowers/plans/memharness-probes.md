@@ -1,4 +1,4 @@
-# memharness Phase 0 — live-reality probes (Task 1 findings)
+# memharness Phase 0 — live-reality probes (Task 1 findings) — Rev 2 — revised after architect+critic review
 
 > **Purpose:** Task 1 of `docs/superpowers/plans/2026-07-03-air-agent-memharness-phase0.md` is a
 > **read-only reality check** run on Peter's machine BEFORE any code is written. It pins the three
@@ -38,8 +38,9 @@ $ gbrain query "test" --limit 3
 - Per-hit fields available: page/slug identifier = `____`, chunk text = `____`, score = `____`
 - **Slug ↔ `~/brain`-relative-path convention** (needed for known-item match normalization, Task 27):
   e.g. slug `air/session-start-protocol` ↔ file `air/session-start-protocol.md`? Confirm: ____
-- Does `balanced` mode need an explicit flag, or is it the default? ____  (reranker `zerank-2` OFF = the day-driver arm we must beat)
+- **(Rev 2) Does `balanced` mode need an explicit flag, or is it the default?** ____  (reranker `zerank-2` OFF = the day-driver arm we must beat — the arm MUST pin the right pipeline; record the exact argv)
 - `tokenmax` secondary arm (reranker ON) invocation, if recording it: ____
+- **(Rev 2) Does GBrain index YAML frontmatter, or strip it before chunking?** Check: query for a term that appears ONLY in a page's frontmatter (e.g. a tag value) — a hit means GBrain indexes it. Result: [ ] strips  [ ] indexes → sets `STRIP_FRONTMATTER` (the harness strips ONLY if GBrain strips; if GBrain indexes it, do NOT strip — spec §2 Rev 2). Value chosen: ____
 
 **Reconciliation** (fill if reality ≠ plan assumption `GBRAIN_QUERY_ARGS = ["query", <q>, "--limit", <k>]`): ____
 
@@ -92,4 +93,28 @@ $ grep -rl 'mcp__gbrain__\(query\|search\|recall\)' ~/.claude/projects/**/*.json
 - **Decision:** if deduped real open queries < 50 → set `WEIGHT_SYNTHETIC_HIGHER = true` and the
   report says so (spec §90). Value chosen: ____
 
-**Reconciliation** (fill if the mining regex / JSONL shape differs from the fixture in Task 16): ____
+**Reconciliation** (fill if the mining regex / JSONL shape differs from the committed fixture): ____
+
+---
+
+## Probe D — Anthropic audit preflight (Rev 2)
+
+Feeds: `anthropic.rs::AUDIT_MODEL` pin + the run-start preflight (fail fast BEFORE the ≤2h loop, spec §5 Rev 2).
+
+Command run (one-token Messages call with the pinned model id; requires `ANTHROPIC_API_KEY` in env — skip and note if this machine will only ever run `--local-only`):
+
+```
+$ curl -s https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d '{"model":"claude-sonnet-5","max_tokens":4,"messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
+<paste response (or the error)>
+```
+
+**Findings to pin:**
+
+- Key valid + model id `claude-sonnet-5` accepted? [ ] yes  [ ] no — if the model id errors, the CURRENT Sonnet-tier id to pin instead: `____`
+- Response shape matches the strict parser (first `content` block has `type == "text"`)? ____
+
+**Reconciliation** (fill if `AUDIT_MODEL` must change from `claude-sonnet-5`): ____
