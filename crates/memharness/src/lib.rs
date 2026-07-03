@@ -1,6 +1,7 @@
 //! memharness library surface — shared by the binary (`main.rs`) and the hermetic integration
 //! tests. DEV-ONLY (see Cargo.toml header); never ships.
 #![forbid(unsafe_code)]
+pub mod corpus;
 pub mod frontmatter;
 // Module lines are added by their tasks, keeping every intermediate commit compiling:
 // pub mod frontmatter;  (Task 4)     pub mod corpus;   (Task 8)
