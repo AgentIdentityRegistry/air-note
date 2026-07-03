@@ -18,6 +18,10 @@ const OP_TIMEOUT: Duration = Duration::from_secs(600);
 /// A connected wire client: one `UnixStream`, one op in flight at a time.
 pub struct WireClient {
     stream: UnixStream,
+    /// The frame protocol is not cancellation-safe, so a timed-out stream is permanently
+    /// unusable — this flag turns accidental reuse into an instant named error instead of a
+    /// framing desync (enforcing the pinned drop-on-error design).
+    poisoned: bool,
 }
 
 impl WireClient {
@@ -31,13 +35,16 @@ impl WireClient {
         if hello_ok.proto_version != PROTO_VERSION {
             anyhow::bail!("daemon protocol {} != client {}", hello_ok.proto_version, PROTO_VERSION);
         }
-        Ok(Self { stream })
+        Ok(Self { stream, poisoned: false })
     }
 
     /// One Request → one Response, bounded by `OP_TIMEOUT`. On timeout the frame future is
-    /// dropped mid-I/O — the stream is corrupt and MUST NOT be reused; the error tells the
-    /// caller to discard this client.
+    /// dropped mid-I/O — the stream is corrupt and MUST NOT be reused; the client poisons
+    /// itself so any later call fails by name.
     async fn call(&mut self, req: Request) -> anyhow::Result<Response> {
+        if self.poisoned {
+            anyhow::bail!("wire client poisoned by an earlier timeout; reconnect required");
+        }
         let fut = async {
             write_frame(&mut self.stream, &serde_json::to_vec(&req)?).await?;
             let frame = read_frame(&mut self.stream).await?;
@@ -45,7 +52,10 @@ impl WireClient {
         };
         match tokio::time::timeout(OP_TIMEOUT, fut).await {
             Ok(r) => r,
-            Err(_) => anyhow::bail!("wire op timed out after {OP_TIMEOUT:?}; stream is now unusable"),
+            Err(_) => {
+                self.poisoned = true;
+                anyhow::bail!("wire op timed out after {OP_TIMEOUT:?}; stream is now unusable")
+            }
         }
     }
 

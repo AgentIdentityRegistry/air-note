@@ -154,6 +154,10 @@ pub fn pairwise_prompt(query: &str, answer_a: &str, answer_b: &str) -> String {
 /// Fallback case rule: single-letter signals must be UPPERCASE — lowercase 'a'/'b' are English
 /// articles/pronoun fragments ("It's a draw"), never picks; their presence anywhere marks the
 /// reply conversational → ambiguous → None. TIE is case-insensitive (no English-word collision).
+///
+/// Accepted residual: a sentence-initial capitalized article + a tie-synonym avoiding
+/// 'tie'/'b' (e.g. "A draw.") parses as A — bounded by the swap protocol (consistent replies
+/// self-cancel to Uncertain) and position-symmetric (noise, not bias).
 pub fn parse_pick_token(text: &str) -> Option<PosPick> {
     let t = text.trim().to_uppercase();
     match t.as_str() {
@@ -338,6 +342,7 @@ mod tests {
         assert_eq!(parse_pick_token("I cannot decide"), None);
         // "a" as an article + "tie" → article blocker wins → ambiguous (safe: audited as Uncertain).
         assert_eq!(parse_pick_token("It's a tie between them"), None);
+        assert_eq!(parse_pick_token("A tie seems right"), None, "two signals — the tie token rescues the sentence-initial article");
         // The English article "a" must NEVER be a decisive pick (review Fix 2 regressions).
         assert_eq!(parse_pick_token("It's a draw"), None);
         assert_eq!(parse_pick_token("It's a toss-up"), None);
