@@ -10,6 +10,7 @@ pub mod frontmatter;
 pub mod judge;
 pub mod mine;
 pub mod ollama;
+pub mod report;
 pub mod resolve;
 pub mod stats;
 pub mod synth;
