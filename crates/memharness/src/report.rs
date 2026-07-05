@@ -66,6 +66,11 @@ pub struct ReportModel {
     pub corpus: CorpusManifest,
     pub gbrain_version: String,
     pub gbrain_page_count: Option<usize>,
+    /// gbrain pipeline fingerprint (Probe A): configured `search.mode` + `search.reranker.model`
+    /// (or "unknown" if unavailable). Recorded so a config change BETWEEN two baseline runs is
+    /// visible in the report instead of silently confounding the cross-run comparison.
+    pub gbrain_mode: String,
+    pub gbrain_reranker: String,
     /// |gbrain_pages − corpus_pages| / corpus_pages; None = count unavailable ("drift unknown").
     pub drift_fraction: Option<f64>,
     pub ollama_model: String,
@@ -216,6 +221,11 @@ pub fn render_markdown(r: &ReportModel) -> String {
             None => String::new(),
         },
     ));
+    s.push_str(&format!(
+        "GBrain pipeline: mode={} · reranker={} (Probe A fingerprint — a config change between \
+         runs shows here instead of silently confounding the comparison)\n\n",
+        r.gbrain_mode, r.gbrain_reranker,
+    ));
     s.push_str("| segment | n | AIR s@k | GBrain s@k | AIR MRR | GBrain MRR | AIR win% | 95% CI |\n");
     s.push_str("|---|---|---|---|---|---|---|---|\n");
     for seg in &r.segments {
@@ -226,6 +236,11 @@ pub fn render_markdown(r: &ReportModel) -> String {
         ));
     }
     s.push('\n');
+    s.push_str(
+        "> 95% CI column: known-item rows show the CI of the AIR−GBrain success@k DIFFERENCE \
+         (interval above 0 favors AIR); open rows show the CI of AIR's absolute win-rate \
+         (0.5 = tie). Different estimands — read a CI within its row type, not across.\n\n",
+    );
     // 3. EN vs KO (the expected bilingual gap made visible).
     s.push_str("### EN vs KO\n");
     for seg in r.segments.iter().filter(|s| s.label.contains("·en·") || s.label.contains("·ko·")) {
@@ -349,6 +364,8 @@ mod tests {
                 },
                 gbrain_version: "gbrain 0.42".into(),
                 gbrain_page_count: Some(866),
+                gbrain_mode: "tokenmax".into(),
+                gbrain_reranker: "zeroentropyai:zerank-2".into(),
                 drift_fraction: Some(0.01),
                 ollama_model: "qwen2.5:7b".into(),
                 egress_pairs_sent: 4,
@@ -468,6 +485,11 @@ mod tests {
         assert!(md.contains("Context packing"), "per-arm pack stats present");
         assert!(md.contains("near-duplicate"), "exact-only dedup caveat present");
         assert!(md.contains("binary success flags"), "tie-heavy Wilcoxon caveat present");
+        assert!(
+            md.contains("GBrain pipeline: mode=tokenmax · reranker=zeroentropyai:zerank-2"),
+            "gbrain pipeline fingerprint present (finding 4)"
+        );
+        assert!(md.contains("Different estimands"), "CI dual-estimand caveat present (finding 2)");
         assert!(!md.contains("INVALID RUN"), "no banner at 0 drift");
         // GOLDEN on synthetic data: render is deterministic.
         assert_eq!(md, ReportModel::sample_golden_markdown());

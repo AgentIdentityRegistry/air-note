@@ -111,11 +111,25 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     eprintln!("memharness: corpus prepared — {} pages, {} bytes", manifest.file_count, manifest.total_bytes);
     // Early drift bail (review follow-up): additive INSURANCE — the end-of-run measurement
     // still lands in the report; this refuses to SPEND the run budget on a result already
-    // known to be INVALID. (Structural baseline today: 867 harness pages vs 895 indexed
-    // ≈ 3.2% — under the threshold, but with <2% headroom.)
+    // known to be INVALID. Scoped to the ~/brain corpus: drift vs the gbrain index is only
+    // meaningful when the harness corpus IS the brain gbrain indexes. A fixture/experiment
+    // `--corpus` (the runbook's smoke run) diverges from the index structurally and must still
+    // reach the full pipeline — its report carries the INVALID banner instead of bailing here.
+    // Both sides are CANONICALIZED so a trailing slash, a symlinked ~/brain, or $HOME variance
+    // can't silently disable the insurance (corpus_src exists — we just prepared it; if ~/brain
+    // is absent, canonicalize→None→not-brain→fall through to the report banner, never a wrong
+    // early bail). (Structural baseline today: 867 harness pages vs 895 indexed ≈ 3.2% — under
+    // the threshold, but with <2% headroom.)
+    let corpus_is_brain = match (
+        std::fs::canonicalize(&corpus_src).ok(),
+        std::fs::canonicalize(dirs_home().join("brain")).ok(),
+    ) {
+        (Some(corpus), Some(brain)) => corpus == brain,
+        _ => false,
+    };
     let drift = (gbrain_pages as f64 - manifest.file_count as f64).abs()
         / manifest.file_count.max(1) as f64;
-    if drift > memharness::report::DRIFT_INVALID_FRACTION {
+    if corpus_is_brain && drift > memharness::report::DRIFT_INVALID_FRACTION {
         anyhow::bail!(
             "corpus drift {:.1}% > {:.0}% — the run would render INVALID; re-sync GBrain (or \
              investigate exclusion asymmetry: dot-entries/symlinks/non-md are skipped by the \
@@ -170,6 +184,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // ── Drift check + report (spec §2/§7 Rev 2). ──
     let (gbrain_version, gbrain_page_count) = memharness::arms::gbrain_version_and_count();
+    let (gbrain_mode, gbrain_reranker) = memharness::arms::gbrain_pipeline_fingerprint();
     let drift_fraction = gbrain_page_count.map(|p| {
         (p as f64 - manifest.file_count as f64).abs() / (manifest.file_count.max(1)) as f64
     });
@@ -180,6 +195,8 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         corpus: manifest,
         gbrain_version,
         gbrain_page_count,
+        gbrain_mode,
+        gbrain_reranker,
         drift_fraction,
         ollama_model: args.model.clone(),
         egress_pairs_sent: outcome.egress_pairs_sent,
@@ -310,16 +327,24 @@ fn build_query_cases(
     let stage = std::time::Instant::now();
     use rand::SeedableRng;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(args.seed);
+    // Read every prepared page ONCE, propagating errors — an unreadable page we JUST wrote is a
+    // real anomaly, not something to silently mislabel as English (the old `.unwrap_or_default()`
+    // could bucket a KO page into the EN segment, defeating the whole point of the bilingual
+    // split). Reused for BOTH language detection and synth generation below (no double read of
+    // the sampled pages). Path reconstruction from the NFC-normalized page id relies on APFS
+    // being case/normalization-insensitive (macOS-only dev tool).
+    let mut page_text: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(manifest.entries.len());
+    for e in &manifest.entries {
+        let text = std::fs::read_to_string(corpus_home.join(format!("{}.md", e.page_id)))
+            .with_context(|| format!("reading prepared page {} (language detection)", e.page_id))?;
+        page_text.insert(e.page_id.clone(), text);
+    }
     let pages: Vec<PageRef> = manifest
         .entries
         .iter()
         .map(|e| {
-            // Path reconstruction from the NFC-normalized page id relies on APFS being
-            // case/normalization-insensitive; a read failure defaults to En silently
-            // (acceptable: macOS-only dev tool).
-            let text = std::fs::read_to_string(corpus_home.join(format!("{}.md", e.page_id)))
-                .unwrap_or_default();
-            let lang = match memharness::frontmatter::detect_lang(&text) {
+            let lang = match memharness::frontmatter::detect_lang(&page_text[&e.page_id]) {
                 Lang::Ko => "ko".to_string(),
                 Lang::En => "en".to_string(),
             };
@@ -330,8 +355,7 @@ fn build_query_cases(
     let generator = memharness::synth::OllamaQueryGenerator { model: args.model.clone() };
     let mut synth = Vec::with_capacity(sampled.len());
     for page in &sampled {
-        let text = std::fs::read_to_string(corpus_home.join(format!("{}.md", page.page_id)))?;
-        synth.extend(generator.generate_queries(page, &text)?);
+        synth.extend(generator.generate_queries(page, &page_text[&page.page_id])?);
     }
     eprintln!("memharness: {} synthetic queries generated", synth.len());
     log_stage_secs("synth generation", stage);

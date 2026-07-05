@@ -297,6 +297,27 @@ pub fn gbrain_version_and_count() -> (String, Option<usize>) {
     (version, count)
 }
 
+/// The gbrain pipeline fingerprint (Probe A §79-83): configured `search.mode` +
+/// `search.reranker.model`, each via `gbrain config get <key>` (plain trimmed value on stdout —
+/// probe-verified `tokenmax` / `zeroentropyai:zerank-2` on 2026-07-03). Recorded in the report so
+/// a config change BETWEEN two baseline runs is visible, not a silent cross-run confound. Any
+/// failure → "unknown" (honest), never omitted — the same QUIET discipline as
+/// `gbrain_version_and_count` (report metadata, not a fail-fast gate).
+pub fn gbrain_pipeline_fingerprint() -> (String, String) {
+    let deadline = std::time::Duration::from_secs(GBRAIN_CALL_TIMEOUT_SECS);
+    let get = |key: &str| -> String {
+        let mut cmd = std::process::Command::new("gbrain");
+        cmd.arg("config").arg("get").arg(key).env("GBRAIN_SOURCE", "default");
+        output_with_deadline(&mut cmd, deadline)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    (get("search.mode"), get("search.reranker.model"))
+}
+
 // ── The shared answerer seam (spec §4: identical model + prompt + budget on both arms). ──
 
 /// Both arms synthesize the final answer through the SAME implementation — retrieval is the
