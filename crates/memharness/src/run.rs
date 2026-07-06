@@ -22,14 +22,14 @@ use crate::stats::{
 use crate::synth::SynthQuery;
 
 /// Segment tag: where a query came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QuerySource {
     Real,
     Synthetic,
 }
 
 /// One query case. `gold_page_id`: Some = known-item (mechanical), None = open (judged).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueryCase {
     pub text: String,
     pub lang: String, // "en" | "ko"
