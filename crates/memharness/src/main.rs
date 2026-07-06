@@ -56,6 +56,8 @@ struct RunArgs {
     #[arg(long, conflicts_with = "cases")]
     save_cases: Option<PathBuf>,
     /// Load a frozen case list (skips transcript mining AND synth generation entirely).
+    /// Gold pages absent from the CURRENT corpus score as symmetric misses — the report's
+    /// corpus_sha is the cross-check (the compare subcommand enforces it).
     #[arg(long)]
     cases: Option<PathBuf>,
     /// Local Ollama model for answerer/judge/synth.

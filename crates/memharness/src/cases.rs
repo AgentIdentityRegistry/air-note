@@ -27,8 +27,19 @@ fn jsonl_sha(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Save cases as JSONL (creating parent dirs); returns the sha of the bytes written.
+/// Save cases as JSONL (creating parent dirs); returns the sha of the bytes written. REFUSES
+/// to overwrite an existing file: the frozen list is an identity-bearing artifact (every gate
+/// pairs runs by its sha), so re-freezing must be deliberate — delete the old list or pick a
+/// new path (spec §6 "re-freeze deliberately, never silently"; same discipline as
+/// `report::write_report`'s overwrite refusal).
 pub fn save_cases(path: &Path, cases: &[QueryCase]) -> anyhow::Result<String> {
+    if path.exists() {
+        anyhow::bail!(
+            "frozen case list already exists at {} — refusing to overwrite an identity-bearing \
+             artifact; re-freeze deliberately (delete it or save to a new path)",
+            path.display()
+        );
+    }
     let bytes = cases_to_jsonl(cases)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -97,6 +108,10 @@ mod tests {
         // Saving the same list again produces the same bytes → same sha (determinism).
         let path2 = dir.path().join("again.jsonl");
         assert_eq!(save_cases(&path2, &sample()).unwrap(), saved_sha);
+        // Overwriting an existing frozen list is REFUSED — identity artifacts die loudly
+        // (re-freeze deliberately: spec §6; mirrors write_report's overwrite refusal).
+        let err = save_cases(&path, &sample()).unwrap_err().to_string();
+        assert!(err.contains("refusing to overwrite"), "overwrite refused: {err}");
     }
 
     #[test]
