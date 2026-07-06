@@ -17,6 +17,7 @@
 #![deny(missing_docs)]
 
 pub mod actuator;
+pub mod chunk;
 pub mod embed;
 pub mod error;
 pub mod event;
