@@ -3,7 +3,9 @@
 //! case-list sha (different lists ⇒ unpaired noise, the exact flaw the freeze protocol exists
 //! to kill). Per segment: paired Wilcoxon (candidate vs baseline) + s@k delta.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::Context as _;
 
 use crate::run::CaseResult;
 use crate::stats::{wilcoxon_signed_rank, WilcoxonResult};
@@ -22,15 +24,16 @@ pub struct SegmentComparison {
 /// Pull (case_list_sha, corpus_sha, case_results) out of a scores.json string. Parses via
 /// `Value` because `ReportModel` deliberately does not derive Deserialize — only these three
 /// fields matter here.
-fn extract_run(scores_json: &str) -> anyhow::Result<(String, String, Vec<CaseResult>)> {
-    let v: serde_json::Value = serde_json::from_str(scores_json)?;
+fn extract_run(role: &str, scores_json: &str) -> anyhow::Result<(String, String, Vec<CaseResult>)> {
+    let v: serde_json::Value = serde_json::from_str(scores_json)
+        .with_context(|| format!("parsing {role} scores.json (pass scores.json, not report.md)"))?;
     let case_sha = v
         .get("case_list_sha")
         .and_then(|s| s.as_str())
         .map(str::to_string)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "scores.json carries no case_list_sha — the run was not frozen \
+                "{role} scores.json carries no case_list_sha — the run was not frozen \
                  (--cases/--save-cases); compare refuses unfrozen runs"
             )
         })?;
@@ -38,14 +41,14 @@ fn extract_run(scores_json: &str) -> anyhow::Result<(String, String, Vec<CaseRes
         .get("corpus_sha")
         .and_then(|s| s.as_str())
         .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("scores.json has no corpus_sha (pre-rung-0 run?)"))?;
+        .ok_or_else(|| anyhow::anyhow!("{role} scores.json has no corpus_sha (pre-rung-0 run?)"))?;
     let results: Vec<CaseResult> = serde_json::from_value(
-        v.get("case_results")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("scores.json has no case_results (pre-rung-0 run?)"))?,
+        v.get("case_results").cloned().ok_or_else(|| {
+            anyhow::anyhow!("{role} scores.json has no case_results (pre-rung-0 run?)")
+        })?,
     )?;
     if results.is_empty() {
-        anyhow::bail!("case_results is empty — nothing to pair");
+        anyhow::bail!("{role} case_results is empty — nothing to pair");
     }
     Ok((case_sha, corpus_sha, results))
 }
@@ -54,8 +57,8 @@ fn extract_run(scores_json: &str) -> anyhow::Result<(String, String, Vec<CaseRes
 /// an identical corpus snapshot (spec §3.0.1: gates across snapshots are invalid — enforced
 /// here in the tool, not left to a human reading two reports).
 pub fn compare_runs(baseline: &str, candidate: &str) -> anyhow::Result<Vec<SegmentComparison>> {
-    let (sha_b, corpus_b, base) = extract_run(baseline)?;
-    let (sha_c, corpus_c, cand) = extract_run(candidate)?;
+    let (sha_b, corpus_b, base) = extract_run("baseline", baseline)?;
+    let (sha_c, corpus_c, cand) = extract_run("candidate", candidate)?;
     if corpus_b != corpus_c {
         anyhow::bail!(
             "corpus snapshot mismatch ({corpus_b} vs {corpus_c}) — the runs ingested different \
@@ -72,8 +75,22 @@ pub fn compare_runs(baseline: &str, candidate: &str) -> anyhow::Result<Vec<Segme
         anyhow::bail!("case_results length mismatch ({} vs {})", base.len(), cand.len());
     }
     let base_by_idx: BTreeMap<usize, &CaseResult> = base.iter().map(|c| (c.case_idx, c)).collect();
+    // Duplicate-idx guards (quality review, Important): a hand-damaged scores.json with a
+    // repeated case_idx would otherwise silently double-pair one baseline case and drop
+    // another. With BOTH sides unique + equal lengths + every candidate idx found in baseline,
+    // the pairing is a proven bijection — corruption fails loud, never mis-scores a gate.
+    if base_by_idx.len() != base.len() {
+        anyhow::bail!("baseline contains duplicate case_idx — corrupt scores.json");
+    }
+    let mut seen_cand_idx = BTreeSet::new();
     let mut by_label: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
     for c in &cand {
+        if !seen_cand_idx.insert(c.case_idx) {
+            anyhow::bail!(
+                "case_idx {} appears twice in candidate — corrupt scores.json",
+                c.case_idx
+            );
+        }
         let b = base_by_idx.get(&c.case_idx).ok_or_else(|| {
             anyhow::anyhow!("case_idx {} in candidate but not baseline — corrupt pairing", c.case_idx)
         })?;
@@ -178,6 +195,33 @@ mod tests {
         let relabeled = scores(Some("aaa"), "cc", 3, 1, "synthetic·ko·known-item");
         assert!(
             compare_runs(&baseline, &relabeled).unwrap_err().to_string().contains("label mismatch"),
+        );
+
+        // A duplicate case_idx (hand-damaged file) must fail loud — silently double-pairing one
+        // baseline case while dropping another would mis-score a SHIP/NO-SHIP gate (quality
+        // review, Important). Both sides guarded.
+        let case = |idx: usize| {
+            format!(
+                r#"{{"case_idx":{idx},"label":"synthetic·en·known-item","air_rank":0,"gbrain_rank":null,"air_success":true,"gbrain_success":false}}"#
+            )
+        };
+        let dup = format!(
+            r#"{{"case_list_sha":"aaa","corpus_sha":"cc","case_results":[{},{}]}}"#,
+            case(0),
+            case(0)
+        );
+        let ok2 = format!(
+            r#"{{"case_list_sha":"aaa","corpus_sha":"cc","case_results":[{},{}]}}"#,
+            case(0),
+            case(1)
+        );
+        assert!(
+            compare_runs(&ok2, &dup).unwrap_err().to_string().contains("appears twice"),
+            "duplicate candidate case_idx refused"
+        );
+        assert!(
+            compare_runs(&dup, &ok2).unwrap_err().to_string().contains("duplicate case_idx"),
+            "duplicate baseline case_idx refused"
         );
     }
 }
