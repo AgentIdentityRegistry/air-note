@@ -156,9 +156,14 @@ pub const GRAPH_REINFORCE_TOPK: usize = 3;
 /// How many candidates each arm fetches before fusion. Over-fetching well beyond
 /// the caller's final `k` lets RRF see enough of each arm's tail to reorder
 /// correctly (an id ranked, say, #20 by keyword but #1 by vector should still be
-/// fusible). 50 comfortably exceeds any realistic interactive `k` while staying
-/// cheap for the small-to-medium corpora BossClaw holds.
-pub const FUSION_FETCH: usize = 50;
+/// fusible). Was 50 — measured as a hard recall ceiling on an ~880-page corpus:
+/// an id ranked >50 in BOTH arms could never surface regardless of `k`
+/// (retrieval-floor spec Rev 2 §2). 200 ≈ 23% of that corpus and stays cheap
+/// (HNSW search uses ef = max(requested, 64); post-fusion boosts are
+/// O(candidates) multiplies). Re-tunable — a measurement subject, not a tuned
+/// truth. NOTE for the chunking rung: once chunking lands this counts CHUNK
+/// slots before per-event fold-back (spec §3.4.4 over-fetch rule).
+pub const FUSION_FETCH: usize = 200;
 
 /// Fuse several ranked id-lists into a per-id reciprocal-rank-fusion score.
 ///
