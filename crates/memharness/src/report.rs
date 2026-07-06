@@ -249,7 +249,7 @@ pub fn render_markdown(r: &ReportModel) -> String {
         short(&r.corpus_sha),
         match &r.case_list_sha {
             Some(sha) => format!(" · frozen case list: {}", short(sha)),
-            None => " · case list: ad-hoc (UNFROZEN — not comparable across runs)".to_string(),
+            None => " · case list: ad-hoc (UNFROZEN — not comparable across runs; --save-cases to freeze, --cases to reuse)".to_string(),
         },
     ));
     s.push_str("| segment | n | AIR s@k | GBrain s@k | AIR MRR | GBrain MRR | AIR win% | 95% CI |\n");
