@@ -7795,23 +7795,31 @@ mod tests {
     }
 
     /// Adaptive over-fetch: a fixed `k * CHUNK_OVERFETCH` fetch is STARVED by fat
-    /// documents whose many near-query chunks fill the nearest slots; adaptive
-    /// doubling grows the fetch until the fold yields `k` distinct events.
+    /// documents whose many chunks — all STRICTLY nearer the query than any
+    /// single — fill the nearest slots; only adaptive doubling grows the fetch
+    /// far enough to fold in the single-chunk events.
     ///
-    /// **Corpus (3 fat × 8 chunks + 8 singles = 32 chunks over 11 events).** Fat
-    /// chunks share all four query tokens (nearest); singles share only one
-    /// (farther), so a fixed fetch fills with fat chunks and folds to few events.
-    /// Each fat chunk also carries a per-chunk unique token so no two index
-    /// points are exact duplicates (identical duplicates make HNSW recall
-    /// degenerate); the corpus stays small and well-separated so a wide search
-    /// reliably returns the whole index (seed-robust, unlike a large fat-tailed
-    /// corpus where ANN recall of the far tail is per-seed unreliable — the same
-    /// caveat the C4 index test documents).
+    /// **Distance construction (the non-vacuity mechanism).** Fat-doc chunks each
+    /// embed to EXACTLY the query vector (`qneedle` alone) → cosine distance ~0.
+    /// Each single embeds `"qneedle uniqueN"` → its mass splits between the shared
+    /// `qneedle` bucket and a per-doc bucket → cosine with the query is `< 1` but
+    /// strictly `> 0`. So every fat chunk is nearer than every single, and the
+    /// nearest `k * CHUNK_OVERFETCH` neighbours are ALL fat chunks.
     ///
-    /// With `k = 6`: the first pass (`6 * CHUNK_OVERFETCH = 24` chunks) folds to
-    /// only 3–4 distinct events (all fat, singles starved) — strictly `< 6`, so a
-    /// fixed fetch would fail. One doubling (`48 ≥ 32 total` ⇒ index exhausted)
-    /// returns the whole corpus, folding to all 11 events, truncated to `k = 6`.
+    /// **Corpus:** 3 fat events × 9 chunks (27 fat chunks) + 10 single events = 37
+    /// chunks over 13 events; `k = 6`. The whole corpus is small and
+    /// `HnswIndex::search` uses `ef = max(requested, 64) ≥ 37`, so the search is
+    /// effectively EXACT (seed-robust): the first pass (`6 * 4 = 24` chunks)
+    /// reliably returns 24 fat chunks and folds to just the 3 fat events (`< k`),
+    /// while the adaptive `vector_search` doubles the window and recovers to
+    /// `min(k, 13) = 6` distinct events.
+    ///
+    /// A CONTROL assertion (below) reconstructs an independent index and PROVES a
+    /// fixed `k * CHUNK_OVERFETCH` fetch folds to `< k` on THIS corpus — so the
+    /// adaptive assertion genuinely distinguishes adaptive from fixed (a fixed
+    /// `vector_search` would return `< k` distinct and fail). This test is
+    /// mutation-verified: forcing `vector_search` to a single fixed pass makes the
+    /// final `distinct.len() == 6` assertion fail (it returns 3).
     #[test]
     fn vector_search_adaptive_overfetch_survives_fat_docs_at_small_k() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7820,51 +7828,61 @@ mod tests {
         let embedder = MockEmbedder::new(dim);
         let embed1 = |t: &str| embedder.embed(&[t.to_string()]).unwrap().remove(0);
 
-        // Query carries four shared tokens; fat chunks contain all four (near),
-        // singles contain only one (far).
-        let query = embed1("qa qb qc qd");
-        let fat_sizes = [8usize, 8, 8];
-        const SINGLES: usize = 8;
+        // Query = the bare needle token. Fat chunks embed to the SAME vector
+        // (distance ~0); singles share the needle but add a unique token (farther).
+        let qv = embed1("qneedle");
+        const FAT_EVENTS: usize = 3;
+        const FAT_CHUNKS: usize = 9;
+        const SINGLES: usize = 10;
+        let total_events = FAT_EVENTS + SINGLES; // 13
 
-        for (e, n) in fat_sizes.into_iter().enumerate() {
-            let vecs: Vec<Vec<f32>> = (0..n)
-                // per-chunk unique token → no exact-duplicate index points, but
-                // 4/5 tokens shared with the query keeps every chunk near it.
-                .map(|c| embed1(&format!("qa qb qc qd fat{e}c{c}")))
-                .collect();
+        for e in 0..FAT_EVENTS {
+            // Every chunk is pure needle → identical to the query vector.
+            let vecs: Vec<Vec<f32>> = (0..FAT_CHUNKS).map(|_| qv.clone()).collect();
             insert_controlled_chunks(&log, &format!("fat-{e:02}"), &vecs);
         }
         for i in 0..SINGLES {
-            insert_controlled_chunks(&log, &format!("single-{i:02}"), &[embed1(&format!("qa single{i}"))]);
+            // needle + a per-doc unique token → strictly farther than any fat chunk.
+            insert_controlled_chunks(&log, &format!("single-{i:02}"), &[embed1(&format!("qneedle uniqueword{i}"))]);
         }
 
         log.rebuild_indexes(&embedder).unwrap();
 
         let k = 6;
 
-        // Non-vacuity, asserted structurally (no ANN seed dependence): the fat
-        // chunks (all strictly nearer the query than any single) number
-        // `3*8 = 24`, which is ≥ the first pass's `k * CHUNK_OVERFETCH` window.
-        // So the nearest `k*CHUNK_OVERFETCH` chunks are ALL fat, folding to at
-        // most the 3 fat events (< k). Only the adaptive doubling — which grows
-        // the window past the 32-chunk corpus and pulls in the singles — can
-        // reach k distinct events. This makes the growth load-bearing for the
-        // assertion below, independent of per-seed HNSW recall.
-        let fat_chunk_count = fat_sizes.iter().sum::<usize>();
-        let fat_event_count = fat_sizes.len();
-        assert!(
-            fat_chunk_count >= k * crate::recall::CHUNK_OVERFETCH && fat_event_count < k,
-            "corpus must starve a fixed k*CHUNK_OVERFETCH fetch: {fat_chunk_count} fat \
-             chunks over {fat_event_count} events vs first window {}",
-            k * crate::recall::CHUNK_OVERFETCH
+        // ── CONTROL: prove the corpus STARVES a fixed k*CHUNK_OVERFETCH fetch. ──
+        // Reconstruct an independent HnswIndex from the same chunk vectors the
+        // log's index holds, take exactly the first-pass window, and fold it. If
+        // this does NOT drop below k, the corpus stopped starving (HNSW drift) and
+        // the adaptive assertion below would be vacuous — so we assert the premise
+        // loudly here rather than assume it.
+        {
+            let rows = log.vectors_for_model("mock-v1").unwrap();
+            let mut mirror = HnswIndex::with_capacity(rows.len());
+            for (key, v) in &rows {
+                mirror.add(key, v);
+            }
+            let fixed_want = k * crate::recall::CHUNK_OVERFETCH;
+            let raw_fixed = mirror.search(&qv, fixed_want);
+            let fixed_distinct: std::collections::HashSet<&str> =
+                raw_fixed.iter().map(|(key, _)| event_id_of(key)).collect();
+            assert!(
+                fixed_distinct.len() < k,
+                "corpus must starve a FIXED k*CHUNK_OVERFETCH fetch (got {} distinct, \
+                 need < {k}) — else the adaptive test is vacuous",
+                fixed_distinct.len()
+            );
+        }
+
+        // ── ADAPTIVE: the real vector_search recovers to k distinct events. ──
+        let hits = log.vector_search(&qv, k).unwrap();
+        let distinct: std::collections::HashSet<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            k.min(total_events),
+            "adaptive over-fetch reaches k distinct despite fat docs starving the fixed first pass"
         );
-
-        let hits = log.vector_search(&query, k).unwrap();
-
-        // Distinct-event count == min(k, 11) == 6, no event repeats after fold.
-        assert_eq!(hits.len(), k, "adaptive over-fetch must surface k distinct events");
-        let distinct: std::collections::HashSet<&String> = hits.iter().map(|(id, _)| id).collect();
-        assert_eq!(distinct.len(), hits.len(), "no event may appear twice after fold");
+        assert_eq!(hits.len(), distinct.len(), "no duplicate events after fold");
         // All ids bare.
         for (id, _) in &hits {
             assert!(decode_chunk_key(id).is_none(), "folded ids must be bare, got {id:?}");
