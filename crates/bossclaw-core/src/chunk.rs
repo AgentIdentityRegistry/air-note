@@ -13,7 +13,8 @@
 //!   budget is hard-split on a CHAR boundary (never a byte boundary — Korean and
 //!   other multi-byte scripts must never be sliced mid-codepoint).
 //! - consecutive chunks share `CHUNK_OVERLAP_CHARS` of trailing/leading context.
-//! - chunk indices are dense and 0-based (`0..n`), stable for a given input.
+//! - chunk ORDER is stable and dense for a given input; the caller assigns
+//!   `chunk_ix` = position in the returned Vec.
 
 /// Max chars per chunk. This is a GRANULARITY knob, NOT a context-window guard:
 /// potion-base-8M is a model2vec `StaticModel` that MEAN-POOLS token embeddings
@@ -43,6 +44,12 @@ const BLOCK_SEPARATOR: &str = "\n\n";
 /// Split `text` into 1..N overlapping, char-boundary-safe chunks (spec §3.4).
 /// Returns an empty Vec for empty/whitespace-only input. Text within budget
 /// returns exactly `[text.to_string()]` (short docs unchanged).
+///
+/// NOTE the "byte-identical" promise applies ONLY to the within-budget short
+/// path. When a doc splits, adjacent blocks packed into one chunk are rejoined
+/// with `BLOCK_SEPARATOR` (`\n\n`), so the original blank-line whitespace —
+/// including any `\r` — is normalized, not preserved, across a chunk boundary.
+/// Fine for retrieval: the embedder ignores `\r`.
 pub fn chunk_text(text: &str) -> Vec<String> {
     if text.trim().is_empty() {
         return Vec::new();
@@ -89,8 +96,12 @@ pub fn chunk_text(text: &str) -> Vec<String> {
 /// Leading/trailing whitespace inside a block is trimmed so a block's char count
 /// reflects real content (and a whitespace-only block is dropped entirely).
 fn split_into_blocks(text: &str) -> Vec<Vec<char>> {
-    // A "blank line" run is two-or-more consecutive newlines (ignoring the
-    // spaces/tabs that may pad an otherwise-empty line).
+    // A block boundary is a LITERAL blank line: "\n\n" (LF) or "\r\n\r\n" (CRLF).
+    // A line padded with spaces/tabs is NOT treated as blank and does not split.
+    //
+    // `split("\n\n")` alone does NOT split a CRLF blank line — "\r\n\r\n" is
+    // CR LF CR LF, which contains no "\n\n" substring — so we also split on
+    // "\r\n\r\n" to treat Windows/Markdown blank lines as block boundaries.
     text.split("\n\n")
         .flat_map(|part| part.split("\r\n\r\n"))
         .map(str::trim)
@@ -112,6 +123,8 @@ fn flush(current: &mut Vec<char>, chunks: &mut Vec<Vec<char>>) {
 /// `CHUNK_OVERLAP_CHARS` chars of the previous chunk as leading context. All
 /// slicing is on the block's `char` vector, so no codepoint is ever split.
 fn emit_block_with_overlap(block: &[char], chunks: &mut Vec<Vec<char>>) {
+    // Effective stride per interior window: BUDGET - OVERLAP = 1300 NEW chars,
+    // because each window's leading OVERLAP chars re-cover the prior window's tail.
     let mut pos = 0;
     while pos < block.len() {
         // Seed the chunk with overlap carried from the immediately-preceding chunk.
@@ -208,5 +221,51 @@ mod tests {
     fn chunking_is_deterministic() {
         let t = format!("{}\n\n{}", "z".repeat(2_000), "w".repeat(2_000));
         assert_eq!(chunk_text(&t), chunk_text(&t), "same input ⇒ same chunks (stable ix)");
+    }
+
+    #[test]
+    fn interior_windows_of_one_oversized_block_overlap_by_the_budget() {
+        // The hard-split path's window→window overlap chaining, tested WITHIN a
+        // single oversized block (no blank lines) — the property most likely to
+        // silently regress. A cycling alphabet (not one repeated char) makes the
+        // start/end position checks below genuinely constraining: with all-'q'
+        // the assertion would pass trivially regardless of where the slice landed.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let t: String = (0..4_000).map(|i| ALPHABET[i % ALPHABET.len()] as char).collect();
+        // One paragraph, no "\n\n" ⇒ this is the hard-split (not the pack) path.
+        assert!(!t.contains("\n\n"), "test input must be a single un-split block");
+        let chunks = chunk_text(&t);
+        assert!(chunks.len() >= 3, "4000 chars over a 1500 budget ⇒ ≥3 windows: {}", chunks.len());
+        for c in &chunks {
+            assert!(c.chars().count() <= CHUNK_BUDGET_CHARS, "each window within budget");
+        }
+        // Two INTERIOR windows of the same block must share exactly the overlap:
+        // chunk[1] STARTS with chunk[0]'s last CHUNK_OVERLAP_CHARS, and chunk[0]
+        // ENDS with them — a real positional check thanks to the varied alphabet.
+        let tail: String = chunks[0].chars().rev().take(CHUNK_OVERLAP_CHARS).collect();
+        let tail_fwd: String = tail.chars().rev().collect();
+        let head: String = chunks[1].chars().take(CHUNK_OVERLAP_CHARS).collect();
+        assert_eq!(head, tail_fwd, "the shared span must be identical, in order");
+        assert!(
+            chunks[1].starts_with(&head) && chunks[0].ends_with(&tail_fwd),
+            "interior windows carry {CHUNK_OVERLAP_CHARS} chars of shared context"
+        );
+    }
+
+    #[test]
+    fn crlf_blank_line_is_a_block_boundary() {
+        // Guards the load-bearing `flat_map(|part| part.split("\r\n\r\n"))`: a
+        // Windows/Markdown CRLF blank line ("\r\n\r\n") has NO "\n\n" substring,
+        // so `split("\n\n")` alone would keep this as one block. Both sides are
+        // near-budget so a correct 2-block split yields ≥2 chunks; a broken
+        // single block (2800 chars) would still exceed budget but is the wrong
+        // shape — the split_into_blocks probe below pins the boundary directly.
+        let a = "A".repeat(1_400);
+        let b = "B".repeat(1_400);
+        let t = format!("{a}\r\n\r\n{b}");
+        let blocks = split_into_blocks(&t);
+        assert_eq!(blocks.len(), 2, "CRLF blank line must split into 2 blocks");
+        assert!(blocks[0].iter().all(|&c| c == 'A'), "block 0 is all A");
+        assert!(blocks[1].iter().all(|&c| c == 'B'), "block 1 is all B");
     }
 }
