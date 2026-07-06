@@ -47,9 +47,23 @@ pub struct RunConfig {
     pub local_only: bool,
 }
 
+/// One known-item case's mechanical result — persisted in scores.json so a later run over the
+/// SAME frozen case list can be compared PAIRED by `case_idx` (spec §3.0.3). Open cases have no
+/// mechanical result and never appear here.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CaseResult {
+    pub case_idx: usize,
+    pub label: String,
+    pub air_rank: Option<usize>,
+    pub gbrain_rank: Option<usize>,
+    pub air_success: bool,
+    pub gbrain_success: bool,
+}
+
 /// Everything the loop produces; `report.rs` renders it.
 pub struct RunOutcome {
     pub segments: Vec<SegmentResult>,
+    pub case_results: Vec<CaseResult>,
     pub trust: TrustVerdict,
     pub egress_pairs_sent: usize,
     pub examples: Vec<ExamplePair>,
@@ -134,6 +148,7 @@ pub fn run_queries(
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
     let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
     let mut opens: Vec<OpenRecord> = Vec::new();
+    let mut case_results: Vec<CaseResult> = Vec::new();
     let mut air_pack = PackTotals::default();
     let mut gbrain_pack = PackTotals::default();
 
@@ -146,10 +161,21 @@ pub fn run_queries(
         bucket.n += 1;
 
         match &case.gold_page_id {
-            // Known-item: mechanical success@k/MRR, no judge (spec §5).
+            // Known-item: mechanical success@k/MRR, no judge (spec §5) — recorded per-case for
+            // paired cross-run comparison (spec §3.0.3).
             Some(gold) => {
-                bucket.air_ranks.push(gold_rank(&air_hits, gold));
-                bucket.gbrain_ranks.push(gold_rank(&gbrain_hits, gold));
+                let air_rank = gold_rank(&air_hits, gold);
+                let gbrain_rank = gold_rank(&gbrain_hits, gold);
+                case_results.push(CaseResult {
+                    case_idx,
+                    label: bucket_label(case),
+                    air_rank,
+                    gbrain_rank,
+                    air_success: success_at_k(&air_rank, cfg.k),
+                    gbrain_success: success_at_k(&gbrain_rank, cfg.k),
+                });
+                bucket.air_ranks.push(air_rank);
+                bucket.gbrain_ranks.push(gbrain_rank);
             }
             // Open: identical answerer both arms → blind position-swapped local judging.
             None => {
@@ -216,7 +242,7 @@ pub fn run_queries(
     }
 
     let examples = pick_examples(&opens, cases);
-    Ok(RunOutcome { segments, trust, egress_pairs_sent, examples, air_pack, gbrain_pack })
+    Ok(RunOutcome { segments, case_results, trust, egress_pairs_sent, examples, air_pack, gbrain_pack })
 }
 
 /// Audit every not-yet-audited index in `set`: the auditor judges the SAME pair blind +
