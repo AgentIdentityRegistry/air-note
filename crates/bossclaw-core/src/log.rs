@@ -7377,4 +7377,184 @@ mod tests {
             "the tampered undo must not write the injected bytes"
         );
     }
+
+    // ── Rung 3 A7: chunked vectors schema + one-row-per-chunk writes ─────────
+    //
+    // These tests reach the raw `vectors` table via the private store (the same
+    // `log.inner.lock().expect(POISON).conn()` seam the undo-tamper test above
+    // uses) so they can assert the physical on-disk shape — one row per chunk,
+    // a dense `chunk_ix` column — that no public API exposes directly.
+
+    use crate::chunk::CHUNK_BUDGET_CHARS;
+    use crate::embed::MockEmbedder;
+    use crate::index::decode_chunk_key;
+    use crate::event::Event as ChunkTestEvent;
+
+    /// A memory event carrying `text`, mirroring `tests/recall.rs::mk_memory_event`.
+    fn chunk_test_memory_event(text: &str) -> ChunkTestEvent {
+        ChunkTestEvent {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: "memory".to_string(),
+            content: serde_json::json!({ "text": text }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(),
+            signature: None,
+        }
+    }
+
+    /// Prose comfortably longer than one chunk budget: distinct heading/paragraph
+    /// blocks so the char-boundary chunker splits it into several windows.
+    fn long_multi_chunk_text() -> String {
+        let mut s = String::new();
+        // Each block is ~500 chars; ~8 blocks ⇒ ~4000 chars ⇒ several chunks.
+        for block in 0..8 {
+            s.push_str(&format!("# Heading {block}\n\n"));
+            for line in 0..6 {
+                s.push_str(&format!(
+                    "Paragraph {block}.{line} discusses topic{block} in detail with \
+                     several descriptive sentences to consume budget. token{block}{line} \
+                     appears here so the block is lexically distinct from its siblings.\n"
+                ));
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    /// Read the `chunk_ix` values for one event, ordered ascending.
+    fn chunk_ixs_for(log: &EventLog, event_id: &str) -> Vec<i64> {
+        let store = log.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare("SELECT chunk_ix FROM vectors WHERE event_id = ?1 ORDER BY chunk_ix ASC")
+            .unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![event_id], |r| r.get::<_, i64>(0))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn long_event_writes_one_dense_row_per_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+
+        let text = long_multi_chunk_text();
+        assert!(
+            text.chars().count() > CHUNK_BUDGET_CHARS,
+            "fixture must exceed one chunk budget to force multiple chunks"
+        );
+        let expected_chunks = crate::chunk::chunk_text(&text).len();
+        assert!(expected_chunks > 1, "fixture must chunk into >1 windows");
+
+        let id = log.append(chunk_test_memory_event(&text)).unwrap();
+        let embedder = MockEmbedder::new(64);
+        assert!(log.derive_vector(&embedder, &log_event(&log, &id)).unwrap());
+
+        let ixs = chunk_ixs_for(&log, &id);
+        assert_eq!(
+            ixs.len(),
+            expected_chunks,
+            "one vectors row per chunk (chunker said {expected_chunks})"
+        );
+        // Dense 0..n.
+        let expected: Vec<i64> = (0..expected_chunks as i64).collect();
+        assert_eq!(ixs, expected, "chunk_ix must be dense 0..n in order");
+    }
+
+    #[test]
+    fn short_event_writes_exactly_one_row_chunk_ix_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+
+        let id = log.append(chunk_test_memory_event("a short memory")).unwrap();
+        let embedder = MockEmbedder::new(64);
+        assert!(log.derive_vector(&embedder, &log_event(&log, &id)).unwrap());
+
+        assert_eq!(
+            chunk_ixs_for(&log, &id),
+            vec![0],
+            "a short event is exactly one row at chunk_ix 0"
+        );
+    }
+
+    #[test]
+    fn vectors_for_model_returns_chunk_keys_ordered_by_event_then_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+
+        // One long (multi-chunk) event and one short (single-chunk) event.
+        let long_text = long_multi_chunk_text();
+        let long_id = log.append(chunk_test_memory_event(&long_text)).unwrap();
+        let short_id = log.append(chunk_test_memory_event("tiny note")).unwrap();
+
+        let embedder = MockEmbedder::new(64);
+        assert_eq!(log.rederive_pending(&embedder).unwrap(), 2, "two events derived");
+
+        let long_chunks = crate::chunk::chunk_text(&long_text).len();
+        let total = long_chunks + 1; // + the single short chunk
+
+        let rows = log.vectors_for_model("mock-v1").unwrap();
+        assert_eq!(rows.len(), total, "one key per chunk across all events");
+
+        // Every returned key decodes as a composite chunk key.
+        let decoded: Vec<(&str, usize)> = rows
+            .iter()
+            .map(|(k, _)| decode_chunk_key(k).expect("vectors_for_model must return chunk keys"))
+            .collect();
+
+        // Ordered by (event_id ASC, chunk_ix ASC): the flattened order must equal
+        // the order produced by sorting on the (event_id, chunk_ix) tuple.
+        let mut sorted = decoded.clone();
+        sorted.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+        assert_eq!(decoded, sorted, "keys must be (event_id ASC, chunk_ix ASC)");
+
+        // Sanity: the long event contributes its dense 0..long_chunks run.
+        let long_ixs: Vec<usize> = decoded
+            .iter()
+            .filter(|(id, _)| *id == long_id.as_str())
+            .map(|(_, ix)| *ix)
+            .collect();
+        assert_eq!(long_ixs, (0..long_chunks).collect::<Vec<_>>());
+        // …and the short event contributes exactly chunk 0.
+        let short_ixs: Vec<usize> = decoded
+            .iter()
+            .filter(|(id, _)| *id == short_id.as_str())
+            .map(|(_, ix)| *ix)
+            .collect();
+        assert_eq!(short_ixs, vec![0]);
+    }
+
+    #[test]
+    fn fresh_vectors_schema_has_chunk_ix_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+
+        let store = log.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare("PRAGMA table_info(vectors)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "chunk_ix"),
+            "fresh vectors schema must carry a chunk_ix column, got {cols:?}"
+        );
+    }
+
+    /// Fetch a just-appended event back out of the log by id (the append path does
+    /// not return the hydrated `Event`, only its id).
+    fn log_event(log: &EventLog, id: &str) -> ChunkTestEvent {
+        log.stream_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == id)
+            .expect("appended event must be readable")
+    }
 }
