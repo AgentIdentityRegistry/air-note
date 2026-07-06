@@ -4,39 +4,50 @@
 //! database operations that use these helpers live on [`crate::log::EventLog`].
 
 /// Escape an arbitrary user string so it can be used safely as an FTS5
-/// `MATCH` expression.
+/// `MATCH` expression, matching terms INDEPENDENTLY.
 ///
 /// FTS5 parses its `MATCH` argument as a query language that recognises
 /// operators such as `OR`, `AND`, `NOT`, `NEAR`, `*`, and unbalanced
-/// double-quotes as phrase-open/close.  A user-supplied string can contain
+/// double-quotes as phrase-open/close. A user-supplied string can contain
 /// any of these tokens and would otherwise mutate query semantics or cause
 /// a parse error.
 ///
-/// This function wraps the raw string as an FTS5 **quoted phrase**:
+/// The input is split on Unicode whitespace; each term is individually wrapped
+/// as an FTS5 **quoted phrase** (internal `"` doubled per the FTS5 rule) and
+/// the phrases are joined with program-emitted `OR`:
 /// ```text
-/// "raw string here"
+/// "term1" OR "term2" OR "term3"
 /// ```
-/// Double-quote characters inside the raw string are doubled (`"` → `""`)
-/// following the FTS5 string-literal escaping rule, so the entire input is
-/// treated as a literal phrase and no operator injection is possible.
+/// Every user token stays inside quotes, so no operator injection is possible
+/// — the `OR`s are ours, never the user's. Documents matching MORE terms rank
+/// higher via bm25 (retrieval-floor spec Rev 2 §3.2; previously the whole
+/// query was ONE quoted phrase, so multi-word queries only matched exact
+/// adjacent runs — the measured keyword-arm recall ceiling).
 ///
 /// # Examples
 /// ```
 /// use bossclaw_core::keyword::escape_fts_query;
 ///
-/// // Plain text — wrapped in quotes.
-/// assert_eq!(escape_fts_query("hello world"), "\"hello world\"");
+/// // Terms match independently.
+/// assert_eq!(escape_fts_query("hello world"), r#""hello" OR "world""#);
 ///
-/// // FTS5 operator — neutralised inside the quoted phrase.
-/// assert_eq!(escape_fts_query("foo OR bar"), "\"foo OR bar\"");
+/// // FTS5 operator words are neutralised inside per-term quotes.
+/// assert_eq!(escape_fts_query("foo OR bar"), r#""foo" OR "OR" OR "bar""#);
 ///
 /// // Embedded double-quote — doubled per FTS5 escaping rules.
-/// assert_eq!(escape_fts_query(r#"say "hi""#), r#""say ""hi""""#);
+/// assert_eq!(escape_fts_query(r#"a"b"#), r#""a""b""#);
 /// ```
 pub fn escape_fts_query(raw: &str) -> String {
-    // Double every existing double-quote, then wrap the whole string in quotes.
-    let escaped = raw.replace('"', "\"\"");
-    format!("\"{escaped}\"")
+    let terms: Vec<String> = raw
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        // Historical contract for empty/whitespace-only input: one empty quoted
+        // phrase, which FTS5 parses cleanly and matches nothing.
+        return "\"\"".to_string();
+    }
+    terms.join(" OR ")
 }
 
 #[cfg(test)]
