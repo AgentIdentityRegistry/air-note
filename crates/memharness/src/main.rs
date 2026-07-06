@@ -28,11 +28,26 @@ enum Command {
     Run(RunArgs),
 }
 
+/// Which model judges open-query answer quality (known-item scoring is mechanical, no judge).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum JudgeMode {
+    /// Local Ollama model — free + private, but the 2026-07-06 baseline showed it agreeing with
+    /// the cloud reference only ~53% of the time, so its open-query verdicts aren't yet trustworthy.
+    Local,
+    /// Haiku via the API — sharp, pennies, zero local load. Needs a key; the audit ladder
+    /// self-checks Haiku against the Sonnet audit model. Incompatible with --local-only.
+    Cloud,
+}
+
 #[derive(clap::Args)]
 struct RunArgs {
     /// Disable ALL cloud egress (no Anthropic audit; wider error bars).
     #[arg(long)]
     local_only: bool,
+    /// Who judges open-query answer quality: `local` (Ollama) or `cloud` (Haiku, self-checked
+    /// against Sonnet). Cloud needs an ANTHROPIC_API_KEY and is incompatible with --local-only.
+    #[arg(long, value_enum, default_value = "local")]
+    judge: JudgeMode,
     /// Local Ollama model for answerer/judge/synth.
     #[arg(long, default_value = memharness::ollama::DEFAULT_OLLAMA_MODEL)]
     model: String,
@@ -79,6 +94,11 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     // ── Fail-fast preflights BEFORE any expensive work (spec §5 Rev 2). ──
+    if args.judge == JudgeMode::Cloud && args.local_only {
+        anyhow::bail!(
+            "--judge cloud needs the cloud (an ANTHROPIC_API_KEY) and is incompatible with --local-only"
+        );
+    }
     memharness::report::ensure_outside_repo(&reports_dir, &repo_root)?;
     memharness::ollama::preflight(&args.model)?;
     let api_key = if args.local_only {
@@ -86,7 +106,12 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     } else {
         let key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set (or pass --local-only)"))?;
-        memharness::anthropic::preflight(&key)?; // one-token call — a bad key/model dies HERE
+        // Preflight the AUDIT model (Sonnet) — always the reference the judge is checked against.
+        memharness::anthropic::preflight(&key, memharness::anthropic::AUDIT_MODEL)?;
+        // And the cloud JUDGE model (Haiku) when it will do the judging — a bad key/model dies HERE.
+        if args.judge == JudgeMode::Cloud {
+            memharness::anthropic::preflight(&key, memharness::anthropic::JUDGE_MODEL)?;
+        }
         Some(key)
     };
     // Loud gbrain preflight (review follow-up): a missing binary or locked DB fails in ~5s
@@ -166,8 +191,25 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     };
     let gbrain = GbrainWithContext(memharness::arms::GbrainCli { mode: None });
     let answerer = AnswererWithContext(memharness::arms::OllamaAnswerer { model: args.model.clone() });
-    let judge = JudgeWithContext(memharness::judge::OllamaJudge { model: args.model.clone() });
-    let auditor = api_key.map(|api_key| memharness::anthropic::AnthropicAuditor { api_key });
+    let local_judge = JudgeWithContext(memharness::judge::OllamaJudge { model: args.model.clone() });
+    // Auditor (Sonnet): the reference the judge is checked against; present whenever a key is.
+    let auditor = api_key.as_ref().map(|k| memharness::anthropic::AnthropicAuditor {
+        api_key: k.clone(),
+        model: memharness::anthropic::AUDIT_MODEL.to_string(),
+    });
+    // Judge: local Ollama (default) or cloud Haiku (`--judge cloud`; key validated above). With a
+    // cloud judge, judge=Haiku + auditor=Sonnet, so the trust verdict becomes "is Haiku trustworthy?".
+    let cloud_judge = match (args.judge, &api_key) {
+        (JudgeMode::Cloud, Some(k)) => Some(memharness::anthropic::AnthropicAuditor {
+            api_key: k.clone(),
+            model: memharness::anthropic::JUDGE_MODEL.to_string(),
+        }),
+        _ => None,
+    };
+    let judge: &dyn PairJudge = match &cloud_judge {
+        Some(cj) => cj,
+        None => &local_judge,
+    };
     let cfg = RunConfig { k: args.k, seed: args.seed, local_only: args.local_only };
 
     let stage = std::time::Instant::now();
@@ -177,7 +219,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         &mut air,
         &gbrain,
         &answerer,
-        &judge,
+        judge,
         auditor.as_ref().map(|a| a as &dyn PairJudge),
     )?;
     log_stage_secs("run_queries", stage);
@@ -201,6 +243,8 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         ollama_model: args.model.clone(),
         egress_pairs_sent: outcome.egress_pairs_sent,
         local_only: args.local_only,
+        cloud_judge_model: (args.judge == JudgeMode::Cloud)
+            .then(|| memharness::anthropic::JUDGE_MODEL.to_string()),
         near_dedup_applied: false, // exact-only dedup — an EXPLICIT caveat, not a silent gap
         air_pack: outcome.air_pack,
         gbrain_pack: outcome.gbrain_pack,
@@ -408,6 +452,11 @@ mod cli_tests {
         assert_eq!(args.model, memharness::ollama::DEFAULT_OLLAMA_MODEL);
         assert_eq!(args.seed, 42, "default seed");
         assert!(!args.local_only);
+        assert!(args.judge == JudgeMode::Local, "default judge = local (backward compatible)");
+
+        let cli = Cli::parse_from(["memharness", "run", "--judge", "cloud"]);
+        let Command::Run(args) = cli.command;
+        assert!(args.judge == JudgeMode::Cloud, "--judge cloud parses");
 
         let cli = Cli::parse_from([
             "memharness", "run", "--local-only", "--k", "5", "--model", "llama3:8b",

@@ -76,6 +76,10 @@ pub struct ReportModel {
     pub ollama_model: String,
     pub egress_pairs_sent: usize,
     pub local_only: bool,
+    /// Some(model) when `--judge cloud` judged the open queries in the cloud (every open pair
+    /// egresses, beyond the audit sample); None = local judge. Rendered in the Egress section so
+    /// the extra egress is disclosed, never silent.
+    pub cloud_judge_model: Option<String>,
     pub near_dedup_applied: bool, // false in Phase 0 → explicit caveat
     pub air_pack: PackTotals,
     pub gbrain_pack: PackTotals,
@@ -193,12 +197,18 @@ pub fn render_markdown(r: &ReportModel) -> String {
             );
         }
     } else {
+        // Mode-aware wording: the trust verdict compares the JUDGE against the audit model. With
+        // `--judge cloud` the judge is Haiku (not "local"), so name it accurately.
+        let (judged_by, untrusted_msg) = match &r.cloud_judge_model {
+            Some(m) => (format!("Cloud judge ({m}) vs audit"), "the cloud judge is not yet trustworthy"),
+            None => ("Local judge vs cloud audit".to_string(), "the local judge is not yet trustworthy"),
+        };
         s.push_str(&format!(
-            "Local vs cloud agreement: {:.1}% · Cohen's kappa: {:.3} · audited {} pairs · **{}**{}{}\n\n",
+            "{judged_by} agreement: {:.1}% · Cohen's kappa: {:.3} · audited {} pairs · **{}**{}{}\n\n",
             r.trust.agreement * 100.0,
             r.trust.kappa,
             r.trust.audited_count,
-            if r.trust.trusted { "TRUSTED" } else { "the local judge is not yet trustworthy" },
+            if r.trust.trusted { "TRUSTED" } else { untrusted_msg },
             if r.trust.expanded_to_full_audit { " (audit auto-expanded to 100%)" } else { "" },
             if r.trust.audit_n_too_small { " · audit n too small; trust verdict indicative only" } else { "" },
         ));
@@ -293,6 +303,14 @@ pub fn render_markdown(r: &ReportModel) -> String {
         r.egress_pairs_sent,
         if r.local_only { " — zero: --local-only" } else { "" },
     ));
+    if let Some(model) = &r.cloud_judge_model {
+        let open_n: usize = r.segments.iter().filter(|s| s.label.ends_with("open")).map(|s| s.n).sum();
+        s.push_str(&format!(
+            "> Cloud judge = {model}: all {open_n} open-query pair(s) were judged in the cloud (2 \
+             swapped calls each) — additional egress BEYOND the audit line above. The audit sample \
+             then self-checks this judge (the agreement/kappa in the trust verdict is Haiku-vs-audit).\n",
+        ));
+    }
     // 8. Examples.
     s.push_str("\n### Examples (wins/losses with context diffs)\n");
     for ex in &r.examples {
@@ -370,6 +388,7 @@ mod tests {
                 ollama_model: "qwen2.5:7b".into(),
                 egress_pairs_sent: 4,
                 local_only: false,
+                cloud_judge_model: None,
                 near_dedup_applied: false,
                 air_pack: PackTotals { sources_packed: 30, snippets_truncated: 1, chars_packed: 9000 },
                 gbrain_pack: PackTotals { sources_packed: 30, snippets_truncated: 0, chars_packed: 4000 },
@@ -469,6 +488,32 @@ mod tests {
         let ko = "감마선은".repeat(200); // > 200 chars, all multibyte
         let out = truncate_for_example(&ko);
         assert!(out.chars().count() <= 201, "200 chars + ellipsis");
+    }
+
+    #[test]
+    fn cloud_judge_egress_is_disclosed_when_set() {
+        let mut report = ReportModel::sample_for_test();
+        // Local judge (None) → no cloud-judge disclosure line.
+        assert!(!render_markdown(&report).contains("Cloud judge ="), "local judge: no cloud-judge note");
+        // Add an open segment (so there are open pairs to disclose), then set the cloud judge.
+        report.segments.push(SegmentResult {
+            label: "real·en·open".into(),
+            n: 7,
+            air_success_at_k: 0.0,
+            gbrain_success_at_k: 0.0,
+            air_mrr: 0.0,
+            gbrain_mrr: 0.0,
+            air_win_rate: 0.6,
+            ci_low: 0.5,
+            ci_high: 0.7,
+            wilcoxon: None,
+        });
+        report.cloud_judge_model = Some("claude-haiku-4-5-20251001".into());
+        let md = render_markdown(&report);
+        assert!(
+            md.contains("Cloud judge = claude-haiku-4-5-20251001: all 7 open-query pair(s)"),
+            "cloud-judge egress disclosed with the open-pair count: {md}"
+        );
     }
 
     #[test]

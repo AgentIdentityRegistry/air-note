@@ -4,8 +4,16 @@
 //! failure degrades to "audit incomplete — trust verdict unavailable" (never fabricates).
 //! A one-token PREFLIGHT runs before the expensive loop (fail fast, spec §5 Rev 2).
 
-/// The pinned audit model (a current Sonnet-tier id — confirmed/adjusted by Probe D).
+/// The pinned audit model (a current Sonnet-tier id — confirmed/adjusted by Probe D). Used as
+/// the REFERENCE the judge is checked against, whether the judge is the local 7B or cloud Haiku.
 pub const AUDIT_MODEL: &str = "claude-sonnet-5";
+
+/// The pinned cloud-JUDGE model for `--judge cloud`: Haiku 4.5 — cheap, low-latency, and a far
+/// sharper referee than a quantized local 7B (the 2026-07-06 run measured the local judge at only
+/// 53% agreement with Sonnet). Verified accepted by the Messages API 2026-07-06 (the
+/// `claude-haiku-4-5` alias resolves to this dated id). The audit ladder self-checks THIS judge
+/// against AUDIT_MODEL, so a Haiku that drifts from Sonnet is caught — never trusted blindly.
+pub const JUDGE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -64,9 +72,10 @@ struct MessagesReq<'a> {
     thinking: Thinking,
     messages: Vec<ReqMessage<'a>>,
 }
-/// Sonnet 5 enables ADAPTIVE thinking when this field is omitted, and max_tokens covers
-/// thinking + text COMBINED — an unprompted thinking block would eat the 4/8-token budget
-/// and return no text block, deterministically blanking the trust verdict. Explicitly off.
+/// Current Claude models (Sonnet AND Haiku) can enable ADAPTIVE thinking when this field is
+/// omitted, and max_tokens covers thinking + text COMBINED — an unprompted thinking block would
+/// eat the 4/8-token budget and return no text block, deterministically blanking the verdict.
+/// Explicitly off. Verified accepted by both AUDIT_MODEL and JUDGE_MODEL (2026-07-06).
 #[derive(serde::Serialize)]
 struct Thinking {
     #[serde(rename = "type")]
@@ -91,7 +100,7 @@ const RETRY_BACKOFF_SECS: [u64; 2] = [2, 4];
 /// and stops egress; a fabricated verdict is never produced). Transport errors and other
 /// statuses fail fast. Anthropic puts the real cause (invalid key, retired model id) in the
 /// JSON error body, so non-2xx responses quote it.
-fn post_message(api_key: &str, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
+fn post_message(api_key: &str, model: &str, prompt: &str, max_tokens: u32) -> anyhow::Result<String> {
     let mut attempts = 0;
     loop {
         let result = agent()
@@ -100,7 +109,7 @@ fn post_message(api_key: &str, prompt: &str, max_tokens: u32) -> anyhow::Result<
             .set("anthropic-version", ANTHROPIC_VERSION)
             .set("content-type", "application/json")
             .send_json(MessagesReq {
-                model: AUDIT_MODEL,
+                model,
                 max_tokens,
                 thinking: Thinking { kind: "disabled" },
                 messages: vec![ReqMessage { role: "user", content: prompt }],
@@ -130,12 +139,11 @@ fn post_message(api_key: &str, prompt: &str, max_tokens: u32) -> anyhow::Result<
 /// Fail-fast preflight (Rev 2, finding 6): ONE tiny call with the pinned model BEFORE the
 /// expensive loop — a bad key or retired model id fails in seconds, not after 2h. The reply
 /// content is irrelevant; only success matters.
-pub fn preflight(api_key: &str) -> anyhow::Result<()> {
-    post_message(api_key, "Reply with exactly: OK", 4).map(|_| ()).map_err(|e| {
+pub fn preflight(api_key: &str, model: &str) -> anyhow::Result<()> {
+    post_message(api_key, model, "Reply with exactly: OK", 4).map(|_| ()).map_err(|e| {
         anyhow::anyhow!(
             "Anthropic preflight failed ({e}). Check ANTHROPIC_API_KEY and that model \
-             '{AUDIT_MODEL}' exists (update AUDIT_MODEL per Probe D if retired). \
-             Or run with --local-only."
+             '{model}' exists (update the pinned model id if retired). Or run with --local-only."
         )
     })
 }
@@ -145,14 +153,17 @@ pub fn preflight(api_key: &str) -> anyhow::Result<()> {
 /// shared rule — ambiguous → None → Uncertain).
 pub struct AnthropicAuditor {
     pub api_key: String,
+    /// Which model does the picking — AUDIT_MODEL (Sonnet) in the audit role, JUDGE_MODEL
+    /// (Haiku) when it serves as the `--judge cloud` judge. Same protocol either way.
+    pub model: String,
 }
 
 impl PairJudge for AnthropicAuditor {
     fn pick(&self, query: &str, answer_a: &str, answer_b: &str) -> anyhow::Result<Option<PosPick>> {
         // max_tokens 8: a truncated negation ("Answer B is worse than…") could still parse
-        // decisively; Sonnet-tier one-token compliance makes that rare, and the parser's
+        // decisively; frontier one-token compliance makes that rare, and the parser's
         // ambiguity rules (uppercase-only signals, article blockers) are the main guard.
-        let reply = post_message(&self.api_key, &pairwise_prompt(query, answer_a, answer_b), 8)?;
+        let reply = post_message(&self.api_key, &self.model, &pairwise_prompt(query, answer_a, answer_b), 8)?;
         Ok(parse_pick_token(&reply))
     }
 }
@@ -171,17 +182,20 @@ mod tests {
     }
 
     #[test]
-    fn messages_request_disables_thinking() {
-        // Guards the adaptive-thinking trap: omitting `thinking` lets Sonnet 5 spend the whole
-        // 4/8-token budget on a thinking block → no text block → audit_incomplete.
+    fn messages_request_disables_thinking_and_carries_the_model() {
+        // Guards the adaptive-thinking trap: omitting `thinking` lets a current model spend the
+        // whole 4/8-token budget on a thinking block → no text block → audit_incomplete.
+        // Also guards that the model PARAM reaches the request body (so `--judge cloud`'s Haiku
+        // isn't silently sent to Sonnet).
         let req = MessagesReq {
-            model: AUDIT_MODEL,
+            model: JUDGE_MODEL,
             max_tokens: 8,
             thinking: Thinking { kind: "disabled" },
             messages: vec![ReqMessage { role: "user", content: "hi" }],
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["thinking"]["type"], "disabled");
+        assert_eq!(v["model"], JUDGE_MODEL, "the model param must reach the request body");
     }
 
     #[test]
