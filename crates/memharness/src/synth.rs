@@ -80,6 +80,29 @@ pub trait QueryGenerator {
 /// NOT alias them.
 const GENERATOR_EXCERPT_CHAR_CAP: usize = 4000;
 
+/// Attempts (1 first try + retries) at getting a NON-EMPTY generation. A 7B occasionally
+/// emits a transient blank (measured live 2026-07-06: one blank aborted a 40-min generating
+/// run on its ~900th call; manual re-asks of the same page produced good queries 3/3) — one
+/// blank must not kill the run, while PERSISTENT blanks still fail loud in the caller.
+const GENERATOR_ATTEMPTS: usize = 3;
+
+/// Call `generate` up to `attempts` times until it yields a non-empty trimmed string.
+/// `Ok(None)` = every attempt came back blank (caller fails loud with its own context).
+/// Real errors (transport, HTTP) propagate IMMEDIATELY — errors are not blanks, and
+/// `ollama::generate` already owns its own timeout discipline.
+fn first_nonempty(
+    attempts: usize,
+    mut generate: impl FnMut() -> anyhow::Result<String>,
+) -> anyhow::Result<Option<String>> {
+    for _ in 0..attempts {
+        let text = generate()?.trim().to_string();
+        if !text.is_empty() {
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
+}
+
 /// Live generator: asks the local model for ONE specific question the page answers, in the
 /// page's language (Korean pages get Korean queries, spec §3).
 pub struct OllamaQueryGenerator {
@@ -98,10 +121,15 @@ impl QueryGenerator for OllamaQueryGenerator {
             "Read the note below. Write ONE specific question that this note (and ideally only \
              this note) answers. {lang_instr} Output only the question.\n\nNote:\n{excerpt}\n"
         );
-        let text = crate::ollama::generate(&self.model, &prompt)?.trim().to_string();
-        if text.is_empty() {
-            anyhow::bail!("generator returned an empty query for {}", page.page_id);
-        }
+        let text = first_nonempty(GENERATOR_ATTEMPTS, || {
+            crate::ollama::generate(&self.model, &prompt)
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "generator returned an empty query for {} ({GENERATOR_ATTEMPTS} attempts)",
+                page.page_id
+            )
+        })?;
         Ok(vec![SynthQuery { text, gold_page_id: page.page_id.clone(), lang: page.lang.clone() }])
     }
 }
