@@ -1128,6 +1128,13 @@ impl EventLog {
         };
         let chunks = crate::chunk::chunk_text(&text);
         if chunks.is_empty() {
+            // Whitespace-only embeddable text chunks to nothing and is
+            // INTENTIONALLY not embedded (returns Ok(false), zero rows) rather
+            // than storing a degenerate all-zero vector. Consequence, by design:
+            // collect_pending's `v.event_id IS NULL` LEFT JOIN keeps re-collecting
+            // such an event on every rederive_pending pass (it never gains a row);
+            // the cost is one no-op chunk_text per call, and whitespace-only
+            // memories are effectively nonexistent — so this is deliberate, not a bug.
             return Ok(false);
         }
         // Embed EVERY chunk before taking the store lock — the embedder is never
@@ -1371,6 +1378,11 @@ impl EventLog {
         let mut mult = CHUNK_OVERFETCH;
         let mut folded: Vec<(String, f32)> = loop {
             let want = k.saturating_mul(mult);
+            // Each doubling re-searches from scratch (the prior pass's raw hits are
+            // discarded, not extended) — intentional for fold simplicity. The
+            // common case (k = FUSION_FETCH = 200) folds ≥ k distinct events on the
+            // first pass and never re-searches; re-search only kicks in for tiny k
+            // over a fat-tailed chunk distribution.
             let raw = index.search(query_vec, want);
             // A short read means the index holds fewer than `want` chunks
             // (search clamps to index size); refetching cannot surface more, so
@@ -1387,9 +1399,9 @@ impl EventLog {
                     })
                     .or_insert(dist);
             }
-            let folded: Vec<(String, f32)> = best.into_iter().collect();
-            if folded.len() >= k || exhausted {
-                break folded;
+            let pass: Vec<(String, f32)> = best.into_iter().collect();
+            if pass.len() >= k || exhausted {
+                break pass;
             }
             mult = mult.saturating_mul(2);
         };
@@ -7622,6 +7634,28 @@ mod tests {
         );
     }
 
+    /// Whitespace-only embeddable text chunks to nothing, so `derive_vector`
+    /// stores ZERO rows and returns `Ok(false)` — it is intentionally NOT embedded
+    /// (no degenerate all-zero vector). This locks the deliberate consequence that
+    /// such an event is never "done" for collect_pending (documented at the
+    /// `chunks.is_empty()` early return in derive_vector).
+    #[test]
+    fn whitespace_only_event_writes_zero_rows_and_returns_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+
+        let id = log.append(chunk_test_memory_event("   \n\t ")).unwrap();
+        let embedder = MockEmbedder::new(64);
+        assert!(
+            !log.derive_vector(&embedder, &log_event(&log, &id)).unwrap(),
+            "whitespace-only text is not embedded → Ok(false)"
+        );
+        assert!(
+            chunk_ixs_for(&log, &id).is_empty(),
+            "no vector rows land for a whitespace-only event"
+        );
+    }
+
     #[test]
     fn vectors_for_model_returns_chunk_keys_ordered_by_event_then_chunk() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7788,6 +7822,7 @@ mod tests {
     /// event (chunk_ix 0..vecs.len()) directly into the `vectors` table,
     /// bypassing the chunker so the test controls the exact chunk distribution.
     fn insert_controlled_chunks(log: &EventLog, event_id: &str, vecs: &[Vec<f32>]) {
+        assert!(!vecs.is_empty(), "insert_controlled_chunks needs ≥1 chunk vector");
         let dim = vecs[0].len() as i64;
         let blobs: Vec<Vec<u8>> = vecs.iter().map(|v| vec_to_blob(v)).collect();
         let store = log.inner.lock().expect(POISON);
