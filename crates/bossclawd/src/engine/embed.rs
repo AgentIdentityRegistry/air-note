@@ -48,6 +48,21 @@ impl EmbedderProvider for ResourceModel2Vec {
 }
 
 #[cfg(test)]
+mod effective_id_tests {
+    use super::*;
+
+    #[test]
+    fn model_id_is_the_effective_chunks_id() {
+        // The single source of truth carries the +chunks-v1 suffix so vectors are
+        // written, read, and (Phase B) migration-triggered under ONE id.
+        assert_eq!(MODEL_ID, "minishlab/potion-base-8M+chunks-v1");
+        // The base directory-loader id is separate and unchanged (still the HF slug),
+        // so no model DIRECTORY rename is implied by the effective id.
+        assert_eq!(BASE_MODEL_DIR_ID, "minishlab/potion-base-8M");
+    }
+}
+
+#[cfg(test)]
 pub struct MockEmbedderProvider {
     dim: usize,
 }
