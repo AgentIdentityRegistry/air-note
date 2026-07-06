@@ -7923,4 +7923,68 @@ mod tests {
             assert!(decode_chunk_key(id).is_none(), "folded ids must be bare, got {id:?}");
         }
     }
+
+    // ── Rung 3 A11: FTS keyword arm stays WHOLE-DOC under chunking ───────────
+
+    /// Count the `fts_map` side-table rows for one event, via the same
+    /// `store.conn()` seam `chunk_ixs_for` uses. The keyword (FTS5) arm indexes
+    /// each event as ONE whole-doc row; this is the raw accessor that pins it.
+    fn fts_map_row_count(log: &EventLog, event_id: &str) -> i64 {
+        let store = log.inner.lock().expect(POISON);
+        let conn = store.conn();
+        conn.query_row(
+            "SELECT COUNT(*) FROM fts_map WHERE event_id = ?1",
+            rusqlite::params![event_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    /// Chunking (Rung 3) split the VECTOR write path into one row per chunk. The
+    /// KEYWORD (FTS5) arm must stay WHOLE-DOC: exactly one `fts_map` row per
+    /// event, indexing the entire body — NOT one row per chunk. A future edit
+    /// that accidentally chunked `collect_embeddable_events_ordered`/`keyword_add`
+    /// would change BM25 semantics silently; this guard fails if it does.
+    #[test]
+    fn fts_stays_whole_doc_when_vectors_are_chunked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+
+        // A head that on its own exceeds one chunk budget (3000 > 1500 chars),
+        // plus a distinct needle in the TAIL — past chunk 0's window.
+        let head = "alpha ".repeat(500);
+        let needle = "zzunlikelyneedle";
+        let text = format!("{head}\n\n{needle} in the tail");
+
+        let id = log.append(chunk_test_memory_event(&text)).unwrap();
+        let embedder = MockEmbedder::new(64);
+        log.rederive_pending(&embedder).unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+
+        // (1) Sanity — the event genuinely chunks into >1 VECTOR rows, so the
+        //     whole-doc FTS assertion below is not vacuous.
+        let vector_chunks = chunk_ixs_for(&log, &id).len();
+        assert!(
+            vector_chunks > 1,
+            "fixture must chunk into >1 vector rows to be a real invariance test (got {vector_chunks})"
+        );
+
+        // (2) The FTS side has EXACTLY ONE fts_map row for this event — the
+        //     keyword arm is one whole-doc row, NOT one per chunk.
+        assert_eq!(
+            fts_map_row_count(&log, &id),
+            1,
+            "keyword arm must be a single whole-doc fts_map row per event, not one per chunk"
+        );
+
+        // (3) A keyword search for the TAIL needle returns this event — proving
+        //     the keyword arm indexed the WHOLE doc (the needle sits past the
+        //     first chunk's budget), not just chunk 0.
+        let hits = log.keyword_search(needle, 10).unwrap();
+        assert!(
+            hits.iter().any(|(hid, _)| *hid == id),
+            "keyword_search({needle}) must surface the event — the tail needle proves \
+             the whole doc is indexed, not only the first chunk; got {hits:?}"
+        );
+    }
 }
