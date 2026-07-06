@@ -433,6 +433,16 @@ mod tests {
         // Pack totals: every open-case hit packed on both arms.
         assert_eq!(outcome.air_pack.sources_packed, 2);
         assert_eq!(outcome.gbrain_pack.sources_packed, 2);
+
+        // Per-case mechanical results (spec §3.0.3): exactly the ONE known-item case, with
+        // ranks/flags matching the bucket math; opens are NOT recorded here.
+        assert_eq!(outcome.case_results.len(), 1);
+        let cr = &outcome.case_results[0];
+        assert_eq!(cr.case_idx, 0, "case identity = index into the (frozen) case list");
+        assert_eq!(cr.label, "synthetic·en·known-item");
+        assert_eq!(cr.air_rank, Some(0));
+        assert_eq!(cr.gbrain_rank, None);
+        assert!(cr.air_success && !cr.gbrain_success);
     }
 
     #[test]
