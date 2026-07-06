@@ -29,6 +29,8 @@ pub enum QuerySource {
 }
 
 /// One query case. `gold_page_id`: Some = known-item (mechanical), None = open (judged).
+/// Serialized FIELD ORDER is part of the on-disk frozen-list identity (`cases::save_cases`
+/// shas the exact bytes) — do not reorder fields or add unordered-map fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueryCase {
     pub text: String,
