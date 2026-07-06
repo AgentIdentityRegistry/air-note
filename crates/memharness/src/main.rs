@@ -464,6 +464,20 @@ mod cli_tests {
         assert!(args.judge == JudgeMode::Cloud, "--judge cloud parses");
 
         let cli = Cli::parse_from([
+            "memharness", "run", "--known-item-only", "--cases", "/tmp/frozen.jsonl",
+        ]);
+        let Command::Run(args) = cli.command;
+        assert!(args.known_item_only);
+        assert_eq!(args.cases, Some("/tmp/frozen.jsonl".into()));
+        assert!(args.save_cases.is_none());
+
+        // --save-cases and --cases contradict (regenerate vs load) — clap rejects the pair.
+        assert!(Cli::try_parse_from([
+            "memharness", "run", "--save-cases", "/tmp/a.jsonl", "--cases", "/tmp/b.jsonl",
+        ])
+        .is_err());
+
+        let cli = Cli::parse_from([
             "memharness", "run", "--local-only", "--k", "5", "--model", "llama3:8b",
             "--seed", "7", "--corpus", "/tmp/brain", "--reports-dir", "/tmp/reports",
         ]);
