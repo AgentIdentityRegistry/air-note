@@ -1180,6 +1180,71 @@ fn recall_pin_boost_raises_pinned_above_equal() {
     );
 }
 
+/// Downstream-untouched (Rung 3 A10): a MULTI-CHUNK event still flows through the
+/// full recall pipeline by its BARE event id — recency/pin boost applies to it,
+/// and it passes the pages/files + superseded/revoked filters. This is the
+/// end-to-end proof that vector_search's chunk→event fold-back preserves the
+/// bare-event_id contract every downstream stage depends on: if a composite
+/// chunk key leaked, the pin set (keyed by bare id) would never match and the
+/// boost would not land.
+#[test]
+fn recall_multi_chunk_event_keeps_bare_id_downstream_contract() {
+    // A long event (multiple chunks) sharing the query vocabulary, plus a
+    // single-chunk competitor with the SAME query tokens so they tie on
+    // relevance before any boost.
+    let shared = "quantum lattice resonance cascade";
+    let mut long_text = String::new();
+    for block in 0..8 {
+        long_text.push_str(&format!("# Part {block}\n\n"));
+        for line in 0..6 {
+            long_text.push_str(&format!(
+                "{shared} — part {block} line {line} elaborates with filler prose \
+                 and token{block}{line} to keep blocks distinct.\n"
+            ));
+        }
+        long_text.push('\n');
+    }
+    assert!(
+        long_text.chars().count() > 1_500,
+        "long event must exceed one chunk budget"
+    );
+
+    let (log, _dir, ids) = seeded_log(&[long_text.as_str(), shared]);
+    let long_id = &ids[0];
+    let short_id = &ids[1];
+
+    let embedder = MockEmbedder::new(MID_DIM);
+
+    // (1) Baseline: both surface for the shared query, each by its BARE id.
+    let baseline = log
+        .recall(&embedder, shared, RECALL_TOP_K, &RecallOptions::default())
+        .unwrap();
+    let long_hit = find_hit(&baseline, long_id)
+        .expect("multi-chunk event must surface in recall by its bare event id");
+    assert_eq!(
+        &long_hit.event_id, long_id,
+        "the multi-chunk event is identified by its BARE id, not a chunk key"
+    );
+    assert!(
+        find_hit(&baseline, short_id).is_some(),
+        "the single-chunk competitor must also surface"
+    );
+
+    // (2) Pin the multi-chunk event BY ITS BARE ID → the pin boost must land on
+    //     it (proving the folded id matches the pin set) and lift it above the
+    //     unpinned competitor.
+    let opts = RecallOptions { pinned: vec![long_id.clone()], ..Default::default() };
+    let pinned = log.recall(&embedder, shared, RECALL_TOP_K, &opts).unwrap();
+    let long_rank = rank_of(&pinned, long_id).expect("multi-chunk event present when pinned");
+    let short_rank = rank_of(&pinned, short_id).expect("competitor present");
+    assert!(
+        long_rank < short_rank,
+        "pinning the multi-chunk event by its bare id must boost it above the \
+         unpinned competitor (fold-back preserved the bare-id contract); \
+         pinned={pinned:?}"
+    );
+}
+
 /// Degrade-to-keyword (spec §10): WITHOUT building the vector index, recall must
 /// still return keyword results and must NOT error. The vector arm fails with
 /// `InvalidInput` (index not built); recall logs a warning and falls back to the
