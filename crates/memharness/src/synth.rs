@@ -113,6 +113,41 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     #[test]
+    fn first_nonempty_retries_blanks_then_succeeds_or_fails_loud() {
+        // One transient blank must not kill a 40-min generating run (measured live 2026-07-06:
+        // a single empty 7B generation aborted the run on its ~900th call; manual re-asks of
+        // the same page produced good queries 3/3).
+        let mut calls = 0;
+        let got = first_nonempty(3, || {
+            calls += 1;
+            Ok(if calls == 1 { "  \n".to_string() } else { "good question?".to_string() })
+        })
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("good question?"));
+        assert_eq!(calls, 2, "stops at the first non-empty");
+
+        // PERSISTENTLY blank → Ok(None): the caller still fails loud (contract preserved).
+        let mut calls = 0;
+        let got = first_nonempty(3, || {
+            calls += 1;
+            Ok(String::new())
+        })
+        .unwrap();
+        assert!(got.is_none());
+        assert_eq!(calls, 3, "all attempts consumed before giving up");
+
+        // A real transport error propagates immediately — errors are not blanks.
+        let mut calls = 0;
+        let err = first_nonempty(3, || {
+            calls += 1;
+            Err(anyhow::anyhow!("connection refused"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("connection refused"));
+        assert_eq!(calls, 1, "no retry on real errors");
+    }
+
+    #[test]
     fn stratified_selection_is_seeded_and_covers_categories() {
         let pages: Vec<PageRef> = [
             ("air/a", "en"), ("air/b", "en"), ("air/c", "en"),
