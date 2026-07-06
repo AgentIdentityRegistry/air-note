@@ -3,7 +3,9 @@
 #![forbid(unsafe_code)]
 pub mod anthropic;
 pub mod arms;
+pub mod cases;
 pub mod client;
+pub mod compare;
 pub mod corpus;
 pub mod daemon;
 pub mod frontmatter;

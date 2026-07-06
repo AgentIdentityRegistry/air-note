@@ -35,6 +35,22 @@ pub struct CorpusManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
+/// Snapshot identity (spec §3.0.1): sha256 over each entry's `page_id\0sha256\n` in manifest
+/// order (entries are already sorted). Deliberately EXCLUDES `snapshot_unix_secs` — two copies
+/// of byte-identical corpora taken at different times are the SAME snapshot; gates may only
+/// compare runs whose ids match.
+pub fn manifest_sha(manifest: &CorpusManifest) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for e in &manifest.entries {
+        hasher.update(e.page_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(e.sha256.as_bytes());
+        hasher.update([b'\n']);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// `~/brain`-relative path ("air/foo.md") → page id ("air/foo"). The ".md" suffix is stripped
 /// case-insensitively, and the id is NFC-normalized so filesystem-provided names (which may
 /// arrive NFD, e.g. from HFS+) join GBrain's NFC slugs instead of failing silently.
@@ -270,5 +286,27 @@ mod tests {
         let manifest = prepare_corpus(src.path(), dst.path(), false).unwrap();
         assert_eq!(std::fs::read_to_string(dst.path().join("foo.md")).unwrap(), raw);
         assert_eq!(manifest.entries[0].bytes, raw.len() as u64);
+    }
+
+    #[test]
+    fn manifest_sha_is_stable_and_content_sensitive() {
+        let m = CorpusManifest {
+            snapshot_unix_secs: 1,
+            file_count: 2,
+            total_bytes: 10,
+            entries: vec![
+                ManifestEntry { page_id: "a".into(), sha256: "s1".into(), bytes: 5 },
+                ManifestEntry { page_id: "b".into(), sha256: "s2".into(), bytes: 5 },
+            ],
+        };
+        let sha = manifest_sha(&m);
+        assert_eq!(sha.len(), 64, "sha256 hex");
+        assert_eq!(sha, manifest_sha(&m), "deterministic");
+        let mut m2 = m.clone();
+        m2.entries[1].sha256 = "s3".into();
+        assert_ne!(manifest_sha(&m2), sha, "content change changes the id");
+        let mut m3 = m.clone();
+        m3.snapshot_unix_secs = 999; // copy TIME must not change identity
+        assert_eq!(manifest_sha(&m3), sha, "snapshot time is not part of identity");
     }
 }

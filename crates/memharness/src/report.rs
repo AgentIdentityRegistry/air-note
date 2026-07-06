@@ -73,6 +73,13 @@ pub struct ReportModel {
     pub gbrain_reranker: String,
     /// |gbrain_pages − corpus_pages| / corpus_pages; None = count unavailable ("drift unknown").
     pub drift_fraction: Option<f64>,
+    /// Corpus snapshot identity (`corpus::manifest_sha`) — gates only compare equal ids (§3.0.1).
+    pub corpus_sha: String,
+    /// sha of the frozen case-list JSONL when `--cases`/`--save-cases` ran; None = ad-hoc
+    /// generation, loudly labeled UNFROZEN (not comparable across runs).
+    pub case_list_sha: Option<String>,
+    /// Per-known-item-case mechanical results (spec §3.0.3) — scores.json only, never markdown.
+    pub case_results: Vec<crate::run::CaseResult>,
     pub ollama_model: String,
     pub egress_pairs_sent: usize,
     pub local_only: bool,
@@ -236,6 +243,15 @@ pub fn render_markdown(r: &ReportModel) -> String {
          runs shows here instead of silently confounding the comparison)\n\n",
         r.gbrain_mode, r.gbrain_reranker,
     ));
+    let short = |s: &str| s.chars().take(16).collect::<String>();
+    s.push_str(&format!(
+        "Corpus snapshot: {}{} (gates only compare runs with matching identities — spec §3.0)\n\n",
+        short(&r.corpus_sha),
+        match &r.case_list_sha {
+            Some(sha) => format!(" · frozen case list: {}", short(sha)),
+            None => " · case list: ad-hoc (UNFROZEN — not comparable across runs; --save-cases to freeze, --cases to reuse)".to_string(),
+        },
+    ));
     s.push_str("| segment | n | AIR s@k | GBrain s@k | AIR MRR | GBrain MRR | AIR win% | 95% CI |\n");
     s.push_str("|---|---|---|---|---|---|---|---|\n");
     for seg in &r.segments {
@@ -385,6 +401,9 @@ mod tests {
                 gbrain_mode: "tokenmax".into(),
                 gbrain_reranker: "zeroentropyai:zerank-2".into(),
                 drift_fraction: Some(0.01),
+                corpus_sha: "ab".repeat(32),
+                case_list_sha: None,
+                case_results: vec![],
                 ollama_model: "qwen2.5:7b".into(),
                 egress_pairs_sent: 4,
                 local_only: false,
@@ -517,6 +536,30 @@ mod tests {
     }
 
     #[test]
+    fn frozen_case_list_sha_is_rendered_and_cases_land_in_scores_json() {
+        let mut report = ReportModel::sample_for_test();
+        report.case_list_sha = Some("f".repeat(64));
+        report.case_results = vec![crate::run::CaseResult {
+            case_idx: 0,
+            label: "synthetic·en·known-item".into(),
+            air_rank: Some(0),
+            gbrain_rank: None,
+            air_success: true,
+            gbrain_success: false,
+        }];
+        let md = render_markdown(&report);
+        assert!(md.contains("frozen case list: ffffffffffffffff"), "16-char sha prefix: {md}");
+        assert!(!md.contains("UNFROZEN"));
+        assert!(
+            !md.contains("case_idx"),
+            "per-case results are scores.json-only, never markdown"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["case_results"][0]["case_idx"], 0, "per-case results serialize");
+        assert_eq!(json["corpus_sha"], report.corpus_sha);
+    }
+
+    #[test]
     fn renders_trust_first_drift_banner_and_caveats() {
         let mut report = ReportModel::sample_for_test();
         let md = render_markdown(&report);
@@ -536,6 +579,14 @@ mod tests {
         );
         assert!(md.contains("Different estimands"), "CI dual-estimand caveat present (finding 2)");
         assert!(!md.contains("INVALID RUN"), "no banner at 0 drift");
+        assert!(
+            md.contains("Corpus snapshot: "),
+            "snapshot identity rendered (spec §3.0.1)"
+        );
+        assert!(
+            md.contains("UNFROZEN"),
+            "ad-hoc case list is loudly labeled not-comparable: {md}"
+        );
         // GOLDEN on synthetic data: render is deterministic.
         assert_eq!(md, ReportModel::sample_golden_markdown());
 

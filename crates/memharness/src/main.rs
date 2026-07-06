@@ -26,6 +26,8 @@ struct Cli {
 enum Command {
     /// Run one A/B measurement and write a report.
     Run(RunArgs),
+    /// Compare two frozen runs PAIRED (per-case, same case-list sha) — the rung-gate stats.
+    Compare(CompareArgs),
 }
 
 /// Which model judges open-query answer quality (known-item scoring is mechanical, no judge).
@@ -48,6 +50,18 @@ struct RunArgs {
     /// against Sonnet). Cloud needs an ANTHROPIC_API_KEY and is incompatible with --local-only.
     #[arg(long, value_enum, default_value = "local")]
     judge: JudgeMode,
+    /// Score ONLY known-item cases (mechanical, judge-free): the fast retrieval-A/B mode.
+    /// Skips open-query answering/judging/audit AND the ANTHROPIC_API_KEY requirement.
+    #[arg(long)]
+    known_item_only: bool,
+    /// After building the case list (mined + synthetic), save it as JSONL and proceed.
+    #[arg(long, conflicts_with = "cases")]
+    save_cases: Option<PathBuf>,
+    /// Load a frozen case list (skips transcript mining AND synth generation entirely).
+    /// Gold pages absent from the CURRENT corpus score as symmetric misses — the report's
+    /// corpus_sha is the cross-check (the compare subcommand enforces it).
+    #[arg(long)]
+    cases: Option<PathBuf>,
     /// Local Ollama model for answerer/judge/synth.
     #[arg(long, default_value = memharness::ollama::DEFAULT_OLLAMA_MODEL)]
     model: String,
@@ -65,6 +79,16 @@ struct RunArgs {
     seed: u64,
 }
 
+#[derive(clap::Args)]
+struct CompareArgs {
+    /// Baseline run's scores.json (e.g. the frozen Phase 1 baseline).
+    #[arg(long)]
+    baseline: PathBuf,
+    /// Candidate run's scores.json (the rung under test).
+    #[arg(long)]
+    candidate: PathBuf,
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
@@ -72,7 +96,33 @@ fn dirs_home() -> PathBuf {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args),
+        Command::Compare(args) => compare(args),
     }
+}
+
+/// Print the paired comparison table (spec §3.0.3). The GATE read: only the two gating
+/// segments (synthetic·en/ko·known-item, spec §1) may pass or fail a rung.
+fn compare(args: CompareArgs) -> anyhow::Result<()> {
+    let baseline = std::fs::read_to_string(&args.baseline)
+        .with_context(|| format!("reading baseline {}", args.baseline.display()))?;
+    let candidate = std::fs::read_to_string(&args.candidate)
+        .with_context(|| format!("reading candidate {}", args.candidate.display()))?;
+    println!("| segment | n | baseline s@k | candidate s@k | Δ | paired Wilcoxon p |");
+    println!("|---|---|---|---|---|---|");
+    for row in memharness::compare::compare_runs(&baseline, &candidate)? {
+        println!(
+            "| {} | {} | {:.3} | {:.3} | {:+.3} | {:.4}{} |",
+            row.label,
+            row.n,
+            row.baseline_s_at_k,
+            row.candidate_s_at_k,
+            row.candidate_s_at_k - row.baseline_s_at_k,
+            row.wilcoxon.p_value,
+            if row.wilcoxon.small_n_approx { " (small-n approx)" } else { "" },
+        );
+    }
+    println!("\nGating segments (spec §1): synthetic·en·known-item, synthetic·ko·known-item ONLY.");
+    Ok(())
 }
 
 /// Synthetic-query volume target (spec §3: ~200–400).
@@ -99,9 +149,15 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
             "--judge cloud needs the cloud (an ANTHROPIC_API_KEY) and is incompatible with --local-only"
         );
     }
+    if args.judge == JudgeMode::Cloud && args.known_item_only {
+        anyhow::bail!(
+            "--judge cloud is meaningless with --known-item-only (no open queries to judge)"
+        );
+    }
     memharness::report::ensure_outside_repo(&reports_dir, &repo_root)?;
     memharness::ollama::preflight(&args.model)?;
-    let api_key = if args.local_only {
+    let api_key = if args.local_only || args.known_item_only {
+        // --known-item-only scores mechanically — no judge, no audit, no key, zero egress.
         None
     } else {
         let key = std::env::var("ANTHROPIC_API_KEY")
@@ -179,7 +235,14 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     log_stage_secs("ingest+bridge", stage);
 
     // ── Query set: mined real + synthetic (both seeded/deterministic). ──
-    let cases = build_query_cases(&args, &manifest, &corpus_home)?;
+    let (mut cases, case_list_sha) = build_query_cases(&args, &manifest, &corpus_home)?;
+    if args.known_item_only {
+        cases.retain(|c| c.gold_page_id.is_some());
+        eprintln!("memharness: --known-item-only — {} known-item cases retained", cases.len());
+        if cases.is_empty() {
+            anyhow::bail!("--known-item-only left zero cases — nothing to measure");
+        }
+    }
     eprintln!("memharness: {} query cases built", cases.len());
 
     // ── Seams (wrapped in the live-only visibility decorators below). ──
@@ -230,6 +293,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let drift_fraction = gbrain_page_count.map(|p| {
         (p as f64 - manifest.file_count as f64).abs() / (manifest.file_count.max(1)) as f64
     });
+    let corpus_sha = memharness::corpus::manifest_sha(&manifest);
     let report = memharness::report::ReportModel {
         trust: outcome.trust,
         k: args.k,
@@ -240,6 +304,9 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         gbrain_mode,
         gbrain_reranker,
         drift_fraction,
+        corpus_sha,
+        case_list_sha,
+        case_results: outcome.case_results,
         ollama_model: args.model.clone(),
         egress_pairs_sent: outcome.egress_pairs_sent,
         local_only: args.local_only,
@@ -346,7 +413,17 @@ fn build_query_cases(
     args: &RunArgs,
     manifest: &CorpusManifest,
     corpus_home: &Path,
-) -> anyhow::Result<Vec<QueryCase>> {
+) -> anyhow::Result<(Vec<QueryCase>, Option<String>)> {
+    if let Some(path) = &args.cases {
+        let (cases, sha) = memharness::cases::load_cases(path)?;
+        eprintln!(
+            "memharness: {} frozen cases loaded from {} (sha {}…)",
+            cases.len(),
+            path.display(),
+            &sha[..16]
+        );
+        return Ok((cases, Some(sha)));
+    }
     // Real: read every *.jsonl under ~/.claude/projects (best-effort per file). Paths are
     // gathered FIRST and SORTED before reading — `read_dir` order is nondeterministic, and a
     // same-text query mined from two files takes its label from whichever comes first, so
@@ -421,7 +498,19 @@ fn build_query_cases(
         "memharness: {absent_gold} real known-item queries reference pages absent from the corpus \
          (they score as misses on both arms — symmetric)"
     );
-    Ok(cases)
+    let sha = match &args.save_cases {
+        Some(path) => {
+            let sha = memharness::cases::save_cases(path, &cases)?;
+            eprintln!(
+                "memharness: case list saved to {} (sha {}…) — the FROZEN Phase 1 list",
+                path.display(),
+                &sha[..16]
+            );
+            Some(sha)
+        }
+        None => None,
+    };
+    Ok((cases, sha))
 }
 
 /// Recursively gather *.jsonl PATHS (unreadable dirs/files are skipped — transcripts are
@@ -447,7 +536,7 @@ mod cli_tests {
     #[test]
     fn parses_run_with_defaults_and_flags() {
         let cli = Cli::parse_from(["memharness", "run"]);
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else { panic!("run expected") };
         assert_eq!(args.k, 10, "default k (retrieval == scoring)");
         assert_eq!(args.model, memharness::ollama::DEFAULT_OLLAMA_MODEL);
         assert_eq!(args.seed, 42, "default seed");
@@ -455,19 +544,40 @@ mod cli_tests {
         assert!(args.judge == JudgeMode::Local, "default judge = local (backward compatible)");
 
         let cli = Cli::parse_from(["memharness", "run", "--judge", "cloud"]);
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else { panic!("run expected") };
         assert!(args.judge == JudgeMode::Cloud, "--judge cloud parses");
+
+        let cli = Cli::parse_from([
+            "memharness", "run", "--known-item-only", "--cases", "/tmp/frozen.jsonl",
+        ]);
+        let Command::Run(args) = cli.command else { panic!("run expected") };
+        assert!(args.known_item_only);
+        assert_eq!(args.cases, Some("/tmp/frozen.jsonl".into()));
+        assert!(args.save_cases.is_none());
+
+        // --save-cases and --cases contradict (regenerate vs load) — clap rejects the pair.
+        assert!(Cli::try_parse_from([
+            "memharness", "run", "--save-cases", "/tmp/a.jsonl", "--cases", "/tmp/b.jsonl",
+        ])
+        .is_err());
 
         let cli = Cli::parse_from([
             "memharness", "run", "--local-only", "--k", "5", "--model", "llama3:8b",
             "--seed", "7", "--corpus", "/tmp/brain", "--reports-dir", "/tmp/reports",
         ]);
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else { panic!("run expected") };
         assert!(args.local_only);
         assert_eq!(args.k, 5);
         assert_eq!(args.model, "llama3:8b");
         assert_eq!(args.seed, 7);
         assert_eq!(args.corpus, Some("/tmp/brain".into()));
         assert_eq!(args.reports_dir, Some("/tmp/reports".into()));
+
+        let cli = Cli::parse_from([
+            "memharness", "compare", "--baseline", "/tmp/a.json", "--candidate", "/tmp/b.json",
+        ]);
+        let Command::Compare(args) = cli.command else { panic!("compare expected") };
+        assert_eq!(args.baseline, PathBuf::from("/tmp/a.json"));
+        assert_eq!(args.candidate, PathBuf::from("/tmp/b.json"));
     }
 }
