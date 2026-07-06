@@ -94,6 +94,14 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_whitespace_splits_like_ascii() {
+        // The rung-1 recall gain relies on `split_whitespace` splitting ALL Unicode whitespace
+        // (it does — U+00A0 NBSP is White_Space=yes). Pin it: an ASCII-only splitter would
+        // silently fuse NBSP-joined terms back into one phrase — the exact ceiling we removed.
+        assert_eq!(escape_fts_query("foo\u{00A0}bar"), r#""foo" OR "bar""#);
+    }
+
+    #[test]
     fn multiline_mined_queries_split_across_lines() {
         assert_eq!(
             escape_fts_query("line one\nline two"),
