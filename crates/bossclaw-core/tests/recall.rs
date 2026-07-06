@@ -351,12 +351,19 @@ fn derive_vector_upsert_is_idempotent_and_blob_round_trips() {
 
     let embedder = MockEmbedder::new(MID_DIM);
     assert!(log.derive_vector(&embedder, &event).unwrap());
-    // Calling twice (INSERT OR REPLACE) must not duplicate the row.
+    // Calling twice must replace this event's chunk set atomically (DELETE +
+    // INSERT-all), not duplicate rows.
     assert!(log.derive_vector(&embedder, &event).unwrap());
 
     let vectors = log.vectors_for_model(MOCK_MODEL_ID).unwrap();
-    assert_eq!(vectors.len(), 1, "upsert, not duplicate insert");
-    assert_eq!(vectors[0].0, id);
+    assert_eq!(vectors.len(), 1, "short text is one chunk; re-derive replaces, not duplicates");
+    // vectors_for_model now returns composite chunk keys; a short event is a
+    // single chunk 0, so the key decodes to (id, 0).
+    assert_eq!(
+        bossclaw_core::index::decode_chunk_key(&vectors[0].0),
+        Some((id.as_str(), 0)),
+        "single-chunk key must decode to (event_id, 0)"
+    );
 
     // The decoded vector must equal a fresh embed of the same text (blob round-trip).
     let expected = embedder

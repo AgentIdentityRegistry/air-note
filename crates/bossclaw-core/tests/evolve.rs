@@ -1203,12 +1203,14 @@ fn supersede_is_never_embeddable() {
     log.rebuild_graph().unwrap();
 
     // (1) STRUCTURAL: the supersede produced no vector row (embeddable_text → None),
-    //     while both pages (embeddable) did.
+    //     while both pages (embeddable) did. vectors_for_model now returns
+    //     composite chunk keys, so fold each back to its bare event id before the
+    //     membership checks (an embeddable event owns ≥1 chunk key under it).
     let vectored: std::collections::HashSet<String> = log
         .vectors_for_model(embedder.model_id())
         .unwrap()
         .into_iter()
-        .map(|(id, _)| id)
+        .map(|(key, _)| bossclaw_core::index::event_id_of(&key).to_string())
         .collect();
     assert!(
         !vectored.contains(&supersede_id),

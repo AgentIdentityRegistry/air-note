@@ -466,17 +466,25 @@ impl EventLog {
                 hash       TEXT NOT NULL UNIQUE
             )",
         )?;
-        // Tier-A derived vectors. One row per (event, model); the embedding is
-        // little-endian f32 bytes. Keyed on (event_id, model_id) so re-deriving
-        // under the same model is an idempotent upsert and different models can
-        // coexist for the same event without colliding.
+        // Tier-A derived vectors. One row per (event, model, CHUNK); the
+        // embedding is little-endian f32 bytes. A long event's `embeddable_text`
+        // is split by the chunker into `n` windows and each window is embedded
+        // and stored as its own row (`chunk_ix` 0..n); a short event is a single
+        // `chunk_ix = 0` row. Keyed on (event_id, model_id, chunk_ix) so every
+        // chunk of an event coexists, different models coexist for the same
+        // event, and a re-derive of one event replaces exactly its own chunk set.
+        //
+        // `CREATE TABLE IF NOT EXISTS` means a FRESH db is born with the 3-column
+        // key; an EXISTING 2-column db is migrated separately (Phase B) — this
+        // statement never alters an existing table.
         store.exec(
             "CREATE TABLE IF NOT EXISTS vectors (
                 event_id  TEXT NOT NULL,
                 model_id  TEXT NOT NULL,
+                chunk_ix  INTEGER NOT NULL DEFAULT 0,
                 dim       INTEGER NOT NULL,
                 embedding BLOB NOT NULL,
-                PRIMARY KEY(event_id, model_id)
+                PRIMARY KEY(event_id, model_id, chunk_ix)
             )",
         )?;
         // FTS5 full-text index (contentless — the event log is the content of
@@ -1087,11 +1095,22 @@ impl EventLog {
 
     /// Derive and store the Tier-A vector for a single event, if embeddable.
     ///
-    /// If [`embeddable_text`] yields `Some(text)`, the text is embedded as a
-    /// one-item batch and upserted into the `vectors` table under
-    /// `(event.id, embedder.model_id())` (INSERT OR REPLACE), returning
-    /// `Ok(true)`. Non-embeddable events store nothing and return `Ok(false)`.
-    /// Embedder failures propagate as `Err`.
+    /// If [`embeddable_text`] yields `Some(text)`, the text is split by the
+    /// chunker into `n` windows, EACH window is embedded, and all `n` chunk rows
+    /// are written under `(event.id, embedder.model_id(), chunk_ix)`, returning
+    /// `Ok(true)`. Non-embeddable events (and text that chunks to nothing) store
+    /// nothing and return `Ok(false)`. Embedder failures propagate as `Err`.
+    ///
+    /// **Atomic per event.** All chunks are embedded FIRST, outside the store
+    /// lock (the embedder is never called while the lock is held). Then, under a
+    /// single `unchecked_transaction`, the event's prior chunk rows are DELETEd
+    /// and every new chunk INSERTed, committing once. This all-chunks-or-zero
+    /// guarantee is what makes [`EventLog::collect_pending`]'s event-granular
+    /// `v.event_id IS NULL` resume correct: a crash can never leave a partial
+    /// chunk set that resume would mistake for "done" (silently losing the
+    /// remaining chunks). The DELETE clears the prior set, so plain `INSERT`
+    /// (not `INSERT OR REPLACE`) is used — a duplicate `(…, chunk_ix)` would be a
+    /// loud bug, not a silent overwrite.
     ///
     /// Production calls this AFTER [`EventLog::append`] has committed and MAY
     /// ignore the returned `Err`: vector derivation is best-effort (spec §10),
@@ -1107,14 +1126,21 @@ impl EventLog {
             Some(t) => t,
             None => return Ok(false),
         };
-        let embedding = embed_one(embedder, &text)?;
-        let blob = vec_to_blob(&embedding);
+        let chunks = crate::chunk::chunk_text(&text);
+        if chunks.is_empty() {
+            return Ok(false);
+        }
+        // Embed EVERY chunk before taking the store lock — the embedder is never
+        // called while the lock is held (so the store mutex cannot deadlock
+        // against a re-entrant embedder).
+        let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            blobs.push(vec_to_blob(&embed_one(embedder, chunk)?));
+        }
+
         let store = self.inner.lock().expect(POISON);
-        store.conn().execute(
-            "INSERT OR REPLACE INTO vectors (event_id, model_id, dim, embedding)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![event.id, embedder.model_id(), embedder.dim() as i64, blob],
-        )?;
+        let conn = store.conn();
+        write_event_chunks(conn, &event.id, embedder.model_id(), embedder.dim() as i64, &blobs)?;
         Ok(true)
     }
 
@@ -1151,35 +1177,58 @@ impl EventLog {
                     continue;
                 }
             };
-            let embedding = match embed_one(embedder, &text) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!(
-                        "rederive_pending: skipping event {} (embed failed): {e}",
-                        event.id
-                    );
-                    continue;
+            // Chunk, then embed every chunk with the lock RELEASED. An embed
+            // failure on any chunk skips the whole event (best-effort) so we
+            // never write a partial chunk set.
+            let chunks = crate::chunk::chunk_text(&text);
+            if chunks.is_empty() {
+                continue;
+            }
+            let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
+            let mut embed_failed = false;
+            for chunk in &chunks {
+                match embed_one(embedder, chunk) {
+                    Ok(v) => blobs.push(vec_to_blob(&v)),
+                    Err(e) => {
+                        log::warn!(
+                            "rederive_pending: skipping event {} (embed failed): {e}",
+                            event.id
+                        );
+                        embed_failed = true;
+                        break;
+                    }
                 }
-            };
-            let blob = vec_to_blob(&embedding);
+            }
+            if embed_failed {
+                continue;
+            }
+            // One atomic DELETE+INSERT-all transaction per event; count one
+            // `derived` per committed EVENT (not per chunk).
             let store = self.inner.lock().expect(POISON);
-            store.conn().execute(
-                "INSERT OR REPLACE INTO vectors (event_id, model_id, dim, embedding)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![event.id, embedder.model_id(), embedder.dim() as i64, blob],
+            write_event_chunks(
+                store.conn(),
+                &event.id,
+                embedder.model_id(),
+                embedder.dim() as i64,
+                &blobs,
             )?;
             derived += 1;
         }
         Ok(derived)
     }
 
-    /// All stored vectors for `model_id`, as `(event_id, vector)` pairs ordered
-    /// by `event_id ASC`.
+    /// All stored chunk vectors for `model_id`, as `(composite_key, vector)`
+    /// pairs ordered by `(event_id ASC, chunk_ix ASC)`.
+    ///
+    /// Each key is [`crate::index::encode_chunk_key`]`(event_id, chunk_ix)` — one
+    /// entry per stored chunk, not per event — so the rebuilt [`HnswIndex`]
+    /// holds one point per chunk. The bare event id is recovered downstream by
+    /// [`crate::index::event_id_of`] (fold-back in [`EventLog::vector_search`]).
     ///
     /// This is the active-model-filtered read: only vectors derived under the
     /// given `model_id` are returned, so cross-model comparison is impossible by
-    /// construction. The `event_id ASC` ordering is mandatory — the T5
-    /// deterministic index rebuild depends on a stable row order.
+    /// construction. The `(event_id ASC, chunk_ix ASC)` ordering is mandatory —
+    /// the T5 deterministic index rebuild depends on a stable row order.
     pub fn vectors_for_model(
         &self,
         model_id: &str,
@@ -1187,15 +1236,21 @@ impl EventLog {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(
-            "SELECT event_id, embedding FROM vectors WHERE model_id = ?1 ORDER BY event_id ASC",
+            "SELECT event_id, chunk_ix, embedding FROM vectors
+             WHERE model_id = ?1 ORDER BY event_id ASC, chunk_ix ASC",
         )?;
         let rows = stmt.query_map([model_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (event_id, blob) = row?;
-            out.push((event_id, blob_to_vec(&blob)?));
+            let (event_id, chunk_ix, blob) = row?;
+            let key = crate::index::encode_chunk_key(&event_id, chunk_ix as usize);
+            out.push((key, blob_to_vec(&blob)?));
         }
         Ok(out)
     }
@@ -1203,15 +1258,17 @@ impl EventLog {
     /// Rebuild the in-memory vector index AND the FTS5 keyword index from the
     /// encrypted log for the active embedding model.
     ///
-    /// **Vector rebuild:** reads every persisted vector for `embedder.model_id()`
-    /// (via [`EventLog::vectors_for_model`], which returns rows `ORDER BY
-    /// event_id ASC`), builds a fresh [`HnswIndex`] sized to the exact row
-    /// count, and **serially** adds each `(event_id, vector)`.  Serial
-    /// insertion over a deterministic row order is what makes the index
+    /// **Vector rebuild:** reads every persisted CHUNK vector for
+    /// `embedder.model_id()` (via [`EventLog::vectors_for_model`], which returns
+    /// rows `ORDER BY event_id ASC, chunk_ix ASC` keyed by composite chunk key),
+    /// builds a fresh [`HnswIndex`] sized to the exact row count, and
+    /// **serially** adds each `(chunk_key, vector)` — one index point per chunk.
+    /// Serial insertion over a deterministic row order is what makes the index
     /// reproducible across re-opens (spec F2).  The finished index replaces any
     /// previous one.  Because only `model_id`-matching rows are read, the index
     /// can only ever contain active-model vectors — cross-model bleed is
-    /// impossible by construction (spec C4).
+    /// impossible by construction (spec C4).  Per-event fold-back over the chunk
+    /// keys happens later, in [`EventLog::vector_search`].
     ///
     /// **FTS rebuild:** wipes `fts` and `fts_map` entirely, then re-populates
     /// from every `memory`/`page` event (the same embeddable types that feed the
@@ -1229,8 +1286,10 @@ impl EventLog {
         let rows = self.vectors_for_model(embedder.model_id())?;
         let vec_count = rows.len();
         let mut index = HnswIndex::with_capacity(vec_count);
-        for (event_id, vec) in rows {
-            index.add(&event_id, &vec);
+        // `rows` are (composite chunk key, vector); the index holds one point per
+        // chunk. HnswIndex::add de-dups per key, so each chunk is added once.
+        for (key, vec) in rows {
+            index.add(&key, &vec);
         }
         let boxed: Box<dyn VectorIndex> = Box::new(index);
         *self.vector_index.lock().expect(POISON) = Some(boxed);
@@ -1272,26 +1331,73 @@ impl EventLog {
         Ok(())
     }
 
-    /// Search the in-memory vector index for the `k` nearest `(event_id,
-    /// distance)` pairs to `query_vec`, ascending by distance.
+    /// Search the in-memory vector index for the `k` nearest **events** to
+    /// `query_vec`, ascending by distance, as `(bare_event_id, distance)` pairs.
+    ///
+    /// The index holds one point per CHUNK (composite keys), so this method folds
+    /// chunks back to events: it over-fetches raw chunk neighbours, reduces them
+    /// to the best (minimum) distance per event id, and returns the top `k`
+    /// distinct events. Every returned id is a BARE event id — the composite
+    /// chunk keys never escape this method, so every downstream consumer (recall
+    /// fusion, boosts, superseded/revoked filters) keeps its event-id contract.
+    ///
+    /// **Adaptive over-fetch.** A fixed `k * CHUNK_OVERFETCH` fetch can be starved
+    /// by a few fat documents whose many chunks fill the nearest slots. So the
+    /// fetch multiplier starts at [`crate::recall::CHUNK_OVERFETCH`] and DOUBLES
+    /// on each pass until the fold yields `k` distinct events or the index is
+    /// exhausted (a pass that returns fewer chunks than requested — the index is
+    /// smaller than `want`, [`crate::index`]'s `search` clamps to index size).
     ///
     /// Returns [`BossclawError::InvalidInput`] if the index has not been built
     /// yet (no [`EventLog::rebuild_indexes`] call since open) — recall cannot run
-    /// against a missing index. Tombstoned ids are excluded by the index itself.
+    /// against a missing index. Tombstoned chunks are excluded by the index
+    /// itself. `k == 0` returns an empty result without touching the index.
     ///
-    /// T7's `recall()` will embed the query text and then call this.
+    /// T7's `recall()` embeds the query text and then calls this.
     pub fn vector_search(
         &self,
         query_vec: &[f32],
         k: usize,
     ) -> Result<Vec<(String, f32)>, BossclawError> {
+        use crate::index::event_id_of;
+        use crate::recall::CHUNK_OVERFETCH;
         let guard = self.vector_index.lock().expect(POISON);
-        match guard.as_ref() {
-            Some(index) => Ok(index.search(query_vec, k)),
-            None => Err(BossclawError::InvalidInput(
-                "vector index not built — call rebuild_indexes".into(),
-            )),
+        let index = guard.as_ref().ok_or_else(|| {
+            BossclawError::InvalidInput("vector index not built — call rebuild_indexes".into())
+        })?;
+        if k == 0 {
+            return Ok(Vec::new());
         }
+        let mut mult = CHUNK_OVERFETCH;
+        let mut folded: Vec<(String, f32)> = loop {
+            let want = k.saturating_mul(mult);
+            let raw = index.search(query_vec, want);
+            // A short read means the index holds fewer than `want` chunks
+            // (search clamps to index size); refetching cannot surface more, so
+            // this is the last pass regardless of how many events we folded to.
+            let exhausted = raw.len() < want;
+            let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+            for (key, dist) in raw {
+                let id = event_id_of(&key).to_string();
+                best.entry(id)
+                    .and_modify(|d| {
+                        if dist < *d {
+                            *d = dist;
+                        }
+                    })
+                    .or_insert(dist);
+            }
+            let folded: Vec<(String, f32)> = best.into_iter().collect();
+            if folded.len() >= k || exhausted {
+                break folded;
+            }
+            mult = mult.saturating_mul(2);
+        };
+        // Ascending by distance; break ties on event id so the order is
+        // deterministic across HNSW seedings.
+        folded.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        folded.truncate(k);
+        Ok(folded)
     }
 
     /// Index an event in the FTS5 keyword index.
@@ -6940,6 +7046,40 @@ fn vec_to_blob(vec: &[f32]) -> Vec<u8> {
     blob
 }
 
+/// Atomically replace one event's chunk rows for `model_id` with `blobs`
+/// (one blob per chunk, in `chunk_ix` order 0..blobs.len()).
+///
+/// Wraps a DELETE-then-INSERT-all in a single [`Connection::unchecked_transaction`]
+/// so the write is all-chunks-or-zero for that `(event_id, model_id)` — the
+/// atomicity [`EventLog::derive_vector`] documents. The DELETE clears any prior
+/// chunk set (a re-derive under the same model, or a chunk-count change), so a
+/// plain `INSERT` is correct: a duplicate `(…, chunk_ix)` inside one call would
+/// surface as a loud constraint error rather than a silent overwrite.
+///
+/// The caller holds the store lock; this operates on the borrowed `conn`.
+fn write_event_chunks(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+    model_id: &str,
+    dim: i64,
+    blobs: &[Vec<u8>],
+) -> Result<(), BossclawError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM vectors WHERE event_id = ?1 AND model_id = ?2",
+        rusqlite::params![event_id, model_id],
+    )?;
+    for (chunk_ix, blob) in blobs.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO vectors (event_id, model_id, chunk_ix, dim, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![event_id, model_id, chunk_ix as i64, dim, blob],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Decode little-endian `f32` bytes from an `embedding` BLOB.
 ///
 /// Returns [`BossclawError::Store`] if the byte length is not a multiple of
@@ -7556,5 +7696,178 @@ mod tests {
             .into_iter()
             .find(|e| e.id == id)
             .expect("appended event must be readable")
+    }
+
+    // ── Rung 3 A9: adaptive over-fetch + chunk→event fold-back ──────────────
+
+    use crate::index::{event_id_of, HnswIndex, VectorIndex};
+
+    /// Fold-back: with the vector index holding one point per CHUNK,
+    /// `vector_search` must return each event ONCE, keyed by its BARE id, scored
+    /// by the MINIMUM chunk distance for that event across the raw neighbour set.
+    ///
+    /// Expected-best is derived, not hardcoded: we rebuild an independent
+    /// `HnswIndex` from `vectors_for_model` (same composite keys the log's index
+    /// holds), search it wide, filter to the multi-chunk event's chunks, and take
+    /// the min distance — the exact value the fold reduces to. (HNSW deep-rank is
+    /// OS-seeded, so a literal distance constant would be non-deterministic.)
+    #[test]
+    fn vector_search_folds_chunks_to_best_per_event_bare_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+
+        // One multi-chunk event whose text the query targets…
+        let multi_text = long_multi_chunk_text();
+        let multi_id = log.append(chunk_test_memory_event(&multi_text)).unwrap();
+        assert!(
+            crate::chunk::chunk_text(&multi_text).len() > 1,
+            "the target event must span multiple chunks"
+        );
+        // …plus several single-chunk bystanders.
+        for t in ["single alpha note", "single beta note", "single gamma note", "single delta note"] {
+            log.append(chunk_test_memory_event(t)).unwrap();
+        }
+
+        let embedder = MockEmbedder::new(64);
+        log.rederive_pending(&embedder).unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+
+        // Query = embed of the multi event's FIRST chunk (a real near-neighbour of
+        // at least one of its chunks).
+        let first_chunk = crate::chunk::chunk_text(&multi_text).remove(0);
+        let qv = embedder.embed(&[first_chunk]).unwrap().remove(0);
+
+        let k = 3;
+        let hits = log.vector_search(&qv, k).unwrap();
+
+        // (1) Every returned id is BARE (no composite key escapes).
+        for (id, _) in &hits {
+            assert!(
+                decode_chunk_key(id).is_none(),
+                "vector_search must return bare event ids, got composite key {id:?}"
+            );
+        }
+        // (2) The multi-chunk event appears exactly once.
+        let multi_appearances = hits.iter().filter(|(id, _)| *id == multi_id).count();
+        assert_eq!(multi_appearances, 1, "the multi-chunk event must fold to a single hit");
+
+        // (3) Its folded score == the MIN distance among ITS chunks that actually
+        //     appear in the raw neighbour set — computed from an independent
+        //     reconstruction of the same index (not a hardcoded distance).
+        let folded_score = hits
+            .iter()
+            .find(|(id, _)| *id == multi_id)
+            .map(|(_, d)| *d)
+            .expect("multi event present in folded hits");
+
+        let rows = log.vectors_for_model("mock-v1").unwrap();
+        let mut mirror = HnswIndex::with_capacity(rows.len());
+        for (key, v) in &rows {
+            mirror.add(key, v);
+        }
+        // Search wide enough that the raw set is the same population the fold saw.
+        let big_k = rows.len();
+        let raw = mirror.search(&qv, big_k);
+        let expected_best = raw
+            .iter()
+            .filter(|(key, _)| event_id_of(key) == multi_id.as_str())
+            .map(|(_, d)| *d)
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            expected_best.is_finite(),
+            "at least one of the multi event's chunks must be in the raw neighbour set"
+        );
+        assert!(
+            (folded_score - expected_best).abs() <= 1e-6,
+            "folded score must equal the min chunk distance for the event: \
+             folded={folded_score}, expected_best={expected_best}"
+        );
+    }
+
+    /// Controlled chunk-row writer: insert the given per-chunk `vecs` for one
+    /// event (chunk_ix 0..vecs.len()) directly into the `vectors` table,
+    /// bypassing the chunker so the test controls the exact chunk distribution.
+    fn insert_controlled_chunks(log: &EventLog, event_id: &str, vecs: &[Vec<f32>]) {
+        let dim = vecs[0].len() as i64;
+        let blobs: Vec<Vec<u8>> = vecs.iter().map(|v| vec_to_blob(v)).collect();
+        let store = log.inner.lock().expect(POISON);
+        write_event_chunks(store.conn(), event_id, "mock-v1", dim, &blobs).unwrap();
+    }
+
+    /// Adaptive over-fetch: a fixed `k * CHUNK_OVERFETCH` fetch is STARVED by fat
+    /// documents whose many near-query chunks fill the nearest slots; adaptive
+    /// doubling grows the fetch until the fold yields `k` distinct events.
+    ///
+    /// **Corpus (3 fat × 8 chunks + 8 singles = 32 chunks over 11 events).** Fat
+    /// chunks share all four query tokens (nearest); singles share only one
+    /// (farther), so a fixed fetch fills with fat chunks and folds to few events.
+    /// Each fat chunk also carries a per-chunk unique token so no two index
+    /// points are exact duplicates (identical duplicates make HNSW recall
+    /// degenerate); the corpus stays small and well-separated so a wide search
+    /// reliably returns the whole index (seed-robust, unlike a large fat-tailed
+    /// corpus where ANN recall of the far tail is per-seed unreliable — the same
+    /// caveat the C4 index test documents).
+    ///
+    /// With `k = 6`: the first pass (`6 * CHUNK_OVERFETCH = 24` chunks) folds to
+    /// only 3–4 distinct events (all fat, singles starved) — strictly `< 6`, so a
+    /// fixed fetch would fail. One doubling (`48 ≥ 32 total` ⇒ index exhausted)
+    /// returns the whole corpus, folding to all 11 events, truncated to `k = 6`.
+    #[test]
+    fn vector_search_adaptive_overfetch_survives_fat_docs_at_small_k() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = open_log(tmp.path());
+        let dim = 256;
+        let embedder = MockEmbedder::new(dim);
+        let embed1 = |t: &str| embedder.embed(&[t.to_string()]).unwrap().remove(0);
+
+        // Query carries four shared tokens; fat chunks contain all four (near),
+        // singles contain only one (far).
+        let query = embed1("qa qb qc qd");
+        let fat_sizes = [8usize, 8, 8];
+        const SINGLES: usize = 8;
+
+        for (e, n) in fat_sizes.into_iter().enumerate() {
+            let vecs: Vec<Vec<f32>> = (0..n)
+                // per-chunk unique token → no exact-duplicate index points, but
+                // 4/5 tokens shared with the query keeps every chunk near it.
+                .map(|c| embed1(&format!("qa qb qc qd fat{e}c{c}")))
+                .collect();
+            insert_controlled_chunks(&log, &format!("fat-{e:02}"), &vecs);
+        }
+        for i in 0..SINGLES {
+            insert_controlled_chunks(&log, &format!("single-{i:02}"), &[embed1(&format!("qa single{i}"))]);
+        }
+
+        log.rebuild_indexes(&embedder).unwrap();
+
+        let k = 6;
+
+        // Non-vacuity, asserted structurally (no ANN seed dependence): the fat
+        // chunks (all strictly nearer the query than any single) number
+        // `3*8 = 24`, which is ≥ the first pass's `k * CHUNK_OVERFETCH` window.
+        // So the nearest `k*CHUNK_OVERFETCH` chunks are ALL fat, folding to at
+        // most the 3 fat events (< k). Only the adaptive doubling — which grows
+        // the window past the 32-chunk corpus and pulls in the singles — can
+        // reach k distinct events. This makes the growth load-bearing for the
+        // assertion below, independent of per-seed HNSW recall.
+        let fat_chunk_count = fat_sizes.iter().sum::<usize>();
+        let fat_event_count = fat_sizes.len();
+        assert!(
+            fat_chunk_count >= k * crate::recall::CHUNK_OVERFETCH && fat_event_count < k,
+            "corpus must starve a fixed k*CHUNK_OVERFETCH fetch: {fat_chunk_count} fat \
+             chunks over {fat_event_count} events vs first window {}",
+            k * crate::recall::CHUNK_OVERFETCH
+        );
+
+        let hits = log.vector_search(&query, k).unwrap();
+
+        // Distinct-event count == min(k, 11) == 6, no event repeats after fold.
+        assert_eq!(hits.len(), k, "adaptive over-fetch must surface k distinct events");
+        let distinct: std::collections::HashSet<&String> = hits.iter().map(|(id, _)| id).collect();
+        assert_eq!(distinct.len(), hits.len(), "no event may appear twice after fold");
+        // All ids bare.
+        for (id, _) in &hits {
+            assert!(decode_chunk_key(id).is_none(), "folded ids must be bare, got {id:?}");
+        }
     }
 }

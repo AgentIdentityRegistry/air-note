@@ -1292,6 +1292,61 @@ mod orchestrator_tests {
         assert_eq!(hits.iter().filter(|h| h.kind == crate::graph::FILE_INGESTED_EVENT_TYPE).count(), 2);
     }
 
+    /// The single-event ingest path (`derive_vector_for` → `derive_vector`)
+    /// inherits chunked writes transitively: a long ingested file yields more
+    /// than one `vectors` row (one per chunk), keyed by composite chunk key.
+    #[test]
+    fn long_ingested_file_yields_multiple_chunk_vector_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        let folder = dir.path().join("notes");
+        std::fs::create_dir(&folder).unwrap();
+
+        // A file comfortably longer than one chunk budget so it splits.
+        let mut body = String::new();
+        for block in 0..8 {
+            body.push_str(&format!("# Section {block}\n\n"));
+            for line in 0..6 {
+                body.push_str(&format!(
+                    "Section {block} line {line}: descriptive prose consuming budget \
+                     with token{block}{line} to keep blocks lexically distinct.\n"
+                ));
+            }
+            body.push('\n');
+        }
+        assert!(
+            crate::chunk::chunk_text(&body).len() > 1,
+            "fixture must chunk into more than one window"
+        );
+        std::fs::write(folder.join("long.md"), body.as_bytes()).unwrap();
+
+        let emb = MockEmbedder::new(16);
+        let log =
+            EventLog::open_with_recall(&db, &DEK, SigningKey::from_bytes(&KEY_BYTES), &emb).unwrap();
+        log.add_grant(&folder).unwrap();
+        let report = log.ingest_all(&ParserRouter::native_only(), &emb).unwrap();
+        assert_eq!(report.ingested, 1, "one file ingested");
+
+        // The ingested file's event must own >1 chunk keys under it.
+        let file_event_id = log
+            .stream_all()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == crate::graph::FILE_INGESTED_EVENT_TYPE)
+            .expect("a file_ingested event exists")
+            .id;
+        let chunk_rows = log
+            .vectors_for_model("mock-v1") // MockEmbedder::model_id()
+            .unwrap()
+            .into_iter()
+            .filter(|(key, _)| crate::index::event_id_of(key) == file_event_id.as_str())
+            .count();
+        assert!(
+            chunk_rows > 1,
+            "a long ingested file must produce more than one chunk vector row, got {chunk_rows}"
+        );
+    }
+
     #[test]
     fn revoked_grant_is_not_ingested_by_ingest_all() {
         let dir = tempfile::tempdir().unwrap();

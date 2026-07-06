@@ -165,6 +165,18 @@ pub const GRAPH_REINFORCE_TOPK: usize = 3;
 /// slots before per-event fold-back (spec §3.4.4 over-fetch rule).
 pub const FUSION_FETCH: usize = 200;
 
+/// INITIAL over-fetch multiplier for [`EventLog::vector_search`]'s chunk→event
+/// fold-back. Because the vector index holds one point per CHUNK, a top-`k`
+/// *event* result needs more than `k` raw chunk neighbours: a few fat documents
+/// can occupy many of the nearest-chunk slots, starving the singles. So
+/// `vector_search` fetches `k * CHUNK_OVERFETCH` chunks, folds them to distinct
+/// events, and — if that still yields fewer than `k` distinct events — DOUBLES
+/// the multiplier and refetches, until it has `k` events or the index is
+/// exhausted. `4` is only the STARTING point; the adaptive growth is what
+/// guarantees correctness under a fat-tailed chunk distribution, so this value
+/// trades initial cost against refetch count, not recall.
+pub const CHUNK_OVERFETCH: usize = 4;
+
 /// Fuse several ranked id-lists into a per-id reciprocal-rank-fusion score.
 ///
 /// Each inner `Vec<String>` is one arm's results, ordered best-first. For every
