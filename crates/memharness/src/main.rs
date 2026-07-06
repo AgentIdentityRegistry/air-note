@@ -26,6 +26,8 @@ struct Cli {
 enum Command {
     /// Run one A/B measurement and write a report.
     Run(RunArgs),
+    /// Compare two frozen runs PAIRED (per-case, same case-list sha) — the rung-gate stats.
+    Compare(CompareArgs),
 }
 
 /// Which model judges open-query answer quality (known-item scoring is mechanical, no judge).
@@ -77,6 +79,16 @@ struct RunArgs {
     seed: u64,
 }
 
+#[derive(clap::Args)]
+struct CompareArgs {
+    /// Baseline run's scores.json (e.g. the frozen Phase 1 baseline).
+    #[arg(long)]
+    baseline: PathBuf,
+    /// Candidate run's scores.json (the rung under test).
+    #[arg(long)]
+    candidate: PathBuf,
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
@@ -84,7 +96,33 @@ fn dirs_home() -> PathBuf {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args),
+        Command::Compare(args) => compare(args),
     }
+}
+
+/// Print the paired comparison table (spec §3.0.3). The GATE read: only the two gating
+/// segments (synthetic·en/ko·known-item, spec §1) may pass or fail a rung.
+fn compare(args: CompareArgs) -> anyhow::Result<()> {
+    let baseline = std::fs::read_to_string(&args.baseline)
+        .with_context(|| format!("reading baseline {}", args.baseline.display()))?;
+    let candidate = std::fs::read_to_string(&args.candidate)
+        .with_context(|| format!("reading candidate {}", args.candidate.display()))?;
+    println!("| segment | n | baseline s@k | candidate s@k | Δ | paired Wilcoxon p |");
+    println!("|---|---|---|---|---|---|");
+    for row in memharness::compare::compare_runs(&baseline, &candidate)? {
+        println!(
+            "| {} | {} | {:.3} | {:.3} | {:+.3} | {:.4}{} |",
+            row.label,
+            row.n,
+            row.baseline_s_at_k,
+            row.candidate_s_at_k,
+            row.candidate_s_at_k - row.baseline_s_at_k,
+            row.wilcoxon.p_value,
+            if row.wilcoxon.small_n_approx { " (small-n approx)" } else { "" },
+        );
+    }
+    println!("\nGating segments (spec §1): synthetic·en·known-item, synthetic·ko·known-item ONLY.");
+    Ok(())
 }
 
 /// Synthetic-query volume target (spec §3: ~200–400).
@@ -498,7 +536,7 @@ mod cli_tests {
     #[test]
     fn parses_run_with_defaults_and_flags() {
         let cli = Cli::parse_from(["memharness", "run"]);
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else { panic!("run expected") };
         assert_eq!(args.k, 10, "default k (retrieval == scoring)");
         assert_eq!(args.model, memharness::ollama::DEFAULT_OLLAMA_MODEL);
         assert_eq!(args.seed, 42, "default seed");
@@ -506,13 +544,13 @@ mod cli_tests {
         assert!(args.judge == JudgeMode::Local, "default judge = local (backward compatible)");
 
         let cli = Cli::parse_from(["memharness", "run", "--judge", "cloud"]);
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else { panic!("run expected") };
         assert!(args.judge == JudgeMode::Cloud, "--judge cloud parses");
 
         let cli = Cli::parse_from([
             "memharness", "run", "--known-item-only", "--cases", "/tmp/frozen.jsonl",
         ]);
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else { panic!("run expected") };
         assert!(args.known_item_only);
         assert_eq!(args.cases, Some("/tmp/frozen.jsonl".into()));
         assert!(args.save_cases.is_none());
@@ -527,12 +565,19 @@ mod cli_tests {
             "memharness", "run", "--local-only", "--k", "5", "--model", "llama3:8b",
             "--seed", "7", "--corpus", "/tmp/brain", "--reports-dir", "/tmp/reports",
         ]);
-        let Command::Run(args) = cli.command;
+        let Command::Run(args) = cli.command else { panic!("run expected") };
         assert!(args.local_only);
         assert_eq!(args.k, 5);
         assert_eq!(args.model, "llama3:8b");
         assert_eq!(args.seed, 7);
         assert_eq!(args.corpus, Some("/tmp/brain".into()));
         assert_eq!(args.reports_dir, Some("/tmp/reports".into()));
+
+        let cli = Cli::parse_from([
+            "memharness", "compare", "--baseline", "/tmp/a.json", "--candidate", "/tmp/b.json",
+        ]);
+        let Command::Compare(args) = cli.command else { panic!("compare expected") };
+        assert_eq!(args.baseline, PathBuf::from("/tmp/a.json"));
+        assert_eq!(args.candidate, PathBuf::from("/tmp/b.json"));
     }
 }

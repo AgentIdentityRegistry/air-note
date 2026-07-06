@@ -3,6 +3,103 @@
 //! case-list sha (different lists ⇒ unpaired noise, the exact flaw the freeze protocol exists
 //! to kill). Per segment: paired Wilcoxon (candidate vs baseline) + s@k delta.
 
+use std::collections::BTreeMap;
+
+use crate::run::CaseResult;
+use crate::stats::{wilcoxon_signed_rank, WilcoxonResult};
+
+/// One segment's paired comparison row.
+#[derive(Debug)]
+pub struct SegmentComparison {
+    pub label: String,
+    pub n: usize,
+    pub baseline_s_at_k: f64,
+    pub candidate_s_at_k: f64,
+    /// Paired Wilcoxon over per-case success flags, candidate vs baseline.
+    pub wilcoxon: WilcoxonResult,
+}
+
+/// Pull (case_list_sha, corpus_sha, case_results) out of a scores.json string. Parses via
+/// `Value` because `ReportModel` deliberately does not derive Deserialize — only these three
+/// fields matter here.
+fn extract_run(scores_json: &str) -> anyhow::Result<(String, String, Vec<CaseResult>)> {
+    let v: serde_json::Value = serde_json::from_str(scores_json)?;
+    let case_sha = v
+        .get("case_list_sha")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "scores.json carries no case_list_sha — the run was not frozen \
+                 (--cases/--save-cases); compare refuses unfrozen runs"
+            )
+        })?;
+    let corpus_sha = v
+        .get("corpus_sha")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("scores.json has no corpus_sha (pre-rung-0 run?)"))?;
+    let results: Vec<CaseResult> = serde_json::from_value(
+        v.get("case_results")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("scores.json has no case_results (pre-rung-0 run?)"))?,
+    )?;
+    if results.is_empty() {
+        anyhow::bail!("case_results is empty — nothing to pair");
+    }
+    Ok((case_sha, corpus_sha, results))
+}
+
+/// Compare candidate vs baseline PAIRED by `case_idx` over an identical frozen case list AND
+/// an identical corpus snapshot (spec §3.0.1: gates across snapshots are invalid — enforced
+/// here in the tool, not left to a human reading two reports).
+pub fn compare_runs(baseline: &str, candidate: &str) -> anyhow::Result<Vec<SegmentComparison>> {
+    let (sha_b, corpus_b, base) = extract_run(baseline)?;
+    let (sha_c, corpus_c, cand) = extract_run(candidate)?;
+    if corpus_b != corpus_c {
+        anyhow::bail!(
+            "corpus snapshot mismatch ({corpus_b} vs {corpus_c}) — the runs ingested different \
+             corpora; a gate across snapshots is invalid (spec §3.0.1)"
+        );
+    }
+    if sha_b != sha_c {
+        anyhow::bail!(
+            "case-list sha mismatch ({sha_b} vs {sha_c}) — the runs used different frozen \
+             lists; pairing them would be exactly the churn the freeze protocol exists to kill"
+        );
+    }
+    if base.len() != cand.len() {
+        anyhow::bail!("case_results length mismatch ({} vs {})", base.len(), cand.len());
+    }
+    let base_by_idx: BTreeMap<usize, &CaseResult> = base.iter().map(|c| (c.case_idx, c)).collect();
+    let mut by_label: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for c in &cand {
+        let b = base_by_idx.get(&c.case_idx).ok_or_else(|| {
+            anyhow::anyhow!("case_idx {} in candidate but not baseline — corrupt pairing", c.case_idx)
+        })?;
+        if b.label != c.label {
+            anyhow::bail!("case_idx {} label mismatch ({} vs {})", c.case_idx, b.label, c.label);
+        }
+        let entry = by_label.entry(c.label.clone()).or_default();
+        entry.0.push(if b.air_success { 1.0 } else { 0.0 });
+        entry.1.push(if c.air_success { 1.0 } else { 0.0 });
+    }
+    Ok(by_label
+        .into_iter()
+        .map(|(label, (b, c))| {
+            let n = b.len();
+            SegmentComparison {
+                label,
+                n,
+                baseline_s_at_k: b.iter().sum::<f64>() / n as f64,
+                candidate_s_at_k: c.iter().sum::<f64>() / n as f64,
+                // wilcoxon_signed_rank(a, b) tests diffs a[i]−b[i]: candidate first.
+                wilcoxon: wilcoxon_signed_rank(&c, &b),
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
