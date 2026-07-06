@@ -37,6 +37,34 @@ const EF_CONSTRUCTION: usize = 200;
 /// scale their beam with `k`. `ef` must be ≥ `k` for hnsw_rs.
 const EF_SEARCH_MIN: usize = 64;
 
+/// Unit-separator that joins an event id and a chunk index into one `VectorIndex`
+/// key. `0x1f` (US) cannot appear in a Crockford-base32 ULID, so `event_id_of`
+/// below can always recover the bare id — the property the fold-back relies on.
+pub const CHUNK_KEY_SEP: char = '\u{1f}';
+
+/// Encode `(event_id, chunk_ix)` as the composite `VectorIndex` key.
+pub fn encode_chunk_key(event_id: &str, chunk_ix: usize) -> String {
+    format!("{event_id}{CHUNK_KEY_SEP}{chunk_ix}")
+}
+
+/// Decode a composite key back to `(event_id, chunk_ix)`, or `None` if it is not
+/// a well-formed chunk key (no separator, or a non-numeric index). Uses the FIRST
+/// separator (`split_once`) so it agrees byte-for-byte with `event_id_of` on the
+/// event-id field — a stray extra separator makes the index non-numeric ⇒ None
+/// (never a silently-wrong parse). Event ULIDs never contain 0x1f, so real keys
+/// always have exactly one separator.
+pub fn decode_chunk_key(key: &str) -> Option<(&str, usize)> {
+    let (id, ix) = key.split_once(CHUNK_KEY_SEP)?;
+    Some((id, ix.parse().ok()?))
+}
+
+/// The bare event id for a composite (or already-bare) key — the fold-back reduce
+/// key. A key without the separator is returned unchanged (defensive). Uses the
+/// FIRST separator, matching `decode_chunk_key`.
+pub fn event_id_of(key: &str) -> &str {
+    key.split_once(CHUNK_KEY_SEP).map_or(key, |(id, _)| id)
+}
+
 /// An in-memory ANN index over the vectors of a single (active) embedding model.
 ///
 /// NOT persisted in v1 — rebuilt from the encrypted log on open (zero plaintext
