@@ -35,6 +35,22 @@ pub struct CorpusManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
+/// Snapshot identity (spec §3.0.1): sha256 over each entry's `page_id\0sha256\n` in manifest
+/// order (entries are already sorted). Deliberately EXCLUDES `snapshot_unix_secs` — two copies
+/// of byte-identical corpora taken at different times are the SAME snapshot; gates may only
+/// compare runs whose ids match.
+pub fn manifest_sha(manifest: &CorpusManifest) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for e in &manifest.entries {
+        hasher.update(e.page_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(e.sha256.as_bytes());
+        hasher.update([b'\n']);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// `~/brain`-relative path ("air/foo.md") → page id ("air/foo"). The ".md" suffix is stripped
 /// case-insensitively, and the id is NFC-normalized so filesystem-provided names (which may
 /// arrive NFD, e.g. from HFS+) join GBrain's NFC slugs instead of failing silently.

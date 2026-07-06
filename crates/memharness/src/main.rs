@@ -230,6 +230,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let drift_fraction = gbrain_page_count.map(|p| {
         (p as f64 - manifest.file_count as f64).abs() / (manifest.file_count.max(1)) as f64
     });
+    let corpus_sha = memharness::corpus::manifest_sha(&manifest);
     let report = memharness::report::ReportModel {
         trust: outcome.trust,
         k: args.k,
@@ -240,6 +241,10 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         gbrain_mode,
         gbrain_reranker,
         drift_fraction,
+        // Identity wiring lands in the next unit (CLI flags); ad-hoc values keep this commit compiling.
+        corpus_sha,
+        case_list_sha: None,
+        case_results: outcome.case_results,
         ollama_model: args.model.clone(),
         egress_pairs_sent: outcome.egress_pairs_sent,
         local_only: args.local_only,
