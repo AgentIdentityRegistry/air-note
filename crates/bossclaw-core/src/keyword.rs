@@ -44,37 +44,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_text_is_quoted() {
-        assert_eq!(escape_fts_query("hello world"), "\"hello world\"");
+    fn multi_word_queries_become_per_term_or() {
+        // The rung-1 fix (retrieval-floor spec Rev 2 §3.2): terms match INDEPENDENTLY, ranked
+        // by the BM25 that is already there — not as one exact adjacent phrase.
+        assert_eq!(escape_fts_query("hello world"), r#""hello" OR "world""#);
     }
 
     #[test]
-    fn fts5_operators_are_neutralised() {
-        // These would be parsed as operators if not quoted.
-        assert_eq!(escape_fts_query("foo OR bar"), "\"foo OR bar\"");
-        assert_eq!(escape_fts_query("NOT valid"), "\"NOT valid\"");
-        assert_eq!(escape_fts_query("a AND b"), "\"a AND b\"");
-        assert_eq!(escape_fts_query("near(foo bar)"), "\"near(foo bar)\"");
-        assert_eq!(escape_fts_query("prefix*"), "\"prefix*\"");
+    fn single_term_stays_one_quoted_phrase() {
+        assert_eq!(escape_fts_query("hello"), r#""hello""#);
     }
 
     #[test]
-    fn embedded_double_quotes_are_doubled() {
-        // FTS5 escaping: each " inside becomes "".
-        assert_eq!(escape_fts_query(r#"say "hi""#), r#""say ""hi""""#);
+    fn operator_words_are_quoted_terms_never_operators() {
+        // User tokens that spell FTS5 operators stay INSIDE quotes — injection-safe.
+        assert_eq!(escape_fts_query("foo OR bar"), r#""foo" OR "OR" OR "bar""#);
+        assert_eq!(escape_fts_query("NOT valid"), r#""NOT" OR "valid""#);
+        assert_eq!(escape_fts_query("a AND b"), r#""a" OR "AND" OR "b""#);
+        assert_eq!(escape_fts_query("near(foo bar)"), r#""near(foo" OR "bar)""#);
+        assert_eq!(escape_fts_query("prefix*"), r#""prefix*""#);
     }
 
     #[test]
-    fn mixed_operators_and_quotes() {
-        let raw = r#"foo OR "bar"#;
-        let escaped = escape_fts_query(raw);
-        // Should not panic and must be a valid quoted phrase (starts/ends with ").
-        assert!(escaped.starts_with('"'));
-        assert!(escaped.ends_with('"'));
+    fn embedded_double_quotes_are_doubled_per_term() {
+        assert_eq!(escape_fts_query(r#"a"b"#), r#""a""b""#);
+        assert_eq!(escape_fts_query(r#"say "hi"#), r#""say" OR """hi""#);
     }
 
     #[test]
-    fn empty_string_produces_empty_phrase() {
+    fn punctuation_only_terms_are_tolerated() {
+        // Critic-verified: FTS5 tolerates a quoted punctuation token; wasteful but never an error.
+        assert_eq!(escape_fts_query("foo - bar"), r#""foo" OR "-" OR "bar""#);
+    }
+
+    #[test]
+    fn korean_terms_tokenize_on_whitespace() {
+        assert_eq!(escape_fts_query("메모리 하니스"), r#""메모리" OR "하니스""#);
+    }
+
+    #[test]
+    fn multiline_mined_queries_split_across_lines() {
+        assert_eq!(
+            escape_fts_query("line one\nline two"),
+            r#""line" OR "one" OR "line" OR "two""#
+        );
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_keep_the_empty_phrase_contract() {
         assert_eq!(escape_fts_query(""), "\"\"");
+        assert_eq!(escape_fts_query("   \n\t"), "\"\"");
     }
 }
