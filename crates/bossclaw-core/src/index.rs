@@ -208,3 +208,39 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<HnswIndex>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_key_round_trips_and_separator_is_ulid_safe() {
+        let key = encode_chunk_key("01J8Z3ABCDXYZ", 7);
+        assert_eq!(key, "01J8Z3ABCDXYZ\u{1f}7");
+        let (id, ix) = decode_chunk_key(&key).unwrap();
+        assert_eq!(id, "01J8Z3ABCDXYZ");
+        assert_eq!(ix, 7);
+        // 0x1f never appears in a Crockford-base32 ULID, so decoding is unambiguous.
+        assert_eq!(decode_chunk_key("no-separator-here"), None);
+        // Malformed index is rejected (not silently 0).
+        assert_eq!(decode_chunk_key("id\u{1f}notanumber"), None);
+    }
+
+    #[test]
+    fn event_id_of_and_decode_agree_on_split_direction() {
+        // Both use the FIRST separator (split_once) — so a key with a stray extra
+        // separator decodes/reduces identically. (event ULIDs never contain 0x1f,
+        // so this only guards defensive/mixed-data robustness, not a real ULID.)
+        let weird = "01J8Z3ABCDXYZ\u{1f}2\u{1f}5"; // two separators
+        assert_eq!(event_id_of(weird), "01J8Z3ABCDXYZ", "reduce key = first field");
+        // decode_chunk_key rejects it: the index field "2\u{1f}5" isn't a number.
+        assert_eq!(decode_chunk_key(weird), None, "ambiguous multi-sep key is not a valid chunk key");
+    }
+
+    #[test]
+    fn event_id_of_extracts_the_bare_id_for_foldback() {
+        assert_eq!(event_id_of("01J8Z3ABCDXYZ\u{1f}3"), "01J8Z3ABCDXYZ");
+        // A bare (non-chunk) key is returned unchanged — defensive for mixed data.
+        assert_eq!(event_id_of("01J8Z3ABCDXYZ"), "01J8Z3ABCDXYZ");
+    }
+}
