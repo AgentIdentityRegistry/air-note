@@ -517,6 +517,30 @@ mod tests {
     }
 
     #[test]
+    fn frozen_case_list_sha_is_rendered_and_cases_land_in_scores_json() {
+        let mut report = ReportModel::sample_for_test();
+        report.case_list_sha = Some("f".repeat(64));
+        report.case_results = vec![crate::run::CaseResult {
+            case_idx: 0,
+            label: "synthetic·en·known-item".into(),
+            air_rank: Some(0),
+            gbrain_rank: None,
+            air_success: true,
+            gbrain_success: false,
+        }];
+        let md = render_markdown(&report);
+        assert!(md.contains("frozen case list: ffffffffffffffff"), "16-char sha prefix: {md}");
+        assert!(!md.contains("UNFROZEN"));
+        assert!(
+            !md.contains("case_idx"),
+            "per-case results are scores.json-only, never markdown"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["case_results"][0]["case_idx"], 0, "per-case results serialize");
+        assert_eq!(json["corpus_sha"], report.corpus_sha);
+    }
+
+    #[test]
     fn renders_trust_first_drift_banner_and_caveats() {
         let mut report = ReportModel::sample_for_test();
         let md = render_markdown(&report);
@@ -536,6 +560,14 @@ mod tests {
         );
         assert!(md.contains("Different estimands"), "CI dual-estimand caveat present (finding 2)");
         assert!(!md.contains("INVALID RUN"), "no banner at 0 drift");
+        assert!(
+            md.contains("Corpus snapshot: "),
+            "snapshot identity rendered (spec §3.0.1)"
+        );
+        assert!(
+            md.contains("UNFROZEN"),
+            "ad-hoc case list is loudly labeled not-comparable: {md}"
+        );
         // GOLDEN on synthetic data: render is deterministic.
         assert_eq!(md, ReportModel::sample_golden_markdown());
 

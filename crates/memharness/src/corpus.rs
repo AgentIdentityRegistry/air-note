@@ -271,4 +271,26 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dst.path().join("foo.md")).unwrap(), raw);
         assert_eq!(manifest.entries[0].bytes, raw.len() as u64);
     }
+
+    #[test]
+    fn manifest_sha_is_stable_and_content_sensitive() {
+        let m = CorpusManifest {
+            snapshot_unix_secs: 1,
+            file_count: 2,
+            total_bytes: 10,
+            entries: vec![
+                ManifestEntry { page_id: "a".into(), sha256: "s1".into(), bytes: 5 },
+                ManifestEntry { page_id: "b".into(), sha256: "s2".into(), bytes: 5 },
+            ],
+        };
+        let sha = manifest_sha(&m);
+        assert_eq!(sha.len(), 64, "sha256 hex");
+        assert_eq!(sha, manifest_sha(&m), "deterministic");
+        let mut m2 = m.clone();
+        m2.entries[1].sha256 = "s3".into();
+        assert_ne!(manifest_sha(&m2), sha, "content change changes the id");
+        let mut m3 = m.clone();
+        m3.snapshot_unix_secs = 999; // copy TIME must not change identity
+        assert_eq!(manifest_sha(&m3), sha, "snapshot time is not part of identity");
+    }
 }
