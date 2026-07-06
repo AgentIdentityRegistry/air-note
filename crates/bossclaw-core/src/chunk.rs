@@ -30,6 +30,115 @@ pub const CHUNK_BUDGET_CHARS: usize = 1_500;
 /// to bridge a sentence, small enough to avoid ~2× row inflation.
 pub const CHUNK_OVERLAP_CHARS: usize = 200;
 
+/// Overlap must be strictly smaller than the budget, else a chunk full of
+/// carried-over context has zero room for new content and the sliding window
+/// never advances (infinite loop). Enforced at compile time.
+const _: () = assert!(CHUNK_OVERLAP_CHARS < CHUNK_BUDGET_CHARS);
+
+/// The separator that delimits paragraph/heading blocks. A run of one-or-more
+/// blank lines collapses to this canonical join when whole blocks are packed
+/// back into a single chunk.
+const BLOCK_SEPARATOR: &str = "\n\n";
+
+/// Split `text` into 1..N overlapping, char-boundary-safe chunks (spec §3.4).
+/// Returns an empty Vec for empty/whitespace-only input. Text within budget
+/// returns exactly `[text.to_string()]` (short docs unchanged).
+pub fn chunk_text(text: &str) -> Vec<String> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let total_chars = text.chars().count();
+    if total_chars <= CHUNK_BUDGET_CHARS {
+        return vec![text.to_string()]; // fast path: one unchanged chunk
+    }
+
+    // 1) Split into paragraph/heading blocks on blank-line boundaries, dropping
+    //    empty (whitespace-only) blocks — a run of blank lines is one separator.
+    let blocks: Vec<Vec<char>> = split_into_blocks(text);
+
+    // 2) Greedily pack whole blocks into chunks; hard-split any single block that
+    //    exceeds the budget; 3+4) carry CHUNK_OVERLAP_CHARS of context forward.
+    let separator: Vec<char> = BLOCK_SEPARATOR.chars().collect();
+    let mut chunks: Vec<Vec<char>> = Vec::new();
+    let mut current: Vec<char> = Vec::new();
+
+    for block in &blocks {
+        // A block that fits whole into the remaining room joins the current chunk.
+        let joined_len = current.len()
+            + if current.is_empty() { 0 } else { separator.len() }
+            + block.len();
+        if joined_len <= CHUNK_BUDGET_CHARS {
+            if !current.is_empty() {
+                current.extend_from_slice(&separator);
+            }
+            current.extend_from_slice(block);
+            continue;
+        }
+
+        // The block does not fit. Flush what we have, then place the block —
+        // hard-splitting it across as many overlap-prefixed chunks as needed.
+        flush(&mut current, &mut chunks);
+        emit_block_with_overlap(block, &mut chunks);
+    }
+    flush(&mut current, &mut chunks);
+
+    chunks.into_iter().map(|c| c.into_iter().collect()).collect()
+}
+
+/// Split on runs of one-or-more blank lines, returning non-empty char-vec blocks.
+/// Leading/trailing whitespace inside a block is trimmed so a block's char count
+/// reflects real content (and a whitespace-only block is dropped entirely).
+fn split_into_blocks(text: &str) -> Vec<Vec<char>> {
+    // A "blank line" run is two-or-more consecutive newlines (ignoring the
+    // spaces/tabs that may pad an otherwise-empty line).
+    text.split("\n\n")
+        .flat_map(|part| part.split("\r\n\r\n"))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.chars().collect())
+        .collect()
+}
+
+/// Move `current` into `chunks` as a finished chunk, if it has any content.
+/// Never emits an empty chunk (guard rail i).
+fn flush(current: &mut Vec<char>, chunks: &mut Vec<Vec<char>>) {
+    if !current.is_empty() {
+        chunks.push(std::mem::take(current));
+    }
+}
+
+/// Place a single (possibly oversized) block into `chunks`, hard-splitting it on
+/// char-window boundaries. Each new chunk after the first carries the trailing
+/// `CHUNK_OVERLAP_CHARS` chars of the previous chunk as leading context. All
+/// slicing is on the block's `char` vector, so no codepoint is ever split.
+fn emit_block_with_overlap(block: &[char], chunks: &mut Vec<Vec<char>>) {
+    let mut pos = 0;
+    while pos < block.len() {
+        // Seed the chunk with overlap carried from the immediately-preceding chunk.
+        let mut chunk: Vec<char> = overlap_tail(chunks);
+        // Fill the remaining room from the block. `overlap < budget` (compile-time
+        // guarded) guarantees room >= 1, so `pos` always advances.
+        let room = CHUNK_BUDGET_CHARS - chunk.len();
+        let take = room.min(block.len() - pos);
+        chunk.extend_from_slice(&block[pos..pos + take]);
+        pos += take;
+        chunks.push(chunk);
+    }
+}
+
+/// The trailing `CHUNK_OVERLAP_CHARS` chars of the last emitted chunk, or an
+/// empty vec if there is none. Derived from an already-chunked char slice, so
+/// the overlap can never split a codepoint (guard rail iii).
+fn overlap_tail(chunks: &[Vec<char>]) -> Vec<char> {
+    match chunks.last() {
+        Some(prev) => {
+            let start = prev.len().saturating_sub(CHUNK_OVERLAP_CHARS);
+            prev[start..].to_vec()
+        }
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
