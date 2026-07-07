@@ -392,6 +392,20 @@ impl EngineHandle {
         (self.embedder_provider.model_state(), self.embedder_provider.reindex())
     }
 
+    /// Language-pack status for the UI poll (rung 2; U6), the RPC entry point behind
+    /// `Request::ModelStatus`. Onboarding-gated only to avoid touching the engine before onboarding;
+    /// a not-onboarded daemon reports `Ok`/no-progress. Otherwise a pure read of [`Self::model_state`]
+    /// (no log open — the provider cells already hold the resolved state).
+    pub async fn model_status(
+        &self,
+        onboarded: bool,
+    ) -> (crate::engine::embed::ModelState, Option<(u64, u64)>) {
+        if !onboarded {
+            return (crate::engine::embed::ModelState::Ok, None);
+        }
+        self.model_state()
+    }
+
     /// Grant read-access to `path` (canonicalized + appended by the engine). Gated.
     pub async fn add_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -1342,6 +1356,10 @@ impl EngineHandle {
         tokio::spawn(async move {
             if let Err(e) = this.run_language_migration(model_id, sha).await {
                 eprintln!("bossclawd: language migration failed (old model still active): {e}");
+                // Report the failure to the UI (the OLD model still serves; the record stays
+                // InProgress = retryable) and clear the now-stale progress bar. Only the reported
+                // state changes — the signed record is left untouched so a retry/boot can resume.
+                this.embedder_provider.set_failed(e.to_string());
                 this.embedder_provider.set_reindex(None);
             }
         });
@@ -3190,5 +3208,89 @@ mod tests {
             "the index must be invalidated in the SAME step as the embedder swap — never a step \
              later — so no racing recall can pair the NEW embedder with the OLD in-memory index"
         );
+    }
+
+    /// A provider whose `build_candidate` succeeds the FIRST time — so `set_active_model`'s
+    /// synchronous pre-check passes and the InProgress record is written — then FAILS every later
+    /// call, so the background migration's OWN `build_candidate` errors. Drives the failure catch
+    /// that must surface `ModelState::Failed` (old model still serving) while leaving the signed
+    /// record InProgress (retryable).
+    struct FailSecondCandidateProvider {
+        candidate_calls: std::sync::atomic::AtomicUsize,
+        state: Mutex<embed::ModelState>,
+        reindex: Mutex<Option<(u64, u64)>>,
+    }
+    impl FailSecondCandidateProvider {
+        fn new() -> Self {
+            Self {
+                candidate_calls: std::sync::atomic::AtomicUsize::new(0),
+                state: Mutex::new(embed::ModelState::Ok),
+                reindex: Mutex::new(None),
+            }
+        }
+    }
+    impl embed::EmbedderProvider for FailSecondCandidateProvider {
+        fn embedder(&self) -> Result<Arc<dyn bossclaw_core::Embedder>, EngineOpError> {
+            Ok(Arc::new(bossclaw_core::MockEmbedder::new(8)))
+        }
+        fn build_candidate(
+            &self,
+            _model_id: &str,
+            _sha: &str,
+        ) -> Result<Arc<dyn bossclaw_core::Embedder>, EngineOpError> {
+            if self.candidate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(Arc::new(bossclaw_core::MockEmbedder::new(8)))
+            } else {
+                Err(EngineOpError::Embedder("candidate build failed (test)".into()))
+            }
+        }
+        fn model_state(&self) -> embed::ModelState {
+            self.state.lock().unwrap().clone()
+        }
+        fn set_failed(&self, reason: String) {
+            *self.state.lock().unwrap() = embed::ModelState::Failed { reason };
+        }
+        fn set_reindex(&self, progress: Option<(u64, u64)>) {
+            *self.reindex.lock().unwrap() = progress;
+        }
+        fn reindex(&self) -> Option<(u64, u64)> {
+            *self.reindex.lock().unwrap()
+        }
+    }
+
+    /// A background migration that fails must surface `ModelState::Failed` via `model_status` (so the
+    /// UI can tell "migration failed, old model still serving" apart from "migration still running"),
+    /// while leaving the signed record InProgress (retryable) and clearing the stale progress bar.
+    #[tokio::test]
+    async fn failed_migration_surfaces_failed_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handle =
+            test_handle_with_provider(tmp.path().to_path_buf(), Arc::new(FailSecondCandidateProvider::new()));
+        let log = handle.get_or_open(true).await.unwrap();
+        log.append(mk_test_memory("event")).unwrap();
+        handle.run_ingest(true).await.unwrap();
+
+        // The synchronous pre-check (build_candidate #1) passes and the InProgress record is written;
+        // the background migration's own build_candidate (#2) then fails.
+        handle.set_active_model(true, "ml/v1".into(), "sha".into()).await.unwrap();
+
+        // Poll until the background task reports the failure through `model_status`.
+        let mut failed = false;
+        for _ in 0..200 {
+            if matches!(handle.model_status(true).await.0, embed::ModelState::Failed { .. }) {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed, "a failed migration must surface ModelState::Failed via model_status");
+        // The record stays InProgress (retryable) — only the reported state changed.
+        assert_eq!(
+            log.language_pack_record().unwrap().unwrap().migration,
+            bossclaw_core::MigrationState::InProgress,
+            "the signed record is left InProgress on failure (retryable)",
+        );
+        // The stale progress bar is cleared alongside the failure.
+        assert!(handle.model_status(true).await.1.is_none(), "progress cleared on failure");
     }
 }

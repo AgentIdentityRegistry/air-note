@@ -36,6 +36,14 @@ pub enum ModelState {
         /// The sha256 actually found on disk.
         loaded: String,
     },
+    /// A background re-embed migration failed; the OLD model still serves and the signed record
+    /// stays `InProgress` (retryable). Distinct from `Ok` so the UI shows "migration failed — retry"
+    /// rather than a running-migration spinner. Set by the migration task's failure catch; cleared by
+    /// a later successful `publish` (or by re-resolving the model on the next boot).
+    Failed {
+        /// A short, user-safe reason (a rendered engine error; carries no secret material).
+        reason: String,
+    },
 }
 
 /// A pluggable model loader (production = `Model2Vec::from_pretrained`; tests inject a mock). Takes
@@ -67,6 +75,10 @@ pub trait EmbedderProvider: Send + Sync {
     fn model_state(&self) -> ModelState {
         ModelState::Ok
     }
+
+    /// Record that a background migration FAILED (the old model keeps serving; the signed record
+    /// stays `InProgress`, so it is retryable). Surfaced to the UI via `model_state`. Default: no-op.
+    fn set_failed(&self, _reason: String) {}
 
     /// Set the live re-index progress (`(done, total)`), for `ModelStatus`. Default: no-op.
     fn set_reindex(&self, _progress: Option<(u64, u64)>) {}
@@ -231,6 +243,10 @@ impl EmbedderProvider for ResourceModel2Vec {
 
     fn model_state(&self) -> ModelState {
         self.state.lock().expect("model state poisoned").clone()
+    }
+
+    fn set_failed(&self, reason: String) {
+        *self.state.lock().expect("model state poisoned") = ModelState::Failed { reason };
     }
 
     fn set_reindex(&self, progress: Option<(u64, u64)>) {

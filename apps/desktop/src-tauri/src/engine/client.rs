@@ -44,8 +44,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bossclawd_proto::types::{
-    EngineStateWire, EngineStatusWire, MandateSummaryWire, MandateWriteSummaryWire, PreviewDataWire,
-    ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
+    EngineStateWire, EngineStatusWire, MandateSummaryWire, MandateWriteSummaryWire, ModelStateWire,
+    ModelStatusWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
 };
 use bossclawd_proto::{HitWire, OpErrorKindWire, Request, Response};
 
@@ -53,7 +53,7 @@ use super::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use super::transport::Transport;
 use super::{
     ApplyResult, EngineError, EngineOpError, EngineState, EngineStatus, EvolveTelemetry, HitWithText,
-    MandateSummary, MandateWriteSummary, PreviewData, ProposalSummary,
+    MandateSummary, MandateWriteSummary, ModelState, PreviewData, ProposalSummary,
 };
 
 /// A daemon-backed drop-in for today's in-process `EngineHandle`. Generic over the [`Transport`] so
@@ -396,6 +396,32 @@ impl<T: Transport + ?Sized> EngineClient<T> {
         self.unit(Request::EnableCloudReasoner { onboarded, config }).await
     }
 
+    // ── Language pack (rung 2). Staged with the facade seam; the command layer (B2) is the consumer,
+    //    so these are `allow(dead_code)` until `engine_set_active_model` / `engine_model_status` land. ──
+
+    /// Mirrors `EngineHandle::set_active_model`: enable the multilingual language pack. The daemon
+    /// validates the folder+sha, writes the signed consent, and runs the re-embed migration in the
+    /// background; this call returns once that synchronous prologue completes.
+    #[allow(dead_code)]
+    pub async fn set_active_model(
+        &self,
+        onboarded: bool,
+        model_id: String,
+        safetensors_sha: String,
+    ) -> Result<(), EngineOpError> {
+        self.unit(Request::SetActiveModel { onboarded, model_id, safetensors_sha }).await
+    }
+
+    /// Mirrors `EngineHandle::model_status`: the loaded-vs-intended model state + live re-index
+    /// progress (rung 2), rebuilt from the wire into the desktop [`ModelStatus`].
+    #[allow(dead_code)]
+    pub async fn model_status(&self, onboarded: bool) -> Result<ModelStatus, EngineOpError> {
+        match self.request(Request::ModelStatus { onboarded }).await? {
+            Response::ModelStatus(w) => Ok(model_status_from_wire(w)),
+            other => Err(unexpected(other)),
+        }
+    }
+
     // ── Internal request helpers ─────────────────────────────────────────────
 
     /// Send `req` and unwrap the daemon's non-success signals to a typed error. Success and
@@ -520,6 +546,30 @@ fn engine_state_from_wire(w: EngineStateWire) -> EngineState {
         EngineStateWire::KeystoreDbMismatch => EngineState::KeystoreDbMismatch,
         EngineStateWire::ChainFailed => EngineState::ChainFailed,
     }
+}
+
+/// Desktop-side language-pack status (rung 2): the client mirror of `ModelStatusWire`. The facade
+/// (`super::Engine::model_status`) returns this to the language-pack command layer (B2), which is its
+/// only consumer — so it (and its mapper) are `allow(dead_code)` until B2 lands.
+#[allow(dead_code)]
+pub struct ModelStatus {
+    /// The loaded-vs-intended model state.
+    pub state: ModelState,
+    /// Live re-index progress (`(done, total)`) while a migration runs; `None` when idle.
+    pub reindex: Option<(u64, u64)>,
+}
+
+/// `ModelStatusWire` → desktop [`ModelStatus`] (rung 2). Exhaustive on `ModelStateWire` on purpose:
+/// a new wire state must force a desktop mapping here.
+#[allow(dead_code)]
+fn model_status_from_wire(w: ModelStatusWire) -> ModelStatus {
+    let state = match w.state {
+        ModelStateWire::Ok => ModelState::Ok,
+        ModelStateWire::Missing { expected } => ModelState::Missing { expected },
+        ModelStateWire::Mismatch { expected, loaded } => ModelState::Mismatch { expected, loaded },
+        ModelStateWire::Failed { reason } => ModelState::Failed { reason },
+    };
+    ModelStatus { state, reindex: w.reindex.map(|p| (p.done, p.total)) }
 }
 
 /// The `status` swallow-default when the daemon is down: the engine's "can't open" fault state.
