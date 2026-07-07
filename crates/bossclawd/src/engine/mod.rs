@@ -1381,9 +1381,14 @@ impl EngineHandle {
             .await
             .map_err(|e| EngineOpError::Join(e.to_string()))?
             .map_err(|e| EngineOpError::Core(e.to_string()))?;
-        self.embedder_provider.publish(candidate.clone());
+        // Swap the served embedder AND invalidate the recall index in the SAME step (never after GC —
+        // see `publish_and_invalidate`'s doc for why the ordering matters).
+        self.publish_and_invalidate(candidate.clone()).await;
 
-        // Stage 2: GC the old vectors + entity vectors, rebuild indexes under the new model.
+        // Stage 2: GC the old vectors + entity vectors, rebuild indexes under the new model. A
+        // failure here leaves stale old-model rows (harmless — `resume_migration_if_pending` sweeps
+        // them on the next boot) but the index is ALREADY invalidated above, so a racing recall still
+        // rebuilds correctly against the new model regardless of whether/when this GC succeeds.
         let (log3, cand3) = (log.clone(), candidate);
         spawn_blocking(move || log3.reembed_finalize_gc(&*cand3))
             .await
@@ -1391,9 +1396,21 @@ impl EngineHandle {
             .map_err(|e| EngineOpError::Core(e.to_string()))?;
 
         self.embedder_provider.set_reindex(None);
-        // Force a recall-index rebuild on the next recall so it reflects the newly-published model.
-        *self.indexed.lock().await = false;
         Ok(())
+    }
+
+    /// Atomically swap the live embedder cache to `candidate` AND invalidate the recall index, so no
+    /// racing `recall`/`evolve_once` can ever observe the NEW embedder (served from the provider's
+    /// cache the instant `publish` runs) paired with the OLD in-memory vector index (built under the
+    /// old model). New-id vectors already exist at this point — `reembed_prepare` wrote them BEFORE
+    /// the commit point — so a rebuild triggered by the invalidation is correct even before GC runs;
+    /// the two calls must never be separated (a prior version invalidated only after GC, leaving a
+    /// window where a racing recall embedded the query with the NEW model but searched the OLD
+    /// in-memory index — cross-embedding-space garbage results for the whole GC+rebuild duration, and
+    /// permanently if `reembed_finalize_gc` then failed).
+    async fn publish_and_invalidate(&self, candidate: Arc<dyn Embedder>) {
+        self.embedder_provider.publish(candidate);
+        *self.indexed.lock().await = false;
     }
 
     /// Boot-time resume (invariant I6): if a consented `InProgress` migration is recorded, finish it;
@@ -1407,7 +1424,14 @@ impl EngineHandle {
         };
         let rec = match log.language_pack_record() {
             Ok(Some(r)) => r,
-            _ => return,
+            Ok(None) => return, // no consent recorded — nothing to resume (I6)
+            Err(e) => {
+                // A real DB/deserialize failure is NOT "nothing to resume" — a corrupt record must
+                // never silently skip a needed resume, so it is logged (never surfaced as a fault:
+                // this runs unattended at boot, same discipline as the panic-scrubbing hook).
+                eprintln!("bossclawd: boot-resume could not read the language-pack record: {e}");
+                return;
+            }
         };
         match rec.migration {
             bossclaw_core::MigrationState::InProgress => {
@@ -1416,7 +1440,11 @@ impl EngineHandle {
             bossclaw_core::MigrationState::Complete => {
                 // A crash between the flip and the GC can leave stale old-model rows; sweep them.
                 let keep = rec.model_id.clone();
-                let _ = spawn_blocking(move || log.gc_stale_vectors(&keep)).await;
+                match spawn_blocking(move || log.gc_stale_vectors(&keep)).await {
+                    Ok(Ok(_removed)) => {}
+                    Ok(Err(e)) => eprintln!("bossclawd: boot-resume GC of stale vectors failed: {e}"),
+                    Err(e) => eprintln!("bossclawd: boot-resume GC task failed to join: {e}"),
+                }
             }
         }
     }
@@ -3135,5 +3163,32 @@ mod tests {
         let log = handle.get_or_open(true).await.unwrap();
         assert_eq!(log.language_pack_record().unwrap().unwrap().migration, bossclaw_core::MigrationState::Complete);
         assert_eq!(log.vectors_for_model(&id).unwrap().len(), 1, "resume finished the re-embed");
+    }
+
+    /// Regression guard (review MAJOR): the embedder swap and the recall-index invalidation MUST
+    /// happen in the SAME step, never separated. A prior version invalidated the index only AFTER
+    /// `reembed_finalize_gc`, leaving a window where a racing recall got the NEW embedder from the
+    /// provider's cache (swapped by `publish`) but skipped rebuilding because `indexed` was still
+    /// `true` — searching the new-model query embedding against the OLD in-memory vector index
+    /// (cross-embedding-space garbage), for the whole GC+rebuild duration, and permanently if the GC
+    /// then failed. Pins `publish_and_invalidate` as the ONLY path `run_language_migration` uses to
+    /// swap the embedder, so a future reorder that calls `publish` and the index-reset separately
+    /// cannot silently reintroduce the window.
+    #[tokio::test]
+    async fn publish_and_invalidate_clears_the_index_atomically_with_the_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = test_handle_with_provider(
+            tmp.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(8)),
+        );
+        // Simulate an already-built index under the OLD model (what a prior recall would have set).
+        *handle.indexed.lock().await = true;
+        let candidate: Arc<dyn bossclaw_core::Embedder> = Arc::new(bossclaw_core::MockEmbedder::new(8));
+        handle.publish_and_invalidate(candidate).await;
+        assert!(
+            !*handle.indexed.lock().await,
+            "the index must be invalidated in the SAME step as the embedder swap — never a step \
+             later — so no racing recall can pair the NEW embedder with the OLD in-memory index"
+        );
     }
 }

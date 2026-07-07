@@ -83,6 +83,12 @@ mod unix_main {
         let lock_path = data_dir.join(LOCK_FILE);
         // Rung-2 resolution inputs: the env override (dev/harness, highest priority), the bundled
         // English default dir, and the models root under which a downloaded language pack is staged.
+        // `ENV_MODEL_DIR` is read here AND again inside `resolve_bundled_model_dir` — intentional,
+        // not a duplication bug: this read yields the override PATH ITSELF (`env_override`, wired
+        // straight into `with_resolution` as the highest-priority resolution input), while the read
+        // inside `resolve_bundled_model_dir` yields the BUNDLED-DEFAULT fallback (used only when no
+        // signed language pack is active) — the two roles happen to share one env var so a dev/harness
+        // override fully replaces the model dir exactly like the pre-rung-2 single-model behaviour.
         let env_override = std::env::var_os(ENV_MODEL_DIR).map(PathBuf::from);
         let bundled_dir = resolve_bundled_model_dir(&data_dir);
         let data_models_root = data_dir.join("models");
