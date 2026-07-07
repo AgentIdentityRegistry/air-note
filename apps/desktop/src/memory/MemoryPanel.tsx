@@ -9,6 +9,7 @@ import {
 import { vaultSet, vaultHas } from "../vault";
 import { ReasonerConfigPanel } from "./ReasonerConfigPanel";
 import { CloudEgressBanner } from "./CloudEgressBanner";
+import { LanguagePackCard } from "./LanguagePackCard";
 import { searchBlurb, modeBlurb } from "./reasonerView";
 import { toRow } from "./recallView";
 import { formatEvolve } from "./evolveStatus";
@@ -205,6 +206,13 @@ export function MemoryPanel() {
             To enable, install Ollama and run <code>ollama pull qwen2.5:7b-instruct</code>.
           </p>
         ) : null}
+
+        {/* v1 passes installed={false}: the Ok-state model_status payload doesn't report which model
+            is active, so deriving "multilingual active" is deferred (plan B5). The card still drives
+            download→enable and renders the re-index / missing / mismatch / failed states it polls. */}
+        <div style={{ margin: "12px 0" }}>
+          <LanguagePackCard installed={false} />
+        </div>
 
         <div style={{ display: "flex", gap: 8, margin: "8px 0" }}>
           <Button variant="secondary" onClick={onToggleEvolve} disabled={!status || toggling || !reasonerReady}>
