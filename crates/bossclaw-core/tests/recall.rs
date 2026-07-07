@@ -2004,3 +2004,37 @@ fn superseded_page_at_rank_one_does_not_crowd_out_a_valid_memory() {
         "the superseded page must never appear; hits={hits:?}"
     );
 }
+
+// ── Rung 2: signed language_pack record (A1) ────────────────────────────────
+use bossclaw_core::{LanguagePackRecord, MigrationState};
+
+#[test]
+fn language_pack_record_roundtrips_and_is_sticky_and_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    // Absent by default (English default path — no record).
+    assert!(log.language_pack_record().unwrap().is_none());
+
+    // Write an in-progress record.
+    let rec = LanguagePackRecord {
+        model_id: "minishlab/potion-multilingual-128M".to_string(),
+        safetensors_sha: "abc123".to_string(),
+        migration: MigrationState::InProgress,
+        consented_at: "2026-07-07T00:00:00Z".to_string(),
+    };
+    log.set_language_pack_record(&rec).unwrap();
+    assert_eq!(log.language_pack_record().unwrap().unwrap(), rec);
+
+    // Newest wins (flip to complete).
+    let done = LanguagePackRecord { migration: MigrationState::Complete, ..rec.clone() };
+    log.set_language_pack_record(&done).unwrap();
+    assert_eq!(log.language_pack_record().unwrap().unwrap().migration, MigrationState::Complete);
+
+    // It carries no model fields, so it must NOT disturb active_model().
+    assert!(log.active_model().unwrap().is_none(), "language_pack record must not be seen as an active_model config");
+
+    // Signed + chained.
+    log.verify_chain().expect("chain verifies after two language_pack config events");
+}

@@ -96,6 +96,38 @@ pub struct ActiveModel {
     pub schema_version: u32,
 }
 
+/// Whether an opt-in language-pack migration has finished. `InProgress` means consent was
+/// recorded and re-embedding started but the atomic end-flip has NOT run (recall keeps serving
+/// the OLD model); `Complete` means the multilingual model is live (recall serves it). The daemon
+/// resumes an `InProgress` migration on boot (invariant I6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationState {
+    /// Consent recorded and re-embedding started, but the atomic end-flip has NOT run — recall
+    /// keeps serving the OLD model; the daemon resumes this on boot (invariant I6).
+    InProgress,
+    /// The re-embed finished and the multilingual model is live — recall serves it.
+    Complete,
+}
+
+/// The signed opt-in language-pack record — the single source of truth (invariant I2) for which
+/// embedding model is enabled, its verified safetensors sha (invariant I4), and the user's consent.
+/// Stored under [`LANGUAGE_PACK_KEY`] in a signed, hash-chained `config` event. It carries NONE of
+/// [`ActiveModel`]'s fields, so it never disturbs [`EventLog::active_model`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanguagePackRecord {
+    /// The enabled model id (e.g. `"minishlab/potion-multilingual-128M"`).
+    pub model_id: String,
+    /// The sha256 of the model's `model.safetensors`, verified by the downloader before install
+    /// and re-verified by the daemon at load (invariant I4 — the only guard, since both models are
+    /// 256-dim and the dim probe cannot catch a mislabel).
+    pub safetensors_sha: String,
+    /// Whether the consent-gated re-embed has finished (see [`MigrationState`]).
+    pub migration: MigrationState,
+    /// RFC3339 timestamp the user consented, for audit surfacing.
+    pub consented_at: String,
+}
+
 /// A hit from the M6c synthesis cache ([`EventLog::get_synthesis_cache`]).
 ///
 /// Carries the synthesized expected file bytes TOGETHER with the synth-time lineage
@@ -208,6 +240,12 @@ const REASONER_CONFIG_KEY: &str = "reasoner_config";
 /// presence is what authorizes cloud egress, so it MUST be a signed event.
 const CLOUD_REASONER_CONSENT_KEY: &str = "cloud_reasoner_consent";
 
+/// Signed `config` key for the opt-in multilingual language pack (rung 2). Its presence +
+/// `migration == Complete` is the SOLE authority for "load the multilingual model" (invariant I2);
+/// `InProgress` records a consented-but-unfinished re-embed the daemon RESUMES on boot (I6). Written
+/// only by [`EventLog::set_language_pack_record`]; absence means the English default (I7).
+const LANGUAGE_PACK_KEY: &str = "language_pack";
+
 /// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
 /// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
 /// reference a compile-checked variant instead of a stringly-typed key that could drift on a
@@ -224,6 +262,8 @@ pub enum ConfigFlag {
     ReasonerConfig,
     /// The signed cloud-enable consent record ([`CLOUD_REASONER_CONSENT_KEY`]).
     CloudReasonerConsent,
+    /// The signed opt-in multilingual language-pack record ([`LANGUAGE_PACK_KEY`]).
+    LanguagePack,
 }
 
 impl ConfigFlag {
@@ -235,6 +275,7 @@ impl ConfigFlag {
             ConfigFlag::Mandates => MANDATES_ENABLED_KEY,
             ConfigFlag::ReasonerConfig => REASONER_CONFIG_KEY,
             ConfigFlag::CloudReasonerConsent => CLOUD_REASONER_CONSENT_KEY,
+            ConfigFlag::LanguagePack => LANGUAGE_PACK_KEY,
         }
     }
 }
@@ -5121,6 +5162,43 @@ impl EventLog {
             signature: None,
         })?;
         Ok(())
+    }
+
+    /// Persist the signed opt-in language-pack record (invariant I2). CLONES the
+    /// [`EventLog::set_cloud_reasoner_consent`] mechanism exactly — Ed25519-signed + hash-chained
+    /// (tamper-evident via `verify_chain`), the only writer of [`LANGUAGE_PACK_KEY`]. Carries no
+    /// model fields, so it never disturbs [`EventLog::active_model`].
+    pub fn set_language_pack_record(&self, record: &LanguagePackRecord) -> Result<(), BossclawError> {
+        let value = serde_json::to_value(record)?;
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a const identifier
+            // as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(LANGUAGE_PACK_KEY.to_string(), value);
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
+    /// The newest signed language-pack record, or `None` if never set (English default — I7).
+    /// STICKY: the first `config` event (newest-first) carrying the key wins, mirroring
+    /// [`EventLog::cloud_reasoner_consent_json`].
+    pub fn language_pack_record(&self) -> Result<Option<LanguagePackRecord>, BossclawError> {
+        match self.latest_config_value(LANGUAGE_PACK_KEY)? {
+            Some(v) => Ok(Some(serde_json::from_value(v)?)),
+            None => Ok(None),
+        }
     }
 
     /// Whether the evolve loop is enabled (spec §8 off-switch / Rev 2 F2-sec(a)).
