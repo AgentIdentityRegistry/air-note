@@ -386,6 +386,12 @@ impl EngineHandle {
         }
     }
 
+    /// The loaded-vs-intended model state + live re-index progress (rung 2; U5/U6). A pure read of
+    /// the provider's cells; the migration task and the loader guard keep them current.
+    pub fn model_state(&self) -> (crate::engine::embed::ModelState, Option<(u64, u64)>) {
+        (self.embedder_provider.model_state(), self.embedder_provider.reindex())
+    }
+
     /// Grant read-access to `path` (canonicalized + appended by the engine). Gated.
     pub async fn add_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -449,7 +455,7 @@ impl EngineHandle {
         let _guard = self.ingest_lock.try_lock().map_err(|_| EngineOpError::Busy("ingest"))?;
         let provider = self.embedder_provider.clone();
         let report = tokio::task::spawn_blocking(move || -> Result<bossclaw_core::IngestReport, EngineOpError> {
-            let embedder = provider.embedder()?; // lazy, cached — built BEFORE the walk
+            let embedder = provider.embedder_for(&log)?; // resolved (env → signed record → bundled), cached — built BEFORE the walk
             let router = bossclaw_core::ingest::ParserRouter::native_only();
             let report = log.ingest_all(&router, &*embedder).map_err(|e| EngineOpError::Core(e.to_string()))?;
             // Record the active model at vector-birth (idempotent: only when absent or changed).
@@ -499,7 +505,10 @@ impl EngineHandle {
     /// serializes concurrent first-recalls (no double rebuild) and makes "set true only on
     /// success" race-free. Returns the (cached) embedder for the caller.
     async fn ensure_indexed(&self, log: &Arc<EventLog>) -> Result<Arc<dyn Embedder>, EngineOpError> {
-        let embedder = self.embedder_provider.embedder()?;
+        // Resolution-aware (env → signed record → bundled): a signed model whose files are
+        // missing/mismatched makes this fail loud here, so recall REFUSES rather than silently
+        // serving the wrong/empty model (I3/U5). `log: &Arc<EventLog>` auto-derefs to `&EventLog`.
+        let embedder = self.embedder_provider.embedder_for(log)?;
         let mut done = self.indexed.lock().await;
         if !*done {
             let (log2, emb2) = (log.clone(), embedder.clone());
@@ -2794,5 +2803,55 @@ mod tests {
             matches!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Local),
             "a failed enable must never touch the cell (fail-closed write-through)"
         );
+    }
+
+    // ---- Rung 2: resolution-aware recall + consent-gated language migration (A5/A6) ----
+
+    /// A resolution-aware handle wired with a caller-supplied embedder provider (rung 2). Returns an
+    /// `Arc` because the migration entry points (`set_active_model`/`resume_migration_if_pending`)
+    /// take `self: &Arc<Self>` to spawn their background task. Mirrors `new_test_handle`'s vault +
+    /// reasoner and seeds the provider-key cache EMPTY (no keychain prompt).
+    fn test_handle_with_provider(
+        home: std::path::PathBuf,
+        provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    ) -> Arc<EngineHandle> {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        Arc::new(EngineHandle::new(
+            TestVault::new(),
+            home,
+            provider,
+            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        ))
+    }
+
+    /// U5/I3: a recall against a signed `Complete` language pack whose files are absent must REFUSE
+    /// loudly (never silently serve the wrong/empty model), and the provider must surface `Missing`
+    /// so the UI can prompt a re-download. Proves `ensure_indexed` resolves via `embedder_for`.
+    #[tokio::test]
+    async fn recall_refuses_loudly_when_signed_model_missing() {
+        use crate::engine::embed::ResourceModel2Vec;
+        use bossclaw_core::{LanguagePackRecord, MigrationState};
+        // Build a resolution-aware provider whose data root has NO folder for the enabled model.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let provider = std::sync::Arc::new(ResourceModel2Vec::with_resolution(
+            None, root.join("potion-base-8M"), root, crate::engine::embed::MODEL_ID.to_string(),
+        ));
+        let handle = test_handle_with_provider(tmp.path().to_path_buf(), provider);
+        // Onboard + record a Complete multilingual intent whose folder is absent.
+        let log = handle.get_or_open(true).await.unwrap();
+        log.set_language_pack_record(&LanguagePackRecord {
+            model_id: "minishlab/potion-multilingual-128M".into(),
+            safetensors_sha: "abc".into(),
+            migration: MigrationState::Complete,
+            consented_at: "t".into(),
+        }).unwrap();
+        let err = handle.recall(true, "anything".into(), 5).await.unwrap_err();
+        assert!(matches!(err, crate::engine::EngineOpError::Embedder(_)),
+            "recall must refuse when the signed model is missing (I3), got {err:?}");
+        // The resolution path (not a generic embedder failure) ran: the provider surfaces Missing.
+        assert!(matches!(handle.model_state().0, crate::engine::embed::ModelState::Missing { .. }),
+            "the provider surfaces Missing so the UI can prompt a re-download (U5)");
     }
 }

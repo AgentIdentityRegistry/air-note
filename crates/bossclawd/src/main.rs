@@ -81,7 +81,11 @@ mod unix_main {
         }
         let sock_path = resolve_socket_path(&data_dir);
         let lock_path = data_dir.join(LOCK_FILE);
-        let model_dir = resolve_model_dir(&data_dir);
+        // Rung-2 resolution inputs: the env override (dev/harness, highest priority), the bundled
+        // English default dir, and the models root under which a downloaded language pack is staged.
+        let env_override = std::env::var_os(ENV_MODEL_DIR).map(PathBuf::from);
+        let bundled_dir = resolve_bundled_model_dir(&data_dir);
+        let data_models_root = data_dir.join("models");
 
         // (2) Advisory single-owner lock. A live owner answering the socket, or a live PID in the
         // lock file → step aside (exit 0). This is the fast-path check; the bind below is the real gate.
@@ -120,7 +124,12 @@ mod unix_main {
         // restart (the M1a Task 6 review fix; boot additionally reseeds it just below).
         let engine_vault = vault::engine_vault();
         let reasoner_cfg = Arc::new(Mutex::new(ReasonerConfig::default()));
-        let embedder = Arc::new(bossclawd::engine::embed::ResourceModel2Vec::new(model_dir));
+        let embedder = Arc::new(bossclawd::engine::embed::ResourceModel2Vec::with_resolution(
+            env_override,
+            bundled_dir,
+            data_models_root,
+            bossclawd::engine::embed::MODEL_ID.to_string(),
+        ));
         let reasoner_provider = {
             let cell = reasoner_cfg.clone();
             Arc::new(bossclawd::engine::reason::ConfigReasonerProvider::new(move || {
@@ -197,9 +206,10 @@ mod unix_main {
             .unwrap_or_else(|| data_dir.join(SOCKET_FILE))
     }
 
-    /// Model dir: `BOSSCLAWD_MODEL_DIR` if set, else `<data_dir>/models/potion-base-8M` (the install
-    /// path the daemon's installer stages the bundled model into — NOT a Tauri `resource_dir`).
-    fn resolve_model_dir(data_dir: &std::path::Path) -> PathBuf {
+    /// Bundled English model dir: `BOSSCLAWD_MODEL_DIR` (dev/harness override) if set, else the
+    /// staged default `<data_dir>/models/potion-base-8M` (the install path the daemon's installer
+    /// stages the bundled model into — NOT a Tauri `resource_dir`).
+    fn resolve_bundled_model_dir(data_dir: &std::path::Path) -> PathBuf {
         std::env::var_os(ENV_MODEL_DIR)
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("models/potion-base-8M"))
