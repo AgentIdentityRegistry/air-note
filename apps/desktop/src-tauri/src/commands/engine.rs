@@ -662,6 +662,59 @@ pub async fn engine_model_status(state: State<'_, AppState>) -> Result<ModelStat
     Ok(ModelStatusDto { state: state_str, expected, loaded, reason, reindex_done, reindex_total })
 }
 
+/// Copy the bundled English model from `resource_models_dir` into `<data_dir>/models/potion-base-8M`
+/// if the destination is missing (idempotent). This makes the daemon's DEFAULT resolution
+/// (`<data_dir>/models/potion-base-8M`) work WITHOUT the app pushing `BOSSCLAWD_MODEL_DIR` (I1), so a
+/// signed multilingual record can win the pull-resolution. Best-effort: a copy failure is logged, not
+/// fatal (the app still boots; memory features degrade until the model is present). Never overwrites a
+/// model already staged (so a downloaded/user model is never clobbered by the bundled English one).
+pub fn stage_bundled_english(resource_models_dir: &std::path::Path, data_models_root: &std::path::Path) {
+    let src = resource_models_dir.join("potion-base-8M");
+    let dst = data_models_root.join("potion-base-8M");
+    if dst.join("model.safetensors").is_file() {
+        return; // already staged
+    }
+    if let Err(e) = copy_dir_recursive(&src, &dst) {
+        eprintln!("air-agent: could not stage bundled English model: {e} (memory features may be unavailable)");
+    }
+}
+
+/// Recursively copy `src` into `dst`, creating `dst` (and any missing parents) first. Small, local,
+/// and single-purpose (drives [`stage_bundled_english`]); the model tree is shallow (a handful of
+/// files), so a plain recursive walk is sufficient — no external crate needed.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn stages_english_when_absent_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res = tmp.path().join("resources/models");
+        std::fs::create_dir_all(res.join("potion-base-8M")).unwrap();
+        std::fs::write(res.join("potion-base-8M/model.safetensors"), b"weights").unwrap();
+        let data = tmp.path().join("data/models");
+        stage_bundled_english(&res, &data);
+        assert!(data.join("potion-base-8M/model.safetensors").is_file());
+        // Second call is a no-op (does not error, does not re-copy over a user's staged model).
+        stage_bundled_english(&res, &data);
+        assert!(data.join("potion-base-8M/model.safetensors").is_file());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
