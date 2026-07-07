@@ -2127,3 +2127,38 @@ fn reembed_prepare_then_finalize_migrates_vectors_and_entity_vectors() {
     assert!(progress_calls >= 2, "progress reported per embeddable event");
     assert_eq!(stats.gc_removed, 2, "2 old vector rows removed");
 }
+
+// ── Rung 2: I7 invariance guard — the default (no language pack) path is unchanged ──
+
+/// I7 output identity: with NO signed `language_pack` record, the store behaves exactly as it did
+/// before rung 2 — the active model is the base English `mock-v1`, the record machinery is absent,
+/// and the stored vector bytes are stable across an index rebuild. This pins that merely *adding*
+/// the language-pack feature changes nothing about the existing English vector pipeline: a
+/// regression that let the resolver leak a record, rewrite vectors, or reorder the rebuild on the
+/// default path would flip one of these assertions.
+#[test]
+fn default_path_is_byte_identical_without_language_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    for t in ["ocean waves crashing", "forest trees rustling"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+    let v1 = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&v1).unwrap();
+    log.set_active_model(v1.model_id(), v1.dim() as u32).unwrap();
+
+    // No language_pack record was ever written.
+    assert!(log.language_pack_record().unwrap().is_none());
+
+    // The active model + vector bytes are exactly the base model's (I7 output identity).
+    assert_eq!(log.active_model().unwrap().unwrap().active_model_id, MOCK_MODEL_ID);
+    let before = log.vectors_for_model(MOCK_MODEL_ID).unwrap();
+    assert_eq!(before.len(), 2);
+
+    // Re-reading is stable (index rebuild is deterministic — same rows, same order).
+    log.rebuild_indexes(&v1).unwrap();
+    let after = log.vectors_for_model(MOCK_MODEL_ID).unwrap();
+    assert_eq!(before, after, "vectors are byte-identical across a rebuild on the default path (I7)");
+}
