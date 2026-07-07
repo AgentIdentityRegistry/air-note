@@ -610,6 +610,10 @@ pub struct ModelStatusDto {
     pub reason: Option<String>,
     pub reindex_done: Option<u64>,
     pub reindex_total: Option<u64>,
+    /// The model id currently SERVED (a `Complete` record's id, else the bundled English base id). The
+    /// card derives "multilingual active" from this — showing that status and hiding the redundant
+    /// Enable button once the pack is live. `None` only from a daemon predating the field.
+    pub active_model_id: Option<String>,
 }
 
 /// Download + verify + install the multilingual language pack into `<data_dir>/models/` (U3), then
@@ -659,7 +663,15 @@ pub async fn engine_model_status(state: State<'_, AppState>) -> Result<ModelStat
         Some((d, t)) => (Some(d), Some(t)),
         None => (None, None),
     };
-    Ok(ModelStatusDto { state: state_str, expected, loaded, reason, reindex_done, reindex_total })
+    Ok(ModelStatusDto {
+        state: state_str,
+        expected,
+        loaded,
+        reason,
+        reindex_done,
+        reindex_total,
+        active_model_id: status.active_model_id,
+    })
 }
 
 /// Copy the bundled English model from `resource_models_dir` into `<data_dir>/models/potion-base-8M`

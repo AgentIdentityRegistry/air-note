@@ -603,12 +603,17 @@ mod protocol_tests {
         assert_eq!(status, back);
 
         let responses = vec![
-            Response::ModelStatus(ModelStatusWire { state: ModelStateWire::Ok, reindex: None }),
+            Response::ModelStatus(ModelStatusWire {
+                state: ModelStateWire::Ok,
+                reindex: None,
+                active_model_id: Some("minishlab/potion-multilingual-128M".to_string()),
+            }),
             Response::ModelStatus(ModelStatusWire {
                 state: ModelStateWire::Missing {
                     expected: "minishlab/potion-multilingual-128M".to_string(),
                 },
                 reindex: Some(ReindexProgressWire { done: 220, total: 1043 }),
+                active_model_id: Some("minishlab/potion-base-8M".to_string()),
             }),
             Response::ModelStatus(ModelStatusWire {
                 state: ModelStateWire::Mismatch {
@@ -616,10 +621,18 @@ mod protocol_tests {
                     loaded: "deadbeef".to_string(),
                 },
                 reindex: None,
+                active_model_id: Some("minishlab/potion-base-8M".to_string()),
             }),
             Response::ModelStatus(ModelStatusWire {
                 state: ModelStateWire::Failed { reason: "re-embed failed: model boom".to_string() },
                 reindex: None,
+                active_model_id: Some("minishlab/potion-base-8M".to_string()),
+            }),
+            // A daemon that predates the field emits `None`; the round-trip must preserve it.
+            Response::ModelStatus(ModelStatusWire {
+                state: ModelStateWire::Ok,
+                reindex: None,
+                active_model_id: None,
             }),
         ];
         for resp in responses {

@@ -554,6 +554,9 @@ pub struct ModelStatus {
     pub state: ModelState,
     /// Live re-index progress (`(done, total)`) while a migration runs; `None` when idle.
     pub reindex: Option<(u64, u64)>,
+    /// The model id currently SERVED (a `Complete` record's id, else the bundled English base id), so
+    /// the card can show "Multilingual active". `None` only from a daemon predating the wire field.
+    pub active_model_id: Option<String>,
 }
 
 /// `ModelStatusWire` → desktop [`ModelStatus`] (rung 2). Exhaustive on `ModelStateWire` on purpose:
@@ -565,7 +568,11 @@ fn model_status_from_wire(w: ModelStatusWire) -> ModelStatus {
         ModelStateWire::Mismatch { expected, loaded } => ModelState::Mismatch { expected, loaded },
         ModelStateWire::Failed { reason } => ModelState::Failed { reason },
     };
-    ModelStatus { state, reindex: w.reindex.map(|p| (p.done, p.total)) }
+    ModelStatus {
+        state,
+        reindex: w.reindex.map(|p| (p.done, p.total)),
+        active_model_id: w.active_model_id,
+    }
 }
 
 /// The `status` swallow-default when the daemon is down: the engine's "can't open" fault state.

@@ -615,6 +615,11 @@ pub struct ModelStatusWire {
     pub state: ModelStateWire,
     /// Live re-index progress while a migration runs; `None` when idle.
     pub reindex: Option<ReindexProgressWire>,
+    /// The model id currently SERVED — the `Complete` signed record's model id once the migration has
+    /// flipped, else the bundled English base id (an absent/`InProgress` record keeps English serving
+    /// until the flip). Lets the Settings card show "Multilingual active" and stop offering a
+    /// redundant re-download. `None` only from a daemon that predates this field.
+    pub active_model_id: Option<String>,
 }
 
 /// Wire form of the desktop `EvolveTelemetry` (`engine/mod.rs:236`). Session-scoped

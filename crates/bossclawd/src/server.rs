@@ -353,7 +353,11 @@ fn status_wire(s: EngineStatus) -> EngineStatusWire {
 /// Map the daemon's `(ModelState, progress)` (rung 2) to the wire `ModelStatusWire` the Settings card
 /// polls. Exhaustive on `ModelState` on purpose: a new state variant must force a wire mapping here.
 fn model_status_wire(
-    (state, reindex): (crate::engine::embed::ModelState, Option<(u64, u64)>),
+    (state, reindex, active_model_id): (
+        crate::engine::embed::ModelState,
+        Option<(u64, u64)>,
+        String,
+    ),
 ) -> ModelStatusWire {
     let state = match state {
         crate::engine::embed::ModelState::Ok => ModelStateWire::Ok,
@@ -365,7 +369,11 @@ fn model_status_wire(
         }
         crate::engine::embed::ModelState::Failed { reason } => ModelStateWire::Failed { reason },
     };
-    ModelStatusWire { state, reindex: reindex.map(|(done, total)| ReindexProgressWire { done, total }) }
+    ModelStatusWire {
+        state,
+        reindex: reindex.map(|(done, total)| ReindexProgressWire { done, total }),
+        active_model_id: Some(active_model_id),
+    }
 }
 
 /// A recall hit + its hydrated snippet text. The core `Hit` → `HitMirror` conversion is proto's

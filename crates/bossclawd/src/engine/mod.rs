@@ -394,16 +394,30 @@ impl EngineHandle {
 
     /// Language-pack status for the UI poll (rung 2; U6), the RPC entry point behind
     /// `Request::ModelStatus`. Onboarding-gated only to avoid touching the engine before onboarding;
-    /// a not-onboarded daemon reports `Ok`/no-progress. Otherwise a pure read of [`Self::model_state`]
-    /// (no log open — the provider cells already hold the resolved state).
+    /// a not-onboarded daemon reports `Ok`/no-progress/base-id. Otherwise the provider cells for
+    /// state + re-index progress, plus the currently-SERVED model id read from the signed record.
+    ///
+    /// The served id is a pure record read (never force-builds the embedder): a `Complete` record's
+    /// id is what `resolve` loads; an absent/`InProgress` record (or a read failure) means the bundled
+    /// English base is still serving — so the card reflects what is actually served (the old model
+    /// until the migration flips), not merely what was requested.
     pub async fn model_status(
         &self,
         onboarded: bool,
-    ) -> (crate::engine::embed::ModelState, Option<(u64, u64)>) {
+    ) -> (crate::engine::embed::ModelState, Option<(u64, u64)>, String) {
+        let base = crate::engine::embed::MODEL_ID.to_string();
         if !onboarded {
-            return (crate::engine::embed::ModelState::Ok, None);
+            return (crate::engine::embed::ModelState::Ok, None, base);
         }
-        self.model_state()
+        let (state, reindex) = self.model_state();
+        let active_model_id = match self.get_or_open(onboarded).await {
+            Ok(log) => match log.language_pack_record() {
+                Ok(Some(r)) if r.migration == bossclaw_core::MigrationState::Complete => r.model_id,
+                _ => base,
+            },
+            Err(_) => base,
+        };
+        (state, reindex, active_model_id)
     }
 
     /// Grant read-access to `path` (canonicalized + appended by the engine). Gated.
@@ -1329,6 +1343,21 @@ impl EngineHandle {
         safetensors_sha: String,
     ) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        // Idempotent enable (defense-in-depth against a redundant re-enable of the already-active
+        // model): if the requested model is the current, HEALTHY (`Ok`) `Complete` record, a re-enable
+        // would pointlessly re-migrate (and, at the command layer, re-download ~530 MB) the SAME model
+        // — return without touching the record or spawning a migration. A `Missing`/`Mismatch`/`Failed`
+        // state is deliberately EXCLUDED so it still falls through to `build_candidate`'s fail-loud
+        // verification below (the short-circuit never weakens the integrity guard). Consent is
+        // untouched: the existing signed `Complete` record already carries it.
+        let healthy = matches!(self.embedder_provider.model_state(), crate::engine::embed::ModelState::Ok);
+        if healthy {
+            if let Some(r) = log.language_pack_record().map_err(|e| EngineOpError::Core(e.to_string()))? {
+                if r.migration == bossclaw_core::MigrationState::Complete && r.model_id == model_id {
+                    return Ok(());
+                }
+            }
+        }
         // Fail fast if the downloaded folder isn't loadable/verifiable (never write a record we can't
         // honour). Built off to the side — the live embedder is untouched until the migration commits.
         let _candidate = self.embedder_provider.build_candidate(&model_id, &safetensors_sha)?;
@@ -3126,6 +3155,74 @@ mod tests {
         assert_eq!(log.vectors_for_model(&id).unwrap().len(), 2, "new-id vectors cover all events");
         assert!(log.vectors_for_model(crate::engine::embed::MODEL_ID).unwrap().is_empty(), "old GC'd");
         assert_eq!(log.language_pack_record().unwrap().unwrap().migration, bossclaw_core::MigrationState::Complete);
+    }
+
+    /// U6 (review MAJOR): `model_status` must report WHICH model is served so the Settings card can
+    /// show "Multilingual active" instead of a stale Enable button. Before any enable it is the bundled
+    /// English base id (an absent record keeps English serving); after a completed migration it is the
+    /// migrated model id (the `Complete` record's id).
+    #[tokio::test]
+    async fn model_status_reports_active_model_id() {
+        use crate::engine::embed::ResourceModel2Vec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let (id, sha) = stage_mock_model(&root, "ml/v1");
+        let provider = std::sync::Arc::new(
+            ResourceModel2Vec::with_resolution(None, root.join("potion-base-8M"), root, crate::engine::embed::MODEL_ID.to_string())
+                .with_loader_for_test(mock_loader_reporting_ids()),
+        );
+        let handle = test_handle_with_provider(tmp.path().to_path_buf(), provider);
+        let log = handle.get_or_open(true).await.unwrap();
+        for t in ["ocean waves", "forest trees"] { log.append(mk_test_memory(t)).unwrap(); }
+        handle.run_ingest(true).await.unwrap();
+
+        // Before enable: the bundled English base id (nothing has been migrated yet).
+        assert_eq!(handle.model_status(true).await.2, crate::engine::embed::MODEL_ID,
+            "with no language pack, model_status reports the bundled English base id");
+
+        handle.set_active_model(true, id.clone(), sha).await.unwrap();
+        wait_until_active(&handle, &id).await;
+
+        // After a completed migration: the migrated model id (the served model).
+        assert_eq!(handle.model_status(true).await.2, id,
+            "after the migration completes, model_status reports the migrated model id");
+    }
+
+    /// U6 (review MAJOR): re-enabling the ALREADY-ACTIVE model must be a no-op — no re-download, no
+    /// re-migration. `set_active_model` writes a fresh `InProgress` record SYNCHRONOUSLY before it
+    /// returns whenever it starts a migration, so a record still `Complete` immediately after the call
+    /// proves the migration never spawned; and the served vectors are left untouched.
+    #[tokio::test]
+    async fn set_active_model_is_idempotent_for_the_active_model() {
+        use crate::engine::embed::ResourceModel2Vec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let (id, sha) = stage_mock_model(&root, "ml/v1");
+        let provider = std::sync::Arc::new(
+            ResourceModel2Vec::with_resolution(None, root.join("potion-base-8M"), root, crate::engine::embed::MODEL_ID.to_string())
+                .with_loader_for_test(mock_loader_reporting_ids()),
+        );
+        let handle = test_handle_with_provider(tmp.path().to_path_buf(), provider);
+        let log = handle.get_or_open(true).await.unwrap();
+        log.append(mk_test_memory("ocean waves")).unwrap();
+        handle.run_ingest(true).await.unwrap();
+
+        // First enable migrates to completion (record Complete, state Ok, id's vectors written).
+        handle.set_active_model(true, id.clone(), sha.clone()).await.unwrap();
+        wait_until_active(&handle, &id).await;
+        let vectors_before = log.vectors_for_model(&id).unwrap().len();
+
+        // Second enable of the SAME active model: the short-circuit returns Ok without migrating.
+        handle.set_active_model(true, id.clone(), sha.clone()).await.unwrap();
+        assert_eq!(
+            log.language_pack_record().unwrap().unwrap().migration,
+            bossclaw_core::MigrationState::Complete,
+            "a re-enable of the active model must NOT write a fresh InProgress record (no re-migration)",
+        );
+        assert_eq!(log.vectors_for_model(&id).unwrap().len(), vectors_before,
+            "no re-embed ran on the redundant re-enable — the served vectors are untouched");
     }
 
     /// I6: a bare "zero vectors for the loaded model" state must NOT auto-migrate — only an explicit
