@@ -23,6 +23,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod language_pack;
 pub mod ollama_probe;
 pub mod reason;
 pub mod transport;
