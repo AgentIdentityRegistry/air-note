@@ -18,18 +18,22 @@
 #
 # Paths kept consistent with crates/bossclawd/src/main.rs and
 # apps/desktop/src-tauri/src/engine/daemon.rs (socket + data dir left at the shared
-# default <app_data_dir>/bossclawd.sock; only BOSSCLAWD_MODEL_DIR is set).
+# default <app_data_dir>/bossclawd.sock). This unit sets NO env: with pull-based
+# model resolution (rung 2, I1) the daemon resolves its own model (signed record ->
+# staged English default <data_dir>/models/potion-base-8M). The install script
+# STAGES the bundled English model into that default path instead of pinning
+# BOSSCLAWD_MODEL_DIR — an env pin would be highest-priority and would block an
+# opt-in multilingual language pack.
 Description=AIR Agent bossclawd memory daemon
 Documentation=https://github.com/AgentIdentityRegistry/air-note
 
 [Service]
 Type=simple
-# Quote both: systemd does its own word-splitting, so an unquoted path containing a
-# SPACE would silently truncate. Double quotes group the token (systemd.service(5));
-# prior art: agent-bridge-mcp/src/service.mjs. The systemd-smoke CI renders this with
-# a spaced path and asserts the daemon starts, guarding the quoting from regressing.
+# Quote ExecStart: systemd does its own word-splitting, so an unquoted path containing
+# a SPACE would silently truncate. Double quotes group the token (systemd.service(5));
+# prior art: agent-bridge-mcp/src/service.mjs. The systemd-smoke CI renders this with a
+# spaced BIN path and asserts the daemon starts, guarding the quoting from regressing.
 ExecStart="@BOSSCLAWD_BIN@"
-Environment="BOSSCLAWD_MODEL_DIR=@BOSSCLAWD_MODEL_DIR@"
 Restart=always
 RestartSec=2
 

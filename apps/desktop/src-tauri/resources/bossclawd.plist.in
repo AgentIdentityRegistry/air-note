@@ -25,14 +25,16 @@
   Paths (kept consistent with crates/bossclawd/src/main.rs and
   apps/desktop/src-tauri/src/engine/daemon.rs — do not drift):
     - @BOSSCLAWD_BIN@       the co-signed daemon binary (Contents/MacOS/bossclawd)
-    - @BOSSCLAWD_MODEL_DIR@ the embedder model dir (the app bundle's
-                            Contents/Resources/resources/models/potion-base-8M,
-                            or a copy staged into the data dir)
     - @STDOUT_LOG@ / @STDERR_LOG@  under ~/Library/Logs (NEVER /tmp)
   The socket + data dir are left at the daemon's defaults on purpose (fewer knobs):
   both the daemon (main.rs resolve_socket_path) and the app (daemon.rs
   resolve_socket_path) default to <app_data_dir>/bossclawd.sock, so they already
-  agree without an env override. The install script only sets BOSSCLAWD_MODEL_DIR.
+  agree without an env override. This unit sets NO env: with pull-based model
+  resolution (rung 2, I1) the daemon resolves its own model (signed record ->
+  staged English default <data_dir>/models/potion-base-8M). The install script
+  STAGES the bundled English model into that default path instead of pinning
+  BOSSCLAWD_MODEL_DIR — an env pin would be highest-priority and would block an
+  opt-in multilingual language pack.
 -->
 <plist version="1.0">
 <dict>
@@ -43,12 +45,6 @@
   <array>
     <string>@BOSSCLAWD_BIN@</string>
   </array>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>BOSSCLAWD_MODEL_DIR</key>
-    <string>@BOSSCLAWD_MODEL_DIR@</string>
-  </dict>
 
   <key>RunAtLoad</key>
   <true/>
