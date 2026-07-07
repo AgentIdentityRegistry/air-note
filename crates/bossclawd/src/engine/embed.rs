@@ -18,12 +18,13 @@ pub const BASE_MODEL_DIR_ID: &str = "minishlab/potion-base-8M";
 
 /// The single source of truth for the EFFECTIVE embedding model id — the id
 /// stamped on every `vectors` row, read back by the index rebuild, and (Phase B)
-/// compared by the boot migration trigger. The `+chunks-v1` suffix means "same
+/// compared by the boot migration trigger. The `+chunks-vN` suffix means "same
 /// weights, chunked write path": changing the chunking contract (e.g. a different
-/// budget) bumps to `+chunks-v2` and the boot migration re-embeds. Ingest and
-/// recall-open construct `Model2Vec` reporting THIS id (spec §3.4.1: write-id ==
-/// read-id == trigger-id).
-pub const MODEL_ID: &str = "minishlab/potion-base-8M+chunks-v1";
+/// budget) bumps the suffix and the boot migration re-embeds. Bumped v1→v2 when
+/// the 1,500-char budget measured a null and was re-tuned to 600 (chunk.rs).
+/// Ingest and recall-open construct `Model2Vec` reporting THIS id (spec §3.4.1:
+/// write-id == read-id == trigger-id).
+pub const MODEL_ID: &str = "minishlab/potion-base-8M+chunks-v2";
 
 /// Builds (and caches) the embedder. Called on first ingest, never at startup.
 pub trait EmbedderProvider: Send + Sync {
@@ -84,7 +85,7 @@ mod effective_id_tests {
     fn model_id_is_the_effective_chunks_id() {
         // The single source of truth carries the +chunks-v1 suffix so vectors are
         // written, read, and (Phase B) migration-triggered under ONE id.
-        assert_eq!(MODEL_ID, "minishlab/potion-base-8M+chunks-v1");
+        assert_eq!(MODEL_ID, "minishlab/potion-base-8M+chunks-v2");
         // The base directory-loader id is separate and unchanged (still the HF slug),
         // so no model DIRECTORY rename is implied by the effective id.
         assert_eq!(BASE_MODEL_DIR_ID, "minishlab/potion-base-8M");

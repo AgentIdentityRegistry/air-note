@@ -21,15 +21,18 @@
 /// (no transformer window; `config.json` seq_length = 1_000_000), so a larger
 /// chunk never truncates — it only DILUTES the mean over more tokens. Smaller
 /// chunks = sharper, less-diluted matches; the win is measured by the frozen
-/// gate (a v2 re-tune bumps the effective-id suffix and re-migrates). ~1,500
-/// chars keeps most memory/page events at ONE chunk (common case unchanged).
-/// Char count, never byte count. A measurement subject, not a tuned truth.
-pub const CHUNK_BUDGET_CHARS: usize = 1_500;
+/// gate (a re-tune bumps the effective-id suffix and re-migrates). v1 (1,500)
+/// measured a NULL on synthetic·en known-item recall — too coarse for this
+/// corpus's median ~2,237-char gold pages (only ~2 chunks each, barely different
+/// from the whole-doc vector). v2 = 600 so a medium doc splits into ~4 sharper
+/// chunks, targeting the corpus's fact-specific queries. Char count, never byte
+/// count. A measurement subject, not a tuned truth.
+pub const CHUNK_BUDGET_CHARS: usize = 600;
 
 /// Chars of overlap carried between adjacent chunks so a fact spanning a split
-/// point still appears whole in at least one chunk. ~13% of the budget — enough
-/// to bridge a sentence, small enough to avoid ~2× row inflation.
-pub const CHUNK_OVERLAP_CHARS: usize = 200;
+/// point still appears whole in at least one chunk. ~17% of the budget — enough
+/// to bridge a sentence, small enough to avoid excessive row inflation.
+pub const CHUNK_OVERLAP_CHARS: usize = 100;
 
 /// Overlap must be strictly smaller than the budget, else a chunk full of
 /// carried-over context has zero room for new content and the sliding window
