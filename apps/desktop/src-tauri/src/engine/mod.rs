@@ -201,10 +201,7 @@ pub struct EngineStatus {
 /// the daemon's own `embed::ModelState` never crosses the process boundary (the two meet only over
 /// `ModelStatusWire`). `Ok` = the intended model serves; `Missing`/`Mismatch` are the fail-loud
 /// re-download states; `Failed` = a background migration errored while the old model keeps serving.
-///
-/// Staged with the facade seam (rung-2 Task A7): the consumer is the language-pack command layer
-/// (`engine_model_status`, Task B2), so it is `allow(dead_code)` until B2 lands.
-#[allow(dead_code)]
+/// The language-pack command layer (`engine_model_status`, Task B2) maps this to `ModelStatusDto`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelState {
     /// The daemon serves the intended model (or the bundled English default).
@@ -427,14 +424,12 @@ impl Engine {
         self.client.enable_cloud_reasoner(onboarded, config).await
     }
 
-    // ── Language pack (rung 2). Staged with the facade; the command layer (B2) is the consumer, so
-    //    these forward-declared methods are `allow(dead_code)` until `engine_set_active_model` /
-    //    `engine_model_status` land. ──
+    // ── Language pack (rung 2). Consumed by the command layer (B2): `engine_set_active_model` /
+    //    `engine_model_status`. ──
 
     /// Mirrors `EngineClient::set_active_model`: enable the multilingual language pack (validate
     /// folder+sha, write signed consent, run the background re-embed migration). Returns once the
     /// synchronous validation + consent write complete; progress is polled via [`Self::model_status`].
-    #[allow(dead_code)]
     pub async fn set_active_model(
         &self,
         onboarded: bool,
@@ -446,7 +441,6 @@ impl Engine {
 
     /// Mirrors `EngineClient::model_status`: the loaded-vs-intended model state + live re-index
     /// progress, for the Settings language-pack card poll.
-    #[allow(dead_code)]
     pub async fn model_status(&self, onboarded: bool) -> Result<client::ModelStatus, EngineOpError> {
         self.client.model_status(onboarded).await
     }

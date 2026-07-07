@@ -97,6 +97,13 @@ impl IdentityStore {
     pub fn is_onboarded(&self) -> bool {
         self.load_metadata().map(|m| m.is_some()).unwrap_or(false)
     }
+
+    /// The app data dir this store persists identity under. Reused by the language-pack downloader
+    /// (rung 2, B2) to resolve `<data_dir>/models/` — the daemon's default model-resolution root —
+    /// so the app can install a downloaded pack where the daemon's own pull-resolution finds it.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
 }
 
 /// One-time rename migration: copy the agent's identity secrets from the legacy

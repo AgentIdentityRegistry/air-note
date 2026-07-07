@@ -10,12 +10,6 @@
 //! security-critical weights are verified in `install_verified` against the exact sha that names the
 //! id-binding, so I4 holds — nothing is renamed into place until the binding sha matches the bytes.
 
-// Staging allowance: the `download_and_install` entrypoint (and the pipeline it drives) is wired to a
-// Tauri command by Task B2; until then these fns are reached only from the unit tests below, so the
-// non-test bin build sees them as unused. Mirrors the engine/client.rs Task-5-era staging pattern —
-// remove when B2 lands.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// The enabled multilingual model id (the folder name under `<data_dir>/models/`).
@@ -91,7 +85,11 @@ pub fn verify_file(path: &Path, expected: &str) -> Result<(), String> {
 /// this model in the id-binding — then ATOMICALLY rename the staging dir into `dest_dir` and write
 /// `air-model.json` from that verified sha. Fail-closed: on a weights mismatch the staging dir is
 /// removed and nothing is installed. (The tokenizer/config TOFU pins were verified at download.)
-pub fn install_verified(staging: &Path, dest_dir: &Path, model_id: &str, safetensors_sha: &str) -> Result<(), String> {
+fn install_verified(staging: &Path, dest_dir: &Path, model_id: &str, safetensors_sha: &str) -> Result<(), String> {
+    debug_assert!(
+        staging.join(WEIGHTS_FILE).is_file(),
+        "install_verified precondition: the staging dir must hold the fetched weights ({WEIGHTS_FILE})",
+    );
     if let Err(e) = verify_file(&staging.join(WEIGHTS_FILE), safetensors_sha) {
         let _ = std::fs::remove_dir_all(staging);
         return Err(e);

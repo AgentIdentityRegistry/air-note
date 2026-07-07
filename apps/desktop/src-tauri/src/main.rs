@@ -216,6 +216,12 @@ fn main() {
             commands::engine::engine_set_reasoner_config,
             #[cfg(unix)]
             commands::engine::engine_enable_cloud_reasoner,
+            #[cfg(unix)]
+            commands::engine::engine_download_language_pack,
+            #[cfg(unix)]
+            commands::engine::engine_set_active_model,
+            #[cfg(unix)]
+            commands::engine::engine_model_status,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

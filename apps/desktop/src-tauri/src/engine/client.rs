@@ -396,13 +396,12 @@ impl<T: Transport + ?Sized> EngineClient<T> {
         self.unit(Request::EnableCloudReasoner { onboarded, config }).await
     }
 
-    // ── Language pack (rung 2). Staged with the facade seam; the command layer (B2) is the consumer,
-    //    so these are `allow(dead_code)` until `engine_set_active_model` / `engine_model_status` land. ──
+    // ── Language pack (rung 2). Consumed by the command layer (B2): `engine_set_active_model` /
+    //    `engine_model_status`. ──
 
     /// Mirrors `EngineHandle::set_active_model`: enable the multilingual language pack. The daemon
     /// validates the folder+sha, writes the signed consent, and runs the re-embed migration in the
     /// background; this call returns once that synchronous prologue completes.
-    #[allow(dead_code)]
     pub async fn set_active_model(
         &self,
         onboarded: bool,
@@ -414,7 +413,6 @@ impl<T: Transport + ?Sized> EngineClient<T> {
 
     /// Mirrors `EngineHandle::model_status`: the loaded-vs-intended model state + live re-index
     /// progress (rung 2), rebuilt from the wire into the desktop [`ModelStatus`].
-    #[allow(dead_code)]
     pub async fn model_status(&self, onboarded: bool) -> Result<ModelStatus, EngineOpError> {
         match self.request(Request::ModelStatus { onboarded }).await? {
             Response::ModelStatus(w) => Ok(model_status_from_wire(w)),
@@ -550,8 +548,7 @@ fn engine_state_from_wire(w: EngineStateWire) -> EngineState {
 
 /// Desktop-side language-pack status (rung 2): the client mirror of `ModelStatusWire`. The facade
 /// (`super::Engine::model_status`) returns this to the language-pack command layer (B2), which is its
-/// only consumer — so it (and its mapper) are `allow(dead_code)` until B2 lands.
-#[allow(dead_code)]
+/// only consumer.
 pub struct ModelStatus {
     /// The loaded-vs-intended model state.
     pub state: ModelState,
@@ -561,7 +558,6 @@ pub struct ModelStatus {
 
 /// `ModelStatusWire` → desktop [`ModelStatus`] (rung 2). Exhaustive on `ModelStateWire` on purpose:
 /// a new wire state must force a desktop mapping here.
-#[allow(dead_code)]
 fn model_status_from_wire(w: ModelStatusWire) -> ModelStatus {
     let state = match w.state {
         ModelStateWire::Ok => ModelState::Ok,
