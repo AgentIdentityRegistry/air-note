@@ -1980,7 +1980,8 @@ impl EventLog {
         self.rederive_entity_vectors_pending(embedder)?;
 
         // Completeness scan (I5): every embeddable-with-text event MUST now have a new-id vector.
-        let missing = self.count_missing_vectors(embedder.model_id())?;
+        // Reuse the `embeddable` list collected above so this shares ONE scan with the denominator.
+        let missing = self.count_missing_vectors(embedder.model_id(), &embeddable)?;
         if missing > 0 {
             return Err(BossclawError::Store(format!(
                 "re-embed incomplete: {missing} of {total} embeddable events still lack a vector \
@@ -2014,16 +2015,21 @@ impl EventLog {
     pub fn gc_stale_vectors(&self, keep_model_id: &str) -> Result<usize, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
-        conn.execute("DELETE FROM vectors WHERE model_id != ?1", rusqlite::params![keep_model_id])?;
-        let removed = conn.changes() as usize;
-        conn.execute("DELETE FROM entity_vectors WHERE model_id != ?1", rusqlite::params![keep_model_id])?;
+        // Both DELETEs commit together or not at all: a crash between them must never leave the
+        // recall (`vectors`) and entity-resolution (`entity_vectors`) tables under different models.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM vectors WHERE model_id != ?1", rusqlite::params![keep_model_id])?;
+        let removed = tx.changes() as usize;
+        tx.execute("DELETE FROM entity_vectors WHERE model_id != ?1", rusqlite::params![keep_model_id])?;
+        tx.commit()?;
         Ok(removed)
     }
 
-    /// Count embeddable-with-text events that still lack a `vectors` row for `model_id`. Reuses the
-    /// authoritative embeddable-with-text list so it and the completeness contract cannot drift.
-    fn count_missing_vectors(&self, model_id: &str) -> Result<usize, BossclawError> {
-        let embeddable = self.collect_embeddable_events_ordered()?; // (event_id, text), text non-empty
+    /// Count how many of `embeddable` still lack a `vectors` row for `model_id`. `embeddable` is the
+    /// authoritative embeddable-with-text list `(event_id, text)`, passed IN so this scan and the
+    /// caller's completeness denominator share ONE `collect_embeddable_events_ordered` pass (they
+    /// cannot drift, and the scan is not run twice per migration).
+    fn count_missing_vectors(&self, model_id: &str, embeddable: &[(String, String)]) -> Result<usize, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(

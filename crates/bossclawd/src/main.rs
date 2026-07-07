@@ -147,6 +147,10 @@ mod unix_main {
         let onboarded = bossclawd::identity::is_onboarded(&data_dir);
         reseed_reasoner_cell(&engine, &reasoner_cfg, onboarded).await;
 
+        // (5b) Resume a consented-but-interrupted language migration (rung 2; I6). No-op unless a
+        // signed InProgress record exists. Runs in the background; the UI polls model_state.
+        engine.resume_migration_if_pending(onboarded).await;
+
         // (6) Spawn the evolve scheduler (OFF by default; every gate re-read per wake).
         scheduler::spawn(engine.clone(), data_dir.clone());
 
