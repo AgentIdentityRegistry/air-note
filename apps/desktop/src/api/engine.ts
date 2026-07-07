@@ -74,11 +74,29 @@ export const enableCloudReasoner = (config: ReasonerConfigInput): Promise<void> 
 
 // ---- Language pack (rung 2 multilingual, U7) ----
 /**
+ * The multilingual pack's model id — the folder name the daemon serves once the pack is active. The
+ * pinned mirror of the Rust downloader's `MULTILINGUAL_MODEL_ID`; the card compares it against
+ * `ModelStatusDto.active_model_id` to detect "multilingual active" and passes it to `setActiveModel`
+ * on a Failed-migration retry (the files are already on disk).
+ */
+export const MULTILINGUAL_MODEL_ID = "minishlab/potion-multilingual-128M";
+/**
+ * The multilingual pack's pinned weights sha256 — the mirror of the Rust downloader's pinned safetensors
+ * hash (`PACK_FILES[0].sha256`). Only used to re-enable already-downloaded files on a Failed retry; the
+ * daemon re-verifies it against the on-disk bytes (fail-closed), so a drifted mirror fails loud, never
+ * corrupts. Keep in sync with `apps/desktop/src-tauri/src/engine/language_pack.rs`.
+ */
+export const MULTILINGUAL_SAFETENSORS_SHA =
+  "14b5eb39cb4ce5666da8ad1f3dc6be4346e9b2d601c073302fa0a31bf7943397";
+
+/**
  * Loaded-vs-intended model state the Settings card polls (payload-encoded, mirrors the daemon's
  * `engine_model_status`). `state` is `"ok"` when the intended model is serving; `"missing"` and
  * `"mismatch"` are the fail-loud re-download states; `"failed"` means a background re-embed
- * migration errored while the old model keeps serving, with the message in `reason`. Every
- * `Option<_>` field arrives as `null` when absent — serde emits all fields.
+ * migration errored while the old model keeps serving, with the message in `reason`. `active_model_id`
+ * is the model id currently SERVED (`MULTILINGUAL_MODEL_ID` once the pack is live, else the English
+ * base id), which the card uses to show "Multilingual active" and hide the redundant Enable button.
+ * Every `Option<_>` field arrives as `null` when absent — serde emits all fields.
  */
 export type ModelStatusDto = {
   state: "ok" | "missing" | "mismatch" | "failed";
@@ -87,6 +105,7 @@ export type ModelStatusDto = {
   reason: string | null;
   reindex_done: number | null;
   reindex_total: number | null;
+  active_model_id: string | null;
 };
 
 /** Download + verify + install the multilingual pack, then enable it (starts the re-index). */

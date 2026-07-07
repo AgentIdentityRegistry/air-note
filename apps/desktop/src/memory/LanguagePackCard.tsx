@@ -1,25 +1,29 @@
 import { useEffect, useRef, useState } from "react";
 import { SettingsSectionCard } from "../components/ui/SettingsSectionCard";
 import { Button } from "../components/Button";
-import { downloadLanguagePack, modelStatus, type ModelStatusDto } from "../api/engine";
+import {
+  downloadLanguagePack,
+  modelStatus,
+  setActiveModel,
+  MULTILINGUAL_MODEL_ID,
+  MULTILINGUAL_SAFETENSORS_SHA,
+  type ModelStatusDto,
+} from "../api/engine";
 
 /** How often the card refreshes the language-pack state while the tab is open. */
 const POLL_MS = 2000;
 /** Approximate on-disk size of the multilingual pack, surfaced before the user commits to it. */
 const PACK_SIZE_LABEL = "~500 MB";
 
-type Props = {
-  /** Whether the multilingual model is already on disk (drives the Enable vs. active copy). */
-  installed: boolean;
-};
-
 /**
  * Brain → Search & Evolve card that turns on multilingual (e.g. Korean) memory search: it downloads
  * a language pack, then the daemon re-indexes in the background while English search keeps working.
  * Polls `modelStatus` and fails soft — a transport blip while the daemon restarts leaves the
- * last-known state on screen instead of crashing the panel.
+ * last-known state on screen instead of crashing the panel. "Active" is derived from the polled
+ * `active_model_id` (the served model), so once the pack is live the card shows "Multilingual active"
+ * and hides the Enable button instead of re-offering a redundant ~500 MB download.
  */
-export function LanguagePackCard({ installed }: Props) {
+export function LanguagePackCard() {
   const [status, setStatus] = useState<ModelStatusDto | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,6 +43,7 @@ export function LanguagePackCard({ installed }: Props) {
     return () => clearInterval(id);
   }, []);
 
+  /** First enable / re-download recovery: fetch + verify + install the pack, then enable it. */
   const onEnable = async () => {
     setBusy(true);
     setError(null);
@@ -52,8 +57,28 @@ export function LanguagePackCard({ installed }: Props) {
     }
   };
 
+  /**
+   * Retry after a background migration failed. The model FILES are already on disk (only the re-embed
+   * errored), so this re-enables them via `setActiveModel` — no wasteful ~500 MB re-download. The
+   * daemon re-verifies the pinned sha against the on-disk bytes before migrating (fail-closed).
+   */
+  const onRetry = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await setActiveModel(MULTILINGUAL_MODEL_ID, MULTILINGUAL_SAFETENSORS_SHA);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const failed = status?.state === "failed";
   const needsRedownload = status?.state === "missing" || status?.state === "mismatch";
+  /** The served model is the multilingual pack ⇒ it is live (shown only in the ok/idle branch). */
+  const active = status?.active_model_id === MULTILINGUAL_MODEL_ID;
   // Narrow once so the progress copy needs no non-null assertions.
   const reindex =
     status && status.reindex_done != null && status.reindex_total != null && status.reindex_total > 0
@@ -71,9 +96,10 @@ export function LanguagePackCard({ installed }: Props) {
             Multilingual couldn’t turn on: {status?.reason ?? "the re-index failed"}. English search
             is unaffected — retry when you’re ready.
           </p>
-          <Button variant="primary" onClick={onEnable} disabled={busy}>
+          <Button variant="primary" onClick={onRetry} disabled={busy}>
             {busy ? "Working…" : "Retry"}
           </Button>
+          {error ? <p style={{ fontSize: 13, color: "var(--error)" }}>{error}</p> : null}
         </div>
       ) : needsRedownload ? (
         <div>
@@ -92,7 +118,7 @@ export function LanguagePackCard({ installed }: Props) {
           {reindex.total.toLocaleString()} — English search stays available; multilingual turns on
           when this finishes.
         </p>
-      ) : installed ? (
+      ) : active ? (
         <p style={{ fontSize: 13, color: "var(--text-secondary)" }}>Multilingual active.</p>
       ) : (
         <div>

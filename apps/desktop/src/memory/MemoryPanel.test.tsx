@@ -16,6 +16,21 @@ vi.mock("../api/engine", () => ({
   getReasonerConfig: vi.fn(),
   setReasonerConfig: vi.fn(async () => {}),
   enableCloudReasoner: vi.fn(async () => {}),
+  // MemoryPanel renders the real LanguagePackCard, which polls these on mount — stub them so the card
+  // renders (its own behaviour is covered in LanguagePackCard.test.tsx; the values are irrelevant here).
+  modelStatus: vi.fn(async () => ({
+    state: "ok",
+    expected: null,
+    loaded: null,
+    reason: null,
+    reindex_done: null,
+    reindex_total: null,
+    active_model_id: "minishlab/potion-base-8M",
+  })),
+  downloadLanguagePack: vi.fn(async () => {}),
+  setActiveModel: vi.fn(async () => {}),
+  MULTILINGUAL_MODEL_ID: "minishlab/potion-multilingual-128M",
+  MULTILINGUAL_SAFETENSORS_SHA: "test-sha",
 }));
 vi.mock("../vault", () => ({
   vaultSet: vi.fn(async () => {}),

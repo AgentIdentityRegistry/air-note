@@ -207,11 +207,11 @@ export function MemoryPanel() {
           </p>
         ) : null}
 
-        {/* v1 passes installed={false}: the Ok-state model_status payload doesn't report which model
-            is active, so deriving "multilingual active" is deferred (plan B5). The card still drives
-            download→enable and renders the re-index / missing / mismatch / failed states it polls. */}
+        {/* The card polls model_status itself and derives "multilingual active" from the served
+            active_model_id — driving download→enable and rendering the re-index / missing / mismatch
+            / failed / active states with no state passed down. */}
         <div style={{ margin: "12px 0" }}>
-          <LanguagePackCard installed={false} />
+          <LanguagePackCard />
         </div>
 
         <div style={{ display: "flex", gap: 8, margin: "8px 0" }}>

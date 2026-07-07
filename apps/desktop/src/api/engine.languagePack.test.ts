@@ -31,6 +31,7 @@ describe("language-pack bindings", () => {
       reason: "re-embed migration errored",
       reindex_done: null,
       reindex_total: null,
+      active_model_id: "minishlab/potion-base-8M",
     };
     invoke.mockResolvedValue(dto);
     await expect(modelStatus()).resolves.toEqual(dto);
