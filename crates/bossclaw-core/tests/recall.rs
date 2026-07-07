@@ -2038,3 +2038,92 @@ fn language_pack_record_roundtrips_and_is_sticky_and_signed() {
     // Signed + chained.
     log.verify_chain().expect("chain verifies after two language_pack config events");
 }
+
+// ── Rung 2: all-or-nothing migration (A2 / I5 / U8) ─────────────────────────
+
+/// An embedder that FAILS on any text containing the sentinel token, so an injected shortfall
+/// is deterministic. model_id is "flaky-v2" so it partitions distinctly from mock-v1.
+struct FlakyEmbedder {
+    inner: MockEmbedder,
+}
+const FLAKY_MODEL_ID: &str = "flaky-v2";
+const FAIL_TOKEN: &str = "FAILTOKEN";
+impl FlakyEmbedder {
+    fn new(dim: usize) -> Self { Self { inner: MockEmbedder::new(dim) } }
+}
+impl Embedder for FlakyEmbedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, BossclawError> {
+        if texts.iter().any(|t| t.contains(FAIL_TOKEN)) {
+            return Err(BossclawError::Embed("injected embed failure".into()));
+        }
+        self.inner.embed(texts)
+    }
+    fn dim(&self) -> usize { self.inner.dim() }
+    fn model_id(&self) -> &str { FLAKY_MODEL_ID }
+}
+
+#[test]
+fn reembed_prepare_shortfall_returns_err_and_gcs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    // 3 events under mock-v1; one will fail to re-embed under the flaky model.
+    for t in ["ocean waves crashing", "FAILTOKEN broken event", "mountain peaks snowy"] {
+        log.append(mk_memory_event(t)).unwrap();
+    }
+    let v1 = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&v1).unwrap();
+    let old_count = log.vectors_for_model(MOCK_MODEL_ID).unwrap().len();
+    assert_eq!(old_count, 3);
+
+    // Prepare under the flaky model → incomplete → Err.
+    let flaky = FlakyEmbedder::new(MID_DIM);
+    let err = log.reembed_prepare(&flaky, &mut |_done, _total| {}).unwrap_err();
+    assert!(format!("{err}").contains("incomplete"), "shortfall must be reported: {err}");
+
+    // I5: old vectors are INTACT — no GC ran.
+    assert_eq!(
+        log.vectors_for_model(MOCK_MODEL_ID).unwrap().len(),
+        old_count,
+        "a shortfall must leave every old vector intact (no GC)"
+    );
+}
+
+#[test]
+fn reembed_prepare_then_finalize_migrates_vectors_and_entity_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+
+    let mut mem_ids = Vec::new();
+    for t in ["ocean waves crashing", "forest trees rustling"] {
+        mem_ids.push(log.append(mk_memory_event(t)).unwrap());
+    }
+    let v1 = MockEmbedder::new(MID_DIM);
+    log.rederive_pending(&v1).unwrap();
+    // Seed an entity vector under mock-v1 so we can prove entity migration (U8). The entity is
+    // backed by a real `entity` event (+ rebuild_graph) so it lands in the `entities` projection
+    // the migration re-derives from — a bare entity_vectors row with no backing entity is a state
+    // production never produces (the migration reads labels from the `entities` table).
+    let aria = log
+        .entity("Aria Novak", &[], "person", "m4-reasoner", std::slice::from_ref(&mem_ids[0]))
+        .unwrap();
+    log.rebuild_graph().unwrap();
+    log.derive_entity_vector(&v1, &aria, "Aria Novak").unwrap();
+    assert_eq!(log.entity_vectors_for_model(MOCK_MODEL_ID).unwrap().len(), 1);
+
+    // Prepare + finalize under mock-v2 (both succeed).
+    let v2 = MockEmbedderV2::new(MID_DIM);
+    let mut progress_calls = 0usize;
+    log.reembed_prepare(&v2, &mut |_done, _total| progress_calls += 1).unwrap();
+    let stats = log.reembed_finalize_gc(&v2).unwrap();
+
+    // New-id vectors cover all events; old-id vectors + entity vectors are GC'd.
+    assert_eq!(log.vectors_for_model(MOCK_V2_MODEL_ID).unwrap().len(), 2);
+    assert!(log.vectors_for_model(MOCK_MODEL_ID).unwrap().is_empty(), "old vectors GC'd");
+    assert_eq!(log.entity_vectors_for_model(MOCK_V2_MODEL_ID).unwrap().len(), 1, "entity vector migrated (U8)");
+    assert!(log.entity_vectors_for_model(MOCK_MODEL_ID).unwrap().is_empty(), "old entity vectors GC'd (U8)");
+    assert!(progress_calls >= 2, "progress reported per embeddable event");
+    assert_eq!(stats.gc_removed, 2, "2 old vector rows removed");
+}
