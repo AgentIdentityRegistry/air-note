@@ -53,6 +53,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "air-memory-mcp"
+version = "0.0.1"
+dependencies = [
+ "bossclawd-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "air-rs"
 version = "0.0.1"
 dependencies = [
