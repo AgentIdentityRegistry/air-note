@@ -96,6 +96,38 @@ pub struct ActiveModel {
     pub schema_version: u32,
 }
 
+/// Whether an opt-in language-pack migration has finished. `InProgress` means consent was
+/// recorded and re-embedding started but the atomic end-flip has NOT run (recall keeps serving
+/// the OLD model); `Complete` means the multilingual model is live (recall serves it). The daemon
+/// resumes an `InProgress` migration on boot (invariant I6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationState {
+    /// Consent recorded and re-embedding started, but the atomic end-flip has NOT run — recall
+    /// keeps serving the OLD model; the daemon resumes this on boot (invariant I6).
+    InProgress,
+    /// The re-embed finished and the multilingual model is live — recall serves it.
+    Complete,
+}
+
+/// The signed opt-in language-pack record — the single source of truth (invariant I2) for which
+/// embedding model is enabled, its verified safetensors sha (invariant I4), and the user's consent.
+/// Stored under [`LANGUAGE_PACK_KEY`] in a signed, hash-chained `config` event. It carries NONE of
+/// [`ActiveModel`]'s fields, so it never disturbs [`EventLog::active_model`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanguagePackRecord {
+    /// The enabled model id (e.g. `"minishlab/potion-multilingual-128M"`).
+    pub model_id: String,
+    /// The sha256 of the model's `model.safetensors`, verified by the downloader before install
+    /// and re-verified by the daemon at load (invariant I4 — the only guard, since both models are
+    /// 256-dim and the dim probe cannot catch a mislabel).
+    pub safetensors_sha: String,
+    /// Whether the consent-gated re-embed has finished (see [`MigrationState`]).
+    pub migration: MigrationState,
+    /// RFC3339 timestamp the user consented, for audit surfacing.
+    pub consented_at: String,
+}
+
 /// A hit from the M6c synthesis cache ([`EventLog::get_synthesis_cache`]).
 ///
 /// Carries the synthesized expected file bytes TOGETHER with the synth-time lineage
@@ -208,6 +240,12 @@ const REASONER_CONFIG_KEY: &str = "reasoner_config";
 /// presence is what authorizes cloud egress, so it MUST be a signed event.
 const CLOUD_REASONER_CONSENT_KEY: &str = "cloud_reasoner_consent";
 
+/// Signed `config` key for the opt-in multilingual language pack (rung 2). Its presence +
+/// `migration == Complete` is the SOLE authority for "load the multilingual model" (invariant I2);
+/// `InProgress` records a consented-but-unfinished re-embed the daemon RESUMES on boot (I6). Written
+/// only by [`EventLog::set_language_pack_record`]; absence means the English default (I7).
+const LANGUAGE_PACK_KEY: &str = "language_pack";
+
 /// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
 /// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
 /// reference a compile-checked variant instead of a stringly-typed key that could drift on a
@@ -224,6 +262,8 @@ pub enum ConfigFlag {
     ReasonerConfig,
     /// The signed cloud-enable consent record ([`CLOUD_REASONER_CONSENT_KEY`]).
     CloudReasonerConsent,
+    /// The signed opt-in multilingual language-pack record ([`LANGUAGE_PACK_KEY`]).
+    LanguagePack,
 }
 
 impl ConfigFlag {
@@ -235,6 +275,7 @@ impl ConfigFlag {
             ConfigFlag::Mandates => MANDATES_ENABLED_KEY,
             ConfigFlag::ReasonerConfig => REASONER_CONFIG_KEY,
             ConfigFlag::CloudReasonerConsent => CLOUD_REASONER_CONSENT_KEY,
+            ConfigFlag::LanguagePack => LANGUAGE_PACK_KEY,
         }
     }
 }
@@ -1118,6 +1159,27 @@ impl EventLog {
         Ok(true)
     }
 
+    /// Derive + upsert one pending event's vector under `embedder.model_id()`. Returns `Ok(true)`
+    /// if a vector was written, `Ok(false)` if the event has no embeddable text (legitimately
+    /// vector-less), or `Err` if the embedder failed. Shared by [`EventLog::rederive_pending`]
+    /// (which swallows the `Err` — best-effort) and [`EventLog::reembed_prepare`] (which tolerates
+    /// it here and catches the resulting shortfall with a strict completeness scan).
+    fn embed_and_upsert(&self, embedder: &dyn Embedder, event: &Event) -> Result<bool, BossclawError> {
+        let text = match embeddable_text(event) {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+        let embedding = embed_one(embedder, &text)?;
+        let blob = vec_to_blob(&embedding);
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT OR REPLACE INTO vectors (event_id, model_id, dim, embedding)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![event.id, embedder.model_id(), embedder.dim() as i64, blob],
+        )?;
+        Ok(true)
+    }
+
     /// Backfill every embeddable event that has no vector for this model.
     ///
     /// This is both the initial backfill and the spec §10 retry hook: it finds
@@ -1134,41 +1196,14 @@ impl EventLog {
         let pending = self.collect_pending(embedder.model_id())?;
         let mut derived = 0usize;
         for event in pending {
-            // `collect_pending` already filters to embeddable event types, but
-            // the individual event's `content["text"]` may still be absent or
-            // non-string (malformed data). Warn so the bad event is visible;
-            // do NOT insert a tombstone — a zero-length vector would corrupt
-            // T5 index reads.
-            let text = match embeddable_text(&event) {
-                Some(t) => t,
-                None => {
-                    log::warn!(
-                        "rederive_pending: event {} (type={}) has no embeddable text; \
-                         skipping (malformed content)",
-                        event.id,
-                        event.event_type,
-                    );
-                    continue;
-                }
-            };
-            let embedding = match embed_one(embedder, &text) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!(
-                        "rederive_pending: skipping event {} (embed failed): {e}",
-                        event.id
-                    );
-                    continue;
-                }
-            };
-            let blob = vec_to_blob(&embedding);
-            let store = self.inner.lock().expect(POISON);
-            store.conn().execute(
-                "INSERT OR REPLACE INTO vectors (event_id, model_id, dim, embedding)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![event.id, embedder.model_id(), embedder.dim() as i64, blob],
-            )?;
-            derived += 1;
+            match self.embed_and_upsert(embedder, &event) {
+                Ok(true) => derived += 1,
+                Ok(false) => log::warn!(
+                    "rederive_pending: event {} (type={}) has no embeddable text; skipping (malformed content)",
+                    event.id, event.event_type,
+                ),
+                Err(e) => log::warn!("rederive_pending: skipping event {} (embed failed): {e}", event.id),
+            }
         }
         Ok(derived)
     }
@@ -1905,6 +1940,140 @@ impl EventLog {
         );
 
         Ok(ReembedStats { reembedded, gc_removed, elapsed_ms })
+    }
+
+    /// STAGE 1 of a crash-safe language migration (invariant I5): re-embed every embeddable event
+    /// AND every entity under `embedder.model_id()`, writing the new-id rows ALONGSIDE the existing
+    /// old-id rows (nothing is deleted here). Reports progress as `(done, total)` over embeddable
+    /// events. Returns `Ok(())` only when EVERY embeddable-with-text event has a new-id vector; a
+    /// shortfall (an embed failure) returns `Err` with NO GC, so recall keeps serving the old model
+    /// and the migration is retryable. Idempotent: a re-run derives only the still-missing rows.
+    ///
+    /// The store `Mutex` is never held across [`Embedder::embed`] (each upsert takes it briefly),
+    /// matching [`EventLog::rederive_pending`]'s lock discipline.
+    pub fn reembed_prepare(
+        &self,
+        embedder: &dyn Embedder,
+        on_progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), BossclawError> {
+        // Total embeddable-with-text events (the completeness denominator — events lacking text are
+        // legitimately vector-less and must NOT count against completeness).
+        let embeddable = self.collect_embeddable_events_ordered()?;
+        let total = embeddable.len() as u64;
+        on_progress(0, total);
+
+        // Re-embed the pending memory/page/file vectors under the new id.
+        let pending = self.collect_pending(embedder.model_id())?;
+        let mut done = (total as usize).saturating_sub(pending.len()) as u64;
+        for event in pending {
+            // A single embed failure is tolerated here; the completeness scan below turns it into
+            // the all-or-nothing `Err`.
+            if let Ok(true) = self.embed_and_upsert(embedder, &event) {
+                done += 1;
+                on_progress(done, total);
+            }
+        }
+
+        // Re-embed entity resolution vectors under the new id (U8). The entities projection must be
+        // current, so rebuild it first (cheap; deterministic fold over entity events).
+        self.rebuild_graph()?;
+        self.rederive_entity_vectors_pending(embedder)?;
+
+        // Completeness scan (I5): every embeddable-with-text event MUST now have a new-id vector.
+        // Reuse the `embeddable` list collected above so this shares ONE scan with the denominator.
+        let missing = self.count_missing_vectors(embedder.model_id(), &embeddable)?;
+        if missing > 0 {
+            return Err(BossclawError::Store(format!(
+                "re-embed incomplete: {missing} of {total} embeddable events still lack a vector \
+                 under {} — no vectors were garbage-collected; retry",
+                embedder.model_id()
+            )));
+        }
+        Ok(())
+    }
+
+    /// STAGE 2 of a crash-safe language migration: after the signed record has been flipped to
+    /// `Complete` (the commit point — done by the daemon between prepare and this call), GC every
+    /// `vectors` AND `entity_vectors` row for a model OTHER than `embedder.model_id()`, then rebuild
+    /// the in-memory recall + entity indexes under the new model. Returns [`ReembedStats`]. Safe to
+    /// re-run (idempotent GC of already-removed rows).
+    pub fn reembed_finalize_gc(&self, embedder: &dyn Embedder) -> Result<ReembedStats, BossclawError> {
+        let started = Instant::now();
+        let gc_removed = self.gc_stale_vectors(embedder.model_id())?;
+        self.rebuild_indexes(embedder)?;
+        self.rebuild_entity_index(embedder)?;
+        Ok(ReembedStats {
+            reembedded: self.vectors_for_model(embedder.model_id())?.len(),
+            gc_removed,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    /// GC every `vectors` + `entity_vectors` row whose `model_id` differs from `keep_model_id`.
+    /// Returns the number of `vectors` rows removed. Idempotent. Used by [`EventLog::reembed_finalize_gc`]
+    /// and by the daemon's boot sweep after a crash between the record-flip and the GC.
+    pub fn gc_stale_vectors(&self, keep_model_id: &str) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        // Both DELETEs commit together or not at all: a crash between them must never leave the
+        // recall (`vectors`) and entity-resolution (`entity_vectors`) tables under different models.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM vectors WHERE model_id != ?1", rusqlite::params![keep_model_id])?;
+        let removed = tx.changes() as usize;
+        tx.execute("DELETE FROM entity_vectors WHERE model_id != ?1", rusqlite::params![keep_model_id])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Count how many of `embeddable` still lack a `vectors` row for `model_id`. `embeddable` is the
+    /// authoritative embeddable-with-text list `(event_id, text)`, passed IN so this scan and the
+    /// caller's completeness denominator share ONE `collect_embeddable_events_ordered` pass (they
+    /// cannot drift, and the scan is not run twice per migration).
+    fn count_missing_vectors(&self, model_id: &str, embeddable: &[(String, String)]) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM vectors WHERE event_id = ?1 AND model_id = ?2",
+        )?;
+        let mut missing = 0usize;
+        for (event_id, _text) in embeddable {
+            let has: bool = stmt.exists(rusqlite::params![event_id, model_id])?;
+            if !has {
+                missing += 1;
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Re-derive resolution vectors under `embedder.model_id()` for every entity in the current
+    /// projection that lacks one (U8). Reads the label from the `entities` table; idempotent upsert.
+    pub fn rederive_entity_vectors_pending(&self, embedder: &dyn Embedder) -> Result<usize, BossclawError> {
+        // Collect (entity_id, label) for entities missing a vector under the new model, releasing
+        // the lock before embedding (same discipline as collect_pending).
+        let pending: Vec<(String, String)> = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            let mut stmt = conn.prepare(
+                "SELECT e.entity_id, e.label FROM entities e
+                 LEFT JOIN entity_vectors v ON v.entity_id = e.entity_id AND v.model_id = ?1
+                 WHERE v.entity_id IS NULL
+                 ORDER BY e.entity_id ASC",
+            )?;
+            let rows = stmt.query_map([embedder.model_id()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+        let mut derived = 0usize;
+        for (entity_id, label) in pending {
+            self.derive_entity_vector(embedder, &entity_id, &label)?;
+            derived += 1;
+        }
+        Ok(derived)
     }
 
     /// Record the active embedding model as a signed `config` event so
@@ -4903,7 +5072,7 @@ impl EventLog {
     /// All entity vectors for `model_id` as `(entity_id, vector)` pairs, ordered
     /// `entity_id ASC` (deterministic rebuild order). Mirrors
     /// [`EventLog::vectors_for_model`] but over the `entity_vectors` table.
-    fn entity_vectors_for_model(
+    pub fn entity_vectors_for_model(
         &self,
         model_id: &str,
     ) -> Result<Vec<(String, Vec<f32>)>, BossclawError> {
@@ -5121,6 +5290,43 @@ impl EventLog {
             signature: None,
         })?;
         Ok(())
+    }
+
+    /// Persist the signed opt-in language-pack record (invariant I2). CLONES the
+    /// [`EventLog::set_cloud_reasoner_consent`] mechanism exactly — Ed25519-signed + hash-chained
+    /// (tamper-evident via `verify_chain`), the only writer of [`LANGUAGE_PACK_KEY`]. Carries no
+    /// model fields, so it never disturbs [`EventLog::active_model`].
+    pub fn set_language_pack_record(&self, record: &LanguagePackRecord) -> Result<(), BossclawError> {
+        let value = serde_json::to_value(record)?;
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a const identifier
+            // as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(LANGUAGE_PACK_KEY.to_string(), value);
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
+    /// The newest signed language-pack record, or `None` if never set (English default — I7).
+    /// STICKY: the first `config` event (newest-first) carrying the key wins, mirroring
+    /// [`EventLog::cloud_reasoner_consent_json`].
+    pub fn language_pack_record(&self) -> Result<Option<LanguagePackRecord>, BossclawError> {
+        match self.latest_config_value(LANGUAGE_PACK_KEY)? {
+            Some(v) => Ok(Some(serde_json::from_value(v)?)),
+            None => Ok(None),
+        }
     }
 
     /// Whether the evolve loop is enabled (spec §8 off-switch / Rev 2 F2-sec(a)).

@@ -542,3 +542,47 @@ async fn custom_embedder_provider_reaches_recall_over_the_wire() {
         other => panic!("expected Recall, got {other:?}"),
     }
 }
+
+// ── Rung 2: the language-pack ops reach the engine over the socket (A7). ──
+
+/// `ModelStatus` round-trips over the wire: a fresh onboarded daemon with no language pack reports
+/// `ModelStateWire::Ok` and no re-index progress (the mock provider's default state).
+#[tokio::test]
+async fn model_status_roundtrips_over_the_socket() {
+    use bossclawd_proto::types::ModelStateWire;
+
+    let (_dir, sock_path) = spawn_daemon().await;
+    let mut client = Client::connect(&sock_path).await;
+    match client.call(Request::ModelStatus { onboarded: true }).await {
+        Response::ModelStatus(w) => {
+            assert!(matches!(w.state, ModelStateWire::Ok), "no language pack → Ok, got {:?}", w.state);
+            assert!(w.reindex.is_none(), "no migration running → no progress");
+        }
+        other => panic!("expected ModelStatus, got {other:?}"),
+    }
+}
+
+/// `SetActiveModel` reaches `EngineHandle::set_active_model` over the wire: against the mock embedder
+/// provider (whose `build_candidate` is unsupported) the synchronous validation fails, so the arm
+/// surfaces the typed `Embedder` error — proving the dispatch arm is wired through (not that a real
+/// migration runs, which needs real weights the hermetic daemon has none of).
+#[tokio::test]
+async fn set_active_model_reaches_the_engine_over_the_socket() {
+    let (_dir, sock_path) = spawn_daemon().await;
+    let mut client = Client::connect(&sock_path).await;
+    let resp = client
+        .call(Request::SetActiveModel {
+            onboarded: true,
+            model_id: "minishlab/potion-multilingual-128M".into(),
+            safetensors_sha: "deadbeef".into(),
+        })
+        .await;
+    match resp {
+        Response::Err { kind, .. } => assert_eq!(
+            kind,
+            bossclawd_proto::OpErrorKindWire::Embedder,
+            "the mock provider cannot build a candidate → typed Embedder error",
+        ),
+        other => panic!("expected Err(Embedder), got {other:?}"),
+    }
+}

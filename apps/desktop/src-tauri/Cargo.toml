@@ -25,6 +25,7 @@ unsigned-varint = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+fs2 = "0.4"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "1.0"

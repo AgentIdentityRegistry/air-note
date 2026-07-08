@@ -33,7 +33,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::types::{
     ApplyResultWire, EngineStatusWire, EvolveReportMirror, EvolveStatusMirror, EvolveTelemetryWire,
     FileRecordMirror, GrantMirror, HitMirror, IngestReportMirror, MandateSummaryWire,
-    MandateWriteSummaryWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire,
+    MandateWriteSummaryWire, ModelStatusWire, PreviewDataWire, ProposalSummaryWire,
+    ReasonerConfigWire,
 };
 
 /// The wire-protocol version. Bumped on any breaking change to [`Request`],
@@ -140,6 +141,14 @@ pub enum Request {
     SetReasonerConfig { onboarded: bool, config: serde_json::Value },
     /// `EngineHandle::enable_cloud_reasoner` → `engine_enable_cloud_reasoner`.
     EnableCloudReasoner { onboarded: bool, config: serde_json::Value },
+    /// `EngineHandle::set_active_model` → `engine_set_active_model` (rung 2). Enables the
+    /// multilingual language pack: validate folder+sha, write the signed consent + in-progress
+    /// marker, run the crash-safe re-embed migration in the background. Progress is polled via
+    /// [`Request::ModelStatus`].
+    SetActiveModel { onboarded: bool, model_id: String, safetensors_sha: String },
+    /// `EngineHandle::model_status` → `engine_model_status` (rung 2). Loaded-vs-intended model state
+    /// + live re-index progress. Polled by the Settings language-pack card.
+    ModelStatus { onboarded: bool },
 }
 
 /// One response from the daemon to the client. Each success variant carries the
@@ -204,6 +213,8 @@ pub enum Response {
     ReasonerConfig(ReasonerConfigWire),
     /// `GetReasonerReady` result — the fail-closed cloud-readiness flag.
     ReasonerReady(bool),
+    /// `ModelStatus` result (rung 2) — the loaded-vs-intended model state + live re-index progress.
+    ModelStatus(ModelStatusWire),
     /// The engine is not onboarded (mirrors `EngineError::NotOnboarded`). A signal,
     /// not a fault — the UI shows onboarding.
     NotOnboarded,
@@ -570,6 +581,63 @@ mod protocol_tests {
             let bytes = serde_json::to_vec(&resp).unwrap();
             let back: Response = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(resp, back, "Err payload round-trips for {kind:?}");
+        }
+    }
+
+    /// The rung-2 ops round-trip through JSON: the `SetActiveModel`/`ModelStatus` requests and every
+    /// `ModelState` arm (including the `Failed` migration state) inside a `Response::ModelStatus`.
+    #[test]
+    fn rung2_ops_serde_roundtrip() {
+        use crate::types::{ModelStateWire, ModelStatusWire, ReindexProgressWire};
+
+        let req = Request::SetActiveModel {
+            onboarded: true,
+            model_id: "minishlab/potion-multilingual-128M".to_string(),
+            safetensors_sha: "deadbeef".to_string(),
+        };
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+        assert_eq!(req, back);
+
+        let status = Request::ModelStatus { onboarded: false };
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&status).unwrap()).unwrap();
+        assert_eq!(status, back);
+
+        let responses = vec![
+            Response::ModelStatus(ModelStatusWire {
+                state: ModelStateWire::Ok,
+                reindex: None,
+                active_model_id: Some("minishlab/potion-multilingual-128M".to_string()),
+            }),
+            Response::ModelStatus(ModelStatusWire {
+                state: ModelStateWire::Missing {
+                    expected: "minishlab/potion-multilingual-128M".to_string(),
+                },
+                reindex: Some(ReindexProgressWire { done: 220, total: 1043 }),
+                active_model_id: Some("minishlab/potion-base-8M".to_string()),
+            }),
+            Response::ModelStatus(ModelStatusWire {
+                state: ModelStateWire::Mismatch {
+                    expected: "minishlab/potion-multilingual-128M".to_string(),
+                    loaded: "deadbeef".to_string(),
+                },
+                reindex: None,
+                active_model_id: Some("minishlab/potion-base-8M".to_string()),
+            }),
+            Response::ModelStatus(ModelStatusWire {
+                state: ModelStateWire::Failed { reason: "re-embed failed: model boom".to_string() },
+                reindex: None,
+                active_model_id: Some("minishlab/potion-base-8M".to_string()),
+            }),
+            // A daemon that predates the field emits `None`; the round-trip must preserve it.
+            Response::ModelStatus(ModelStatusWire {
+                state: ModelStateWire::Ok,
+                reindex: None,
+                active_model_id: None,
+            }),
+        ];
+        for resp in responses {
+            let back: Response = serde_json::from_slice(&serde_json::to_vec(&resp).unwrap()).unwrap();
+            assert_eq!(resp, back, "ModelStatus round-trips: {resp:?}");
         }
     }
 

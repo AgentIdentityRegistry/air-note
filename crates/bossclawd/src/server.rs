@@ -24,8 +24,9 @@ use std::sync::Arc;
 
 use bossclawd_proto::types::{
     ApplyResultWire, CloudProviderWire, EngineStateWire, EngineStatusWire, EvolveStatusMirror,
-    EvolveTelemetryWire, MandateSummaryWire, MandateWriteSummaryWire, PreviewDataWire,
-    ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
+    EvolveTelemetryWire, MandateSummaryWire, MandateWriteSummaryWire, ModelStateWire,
+    ModelStatusWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
+    ReindexProgressWire,
 };
 use bossclawd_proto::{
     read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response,
@@ -255,6 +256,14 @@ async fn dispatch(engine: &Arc<EngineHandle>, req: Request) -> Response {
         Request::EnableCloudReasoner { onboarded, config } => {
             unit_result(engine.enable_cloud_reasoner(onboarded, config).await)
         }
+
+        // ── Language pack (rung 2). ──
+        Request::SetActiveModel { onboarded, model_id, safetensors_sha } => {
+            unit_result(engine.set_active_model(onboarded, model_id, safetensors_sha).await)
+        }
+        Request::ModelStatus { onboarded } => {
+            Response::ModelStatus(model_status_wire(engine.model_status(onboarded).await))
+        }
     }
 }
 
@@ -338,6 +347,32 @@ fn status_wire(s: EngineStatus) -> EngineStatusWire {
         },
         event_count: s.event_count,
         chain_ok: s.chain_ok,
+    }
+}
+
+/// Map the daemon's `(ModelState, progress)` (rung 2) to the wire `ModelStatusWire` the Settings card
+/// polls. Exhaustive on `ModelState` on purpose: a new state variant must force a wire mapping here.
+fn model_status_wire(
+    (state, reindex, active_model_id): (
+        crate::engine::embed::ModelState,
+        Option<(u64, u64)>,
+        String,
+    ),
+) -> ModelStatusWire {
+    let state = match state {
+        crate::engine::embed::ModelState::Ok => ModelStateWire::Ok,
+        crate::engine::embed::ModelState::Missing { expected } => {
+            ModelStateWire::Missing { expected }
+        }
+        crate::engine::embed::ModelState::Mismatch { expected, loaded } => {
+            ModelStateWire::Mismatch { expected, loaded }
+        }
+        crate::engine::embed::ModelState::Failed { reason } => ModelStateWire::Failed { reason },
+    };
+    ModelStatusWire {
+        state,
+        reindex: reindex.map(|(done, total)| ReindexProgressWire { done, total }),
+        active_model_id: Some(active_model_id),
     }
 }
 

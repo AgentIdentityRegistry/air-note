@@ -23,6 +23,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod language_pack;
 pub mod ollama_probe;
 pub mod reason;
 pub mod transport;
@@ -193,6 +194,35 @@ pub struct EngineStatus {
     pub state: EngineState,
     pub event_count: i64,
     pub chain_ok: bool,
+}
+
+/// Desktop mirror of `bossclawd_proto::types::ModelStateWire` (rung 2): the loaded-vs-intended
+/// embedder state the language-pack Settings card renders. The client rebuilds this off the wire;
+/// the daemon's own `embed::ModelState` never crosses the process boundary (the two meet only over
+/// `ModelStatusWire`). `Ok` = the intended model serves; `Missing`/`Mismatch` are the fail-loud
+/// re-download states; `Failed` = a background migration errored while the old model keeps serving.
+/// The language-pack command layer (`engine_model_status`, Task B2) maps this to `ModelStatusDto`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelState {
+    /// The daemon serves the intended model (or the bundled English default).
+    Ok,
+    /// The signed intent names a model whose folder is absent (prompt a re-download).
+    Missing {
+        /// The model id the signed record expected to find on disk.
+        expected: String,
+    },
+    /// The intended model's weights failed their sha256 integrity check (prompt a re-download).
+    Mismatch {
+        /// The model id the signed record expected.
+        expected: String,
+        /// The sha256 actually found on disk.
+        loaded: String,
+    },
+    /// A background re-embed migration failed; the OLD model still serves (retryable).
+    Failed {
+        /// A short, user-safe reason for the Settings card.
+        reason: String,
+    },
 }
 
 /// A recall `Hit` paired with its hydrated snippet text (`recall.rs::Hit` carries no text).
@@ -392,5 +422,26 @@ impl Engine {
 
     pub async fn enable_cloud_reasoner(&self, onboarded: bool, config: serde_json::Value) -> Result<(), EngineOpError> {
         self.client.enable_cloud_reasoner(onboarded, config).await
+    }
+
+    // ── Language pack (rung 2). Consumed by the command layer (B2): `engine_set_active_model` /
+    //    `engine_model_status`. ──
+
+    /// Mirrors `EngineClient::set_active_model`: enable the multilingual language pack (validate
+    /// folder+sha, write signed consent, run the background re-embed migration). Returns once the
+    /// synchronous validation + consent write complete; progress is polled via [`Self::model_status`].
+    pub async fn set_active_model(
+        &self,
+        onboarded: bool,
+        model_id: String,
+        safetensors_sha: String,
+    ) -> Result<(), EngineOpError> {
+        self.client.set_active_model(onboarded, model_id, safetensors_sha).await
+    }
+
+    /// Mirrors `EngineClient::model_status`: the loaded-vs-intended model state + live re-index
+    /// progress, for the Settings language-pack card poll.
+    pub async fn model_status(&self, onboarded: bool) -> Result<client::ModelStatus, EngineOpError> {
+        self.client.model_status(onboarded).await
     }
 }

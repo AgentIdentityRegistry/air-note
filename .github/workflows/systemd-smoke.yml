@@ -145,16 +145,16 @@ jobs:
 
       - name: Stage a stub daemon + model dir in paths WITH SPACES
         run: |
-          # Binary path with a space -> proves ExecStart quoting. The stub records its
-          # BOSSCLAWD_MODEL_DIR to a marker file (proving Environment= quoting), then
-          # sleeps so systemd sees a live Type=simple service.
+          # Binary path with a space -> proves ExecStart quoting. The stub just sleeps so
+          # systemd sees a live Type=simple service. (BOSSCLAWD_MODEL_DIR is no longer
+          # pushed via Environment=; the daemon pulls its model from the data dir, so the
+          # installer stages English into <data_dir> instead of setting an env var.)
           BIN_DIR="$RUNNER_TEMP/air bin"
           MODEL_DIR="$RUNNER_TEMP/air models/potion-base-8M"
           mkdir -p "$BIN_DIR" "$MODEL_DIR"
           BIN="$BIN_DIR/bossclawd"
           cat > "$BIN" <<'SH'
           #!/usr/bin/env bash
-          printf '%s' "${BOSSCLAWD_MODEL_DIR:-<unset>}" > "$RUNNER_TEMP/model-dir-seen"
           exec sleep 3600
           SH
           chmod +x "$BIN"
@@ -174,16 +174,6 @@ jobs:
           echo "unit never became active (last: $state)" >&2
           journalctl --user -u bossclawd.service --no-pager | tail -30 >&2
           exit 1
-
-      - name: Assert the stub saw the SPACED model dir (Environment= quoting proof)
-        run: |
-          for i in $(seq 1 15); do
-            [ -f "$RUNNER_TEMP/model-dir-seen" ] && break
-            sleep 1
-          done
-          seen="$(cat "$RUNNER_TEMP/model-dir-seen" 2>/dev/null || echo '<missing>')"
-          echo "BOSSCLAWD_MODEL_DIR seen by daemon: $seen"
-          [ "$seen" = "$STUB_MODEL_DIR" ] || { echo "model dir wrong (quoting broke): got [$seen] want [$STUB_MODEL_DIR]" >&2; exit 1; }
 
       - name: Restart=always — kill the daemon, expect a new MainPID
         run: |

@@ -591,6 +591,142 @@ pub async fn engine_enable_cloud_reasoner(
     state.engine.enable_cloud_reasoner(onboarded, config).await.map_err(|e| e.to_string())
 }
 
+// ---- Language pack (rung 2, U3/U6/U7) ----
+
+/// The language-pack status the Settings card polls (rung 2, U6). Payload-encoded like
+/// `engine_ollama_status` so the card can poll the model states without a throw. `state` is one of
+/// `"ok"`/`"missing"`/`"mismatch"`/`"failed"`; `expected`/`loaded` accompany the fail-loud re-download
+/// states; `reason` accompanies `"failed"` (a background migration errored while the old model keeps
+/// serving); `reindex_done`/`reindex_total` are present only while a background migration runs.
+///
+/// (Drift from the plan's DTO: the daemon gained a `Failed` model state after the plan was written —
+/// A7 commit `fd1a982` — so this DTO carries a `reason` field the plan's five-field sketch lacked, to
+/// represent it without abusing `loaded`. All non-`failed` states leave `reason` `None`.)
+#[derive(serde::Serialize)]
+pub struct ModelStatusDto {
+    pub state: String,
+    pub expected: Option<String>,
+    pub loaded: Option<String>,
+    pub reason: Option<String>,
+    pub reindex_done: Option<u64>,
+    pub reindex_total: Option<u64>,
+    /// The model id currently SERVED (a `Complete` record's id, else the bundled English base id). The
+    /// card derives "multilingual active" from this — showing that status and hiding the redundant
+    /// Enable button once the pack is live. `None` only from a daemon predating the field.
+    pub active_model_id: Option<String>,
+}
+
+/// Download + verify + install the multilingual language pack into `<data_dir>/models/` (U3), then
+/// enable it via the daemon's `SetActiveModel` (which runs the consent-gated re-embed migration).
+/// Returns once enable is ACCEPTED; the card polls `engine_model_status` for re-index progress.
+#[tauri::command]
+pub async fn engine_download_language_pack(state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let models_root = state.identity_store.data_dir().join("models");
+    // No progress sink yet: the card polls `engine_model_status` for re-index progress, and the
+    // download itself is reported coarsely by the pending/ready card states (B5). A future task can
+    // thread a Tauri event emitter here without changing the downloader's `ProgressFn` seam.
+    let mut noop = |_done: u64, _total: u64| {};
+    let (model_id, sha) =
+        crate::engine::language_pack::download_and_install(&models_root, &mut noop).await?;
+    state.engine.set_active_model(onboarded, model_id, sha).await.map_err(|e| e.to_string())
+}
+
+/// Enable an already-downloaded language pack (retry path / re-download recovery). Thin passthrough
+/// to the daemon's `SetActiveModel`.
+#[tauri::command]
+pub async fn engine_set_active_model(
+    model_id: String,
+    safetensors_sha: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_active_model(onboarded, model_id, safetensors_sha).await.map_err(|e| e.to_string())
+}
+
+/// Poll the loaded-vs-intended model state + re-index progress (U6). The four model states are
+/// payload-encoded (no throw), so the card can render them without a try/catch on the happy path; a
+/// daemon-unreachable transport failure still surfaces as an `Err`, which the card's poll swallows.
+#[tauri::command]
+pub async fn engine_model_status(state: State<'_, AppState>) -> Result<ModelStatusDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let status = state.engine.model_status(onboarded).await.map_err(|e| e.to_string())?;
+    let (state_str, expected, loaded, reason) = match status.state {
+        crate::engine::ModelState::Ok => ("ok".to_string(), None, None, None),
+        crate::engine::ModelState::Missing { expected } => ("missing".to_string(), Some(expected), None, None),
+        crate::engine::ModelState::Mismatch { expected, loaded } => {
+            ("mismatch".to_string(), Some(expected), Some(loaded), None)
+        }
+        crate::engine::ModelState::Failed { reason } => ("failed".to_string(), None, None, Some(reason)),
+    };
+    let (reindex_done, reindex_total) = match status.reindex {
+        Some((d, t)) => (Some(d), Some(t)),
+        None => (None, None),
+    };
+    Ok(ModelStatusDto {
+        state: state_str,
+        expected,
+        loaded,
+        reason,
+        reindex_done,
+        reindex_total,
+        active_model_id: status.active_model_id,
+    })
+}
+
+/// Copy the bundled English model from `resource_models_dir` into `<data_dir>/models/potion-base-8M`
+/// if the destination is missing (idempotent). This makes the daemon's DEFAULT resolution
+/// (`<data_dir>/models/potion-base-8M`) work WITHOUT the app pushing `BOSSCLAWD_MODEL_DIR` (I1), so a
+/// signed multilingual record can win the pull-resolution. Best-effort: a copy failure is logged, not
+/// fatal (the app still boots; memory features degrade until the model is present). Never overwrites a
+/// model already staged (so a downloaded/user model is never clobbered by the bundled English one).
+pub fn stage_bundled_english(resource_models_dir: &std::path::Path, data_models_root: &std::path::Path) {
+    let src = resource_models_dir.join("potion-base-8M");
+    let dst = data_models_root.join("potion-base-8M");
+    if dst.join("model.safetensors").is_file() {
+        return; // already staged
+    }
+    if let Err(e) = copy_dir_recursive(&src, &dst) {
+        eprintln!("air-agent: could not stage bundled English model: {e} (memory features may be unavailable)");
+    }
+}
+
+/// Recursively copy `src` into `dst`, creating `dst` (and any missing parents) first. Small, local,
+/// and single-purpose (drives [`stage_bundled_english`]); the model tree is shallow (a handful of
+/// files), so a plain recursive walk is sufficient — no external crate needed.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), to)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn stages_english_when_absent_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let res = tmp.path().join("resources/models");
+        std::fs::create_dir_all(res.join("potion-base-8M")).unwrap();
+        std::fs::write(res.join("potion-base-8M/model.safetensors"), b"weights").unwrap();
+        let data = tmp.path().join("data/models");
+        stage_bundled_english(&res, &data);
+        assert!(data.join("potion-base-8M/model.safetensors").is_file());
+        // Second call is a no-op (does not error, does not re-copy over a user's staged model).
+        stage_bundled_english(&res, &data);
+        assert!(data.join("potion-base-8M/model.safetensors").is_file());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -76,24 +76,23 @@ fn main() {
                 let bin_path = std::env::current_exe()
                     .map(|exe| crate::engine::daemon::resolve_bin_path(&exe))
                     .unwrap_or_else(|_| std::path::PathBuf::from("bossclawd"));
-                // The embedder model ships in the app bundle at
-                // `<resource_dir>/resources/models/potion-base-8M` (tauri.conf.json bundle.resources).
-                // An app-spawned daemon inherits no BOSSCLAWD_MODEL_DIR, so we pass this path through
-                // its env (see `ensure_started`/`build_daemon_command`); otherwise it would use the
-                // daemon's default `<data_dir>/models/...`, which nothing stages. This is the SAME
-                // resource path the pre-M1a in-process embedder used, now routed via the daemon env,
-                // and the SAME path the launchd/systemd installer templates into its unit.
-                let model_dir = app
-                    .path()
-                    .resource_dir()
-                    .expect("resource dir")
-                    .join("resources/models/potion-base-8M");
+                // Stage the bundled English model into the daemon's DEFAULT resolution path
+                // (`<data_dir>/models/potion-base-8M`, writable) so pull-based model resolution
+                // (rung 2, I1) works WITHOUT the app pushing `BOSSCLAWD_MODEL_DIR`. The env would be
+                // highest-priority and would block an opt-in multilingual language pack, so the app
+                // no longer sets it — the daemon resolves its own model (signed record → staged
+                // English default). The model ships read-only in the app bundle at
+                // `<resource_dir>/resources/models`; staging copies English into the writable data
+                // dir the first time only (idempotent). The launchd/systemd installer stages the
+                // same way (O2), so both spawn paths agree without an env pin.
+                let resource_models =
+                    app.path().resource_dir().expect("resource dir").join("resources/models");
+                let data_models_root = data_dir.join("models");
+                crate::commands::engine::stage_bundled_english(&resource_models, &data_models_root);
                 // `.setup` is sync (no reactor yet), so block on the bounded start attempt. Its
                 // result only affects logging — a `false` still boots the app (client → Unavailable).
                 tauri::async_runtime::block_on(async {
-                    let _up =
-                        crate::engine::daemon::ensure_started(&sock_path, &bin_path, &model_dir)
-                            .await;
+                    let _up = crate::engine::daemon::ensure_started(&sock_path, &bin_path).await;
                 });
                 // The transport lazily connects on first request, so it's fine to build it whether or
                 // not the daemon is up yet — a not-yet-ready daemon just yields `Unavailable` until it
@@ -216,6 +215,12 @@ fn main() {
             commands::engine::engine_set_reasoner_config,
             #[cfg(unix)]
             commands::engine::engine_enable_cloud_reasoner,
+            #[cfg(unix)]
+            commands::engine::engine_download_language_pack,
+            #[cfg(unix)]
+            commands::engine::engine_set_active_model,
+            #[cfg(unix)]
+            commands::engine::engine_model_status,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

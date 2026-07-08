@@ -566,6 +566,62 @@ pub struct EngineStatusWire {
     pub chain_ok: bool,
 }
 
+/// The loaded-vs-intended embedder state for the language-pack UI (invariants I3/U5/U6). `Ok` when
+/// the daemon serves the intended model; `Missing`/`Mismatch` are the fail-loud states (recall
+/// refuses rather than silently serving English) the Settings card surfaces as re-download; `Failed`
+/// is a background migration that errored while the OLD model keeps serving (the signed record stays
+/// `InProgress`, so it is retryable) — distinct from a still-running migration so the UI shows
+/// "migration failed — retry" rather than a spinner.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum ModelStateWire {
+    /// The daemon serves the intended model (or the bundled English default).
+    Ok,
+    /// The signed intent names a model whose folder is absent (e.g. profile copied to a new machine).
+    Missing {
+        /// The model id the signed record expected to find on disk.
+        expected: String,
+    },
+    /// The intended model's folder exists but its safetensors sha does not match the signed sha.
+    Mismatch {
+        /// The model id the signed record expected.
+        expected: String,
+        /// The sha256 actually found on disk.
+        loaded: String,
+    },
+    /// A background re-embed migration failed; the OLD model still serves and the record stays
+    /// `InProgress` (retryable). Carries a short, user-safe reason for the Settings card.
+    Failed {
+        /// Why the migration failed (a rendered engine error message; carries no secret material).
+        reason: String,
+    },
+}
+
+/// Re-index progress during a background language-pack migration (U6). `done`/`total` count
+/// embeddable events; `done == total` at completion, just before the state returns to `Ok`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReindexProgressWire {
+    /// Events re-embedded under the new model so far.
+    pub done: u64,
+    /// Total embeddable events the migration must re-embed.
+    pub total: u64,
+}
+
+/// The language-pack status the Settings card polls (U6): the model state + optional live re-index
+/// progress. Kept DISTINCT from [`EngineStatusWire`] so every existing `Status` consumer is untouched
+/// (the invariance guard) and the card can render migration progress without widening the base status.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ModelStatusWire {
+    /// The loaded-vs-intended model state.
+    pub state: ModelStateWire,
+    /// Live re-index progress while a migration runs; `None` when idle.
+    pub reindex: Option<ReindexProgressWire>,
+    /// The model id currently SERVED — the `Complete` signed record's model id once the migration has
+    /// flipped, else the bundled English base id (an absent/`InProgress` record keeps English serving
+    /// until the flip). Lets the Settings card show "Multilingual active" and stop offering a
+    /// redundant re-download. `None` only from a daemon that predates this field.
+    pub active_model_id: Option<String>,
+}
+
 /// Wire form of the desktop `EvolveTelemetry` (`engine/mod.rs:236`). Session-scoped
 /// evolve telemetry the engine's core `EvolveStatus` stubs; produced daemon-side by
 /// `record_tick` and merged into `EvolveStatusDto` desktop-side (Tasks 5/6).

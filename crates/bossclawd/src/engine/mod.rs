@@ -386,6 +386,40 @@ impl EngineHandle {
         }
     }
 
+    /// The loaded-vs-intended model state + live re-index progress (rung 2; U5/U6). A pure read of
+    /// the provider's cells; the migration task and the loader guard keep them current.
+    pub fn model_state(&self) -> (crate::engine::embed::ModelState, Option<(u64, u64)>) {
+        (self.embedder_provider.model_state(), self.embedder_provider.reindex())
+    }
+
+    /// Language-pack status for the UI poll (rung 2; U6), the RPC entry point behind
+    /// `Request::ModelStatus`. Onboarding-gated only to avoid touching the engine before onboarding;
+    /// a not-onboarded daemon reports `Ok`/no-progress/base-id. Otherwise the provider cells for
+    /// state + re-index progress, plus the currently-SERVED model id read from the signed record.
+    ///
+    /// The served id is a pure record read (never force-builds the embedder): a `Complete` record's
+    /// id is what `resolve` loads; an absent/`InProgress` record (or a read failure) means the bundled
+    /// English base is still serving — so the card reflects what is actually served (the old model
+    /// until the migration flips), not merely what was requested.
+    pub async fn model_status(
+        &self,
+        onboarded: bool,
+    ) -> (crate::engine::embed::ModelState, Option<(u64, u64)>, String) {
+        let base = crate::engine::embed::MODEL_ID.to_string();
+        if !onboarded {
+            return (crate::engine::embed::ModelState::Ok, None, base);
+        }
+        let (state, reindex) = self.model_state();
+        let active_model_id = match self.get_or_open(onboarded).await {
+            Ok(log) => match log.language_pack_record() {
+                Ok(Some(r)) if r.migration == bossclaw_core::MigrationState::Complete => r.model_id,
+                _ => base,
+            },
+            Err(_) => base,
+        };
+        (state, reindex, active_model_id)
+    }
+
     /// Grant read-access to `path` (canonicalized + appended by the engine). Gated.
     pub async fn add_grant(&self, onboarded: bool, path: PathBuf) -> Result<(), EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
@@ -449,7 +483,7 @@ impl EngineHandle {
         let _guard = self.ingest_lock.try_lock().map_err(|_| EngineOpError::Busy("ingest"))?;
         let provider = self.embedder_provider.clone();
         let report = tokio::task::spawn_blocking(move || -> Result<bossclaw_core::IngestReport, EngineOpError> {
-            let embedder = provider.embedder()?; // lazy, cached — built BEFORE the walk
+            let embedder = provider.embedder_for(&log)?; // resolved (env → signed record → bundled), cached — built BEFORE the walk
             let router = bossclaw_core::ingest::ParserRouter::native_only();
             let report = log.ingest_all(&router, &*embedder).map_err(|e| EngineOpError::Core(e.to_string()))?;
             // Record the active model at vector-birth (idempotent: only when absent or changed).
@@ -499,7 +533,10 @@ impl EngineHandle {
     /// serializes concurrent first-recalls (no double rebuild) and makes "set true only on
     /// success" race-free. Returns the (cached) embedder for the caller.
     async fn ensure_indexed(&self, log: &Arc<EventLog>) -> Result<Arc<dyn Embedder>, EngineOpError> {
-        let embedder = self.embedder_provider.embedder()?;
+        // Resolution-aware (env → signed record → bundled): a signed model whose files are
+        // missing/mismatched makes this fail loud here, so recall REFUSES rather than silently
+        // serving the wrong/empty model (I3/U5). `log: &Arc<EventLog>` auto-derefs to `&EventLog`.
+        let embedder = self.embedder_provider.embedder_for(log)?;
         let mut done = self.indexed.lock().await;
         if !*done {
             let (log2, emb2) = (log.clone(), embedder.clone());
@@ -1280,6 +1317,182 @@ fn map_err_state(e: &EngineError) -> EngineState {
         EngineError::KeystoreInconsistent => EngineState::KeystoreInconsistent,
         EngineError::KeystoreDbMismatch(_) | EngineError::Vault(_) | EngineError::Join(_) => {
             EngineState::KeystoreDbMismatch
+        }
+    }
+}
+
+/// Current time as an RFC3339 string — the audit stamp for a signed language-pack consent record.
+/// Reuses the same `chrono` timestamp source the cloud-consent writer (`enable_cloud_reasoner`)
+/// uses, so every signed consent record the engine writes is stamped identically.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Rung-2 language-pack activation: the consent-gated, crash-safe migration that swaps the served
+/// embedder (U4, I5, I6). These methods take `self: &Arc<Self>` where they hand an owned `Arc` to a
+/// background task; the daemon already shares the engine as an `Arc`.
+impl EngineHandle {
+    /// Enable the multilingual language pack (rung 2; consent-gated — I6). Writes the signed
+    /// `InProgress` record (the ONLY authority that starts a GC-bearing migration), then spawns the
+    /// crash-safe migration in the background and returns immediately (the UI polls `model_state`).
+    /// A folder/sha problem is surfaced synchronously (nothing is written) so the UI shows it at once.
+    pub async fn set_active_model(
+        self: &Arc<Self>,
+        onboarded: bool,
+        model_id: String,
+        safetensors_sha: String,
+    ) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        // Idempotent enable (defense-in-depth against a redundant re-enable of the already-active
+        // model): if the requested model is the current, HEALTHY (`Ok`) `Complete` record, a re-enable
+        // would pointlessly re-migrate (and, at the command layer, re-download ~530 MB) the SAME model
+        // — return without touching the record or spawning a migration. A `Missing`/`Mismatch`/`Failed`
+        // state is deliberately EXCLUDED so it still falls through to `build_candidate`'s fail-loud
+        // verification below (the short-circuit never weakens the integrity guard). Consent is
+        // untouched: the existing signed `Complete` record already carries it.
+        let healthy = matches!(self.embedder_provider.model_state(), crate::engine::embed::ModelState::Ok);
+        if healthy {
+            if let Some(r) = log.language_pack_record().map_err(|e| EngineOpError::Core(e.to_string()))? {
+                if r.migration == bossclaw_core::MigrationState::Complete && r.model_id == model_id {
+                    return Ok(());
+                }
+            }
+        }
+        // Fail fast if the downloaded folder isn't loadable/verifiable (never write a record we can't
+        // honour). Built off to the side — the live embedder is untouched until the migration commits.
+        let _candidate = self.embedder_provider.build_candidate(&model_id, &safetensors_sha)?;
+        // Record consent + the in-progress marker (signed). This is what authorizes the migration (I6).
+        let record = bossclaw_core::LanguagePackRecord {
+            model_id: model_id.clone(),
+            safetensors_sha: safetensors_sha.clone(),
+            migration: bossclaw_core::MigrationState::InProgress,
+            consented_at: now_rfc3339(),
+        };
+        let log2 = log.clone();
+        spawn_blocking(move || log2.set_language_pack_record(&record))
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))?
+            .map_err(|e| EngineOpError::Core(e.to_string()))?;
+        // Run the migration in the background (see `run_language_migration`). Errors are surfaced via
+        // `model_state`; the record stays InProgress on failure (retryable).
+        self.spawn_migration(model_id, safetensors_sha);
+        Ok(())
+    }
+
+    /// Spawn the background migration task. Extracted so both the enable path and boot-resume use it.
+    fn spawn_migration(self: &Arc<Self>, model_id: String, sha: String) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = this.run_language_migration(model_id, sha).await {
+                eprintln!("bossclawd: language migration failed (old model still active): {e}");
+                // Report the failure to the UI (the OLD model still serves; the record stays
+                // InProgress = retryable) and clear the now-stale progress bar. Only the reported
+                // state changes — the signed record is left untouched so a retry/boot can resume.
+                this.embedder_provider.set_failed(e.to_string());
+                this.embedder_provider.set_reindex(None);
+            }
+        });
+    }
+
+    /// The crash-safe, all-or-nothing migration body (invariant I5). Prepare (re-embed new vectors +
+    /// entity vectors, count-checked) → flip the signed record to `Complete` (the commit point) →
+    /// **publish** the new embedder (the atomic swap the running daemon serves from) → GC the old
+    /// rows. On any failure BEFORE the flip: nothing is GC'd, the record stays InProgress, the old
+    /// model keeps serving (retryable). Calling `publish` (not merely writing the record) is
+    /// load-bearing: `embedder_for` caches resolve-once, so on a live daemon ONLY `publish` swaps
+    /// the served model — a bare record write would leave the old embedder serving until restart.
+    async fn run_language_migration(&self, model_id: String, sha: String) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(true).await.map_err(EngineOpError::Open)?;
+        let candidate = self.embedder_provider.build_candidate(&model_id, &sha)?;
+
+        // Stage 1: re-embed under the new id (progress-reporting). No GC yet — old vectors intact.
+        let (log1, cand1, prov1) = (log.clone(), candidate.clone(), self.embedder_provider.clone());
+        spawn_blocking(move || {
+            let mut on = |done: u64, total: u64| prov1.set_reindex(Some((done, total)));
+            log1.reembed_prepare(&*cand1, &mut on)
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+        .map_err(|e| EngineOpError::Core(e.to_string()))?;
+
+        // Commit point: flip the signed record to Complete, THEN publish the new embedder so the
+        // live daemon serves it (a bare record write would not swap the resolve-once cache).
+        let done_record = bossclaw_core::LanguagePackRecord {
+            model_id: model_id.clone(),
+            safetensors_sha: sha,
+            migration: bossclaw_core::MigrationState::Complete,
+            consented_at: now_rfc3339(),
+        };
+        let log2 = log.clone();
+        spawn_blocking(move || log2.set_language_pack_record(&done_record))
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))?
+            .map_err(|e| EngineOpError::Core(e.to_string()))?;
+        // Swap the served embedder AND invalidate the recall index in the SAME step (never after GC —
+        // see `publish_and_invalidate`'s doc for why the ordering matters).
+        self.publish_and_invalidate(candidate.clone()).await;
+
+        // Stage 2: GC the old vectors + entity vectors, rebuild indexes under the new model. A
+        // failure here leaves stale old-model rows (harmless — `resume_migration_if_pending` sweeps
+        // them on the next boot) but the index is ALREADY invalidated above, so a racing recall still
+        // rebuilds correctly against the new model regardless of whether/when this GC succeeds.
+        let (log3, cand3) = (log.clone(), candidate);
+        spawn_blocking(move || log3.reembed_finalize_gc(&*cand3))
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))?
+            .map_err(|e| EngineOpError::Core(e.to_string()))?;
+
+        self.embedder_provider.set_reindex(None);
+        Ok(())
+    }
+
+    /// Atomically swap the live embedder cache to `candidate` AND invalidate the recall index, so no
+    /// racing `recall`/`evolve_once` can ever observe the NEW embedder (served from the provider's
+    /// cache the instant `publish` runs) paired with the OLD in-memory vector index (built under the
+    /// old model). New-id vectors already exist at this point — `reembed_prepare` wrote them BEFORE
+    /// the commit point — so a rebuild triggered by the invalidation is correct even before GC runs;
+    /// the two calls must never be separated (a prior version invalidated only after GC, leaving a
+    /// window where a racing recall embedded the query with the NEW model but searched the OLD
+    /// in-memory index — cross-embedding-space garbage results for the whole GC+rebuild duration, and
+    /// permanently if `reembed_finalize_gc` then failed).
+    async fn publish_and_invalidate(&self, candidate: Arc<dyn Embedder>) {
+        self.embedder_provider.publish(candidate);
+        *self.indexed.lock().await = false;
+    }
+
+    /// Boot-time resume (invariant I6): if a consented `InProgress` migration is recorded, finish it;
+    /// if `Complete`, GC any stale rows a crash left behind (idempotent); if absent, do nothing. This
+    /// is the ONLY boot-time migration — there is NO un-consented "zero vectors" heuristic, so a
+    /// fresh brain with no signed record never auto-migrates.
+    pub async fn resume_migration_if_pending(self: &Arc<Self>, onboarded: bool) {
+        let log = match self.get_or_open(onboarded).await {
+            Ok(l) => l,
+            Err(_) => return, // not onboarded / open failure — nothing to resume
+        };
+        let rec = match log.language_pack_record() {
+            Ok(Some(r)) => r,
+            Ok(None) => return, // no consent recorded — nothing to resume (I6)
+            Err(e) => {
+                // A real DB/deserialize failure is NOT "nothing to resume" — a corrupt record must
+                // never silently skip a needed resume, so it is logged (never surfaced as a fault:
+                // this runs unattended at boot, same discipline as the panic-scrubbing hook).
+                eprintln!("bossclawd: boot-resume could not read the language-pack record: {e}");
+                return;
+            }
+        };
+        match rec.migration {
+            bossclaw_core::MigrationState::InProgress => {
+                self.spawn_migration(rec.model_id, rec.safetensors_sha);
+            }
+            bossclaw_core::MigrationState::Complete => {
+                // A crash between the flip and the GC can leave stale old-model rows; sweep them.
+                let keep = rec.model_id.clone();
+                match spawn_blocking(move || log.gc_stale_vectors(&keep)).await {
+                    Ok(Ok(_removed)) => {}
+                    Ok(Err(e)) => eprintln!("bossclawd: boot-resume GC of stale vectors failed: {e}"),
+                    Err(e) => eprintln!("bossclawd: boot-resume GC task failed to join: {e}"),
+                }
+            }
         }
     }
 }
@@ -2794,5 +3007,387 @@ mod tests {
             matches!(cell.lock().unwrap().mode, crate::engine::reason::ReasonerMode::Local),
             "a failed enable must never touch the cell (fail-closed write-through)"
         );
+    }
+
+    // ---- Rung 2: resolution-aware recall + consent-gated language migration (A5/A6) ----
+
+    /// A resolution-aware handle wired with a caller-supplied vault + embedder provider (rung 2). The
+    /// vault is a parameter so two handles over ONE data dir (crash → boot-resume) can SHARE a DEK
+    /// and thus decrypt the same brain.db. Returns an `Arc` because the migration entry points
+    /// (`set_active_model`/`resume_migration_if_pending`) take `self: &Arc<Self>` to spawn their
+    /// background task. Seeds the provider-key cache EMPTY (no keychain prompt).
+    fn test_handle_with_vault_and_provider(
+        vault: Arc<TestVault>,
+        home: std::path::PathBuf,
+        provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    ) -> Arc<EngineHandle> {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        Arc::new(EngineHandle::new(
+            vault,
+            home,
+            provider,
+            Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        ))
+    }
+
+    /// A resolution-aware handle over a FRESH vault (single-handle tests). Mirrors `new_test_handle`.
+    fn test_handle_with_provider(
+        home: std::path::PathBuf,
+        provider: Arc<dyn crate::engine::embed::EmbedderProvider>,
+    ) -> Arc<EngineHandle> {
+        test_handle_with_vault_and_provider(TestVault::new(), home, provider)
+    }
+
+    /// U5/I3: a recall against a signed `Complete` language pack whose files are absent must REFUSE
+    /// loudly (never silently serve the wrong/empty model), and the provider must surface `Missing`
+    /// so the UI can prompt a re-download. Proves `ensure_indexed` resolves via `embedder_for`.
+    #[tokio::test]
+    async fn recall_refuses_loudly_when_signed_model_missing() {
+        use crate::engine::embed::ResourceModel2Vec;
+        use bossclaw_core::{LanguagePackRecord, MigrationState};
+        // Build a resolution-aware provider whose data root has NO folder for the enabled model.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let provider = std::sync::Arc::new(ResourceModel2Vec::with_resolution(
+            None, root.join("potion-base-8M"), root, crate::engine::embed::MODEL_ID.to_string(),
+        ));
+        let handle = test_handle_with_provider(tmp.path().to_path_buf(), provider);
+        // Onboard + record a Complete multilingual intent whose folder is absent.
+        let log = handle.get_or_open(true).await.unwrap();
+        log.set_language_pack_record(&LanguagePackRecord {
+            model_id: "minishlab/potion-multilingual-128M".into(),
+            safetensors_sha: "abc".into(),
+            migration: MigrationState::Complete,
+            consented_at: "t".into(),
+        }).unwrap();
+        let err = handle.recall(true, "anything".into(), 5).await.unwrap_err();
+        assert!(matches!(err, crate::engine::EngineOpError::Embedder(_)),
+            "recall must refuse when the signed model is missing (I3), got {err:?}");
+        // The resolution path (not a generic embedder failure) ran: the provider surfaces Missing.
+        assert!(matches!(handle.model_state().0, crate::engine::embed::ModelState::Missing { .. }),
+            "the provider surfaces Missing so the UI can prompt a re-download (U5)");
+    }
+
+    // ---- A6 helpers: staged mock model + id-reporting loader + memory factory + status poll ----
+
+    /// An embedder that wraps a `MockEmbedder` but reports the RESOLVED model id, so a migration's
+    /// re-embed writes rows under the new id without real weights (mirrors embed.rs's `IdOverride`).
+    struct IdReportingEmbedder { inner: Arc<dyn bossclaw_core::Embedder>, id: String }
+    impl bossclaw_core::Embedder for IdReportingEmbedder {
+        fn embed(&self, t: &[String]) -> Result<Vec<Vec<f32>>, bossclaw_core::BossclawError> { self.inner.embed(t) }
+        fn dim(&self) -> usize { self.inner.dim() }
+        fn model_id(&self) -> &str { &self.id }
+    }
+
+    /// A loader yielding a dim-8 `MockEmbedder` that reports whatever id resolution asks for, so the
+    /// migration can be driven end-to-end without real weights (reuses A4's IdOverride pattern).
+    fn mock_loader_reporting_ids() -> crate::engine::embed::LoaderFn {
+        Arc::new(|_dir: &std::path::Path, id: &str| {
+            let inner = Arc::new(bossclaw_core::MockEmbedder::new(8)) as Arc<dyn bossclaw_core::Embedder>;
+            Ok(Arc::new(IdReportingEmbedder { inner, id: id.to_string() }) as Arc<dyn bossclaw_core::Embedder>)
+        })
+    }
+
+    /// Stage a downloadable model folder under `root/<id>` (fake weights) and return `(id, sha256)`
+    /// so a signed record / `build_candidate` can bind + verify it.
+    fn stage_mock_model(root: &std::path::Path, id: &str) -> (String, String) {
+        use sha2::{Digest, Sha256};
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = b"mock-weights";
+        std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+        let sha = hex::encode(Sha256::digest(bytes));
+        (id.to_string(), sha)
+    }
+
+    /// Build one `memory` event (the embed/evolve queue consumes these). Mirrors `seed_one_memory`
+    /// but returns the event for the caller to append.
+    fn mk_test_memory(text: &str) -> bossclaw_core::Event {
+        bossclaw_core::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: "memory".to_string(),
+            content: serde_json::json!({ "text": text }),
+            model_meta: None, prev_hash: String::new(), hash: None,
+            signed_by_did: "did:wba:AIR-TEST".to_string(), signature: None,
+        }
+    }
+
+    /// Poll until the WHOLE migration has finished for `expected_id` (bounded). The signed record
+    /// flips to `Complete` at the commit point, but the GC + index rebuild run AFTER it; the provider
+    /// clears its re-index progress to `None` only once the whole migration finishes, so gate on both
+    /// to never observe a half-done (record Complete, old rows not yet GC'd) state.
+    async fn wait_until_active(handle: &Arc<EngineHandle>, expected_id: &str) {
+        for _ in 0..200 {
+            let rec = handle.get_or_open(true).await.unwrap().language_pack_record().unwrap();
+            let complete = matches!(&rec, Some(r)
+                if r.migration == bossclaw_core::MigrationState::Complete && r.model_id == expected_id);
+            if complete && handle.model_state().1.is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("migration did not complete within the bound");
+    }
+
+    /// I5 enable path: `set_active_model` drives the migration to completion — new-id vectors cover
+    /// every event, the old model's rows are GC'd, and the signed record ends `Complete`.
+    #[tokio::test]
+    async fn set_active_model_migrates_to_completion() {
+        use crate::engine::embed::ResourceModel2Vec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let (id, sha) = stage_mock_model(&root, "ml/v1");
+        let provider = std::sync::Arc::new(
+            ResourceModel2Vec::with_resolution(None, root.join("potion-base-8M"), root, crate::engine::embed::MODEL_ID.to_string())
+                .with_loader_for_test(mock_loader_reporting_ids()),
+        );
+        let handle = test_handle_with_provider(tmp.path().to_path_buf(), provider);
+        let log = handle.get_or_open(true).await.unwrap();
+        for t in ["ocean waves", "forest trees"] { log.append(mk_test_memory(t)).unwrap(); }
+        handle.run_ingest(true).await.unwrap(); // records the bundled model; seeds any English vectors
+
+        handle.set_active_model(true, id.clone(), sha).await.unwrap();
+        // set_active_model spawns a background task; await completion via the status poll.
+        wait_until_active(&handle, &id).await;
+
+        assert_eq!(log.vectors_for_model(&id).unwrap().len(), 2, "new-id vectors cover all events");
+        assert!(log.vectors_for_model(crate::engine::embed::MODEL_ID).unwrap().is_empty(), "old GC'd");
+        assert_eq!(log.language_pack_record().unwrap().unwrap().migration, bossclaw_core::MigrationState::Complete);
+    }
+
+    /// U6 (review MAJOR): `model_status` must report WHICH model is served so the Settings card can
+    /// show "Multilingual active" instead of a stale Enable button. Before any enable it is the bundled
+    /// English base id (an absent record keeps English serving); after a completed migration it is the
+    /// migrated model id (the `Complete` record's id).
+    #[tokio::test]
+    async fn model_status_reports_active_model_id() {
+        use crate::engine::embed::ResourceModel2Vec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let (id, sha) = stage_mock_model(&root, "ml/v1");
+        let provider = std::sync::Arc::new(
+            ResourceModel2Vec::with_resolution(None, root.join("potion-base-8M"), root, crate::engine::embed::MODEL_ID.to_string())
+                .with_loader_for_test(mock_loader_reporting_ids()),
+        );
+        let handle = test_handle_with_provider(tmp.path().to_path_buf(), provider);
+        let log = handle.get_or_open(true).await.unwrap();
+        for t in ["ocean waves", "forest trees"] { log.append(mk_test_memory(t)).unwrap(); }
+        handle.run_ingest(true).await.unwrap();
+
+        // Before enable: the bundled English base id (nothing has been migrated yet).
+        assert_eq!(handle.model_status(true).await.2, crate::engine::embed::MODEL_ID,
+            "with no language pack, model_status reports the bundled English base id");
+
+        handle.set_active_model(true, id.clone(), sha).await.unwrap();
+        wait_until_active(&handle, &id).await;
+
+        // After a completed migration: the migrated model id (the served model).
+        assert_eq!(handle.model_status(true).await.2, id,
+            "after the migration completes, model_status reports the migrated model id");
+    }
+
+    /// U6 (review MAJOR): re-enabling the ALREADY-ACTIVE model must be a no-op — no re-download, no
+    /// re-migration. `set_active_model` writes a fresh `InProgress` record SYNCHRONOUSLY before it
+    /// returns whenever it starts a migration, so a record still `Complete` immediately after the call
+    /// proves the migration never spawned; and the served vectors are left untouched.
+    #[tokio::test]
+    async fn set_active_model_is_idempotent_for_the_active_model() {
+        use crate::engine::embed::ResourceModel2Vec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let (id, sha) = stage_mock_model(&root, "ml/v1");
+        let provider = std::sync::Arc::new(
+            ResourceModel2Vec::with_resolution(None, root.join("potion-base-8M"), root, crate::engine::embed::MODEL_ID.to_string())
+                .with_loader_for_test(mock_loader_reporting_ids()),
+        );
+        let handle = test_handle_with_provider(tmp.path().to_path_buf(), provider);
+        let log = handle.get_or_open(true).await.unwrap();
+        log.append(mk_test_memory("ocean waves")).unwrap();
+        handle.run_ingest(true).await.unwrap();
+
+        // First enable migrates to completion (record Complete, state Ok, id's vectors written).
+        handle.set_active_model(true, id.clone(), sha.clone()).await.unwrap();
+        wait_until_active(&handle, &id).await;
+        let vectors_before = log.vectors_for_model(&id).unwrap().len();
+
+        // Second enable of the SAME active model: the short-circuit returns Ok without migrating.
+        handle.set_active_model(true, id.clone(), sha.clone()).await.unwrap();
+        assert_eq!(
+            log.language_pack_record().unwrap().unwrap().migration,
+            bossclaw_core::MigrationState::Complete,
+            "a re-enable of the active model must NOT write a fresh InProgress record (no re-migration)",
+        );
+        assert_eq!(log.vectors_for_model(&id).unwrap().len(), vectors_before,
+            "no re-embed ran on the redundant re-enable — the served vectors are untouched");
+    }
+
+    /// I6: a bare "zero vectors for the loaded model" state must NOT auto-migrate — only an explicit
+    /// `set_active_model` writes a language-pack record. A recall over an un-consented store leaves
+    /// the record absent.
+    #[tokio::test]
+    async fn zero_vectors_never_auto_migrates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = test_handle_with_provider(
+            tmp.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(8)),
+        );
+        let log = handle.get_or_open(true).await.unwrap();
+        log.append(mk_test_memory("lonely event")).unwrap();
+        // No set_active_model call. A recall must NOT write a language_pack record.
+        let _ = handle.recall(true, "lonely".into(), 5).await;
+        assert!(log.language_pack_record().unwrap().is_none(), "no consent → no migration record (I6)");
+    }
+
+    /// I6: an interrupted-but-consented migration (InProgress record + partial vectors) resumes on
+    /// boot via the SAME all-or-nothing flow, finishing the re-embed and flipping to Complete.
+    #[tokio::test]
+    async fn interrupted_migration_resumes_on_boot() {
+        use crate::engine::embed::ResourceModel2Vec;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("models");
+        std::fs::create_dir_all(root.join("potion-base-8M")).unwrap();
+        let (id, sha) = stage_mock_model(&root, "ml/v1");
+        // The two handles share ONE vault so the boot handle decrypts the crash handle's brain.db.
+        let vault = TestVault::new();
+        // Simulate a crash mid-migration: InProgress record written, English vectors intact, NO new.
+        {
+            let provider = std::sync::Arc::new(
+                ResourceModel2Vec::new(root.join("potion-base-8M")).with_loader_for_test(mock_loader_reporting_ids()),
+            );
+            let handle = test_handle_with_vault_and_provider(vault.clone(), tmp.path().to_path_buf(), provider);
+            let log = handle.get_or_open(true).await.unwrap();
+            log.append(mk_test_memory("resume me")).unwrap();
+            handle.run_ingest(true).await.unwrap();
+            log.set_language_pack_record(&bossclaw_core::LanguagePackRecord {
+                model_id: id.clone(), safetensors_sha: sha.clone(),
+                migration: bossclaw_core::MigrationState::InProgress, consented_at: "t".into(),
+            }).unwrap();
+        }
+        // Fresh handle (new process) with the resolution-aware provider → boot resume.
+        let provider = std::sync::Arc::new(
+            ResourceModel2Vec::with_resolution(None, root.join("potion-base-8M"), root.clone(), crate::engine::embed::MODEL_ID.to_string())
+                .with_loader_for_test(mock_loader_reporting_ids()),
+        );
+        let handle = test_handle_with_vault_and_provider(vault.clone(), tmp.path().to_path_buf(), provider);
+        handle.resume_migration_if_pending(true).await;
+        wait_until_active(&handle, &id).await;
+        let log = handle.get_or_open(true).await.unwrap();
+        assert_eq!(log.language_pack_record().unwrap().unwrap().migration, bossclaw_core::MigrationState::Complete);
+        assert_eq!(log.vectors_for_model(&id).unwrap().len(), 1, "resume finished the re-embed");
+    }
+
+    /// Regression guard (review MAJOR): the embedder swap and the recall-index invalidation MUST
+    /// happen in the SAME step, never separated. A prior version invalidated the index only AFTER
+    /// `reembed_finalize_gc`, leaving a window where a racing recall got the NEW embedder from the
+    /// provider's cache (swapped by `publish`) but skipped rebuilding because `indexed` was still
+    /// `true` — searching the new-model query embedding against the OLD in-memory vector index
+    /// (cross-embedding-space garbage), for the whole GC+rebuild duration, and permanently if the GC
+    /// then failed. Pins `publish_and_invalidate` as the ONLY path `run_language_migration` uses to
+    /// swap the embedder, so a future reorder that calls `publish` and the index-reset separately
+    /// cannot silently reintroduce the window.
+    #[tokio::test]
+    async fn publish_and_invalidate_clears_the_index_atomically_with_the_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = test_handle_with_provider(
+            tmp.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(8)),
+        );
+        // Simulate an already-built index under the OLD model (what a prior recall would have set).
+        *handle.indexed.lock().await = true;
+        let candidate: Arc<dyn bossclaw_core::Embedder> = Arc::new(bossclaw_core::MockEmbedder::new(8));
+        handle.publish_and_invalidate(candidate).await;
+        assert!(
+            !*handle.indexed.lock().await,
+            "the index must be invalidated in the SAME step as the embedder swap — never a step \
+             later — so no racing recall can pair the NEW embedder with the OLD in-memory index"
+        );
+    }
+
+    /// A provider whose `build_candidate` succeeds the FIRST time — so `set_active_model`'s
+    /// synchronous pre-check passes and the InProgress record is written — then FAILS every later
+    /// call, so the background migration's OWN `build_candidate` errors. Drives the failure catch
+    /// that must surface `ModelState::Failed` (old model still serving) while leaving the signed
+    /// record InProgress (retryable).
+    struct FailSecondCandidateProvider {
+        candidate_calls: std::sync::atomic::AtomicUsize,
+        state: Mutex<embed::ModelState>,
+        reindex: Mutex<Option<(u64, u64)>>,
+    }
+    impl FailSecondCandidateProvider {
+        fn new() -> Self {
+            Self {
+                candidate_calls: std::sync::atomic::AtomicUsize::new(0),
+                state: Mutex::new(embed::ModelState::Ok),
+                reindex: Mutex::new(None),
+            }
+        }
+    }
+    impl embed::EmbedderProvider for FailSecondCandidateProvider {
+        fn embedder(&self) -> Result<Arc<dyn bossclaw_core::Embedder>, EngineOpError> {
+            Ok(Arc::new(bossclaw_core::MockEmbedder::new(8)))
+        }
+        fn build_candidate(
+            &self,
+            _model_id: &str,
+            _sha: &str,
+        ) -> Result<Arc<dyn bossclaw_core::Embedder>, EngineOpError> {
+            if self.candidate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(Arc::new(bossclaw_core::MockEmbedder::new(8)))
+            } else {
+                Err(EngineOpError::Embedder("candidate build failed (test)".into()))
+            }
+        }
+        fn model_state(&self) -> embed::ModelState {
+            self.state.lock().unwrap().clone()
+        }
+        fn set_failed(&self, reason: String) {
+            *self.state.lock().unwrap() = embed::ModelState::Failed { reason };
+        }
+        fn set_reindex(&self, progress: Option<(u64, u64)>) {
+            *self.reindex.lock().unwrap() = progress;
+        }
+        fn reindex(&self) -> Option<(u64, u64)> {
+            *self.reindex.lock().unwrap()
+        }
+    }
+
+    /// A background migration that fails must surface `ModelState::Failed` via `model_status` (so the
+    /// UI can tell "migration failed, old model still serving" apart from "migration still running"),
+    /// while leaving the signed record InProgress (retryable) and clearing the stale progress bar.
+    #[tokio::test]
+    async fn failed_migration_surfaces_failed_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handle =
+            test_handle_with_provider(tmp.path().to_path_buf(), Arc::new(FailSecondCandidateProvider::new()));
+        let log = handle.get_or_open(true).await.unwrap();
+        log.append(mk_test_memory("event")).unwrap();
+        handle.run_ingest(true).await.unwrap();
+
+        // The synchronous pre-check (build_candidate #1) passes and the InProgress record is written;
+        // the background migration's own build_candidate (#2) then fails.
+        handle.set_active_model(true, "ml/v1".into(), "sha".into()).await.unwrap();
+
+        // Poll until the background task reports the failure through `model_status`.
+        let mut failed = false;
+        for _ in 0..200 {
+            if matches!(handle.model_status(true).await.0, embed::ModelState::Failed { .. }) {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(failed, "a failed migration must surface ModelState::Failed via model_status");
+        // The record stays InProgress (retryable) — only the reported state changed.
+        assert_eq!(
+            log.language_pack_record().unwrap().unwrap().migration,
+            bossclaw_core::MigrationState::InProgress,
+            "the signed record is left InProgress on failure (retryable)",
+        );
+        // The stale progress bar is cleared alongside the failure.
+        assert!(handle.model_status(true).await.1.is_none(), "progress cleared on failure");
     }
 }

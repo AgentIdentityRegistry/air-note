@@ -39,9 +39,11 @@
 # daemon (crates/bossclawd/src/main.rs: SOCKET_FILE="bossclawd.sock", default
 # <data_dir>/bossclawd.sock) and the app (apps/desktop/src-tauri/src/engine/
 # daemon.rs: same default) already agree, so no BOSSCLAWD_SOCKET override is needed.
-# The only env we set is BOSSCLAWD_MODEL_DIR, because the daemon's default
-# (<data_dir>/models/potion-base-8M, main.rs) is NOT where the app bundle ships the
-# model (Contents/Resources/resources/models/potion-base-8M); we point it there.
+# The unit sets NO env either: with pull-based model resolution (rung 2, I1) the
+# daemon resolves its own model (signed record -> staged English default
+# <data_dir>/models/potion-base-8M). This script STAGES the bundled English model
+# into that default path instead of pinning BOSSCLAWD_MODEL_DIR — an env pin would
+# be highest-priority and would block an opt-in multilingual language pack.
 #
 # ============================================================================
 #  MANUAL SMOKE TEST (Task 8 Step 3) — run on a signed build; Peter-gated.
@@ -106,7 +108,8 @@ Usage: $(basename "$0") <install|uninstall|status> [--bin PATH] [--model-dir PAT
 Options (override auto-detection):
   --bin PATH        Absolute path to the co-signed bossclawd binary. Default:
                     <exe-sibling in the installed AIR Agent app> (auto-detected).
-  --model-dir PATH  Absolute path to the embedder model dir (potion-base-8M).
+  --model-dir PATH  Absolute path to the bundled English model SOURCE (potion-base-8M),
+                    staged into the daemon's default <data_dir>/models/potion-base-8M.
                     Default: the model inside the detected app bundle.
 
 Auto-start is per-USER (launchd LaunchAgent / systemd --user), never root, because
@@ -218,7 +221,7 @@ render_template() {
 plist_path() { echo "${HOME}/Library/LaunchAgents/${LABEL}.plist"; }
 
 install_macos() {
-  local bin="$1" model_dir="$2"
+  local bin="$1"
   local plist; plist="$(plist_path)"
   local logdir; logdir="$(log_dir_macos)"
   local out_log="${logdir}/bossclawd.out.log"
@@ -237,7 +240,6 @@ install_macos() {
   rendered="$(render_template "${PLIST_TEMPLATE}" \
     "LABEL=${LABEL}" \
     "BOSSCLAWD_BIN=${bin}" \
-    "BOSSCLAWD_MODEL_DIR=${model_dir}" \
     "STDOUT_LOG=${out_log}" \
     "STDERR_LOG=${err_log}")"
   printf '%s' "${rendered}" > "${plist}"
@@ -262,7 +264,6 @@ install_macos() {
   info "installed launchd agent ${LABEL}"
   info "  plist:   ${plist}"
   info "  binary:  ${bin}"
-  info "  model:   ${model_dir}"
   info "  logs:    ${out_log}"
   info "           ${err_log}"
   info "the daemon now starts at login and relaunches on crash (KeepAlive)."
@@ -301,14 +302,13 @@ status_macos() {
 unit_path() { echo "${HOME}/.config/systemd/user/${SYSTEMD_UNIT}"; }
 
 install_linux() {
-  local bin="$1" model_dir="$2"
+  local bin="$1"
   local unit; unit="$(unit_path)"
   mkdir -p "$(dirname "${unit}")"
 
   local rendered
   rendered="$(render_template "${SYSTEMD_TEMPLATE}" \
-    "BOSSCLAWD_BIN=${bin}" \
-    "BOSSCLAWD_MODEL_DIR=${model_dir}")"
+    "BOSSCLAWD_BIN=${bin}")"
   printf '%s' "${rendered}" > "${unit}"
   chmod 0644 "${unit}"
 
@@ -321,7 +321,6 @@ install_linux() {
   info "installed systemd --user unit ${SYSTEMD_UNIT}"
   info "  unit:   ${unit}"
   info "  binary: ${bin}"
-  info "  model:  ${model_dir}"
   info "  logs:   journalctl --user -u ${SYSTEMD_UNIT}"
   info "the daemon now starts at login and relaunches on crash (Restart=always)."
 }
@@ -398,13 +397,30 @@ main() {
       [[ -x "${bin}" ]] || die "binary not found or not executable: ${bin}"
       case "${bin}" in /*) ;; *) die "--bin must be an ABSOLUTE path (launchd/systemd have no PATH): ${bin}" ;; esac
 
-      # Resolve the model dir: explicit override, else derive from the binary.
+      # Resolve the model SOURCE dir: explicit override, else derive from the binary. This is the
+      # source we STAGE into the daemon's default resolution path (below) — no longer an env pin.
       local model_dir="${model_override}"
       [[ -z "${model_dir}" ]] && model_dir="$(autodetect_model_dir "${os}" "${bin}")"
       case "${model_dir}" in /*) ;; *) die "--model-dir must be an ABSOLUTE path: ${model_dir}" ;; esac
-      [[ -d "${model_dir}" ]] || info "note: model dir does not exist yet: ${model_dir} (the daemon will error until it does — check --model-dir)"
+      [[ -d "${model_dir}" ]] || info "note: model source dir does not exist yet: ${model_dir} (the daemon will error until a model is staged — check --model-dir)"
 
-      if [[ "${os}" == "macos" ]]; then install_macos "${bin}" "${model_dir}"; else install_linux "${bin}" "${model_dir}"; fi
+      # Stage the bundled English model into the daemon's default resolution path so pull-based
+      # model resolution (rung 2, I1) works without pinning BOSSCLAWD_MODEL_DIR (which would be
+      # highest-priority and block the opt-in multilingual language pack). Idempotent: skip if a
+      # model is already staged. On the Linux default the source IS the staging target, so there
+      # is nothing to copy (the operator passes --model-dir to point at a real source).
+      local staged; staged="$(app_data_dir "${os}")/models/potion-base-8M"
+      if [[ -f "${staged}/model.safetensors" ]]; then
+        info "english model already staged: ${staged}"
+      elif [[ "${model_dir}" == "${staged}" ]]; then
+        info "note: model source is the staging target (${staged}); nothing to copy"
+      else
+        info "staging english model: ${model_dir} -> ${staged}"
+        mkdir -p "${staged}"
+        cp -R "${model_dir}/." "${staged}/"
+      fi
+
+      if [[ "${os}" == "macos" ]]; then install_macos "${bin}"; else install_linux "${bin}"; fi
       ;;
     uninstall)
       if [[ "${os}" == "macos" ]]; then uninstall_macos; else uninstall_linux; fi

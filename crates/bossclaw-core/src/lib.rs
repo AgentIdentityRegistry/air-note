@@ -59,8 +59,8 @@ pub use fastembed::FastEmbed;
 pub use graph::{AsOf, Edge, Entity, Grant, Mandate, Node, Page, WriteGrant, MAX_RECIPE_LEN};
 pub use index::{HnswIndex, VectorIndex};
 pub use log::{
-    ActiveModel, ConfigFlag, EventLog, ReembedStats, SynthCacheRow, LOUD_ACK_REQUIRED_MSG,
-    SCHEMA_VERSION,
+    ActiveModel, ConfigFlag, EventLog, LanguagePackRecord, MigrationState, ReembedStats,
+    SynthCacheRow, LOUD_ACK_REQUIRED_MSG, SCHEMA_VERSION,
 };
 #[cfg(unix)]
 pub use log::MandateAction;
