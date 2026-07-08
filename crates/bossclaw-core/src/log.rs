@@ -4478,6 +4478,42 @@ impl EventLog {
         ENGINE_SIGNER_DID.to_string()
     }
 
+    /// Append a signed `memory`-type event carrying `text`, stamped `origin = external`
+    /// (the taint model, single-sourced via [`crate::graph::EXTERNAL_ORIGIN`]) so a
+    /// remembered note is recallable (`memory` ∈ `EMBEDDABLE_EVENT_TYPES`) yet never
+    /// auto-trusted downstream (`is_external` stays true). Derives + persists the note's
+    /// vector so a subsequent [`EventLog::rebuild_indexes`] + `recall` surfaces it.
+    /// Rejects empty/blank text with [`BossclawError::InvalidInput`] (no empty events).
+    /// Tier-A (`model_meta: None`), signed by the engine DID like every ground-truth write.
+    ///
+    /// Not atomic: `append` commits before `derive_vector_for` runs, so if vector
+    /// derivation fails the memory event is already durable (keyword-recallable) even
+    /// though `Err` is returned. A caller retry could thus double-write; dedup is
+    /// intentionally deferred to a later SP1 task.
+    pub fn remember(&self, embedder: &dyn Embedder, text: &str) -> Result<String, BossclawError> {
+        if text.trim().is_empty() {
+            return Err(BossclawError::InvalidInput("cannot remember empty or blank text".into()));
+        }
+        let event = Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::MEMORY_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "text": text,
+                "origin": crate::graph::EXTERNAL_ORIGIN,
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        };
+        let id = self.append(event)?;
+        self.derive_vector_for(embedder, &id)?;
+        Ok(id)
+    }
+
     /// Derive + persist the vector for a just-appended event id (M5a ingest convenience).
     /// Best-effort: a non-embeddable or text-less event is a no-op.
     pub(crate) fn derive_vector_for(&self, embedder: &dyn Embedder, event_id: &str) -> Result<(), BossclawError> {
@@ -7244,6 +7280,7 @@ pub(crate) mod undo_test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MockEmbedder;
 
     const DEK: [u8; 32] = [42u8; 32];
     const KEY_BYTES: [u8; 32] = [7u8; 32];
@@ -7251,6 +7288,41 @@ mod tests {
     fn open_log(dir: &Path) -> EventLog {
         let key = SigningKey::from_bytes(&KEY_BYTES);
         EventLog::open(&dir.join("m.db"), &DEK, key).unwrap()
+    }
+
+    #[test]
+    fn remember_appends_external_tainted_recallable_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        // A remembered note is a signed `memory` event stamped external-taint.
+        let id = log.remember(&embedder, "ferris the crab loves rust").unwrap();
+        let ev = log.event_by_id(&id).unwrap().expect("event present");
+        assert_eq!(ev.event_type, "memory", "remember writes a memory-type event");
+        assert_eq!(
+            ev.content.get("origin").and_then(|v| v.as_str()),
+            Some("external"),
+            "remembered memories are external-tainted (I2): recallable, never auto-trusted"
+        );
+        assert_eq!(
+            ev.content.get("text").and_then(|v| v.as_str()),
+            Some("ferris the crab loves rust"),
+            "the note text is stored top-level so the embedder finds it"
+        );
+
+        // Recallable immediately: rebuild the indexes, then a recall surfaces it.
+        log.rebuild_indexes(&embedder).unwrap();
+        let hits = log
+            .recall(&embedder, "ferris rust", 5, &RecallOptions::default())
+            .unwrap();
+        assert!(hits.iter().any(|h| h.event_id == id), "remembered note is recallable");
+
+        // Empty / blank text is rejected (no empty memory events).
+        assert!(matches!(
+            log.remember(&embedder, "   "),
+            Err(BossclawError::InvalidInput(_))
+        ));
     }
 
     #[test]
