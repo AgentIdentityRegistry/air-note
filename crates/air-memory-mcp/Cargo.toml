@@ -6,6 +6,10 @@ license = "Apache-2.0"
 description = "air-memory-mcp: an MCP stdio adapter exposing recall + remember over the bossclawd socket as a scoped MemoryClient (SP1)."
 repository = "https://github.com/AgentIdentityRegistry/air-note"
 
+[lib]
+name = "air_memory_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "air-memory-mcp"
 path = "src/main.rs"
