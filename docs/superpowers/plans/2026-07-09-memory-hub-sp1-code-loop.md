@@ -2,6 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Post-build corrections (2026-07-09, applied during subagent-driven execution — DONE; SP1 shipped):**
+> - **Task C3, Step 3 (`mcp.rs`):** the notification check MUST run BEFORE the `match method`, not as a trailing `_ if id.is_none() => None` fallthrough arm. As written in the Step 3 snippet below, a `tools/call` message with no `id` (a JSON-RPC notification) would still dispatch and EXECUTE the tool — including a `remember` write — then reply with `id:null`. Shipped fix: hoist `id.as_ref()?;` (short-circuit to `None`) immediately after computing `id`/`method`, above the method match, and drop the now-redundant fallthrough arm (commit `89d34be`; regression-guarded by `tools_call_notification_gets_no_reply_and_no_side_effect`, mutation-checked).
+> - **Task B1, Step 12:** the authz matrix is **4** `#[tokio::test]` functions, not "5" (a prose miscount; the Step 1 code block defines four).
+
 **Goal:** Let a coding agent, through a small Rust MCP adapter, `recall` AIR memories and `remember` new ones — safely (a scoped `MemoryClient` role the daemon enforces fail-closed), backed by the existing `bossclawd` daemon — proven end-to-end with no UI.
 
 **Architecture:** Three units land in order behind a single daemon socket. (U1) A `remember` write op: a new `EventLog::remember` core fn appends a signed `memory`-type event stamped `origin=external` (reusing the taint model) and derives its vector, exposed as `Request::Remember` → `EngineHandle::remember`. (U2) Per-op authorization: a connection `Role` established at the `Hello` handshake (default `App` = all ops, so the app is byte-for-byte unchanged), enforced fail-closed in the daemon's `dispatch` via a per-role op-allowlist; `MemoryClient` may invoke only `Recall`+`Remember`, and (a security bonus) cannot assert its own onboarding. (U3) A new workspace bin crate `air-memory-mcp`: a hand-rolled MCP-over-stdio JSON-RPC 2.0 server exposing exactly `recall` + `remember`, backed by the daemon socket as a `MemoryClient`, reusing `bossclawd-proto`'s frame codec + handshake verbatim (never reimplementing the wire protocol). (U4) End-to-end proof over the real socket + a documented `.mcp.json` wiring snippet.
@@ -833,7 +837,7 @@ Set `role: Role::App` (import `Role` where needed) at each:
 - [ ] **Step 12: Run the authz matrix + proto tests to verify they pass**
 
 Run: `cargo test -p bossclawd --test authz && cargo test -p bossclawd-proto`
-Expected: all green (5 authz tests + the proto suite incl. the two new `Role` tests).
+Expected: all green (4 authz tests + the proto suite incl. the two new `Role` tests).
 
 - [ ] **Step 13: Prove nothing else regressed (App path unchanged)**
 
