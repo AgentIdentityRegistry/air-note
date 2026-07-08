@@ -13,7 +13,9 @@
 use std::path::PathBuf;
 
 use bossclawd::server;
-use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, Request, Response, PROTO_VERSION};
+use bossclawd_proto::{
+    read_frame, write_frame, Hello, HelloOk, Request, Response, Role, PROTO_VERSION,
+};
 use tokio::net::UnixStream;
 
 /// A connected test client: holds one `UnixStream` and speaks the framed protocol over it.
@@ -27,7 +29,7 @@ impl Client {
     async fn connect(sock_path: &std::path::Path) -> Self {
         let mut stream = UnixStream::connect(sock_path).await.expect("connect to daemon socket");
         // Handshake: send Hello, expect HelloOk.
-        let hello = Hello { proto_version: PROTO_VERSION };
+        let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
         write_frame(&mut stream, &serde_json::to_vec(&hello).unwrap()).await.expect("send Hello");
         let reply = read_frame(&mut stream).await.expect("read HelloOk");
         let hello_ok: HelloOk = serde_json::from_slice(&reply).expect("parse HelloOk");

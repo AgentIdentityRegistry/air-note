@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, PROTO_VERSION};
+use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, Role, PROTO_VERSION};
 use tokio::net::UnixStream;
 
 /// Env override for the socket path (mirrors the daemon's `BOSSCLAWD_SOCKET`). MUST resolve to the
@@ -82,7 +82,7 @@ pub fn resolve_bin_path(current_exe: &Path) -> PathBuf {
 pub async fn probe(sock_path: &Path) -> bool {
     let attempt = async {
         let mut stream = UnixStream::connect(sock_path).await.ok()?;
-        let hello = Hello { proto_version: PROTO_VERSION };
+        let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
         let hello_bytes = serde_json::to_vec(&hello).ok()?;
         write_frame(&mut stream, &hello_bytes).await.ok()?;
         let reply = read_frame(&mut stream).await.ok()?;
