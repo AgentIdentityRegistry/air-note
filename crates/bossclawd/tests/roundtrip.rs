@@ -586,3 +586,59 @@ async fn set_active_model_reaches_the_engine_over_the_socket() {
         other => panic!("expected Err(Embedder), got {other:?}"),
     }
 }
+
+// ── SP1 / M1b: the coding-agent write op reaches the engine over the socket (A2). ──
+
+/// U1 over the wire: a `Remember` writes a memory the very next `Recall` surfaces
+/// (the memory is embeddable + the engine invalidates the recall index on write).
+///
+/// PRE-ARM the index first so this test is LOAD-BEARING on `remember`'s invalidation line.
+/// `remember` persists the event + its vector to the DB but touches NEITHER live index — both
+/// recall arms (in-memory HNSW vector + FTS keyword) are refreshed only by `rebuild_indexes`,
+/// which `ensure_indexed` runs solely while `indexed == false`. On a fresh brain `indexed` starts
+/// `false`, so a follow-up `recall` would rebuild regardless and the note would surface even if
+/// the invalidation line were deleted (an incidental pass). The warmup `recall` below drives
+/// `ensure_indexed` and flips `indexed == true`; from there ONLY `remember`'s
+/// `*self.indexed.lock().await = false` forces the rebuild that surfaces the new note (verified by
+/// mutation-testing: deleting that line turns this test red).
+#[tokio::test]
+async fn remember_then_recall_roundtrips_over_socket() {
+    let (_dir, sock) = spawn_daemon().await;
+    let mut client = Client::connect(&sock).await;
+
+    // Warm the recall index BEFORE writing, so `remember`'s invalidation is the thing under test.
+    match client.call(Request::Recall { onboarded: true, query: "warmup".to_string(), k: 5 }).await {
+        Response::Recall(_) => {} // empty is fine — the point is `ensure_indexed` ran (indexed=true).
+        other => panic!("expected Response::Recall (warmup), got {other:?}"),
+    }
+
+    let resp = client
+        .call(Request::Remember { onboarded: true, text: "aria novak ships rust".to_string() })
+        .await;
+    let event_id = match resp {
+        Response::Remember(id) => id,
+        other => panic!("expected Response::Remember, got {other:?}"),
+    };
+    assert!(!event_id.is_empty(), "Remember returns the new event id");
+
+    let hits = match client
+        .call(Request::Recall { onboarded: true, query: "aria rust".to_string(), k: 5 })
+        .await
+    {
+        Response::Recall(hits) => hits,
+        other => panic!("expected Response::Recall, got {other:?}"),
+    };
+    assert!(
+        hits.iter().any(|h| h.hit.event_id == event_id && h.text.contains("aria novak")),
+        "the remembered note is recalled with its hydrated snippet"
+    );
+
+    // Empty text is rejected (typed Rejected).
+    let err = client
+        .call(Request::Remember { onboarded: true, text: "   ".to_string() })
+        .await;
+    assert!(
+        matches!(err, Response::Err { kind: bossclawd_proto::OpErrorKindWire::Rejected, .. }),
+        "blank remember → Rejected, got {err:?}"
+    );
+}

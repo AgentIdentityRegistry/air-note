@@ -165,6 +165,9 @@ async fn dispatch(engine: &Arc<EngineHandle>, req: Request) -> Response {
                 Response::Recall(hits.into_iter().map(hit_wire).collect())
             })
         }
+        Request::Remember { onboarded, text } => {
+            op_result(engine.remember(onboarded, text).await, Response::Remember)
+        }
 
         // ── Evolve. ──
         Request::EvolveOnce { onboarded } => {

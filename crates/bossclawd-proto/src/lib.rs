@@ -149,6 +149,11 @@ pub enum Request {
     /// `EngineHandle::model_status` → `engine_model_status` (rung 2). Loaded-vs-intended model state
     /// + live re-index progress. Polled by the Settings language-pack card.
     ModelStatus { onboarded: bool },
+    /// `EngineHandle::remember` → the coding-agent write op (SP1 / M1b). Appends a signed
+    /// `memory`-type event stamped `origin=external` (recallable, never auto-trusted). No
+    /// Tauri command maps to it (it is reached only via the `air-memory-mcp` adapter as a
+    /// `MemoryClient`); `onboarded` mirrors every other op.
+    Remember { onboarded: bool, text: String },
 }
 
 /// One response from the daemon to the client. Each success variant carries the
@@ -215,6 +220,8 @@ pub enum Response {
     ReasonerReady(bool),
     /// `ModelStatus` result (rung 2) — the loaded-vs-intended model state + live re-index progress.
     ModelStatus(ModelStatusWire),
+    /// `Remember` result — the id of the newly appended `memory` event.
+    Remember(String),
     /// The engine is not onboarded (mirrors `EngineError::NotOnboarded`). A signal,
     /// not a fault — the UI shows onboarding.
     NotOnboarded,
@@ -494,6 +501,7 @@ mod protocol_tests {
                 acknowledged_loud: true,
             },
             Request::Teardown,
+            Request::Remember { onboarded: true, text: "remember me".to_string() },
             Request::GetReasonerConfig { onboarded: true },
             Request::GetReasonerReady { onboarded: true },
             Request::SetReasonerConfig {
@@ -540,6 +548,7 @@ mod protocol_tests {
             Response::ReasonerReady(true),
             Response::NotOnboarded,
             Response::Busy("ingest".to_string()),
+            Response::Remember("01J-REMEMBERED".to_string()),
             Response::Err {
                 kind: OpErrorKindWire::Core,
                 message: "something went wrong".to_string(),
