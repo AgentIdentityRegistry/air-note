@@ -4,8 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod claude_code;
+
 /// Status of the Claude Code integration on this machine.
-#[allow(dead_code)] // SP2: consumed by the claude_code adapter (Task 5/6)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeCodeStatus {
@@ -18,16 +19,16 @@ pub enum ClaudeCodeStatus {
 }
 
 /// The Claude Code config paths, resolved under a home dir (pure — tests pass a temp home).
-#[allow(dead_code)] // SP2: consumed by the claude_code adapter (Task 5/6)
 #[derive(Debug, Clone)]
 pub struct ClaudeCodePaths {
-    pub claude_dir: PathBuf,    // ~/.claude
-    pub claude_json: PathBuf,   // ~/.claude.json   (mcpServers)
+    pub claude_dir: PathBuf,  // ~/.claude
+    pub claude_json: PathBuf, // ~/.claude.json   (mcpServers)
+    #[allow(dead_code)] // SP2: read by connect/disconnect (Task 6/7)
     pub settings_json: PathBuf, // ~/.claude/settings.json (hooks.SessionStart)
 }
 
 impl ClaudeCodePaths {
-    #[allow(dead_code)] // SP2: consumed by the claude_code adapter (Task 5/6)
+    #[allow(dead_code)] // SP2: consumed by connect/disconnect (Task 6/7) + the Tauri command (Task 8)
     pub fn under(home: &Path) -> Self {
         Self {
             claude_dir: home.join(".claude"),
@@ -41,7 +42,6 @@ impl ClaudeCodePaths {
 /// if it parses, `Err` if it exists with real content that is malformed — so callers fail loud and
 /// NEVER clobber an unparseable user file (I5). (Reads follow a symlink, which is safe: the write
 /// path replaces the link rather than writing through it — see `atomic_write_0600`.)
-#[allow(dead_code)] // SP2: consumed by #[cfg(test)] tests + the claude_code adapter (Task 5/6)
 pub(crate) fn read_json_object(path: &Path) -> std::io::Result<Option<serde_json::Value>> {
     let bytes = match std::fs::read(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
