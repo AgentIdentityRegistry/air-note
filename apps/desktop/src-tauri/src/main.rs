@@ -223,6 +223,12 @@ fn main() {
             commands::engine::engine_set_active_model,
             #[cfg(unix)]
             commands::engine::engine_model_status,
+            #[cfg(unix)]
+            commands::integrations::integrations_status,
+            #[cfg(unix)]
+            commands::integrations::integrations_connect_claude_code,
+            #[cfg(unix)]
+            commands::integrations::integrations_disconnect_claude_code,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

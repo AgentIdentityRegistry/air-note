@@ -26,11 +26,9 @@ const ENV_BIN: &str = "BOSSCLAWD_BIN";
 /// The daemon binary's file name (co-bundled next to the app executable by the installer, Task 8).
 const BIN_NAME: &str = "bossclawd";
 /// Env override for the MCP-adapter binary path.
-#[allow(dead_code)] // SP2: consumed by resolve_memory_bin_path, wired by the upcoming Tauri connect command
 const ENV_MEMORY_BIN: &str = "AIR_MEMORY_MCP_BIN";
 /// The MCP-adapter binary's file name (co-bundled next to the app executable on the same rail as the
 /// daemon, SP2 Task 2).
-#[allow(dead_code)] // SP2: consumed by resolve_memory_bin_path, wired by the upcoming Tauri connect command
 const MEMORY_BIN_NAME: &str = "air-memory-mcp";
 // The socket-path consts (`BOSSCLAWD_SOCKET`, `bossclawd.sock`) live in the shared `bossclawd-paths`
 // crate, so the app resolves the SAME socket the daemon binds — by construction, not by convention.
@@ -87,7 +85,6 @@ pub fn resolve_bin_path(current_exe: &Path) -> PathBuf {
 /// override → exe sibling → parent-sibling dev fallback → the named sibling). SP2 one-click
 /// integration writes this absolute path into the Claude Code MCP config. Delegates to
 /// [`resolve_sibling_bin`].
-#[allow(dead_code)] // SP2: wired by the upcoming Tauri connect command (writes the path into MCP config)
 pub fn resolve_memory_bin_path(current_exe: &Path) -> PathBuf {
     resolve_sibling_bin(current_exe, MEMORY_BIN_NAME, ENV_MEMORY_BIN)
 }

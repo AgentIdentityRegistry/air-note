@@ -19,7 +19,6 @@ const HOOK_MARKER: &str = "air-memory-mcp";
 
 /// Read-only status: `NotFound` if Claude Code isn't detected, else `Connected` iff `~/.claude.json`
 /// parses and has `mcpServers["air-memory"]`. Lenient on malformed (→ `NotConnected`).
-#[allow(dead_code)] // SP2: consumed by connect/disconnect (Task 6/7) + the Tauri command (Task 8)
 pub fn detect(paths: &ClaudeCodePaths) -> std::io::Result<ClaudeCodeStatus> {
     let present = paths.claude_json.exists() || paths.claude_dir.exists();
     if !present {
@@ -110,7 +109,6 @@ fn ensure_array<'a>(
 /// (never replacing) and idempotently. **Both files are parsed + shape-validated BEFORE either is
 /// written** (I5): a malformed / oddly-shaped `settings.json` fails loud with `claude.json` left
 /// byte-unchanged — no partial write, no lying "nothing changed" (review MAJOR M3).
-#[allow(dead_code)] // SP2: consumed by the Tauri command (Task 8); live now via #[cfg(test)] tests
 pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io::Result<()> {
     // ── Phase 1: parse + validate + mutate IN MEMORY (no writes yet). ──
     let mut claude = read_json_object(&paths.claude_json)?.unwrap_or_else(|| serde_json::json!({}));
@@ -140,7 +138,6 @@ pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io
 /// Remove ONLY our `air-memory` MCP server + our SessionStart nudge group(s), preserving everything
 /// else. **Both files are parsed BEFORE either is written** (I5) — a malformed file fails loud with
 /// nothing clobbered. Absent files → nothing to do; only files we actually change are rewritten.
-#[allow(dead_code)] // SP2: consumed by the Tauri command (Task 8); live now via #[cfg(test)] tests
 pub fn disconnect(paths: &ClaudeCodePaths) -> std::io::Result<()> {
     // Parse both up front — a malformed file errors here, before any write.
     let claude = read_json_object(&paths.claude_json)?;

@@ -27,7 +27,6 @@ pub struct ClaudeCodePaths {
 }
 
 impl ClaudeCodePaths {
-    #[allow(dead_code)] // SP2: consumed by connect/disconnect (Task 6/7) + the Tauri command (Task 8)
     pub fn under(home: &Path) -> Self {
         Self {
             claude_dir: home.join(".claude"),
