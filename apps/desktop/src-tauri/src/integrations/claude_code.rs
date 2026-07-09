@@ -460,4 +460,32 @@ mod tests {
         let sj = read(&p.settings_json);
         assert_eq!(sj["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "foreign hook survives");
     }
+
+    #[test]
+    fn end_to_end_connect_disconnect_preserves_foreign_and_stays_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"chrome":{"command":"x"}}}"#).unwrap();
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node keep.mjs"}]}]}}"#,
+        )
+        .unwrap();
+
+        connect(&p, bin(), sock()).unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected);
+        assert_eq!(mode(&p.claude_json), 0o600);
+        assert_eq!(mode(&p.settings_json), 0o600);
+
+        disconnect(&p).unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::NotConnected);
+
+        let cj = read(&p.claude_json);
+        assert_eq!(cj["mcpServers"]["chrome"]["command"], "x", "foreign server survives the cycle");
+        let sj = read(&p.settings_json);
+        let groups = sj["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "only the foreign hook remains");
+        assert_eq!(groups[0]["hooks"][0]["command"], "node keep.mjs");
+    }
 }
