@@ -8,6 +8,8 @@ mod commands;
 mod engine;
 mod file_access;
 mod inbox;
+#[cfg(unix)]
+mod integrations;
 mod llm_stream;
 mod markitdown;
 mod secrets;
