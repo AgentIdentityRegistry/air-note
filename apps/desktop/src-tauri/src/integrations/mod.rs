@@ -23,7 +23,6 @@ pub enum ClaudeCodeStatus {
 pub struct ClaudeCodePaths {
     pub claude_dir: PathBuf,  // ~/.claude
     pub claude_json: PathBuf, // ~/.claude.json   (mcpServers)
-    #[allow(dead_code)] // SP2: read by connect/disconnect (Task 6/7)
     pub settings_json: PathBuf, // ~/.claude/settings.json (hooks.SessionStart)
 }
 
@@ -62,7 +61,6 @@ pub(crate) fn read_json_object(path: &Path) -> std::io::Result<Option<serde_json
 
 /// Serialize pretty + trailing newline (matches how editors/Claude Code leave these files). With the
 /// `preserve_order` feature on (Task 4 Step 1) existing keys keep their order — only our key is added.
-#[allow(dead_code)] // SP2: consumed by the claude_code adapter (Task 5/6)
 pub(crate) fn to_pretty(v: &serde_json::Value) -> Vec<u8> {
     let mut s = serde_json::to_string_pretty(v).expect("serialize json");
     s.push('\n');
@@ -74,7 +72,6 @@ pub(crate) fn to_pretty(v: &serde_json::Value) -> Vec<u8> {
 /// chmod-after, so the file is never briefly world-readable), fsync, then `rename` over the target
 /// (atomic within one filesystem; symlink-safe — `rename` replaces a symlinked target with our
 /// regular file, it does not write through the link) — I2. Std-only, zero new deps.
-#[allow(dead_code)] // SP2: consumed by #[cfg(test)] tests + the claude_code adapter (Task 5/6)
 pub(crate) fn atomic_write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -108,7 +105,6 @@ pub(crate) fn atomic_write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<
 /// Create `dir` (and parents) at mode 0700 **only if we create it**; a pre-existing dir keeps its
 /// perms untouched. For `~/.claude` on a fresh-file connect (review Low — the default umask would
 /// otherwise make a fresh `~/.claude` 0755). `DirBuilder`'s `mode` applies to the components it makes.
-#[allow(dead_code)] // SP2: consumed by the claude_code adapter (Task 5/6)
 pub(crate) fn make_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     if dir.exists() {
