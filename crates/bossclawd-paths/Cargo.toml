@@ -1,0 +1,12 @@
+[package]
+name = "bossclawd-paths"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Single source of truth for the bossclawd daemon's data-dir + Unix socket path resolution, shared verbatim by the daemon and its clients (the air-memory-mcp adapter) so the two can never drift."
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+
+# Deliberately dependency-free (std only). This crate holds OS filesystem-path conventions, which
+# do NOT belong in the wire-protocol crate (`bossclawd-proto`); a tiny dedicated crate keeps the
+# layering clean while letting both the daemon (`bossclawd`) and the adapter (`air-memory-mcp`)
+# import ONE implementation.

@@ -13,19 +13,6 @@ use bossclawd_proto::{
 };
 use tokio::net::UnixStream;
 
-// These four consts + `data_dir()`/`resolve_socket_path()` MUST stay in sync with the daemon's own
-// socket/data-dir resolution in `crates/bossclawd/src/main.rs`. If the daemon changes how it
-// resolves either, update BOTH. SP1 mirrors the logic deliberately rather than extracting a shared
-// crate — OS path logic does not belong in the wire-protocol crate, and this is not a live bug (a
-// follow-up may hoist a shared resolver).
-/// Env override for the socket path (mirrors the daemon's `BOSSCLAWD_SOCKET`).
-const ENV_SOCKET: &str = "BOSSCLAWD_SOCKET";
-/// Env override for the data dir (mirrors the daemon's `BOSSCLAWD_DATA_DIR`).
-const ENV_DATA_DIR: &str = "BOSSCLAWD_DATA_DIR";
-/// The socket file under the data dir (mirrors the daemon's `SOCKET_FILE`).
-const SOCKET_FILE: &str = "bossclawd.sock";
-/// The AIR Agent bundle dir name (mirrors the daemon's `APP_DIR_NAME`).
-const APP_DIR_NAME: &str = "ai.air-agent.desktop";
 /// Per-call connect + round-trip bound. Generous, but guarantees a wedged/absent daemon can never
 /// hang a tool call.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,39 +54,13 @@ impl DaemonError {
     }
 }
 
-/// Resolve the daemon socket path exactly as the daemon does: `BOSSCLAWD_SOCKET` if set, else
+/// Resolve the daemon socket path exactly as the daemon does — `BOSSCLAWD_SOCKET` if set, else
 /// `<data_dir>/bossclawd.sock`, where `data_dir` is `BOSSCLAWD_DATA_DIR` if set, else the platform
-/// app-data dir for the AIR Agent bundle id. A hand-wired `.mcp.json` typically sets
-/// `BOSSCLAWD_SOCKET` explicitly (see the crate README).
+/// app-data dir for the AIR Agent bundle id. Delegates to the shared `bossclawd-paths` crate so the
+/// adapter and the daemon can never resolve to different paths. A hand-wired `.mcp.json` typically
+/// sets `BOSSCLAWD_SOCKET` explicitly (see the crate README).
 pub fn resolve_socket_path() -> PathBuf {
-    if let Some(p) = std::env::var_os(ENV_SOCKET) {
-        return PathBuf::from(p);
-    }
-    data_dir().join(SOCKET_FILE)
-}
-
-/// The platform data dir (mirrors the daemon's `resolve_data_dir`/`app_data_dir`). Falls back to
-/// the current dir only if `HOME` is unset (a degraded environment).
-fn data_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os(ENV_DATA_DIR) {
-        return PathBuf::from(d);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join("Library/Application Support").join(APP_DIR_NAME);
-        }
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            return PathBuf::from(xdg).join(APP_DIR_NAME);
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(".local/share").join(APP_DIR_NAME);
-        }
-    }
-    PathBuf::from(".")
+    bossclawd_paths::resolve_socket_path(&bossclawd_paths::resolve_data_dir())
 }
 
 /// Open a fresh connection, handshake as [`Role::MemoryClient`], send `req`, read the `Response`.

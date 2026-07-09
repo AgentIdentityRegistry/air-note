@@ -41,6 +41,9 @@ bossclaw-core = { path = "../../../crates/bossclaw-core", features = ["ollama"] 
 # mirrors). Unix-only alongside the engine — the daemon transport is a Unix-socket protocol, and the
 # `SocketTransport`/`EngineClient` live under `engine/` which is already `#[cfg(unix)]`-gated.
 bossclawd-proto = { path = "../../../crates/bossclawd-proto" }
+# Single source of truth for the daemon socket/data-dir path resolution, shared with the daemon
+# (`bossclawd`) so the app's `resolve_socket_path` binds the SAME path the daemon serves.
+bossclawd-paths = { path = "../../../crates/bossclawd-paths" }
 zeroize = "1"
 
 # Single-instance guard (CF2): exactly one desktop process, so the in-process POLICY_LOCK is the

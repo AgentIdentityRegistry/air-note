@@ -37,6 +37,9 @@ tokio = { version = "1", features = ["full"] }
 # `signal`+`process` for the PID-liveness probe (lock.rs); `fs` for `umask` (socket 0600 bind in
 # main.rs); `user` for `geteuid` (the accept loop's same-uid peer-credential check in server.rs).
 nix = { version = "0.30", features = ["signal", "process", "fs", "user"] }
+# Single source of truth for data-dir + socket path resolution, shared with the air-memory-mcp
+# adapter so the two can never drift. Used only in `#[cfg(unix)] mod unix_main` (main.rs).
+bossclawd-paths = { path = "../bossclawd-paths" }
 thiserror = "1"
 # Memory/actuator engine — the daemon becomes the single owner. `features=["ollama"]`
 # mirrors the desktop crate so the copied engine modules build byte-identically.

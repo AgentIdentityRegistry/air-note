@@ -20,6 +20,9 @@ path = "src/main.rs"
 # proto's mirror types require it — an accepted trade for not duplicating the security-sensitive
 # wire format in a second language/crate.)
 bossclawd-proto = { path = "../bossclawd-proto" }
+# Single source of truth for daemon data-dir + socket path resolution, shared with the daemon
+# (`bossclawd`) so the adapter can never resolve to a path the daemon does not serve.
+bossclawd-paths = { path = "../bossclawd-paths" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Unix socket + async stdio. `current_thread` runtime is enough (MCP requests are serial); the

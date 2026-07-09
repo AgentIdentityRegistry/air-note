@@ -41,22 +41,16 @@ mod unix_main {
     use bossclawd::{lock, server, vault};
     use tokio::net::UnixListener;
 
-    /// Env override for the data dir (DB + socket + lock live here by default). Falls back to the
-    /// app's per-OS data dir for `ai.air-agent.desktop` so the daemon and app share ONE store.
-    const ENV_DATA_DIR: &str = "BOSSCLAWD_DATA_DIR";
-    /// Env override for the socket path (default: `<data_dir>/bossclawd.sock`).
-    const ENV_SOCKET: &str = "BOSSCLAWD_SOCKET";
     /// Env override for the embedder model dir (default: `<data_dir>/models/potion-base-8M`). NOT a
     /// Tauri `resource_dir` — the daemon locates the bundled model via this env / install path.
     const ENV_MODEL_DIR: &str = "BOSSCLAWD_MODEL_DIR";
     /// The lock file name under the data dir (advisory single-owner lock; the socket bind is authoritative).
     const LOCK_FILE: &str = "bossclawd.lock";
-    /// The default socket file name under the data dir.
-    const SOCKET_FILE: &str = "bossclawd.sock";
 
-    /// The app's data-dir folder name (its Tauri bundle identifier). Used to derive the default data
-    /// dir so the daemon lands on the SAME `ai.air-agent.desktop` store the app uses.
-    const APP_DIR_NAME: &str = "ai.air-agent.desktop";
+    // The data-dir + socket consts (`BOSSCLAWD_DATA_DIR`, `BOSSCLAWD_SOCKET`, the `bossclawd.sock`
+    // socket file, the `ai.air-agent.desktop` bundle id) and their resolution live in the shared
+    // `bossclawd-paths` crate, so the daemon and the `air-memory-mcp` adapter resolve them identically
+    // (a drift would leave the adapter looking for the daemon at the wrong path).
 
     pub fn run() {
         // Scrubbing panic hook (egress-security review L-2): a panic PAYLOAD can embed engine
@@ -79,7 +73,7 @@ mod unix_main {
             eprintln!("bossclawd: cannot create data dir {}: {e}", data_dir.display());
             std::process::exit(1);
         }
-        let sock_path = resolve_socket_path(&data_dir);
+        let sock_path = bossclawd_paths::resolve_socket_path(&data_dir);
         let lock_path = data_dir.join(LOCK_FILE);
         // Rung-2 resolution inputs: the env override (dev/harness, highest priority), the bundled
         // English default dir, and the models root under which a downloaded language pack is staged.
@@ -178,42 +172,23 @@ mod unix_main {
     /// `ai.air-agent.desktop` (macOS `~/Library/Application Support/<id>`, Linux
     /// `$XDG_DATA_HOME|~/.local/share/<id>`). Falls back to the current dir if HOME is unset
     /// (a headless/degraded environment) so the daemon still starts rather than panicking.
+    ///
+    /// The env-name const + the per-OS resolution live in `bossclawd-paths` (shared verbatim with
+    /// the `air-memory-mcp` adapter). This wrapper adds the daemon-specific launchd/systemd log on
+    /// the degraded `.` fallback — the pure `bossclawd_paths::resolve_data_dir` does not log.
     fn resolve_data_dir() -> PathBuf {
-        if let Some(dir) = std::env::var_os(ENV_DATA_DIR) {
+        if let Some(dir) = std::env::var_os(bossclawd_paths::ENV_DATA_DIR) {
             return PathBuf::from(dir);
         }
-        app_data_dir().unwrap_or_else(|| {
+        bossclawd_paths::app_data_dir().unwrap_or_else(|| {
             // Visible in launchd/systemd logs so a degraded environment is diagnosable, not silent.
             eprintln!(
                 "bossclawd: HOME is unset; falling back to the current directory for data \
-                 (degraded environment — set {ENV_DATA_DIR} to pin the store location)"
+                 (degraded environment — set {} to pin the store location)",
+                bossclawd_paths::ENV_DATA_DIR
             );
             PathBuf::from(".")
         })
-    }
-
-    /// The app's platform data dir for the AIR Agent bundle id (matches Tauri's `app_data_dir`).
-    #[cfg(target_os = "macos")]
-    fn app_data_dir() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join("Library/Application Support").join(APP_DIR_NAME))
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    fn app_data_dir() -> Option<PathBuf> {
-        // XDG base-dir spec: $XDG_DATA_HOME, else ~/.local/share.
-        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-            return Some(PathBuf::from(xdg).join(APP_DIR_NAME));
-        }
-        let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".local/share").join(APP_DIR_NAME))
-    }
-
-    /// Socket path: `BOSSCLAWD_SOCKET` if set, else `<data_dir>/bossclawd.sock`.
-    fn resolve_socket_path(data_dir: &std::path::Path) -> PathBuf {
-        std::env::var_os(ENV_SOCKET)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data_dir.join(SOCKET_FILE))
     }
 
     /// Bundled English model dir: `BOSSCLAWD_MODEL_DIR` (dev/harness override) if set, else the
