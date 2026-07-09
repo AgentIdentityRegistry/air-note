@@ -51,11 +51,12 @@ SP1 made the loop *possible* but *manual*: the user must locate the built `air-m
 
 ## 4. Design principles / invariants
 
-- **I1 — Merge, never replace.** Every foreign key in `~/.claude.json` and every foreign hook in `~/.claude/settings.json` is preserved byte-for-byte in meaning. We only add/remove our own `air-memory` mcpServers key and our own SessionStart group.
+- **I1 — Merge, never replace (and keep key order).** Every foreign key in `~/.claude.json` and every foreign hook in `~/.claude/settings.json` is preserved — including existing **key order** (serde `preserve_order`, so merging the user's large real config only appends our key rather than alphabetizing the whole file). We only add/remove our own `air-memory` mcpServers key and our own SessionStart group.
 - **I2 — Atomic + `0600`, no world-readable window.** Write a temp file *in the same directory* as the target, born `0600` (created with mode `0o600`, never chmod-after), `fsync`, then `rename` over the original (atomic within one filesystem). A crash leaves either the old file or the new file, never a truncated one, and never a readable-by-others temp.
-- **I3 — Idempotent.** Connecting twice yields exactly one mcpServers entry and one SessionStart group. `remember`-style de-dup: mcpServers keyed by the name `air-memory`; the hook de-duped by matching our binary in the command string.
-- **I4 — Reversible + surgical.** Disconnect removes *only* the `air-memory` mcpServers key and *only* the SessionStart group whose inner command references our binary — verified by a test that seeds foreign entries and asserts they survive.
-- **I5 — Fail loud, fail closed.** If a target file exists but is malformed JSON, **refuse** and report ("couldn't parse `<path>`; nothing changed") — never clobber. If Claude Code isn't detected, say so and don't scatter stray files.
+- **I3 — Idempotent.** Connecting twice yields exactly one mcpServers entry and one SessionStart group. De-dup: mcpServers keyed by the name `air-memory`; the hook de-duped by matching a command that runs our binary **with the `nudge` subcommand**.
+- **I4 — Reversible + surgical.** Disconnect removes *only* the `air-memory` mcpServers key and *only* the SessionStart group whose inner command runs our binary **with `nudge`** (both required — a foreign hook that merely mentions the string survives) — verified by a test that seeds foreign entries and asserts they survive.
+- **I5 — Fail loud, fail closed, no partial write.** If a target file exists but is malformed JSON, **refuse** and report ("couldn't parse `<path>`; nothing changed") — never clobber. **Both config files are parsed + shape-validated before EITHER is written**, so a malformed/oddly-shaped second file leaves the first byte-unchanged (no partial write, no lying "nothing changed"). If Claude Code isn't detected, say so and don't scatter stray files.
+- **I8 — Injection-safe hook.** The SessionStart hook `command` is shell-executed by Claude Code, so the binary path is POSIX **single-quote-escaped** (single quotes neutralize `"`/`$`/backtick/`\`) — a path metacharacter (or a hostile `AIR_MEMORY_MCP_BIN`) cannot inject a command. The mcpServers `command` is spawned as argv, so it needs no escaping.
 - **I6 — Pure logic over injected paths.** The merge/detect/atomic-write logic is plain functions taking file paths (and the binary + socket paths) as arguments — hermetic, temp-dir tested, no process-global env or real `$HOME`. The Tauri command is a thin wrapper that resolves the real paths and calls them (mirrors `bossclawd-paths`'s `*_from` split).
 - **I7 — Agent-adapter seam.** Claude Code is one adapter today; Codex drops in as a second adapter (TOML) with **no** change to the Tauri command layer or the shared atomic-write/status types, and **no** dead code shipped now (just a labeled seam).
 
@@ -92,9 +93,9 @@ air-memory-mcp bundled sibling               ~/.claude/settings.json (SessionSta
 1. User opens **Settings ▸ Integrations**, sees Claude Code = *Not connected*, clicks **Connect**.
 2. Frontend calls `integrations_connect_claude_code()`.
 3. Backend resolves: our binary (`resolve_memory_bin_path(current_exe)`), the socket (`bossclawd_paths::resolve_socket_path(resolve_data_dir())`), and the two config paths from `$HOME`.
-4. For each file: read (or note absent) → parse JSON (refuse on malformed, I5) → merge our entry idempotently (I1/I3) → `atomic_write_0600` (I2).
-   - `~/.claude.json`: `mcpServers["air-memory"] = { type:"stdio", command:<binary>, args:[], env:{ BOSSCLAWD_SOCKET:<socket> } }`.
-   - `~/.claude/settings.json`: append to `hooks.SessionStart` the group `{ hooks:[{ type:"command", command:"\"<binary>\" nudge", timeout:5 }] }`.
+4. Parse + validate BOTH files first (refuse on malformed, I5 — no partial write), merge in memory (I1/I3), then `atomic_write_0600` both (I2).
+   - `~/.claude.json`: `mcpServers["air-memory"] = { type:"stdio", command:<binary>, args:[], env:{ BOSSCLAWD_SOCKET:<socket> } }` (the `command` is spawned as argv, not shell).
+   - `~/.claude/settings.json`: append to `hooks.SessionStart` the group `{ hooks:[{ type:"command", command:"<single-quote-escaped binary> nudge", timeout:5 }] }` — the hook string IS shell-run, so the path is single-quote-escaped (I8, injection-safe).
 5. Returns a `ConnectReport` (per-file: written / already-present / created-fresh).
 6. Panel re-reads status → **Connected**. (Takes effect on Claude Code's *next* session — see the known limitation.)
 
@@ -105,9 +106,10 @@ air-memory-mcp bundled sibling               ~/.claude/settings.json (SessionSta
 | `~/.claude.json` or `settings.json` is malformed JSON | Refuse; report "couldn't parse `<path>`; nothing changed". No clobber (I5). |
 | Claude Code not detected (neither `~/.claude.json` nor `~/.claude/` exists) | Status `ClaudeCodeNotFound`; Connect disabled with "Install Claude Code first" — don't create stray files. |
 | Config file absent but Claude Code detected (e.g. only `~/.claude/` exists) | Create the missing file fresh, `0600`, containing only our entry. |
-| Partial write (file 1 written, file 2 fails) | Report per-file result; connect is idempotent so a re-click self-heals; disconnect tolerates a missing half. |
+| Malformed / odd-shaped 2nd file (valid 1st) | Both files are parsed + validated BEFORE either is written, so the 1st is left byte-unchanged and the error is honest (no partial write, I5). Only a mid-write I/O failure on the 2nd file is a residual partial case (rare; two files can't be truly atomic) — a re-click self-heals (idempotent). |
 | Disconnect when not connected | No-op success (report "nothing to remove"). |
-| Claude Code is *running* at click time | New server/hook takes effect on its **next** session. Small race: a live Claude Code could rewrite `~/.claude.json` and lose our merge (same window `claude mcp add` has) — documented, low-risk. |
+| Claude Code is *running* at click time | New server/hook takes effect on its **next** session. Real race: Claude Code writes `~/.claude.json` frequently, so a live session can overwrite our merge, or our whole-file rewrite can roll back state it wrote between our read and our rename. `preserve_order` + a minimal footprint shrink the diff but not the window. Mitigation: the panel + README tell the user to **quit Claude Code before connecting**; effect is next-session regardless. (A file lock is out of scope.) |
+| AIR Agent moved / uninstalled after Connect | The written config points at the app's bundled binary; if the app is gone, Claude Code's `air-memory` server + the SessionStart hook fail to spawn each session. Mitigation: panel + README say **Disconnect before moving/uninstalling**; auto-heal is out of scope (SP3+). |
 | Daemon down when a future Claude Code session calls a tool | Not SP2's concern — SP1's adapter already returns a clean "memory service unavailable". |
 
 ## 9. Testing strategy
@@ -124,10 +126,14 @@ air-memory-mcp bundled sibling               ~/.claude/settings.json (SessionSta
 - **Codex build** — a follow-up second adapter (`~/.codex/config.toml`, `[mcp_servers.air-memory]` + its AGENTS.md/nudge equivalent, needs the `toml` crate). SP2 ships only the labeled seam.
 - **Per-project `.mcp.json`** and any project-targeting UI.
 - **Cryptographic role-proof / capability tokens** (SP1.x "Strict").
-- **Hot-applying to a running Claude Code** (documented limitation; effect is next-session).
+- **Hot-applying to a running Claude Code** (documented limitation; effect is next-session; the panel + README say to quit Claude Code before connecting).
+- **Auto-cleanup on app move/uninstall** — the written config points at the app's bundled binary; the panel + README say to Disconnect before moving/uninstalling. A version-independent shim / auto-heal is out of scope (SP3+).
 - Any change to the app's own daemon connection or to SP1's adapter server behavior (only the additive `nudge` subcommand).
 
 ## 11. Open questions to resolve during planning
+
+**Resolved (planning + pre-code architect/critic/security review, 2026-07-10):** config-writer = a `src-tauri/src/integrations/` module (Q1); 3-state status, "Connected" = mcpServers present (Q2); file-presence detection + block-with-hint (Q3); `nudge` subcommand not a script file (Q4); atomic write = **std-only** born-0600 (`tempfile` is dev-only, Q5). Review also locked: `serde_json/preserve_order` (no whole-file reorder), validate-both-before-write (no partial write, I5), single-quote-escaped hook (I8), `0700` `~/.claude`, over-removal-safe removal marker (I4), adapter-binary existence check, honest running-Claude/uninstall copy. The original questions are recorded below.
+
 
 1. **Config-writer home:** a `src-tauri/src/integrations/` module (simplest; Codex is also desktop-driven) vs a small shared crate. Decide by real reuse — default to the module.
 2. **`Status` granularity:** three states (`NotFound`/`NotConnected`/`Connected`) vs adding `PartiallyConnected` for a half-written prior run. How "Connected" is defined — mcpServers entry present (essential) vs both entries present. Default: 3 states, "Connected" = mcpServers entry present, connect always ensures both; the panel can sub-note a missing hook.
