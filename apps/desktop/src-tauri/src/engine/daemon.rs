@@ -25,6 +25,13 @@ use tokio::net::UnixStream;
 const ENV_BIN: &str = "BOSSCLAWD_BIN";
 /// The daemon binary's file name (co-bundled next to the app executable by the installer, Task 8).
 const BIN_NAME: &str = "bossclawd";
+/// Env override for the MCP-adapter binary path.
+#[allow(dead_code)] // SP2: consumed by resolve_memory_bin_path, wired by the upcoming Tauri connect command
+const ENV_MEMORY_BIN: &str = "AIR_MEMORY_MCP_BIN";
+/// The MCP-adapter binary's file name (co-bundled next to the app executable on the same rail as the
+/// daemon, SP2 Task 2).
+#[allow(dead_code)] // SP2: consumed by resolve_memory_bin_path, wired by the upcoming Tauri connect command
+const MEMORY_BIN_NAME: &str = "air-memory-mcp";
 // The socket-path consts (`BOSSCLAWD_SOCKET`, `bossclawd.sock`) live in the shared `bossclawd-paths`
 // crate, so the app resolves the SAME socket the daemon binds — by construction, not by convention.
 
@@ -43,30 +50,46 @@ pub fn resolve_socket_path(app_data_dir: &Path) -> PathBuf {
     bossclawd_paths::resolve_socket_path(app_data_dir)
 }
 
-/// Resolve the daemon binary: `BOSSCLAWD_BIN` if set, else a sibling of the current executable
-/// (`<exe_dir>/bossclawd`, where the installer co-locates it — co-signed with the app, Task 0.5/8),
-/// with a dev fallback to the cargo target dir (`<exe_dir>/../bossclawd` — e.g. from
-/// `target/debug/air_agent_desktop` up to `target/debug/bossclawd`). Returns the first candidate
-/// that exists, or the sibling path unconditionally if none exists (so the spawn attempt surfaces a
-/// clear "not found" rather than this returning nothing). Pure given `current_exe` + the env.
-pub fn resolve_bin_path(current_exe: &Path) -> PathBuf {
-    if let Some(p) = std::env::var_os(ENV_BIN) {
+/// Resolve a sibling binary bundled next to the app executable: `env_var` override → a sibling of
+/// the current executable (`<exe_dir>/<bin_name>`, where the installer co-locates it — co-signed with
+/// the app, Task 0.5/8), with a dev fallback to the parent dir (`<exe_dir>/../<bin_name>` — e.g. from
+/// `target/debug/air_agent_desktop` up to `target/debug/<bin_name>`). Returns the first candidate
+/// that exists, or the primary sibling path unconditionally if none exists (so a later spawn attempt
+/// surfaces a clear "not found" rather than this returning nothing). Single source for both the
+/// daemon and the MCP-adapter binaries (DRY). Pure given `current_exe` + the env.
+fn resolve_sibling_bin(current_exe: &Path, bin_name: &str, env_var: &str) -> PathBuf {
+    if let Some(p) = std::env::var_os(env_var) {
         return PathBuf::from(p);
     }
     let exe_dir = current_exe.parent().unwrap_or_else(|| Path::new("."));
-    let sibling = exe_dir.join(BIN_NAME);
+    let sibling = exe_dir.join(bin_name);
     if sibling.exists() {
         return sibling;
     }
-    // Dev fallback: `cargo run` puts both binaries in the SAME target dir, so the sibling above
-    // already covers `cargo run`. This extra hop covers a nested-exe-dir layout (e.g. an .app
+    // Dev fallback: `cargo run` puts the sibling binaries in the SAME target dir, so the sibling
+    // above already covers `cargo run`. This extra hop covers a nested-exe-dir layout (e.g. an .app
     // bundle's `MacOS/` next to a sibling `Resources/`); it is a best-effort convenience only.
-    let parent_sibling = exe_dir.parent().map(|p| p.join(BIN_NAME));
+    let parent_sibling = exe_dir.parent().map(|p| p.join(bin_name));
     match parent_sibling {
         Some(p) if p.exists() => p,
         // Nothing found — return the primary (sibling) candidate so a later spawn error names it.
         _ => sibling,
     }
+}
+
+/// Resolve the `bossclawd` daemon binary next to the app executable (`BOSSCLAWD_BIN` override → exe
+/// sibling → parent-sibling dev fallback → the named sibling). Delegates to [`resolve_sibling_bin`].
+pub fn resolve_bin_path(current_exe: &Path) -> PathBuf {
+    resolve_sibling_bin(current_exe, BIN_NAME, ENV_BIN)
+}
+
+/// Resolve the `air-memory-mcp` adapter binary next to the app executable (`AIR_MEMORY_MCP_BIN`
+/// override → exe sibling → parent-sibling dev fallback → the named sibling). SP2 one-click
+/// integration writes this absolute path into the Claude Code MCP config. Delegates to
+/// [`resolve_sibling_bin`].
+#[allow(dead_code)] // SP2: wired by the upcoming Tauri connect command (writes the path into MCP config)
+pub fn resolve_memory_bin_path(current_exe: &Path) -> PathBuf {
+    resolve_sibling_bin(current_exe, MEMORY_BIN_NAME, ENV_MEMORY_BIN)
 }
 
 /// Probe `sock_path` for a LIVE daemon: connect + do the `Hello`/`HelloOk` handshake, bounded by
@@ -243,6 +266,27 @@ mod tests {
         std::fs::write(&sibling, b"daemon").unwrap();
         let got = resolve_bin_path(&exe);
         assert_eq!(got, sibling);
+    }
+
+    // ONE test (not two) so the process-global AIR_MEMORY_MCP_BIN can't race a sibling test (review
+    // Minor — set/remove of a shared env var across parallel tests is a latent flake).
+    #[test]
+    fn resolve_memory_bin_env_override_then_sibling_default() {
+        {
+            let _g = EnvGuard::set("AIR_MEMORY_MCP_BIN", "/opt/bin/air-memory-mcp");
+            assert_eq!(
+                resolve_memory_bin_path(Path::new("/apps/AIR.app/Contents/MacOS/air_agent_desktop")),
+                PathBuf::from("/opt/bin/air-memory-mcp"),
+                "env override wins"
+            );
+        } // _g drops here, restoring/removing the var before the next assertion
+        let _g = EnvGuard::remove("AIR_MEMORY_MCP_BIN");
+        // No override + no sibling on disk → the primary sibling candidate (named, for a later spawn
+        // error). Same contract the bossclawd resolver's default test asserts.
+        assert_eq!(
+            resolve_memory_bin_path(Path::new("/nonexistent/dir/air_agent_desktop")),
+            PathBuf::from("/nonexistent/dir/air-memory-mcp"),
+        );
     }
 
     #[tokio::test]
