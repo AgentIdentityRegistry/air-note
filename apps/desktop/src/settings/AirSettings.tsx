@@ -3,6 +3,7 @@ import { Button } from "../components/Button";
 import { resetIdentity } from "../api/tauri";
 import { useIdentity } from "../state/identity";
 import { SourcesPanel } from "../sources/SourcesPanel";
+import { IntegrationsPanel } from "./IntegrationsPanel";
 
 export function AirSettings() {
   const { refresh } = useIdentity();
@@ -18,6 +19,7 @@ export function AirSettings() {
       <h2 style={{ margin: 0 }}>Settings</h2>
 
       <SourcesPanel />
+      <IntegrationsPanel />
 
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Danger Zone</div>
