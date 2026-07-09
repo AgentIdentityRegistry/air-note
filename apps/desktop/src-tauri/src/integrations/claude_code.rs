@@ -137,6 +137,44 @@ pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io
     Ok(())
 }
 
+/// Remove ONLY our `air-memory` MCP server + our SessionStart nudge group(s), preserving everything
+/// else. **Both files are parsed BEFORE either is written** (I5) — a malformed file fails loud with
+/// nothing clobbered. Absent files → nothing to do; only files we actually change are rewritten.
+#[allow(dead_code)] // SP2: consumed by the Tauri command (Task 8); live now via #[cfg(test)] tests
+pub fn disconnect(paths: &ClaudeCodePaths) -> std::io::Result<()> {
+    // Parse both up front — a malformed file errors here, before any write.
+    let claude = read_json_object(&paths.claude_json)?;
+    let settings = read_json_object(&paths.settings_json)?;
+
+    let claude_out = claude.and_then(|mut root| {
+        let removed = root
+            .get_mut("mcpServers")
+            .and_then(|m| m.as_object_mut())
+            .is_some_and(|servers| servers.remove(MCP_SERVER_KEY).is_some());
+        removed.then_some(root)
+    });
+    let settings_out = settings.and_then(|mut root| {
+        let changed = root
+            .get_mut("hooks")
+            .and_then(|h| h.get_mut("SessionStart"))
+            .and_then(|s| s.as_array_mut())
+            .is_some_and(|starts| {
+                let before = starts.len();
+                starts.retain(|g| !is_our_hook_group(g));
+                starts.len() != before
+            });
+        changed.then_some(root)
+    });
+
+    if let Some(root) = claude_out {
+        atomic_write_0600(&paths.claude_json, &to_pretty(&root))?;
+    }
+    if let Some(root) = settings_out {
+        atomic_write_0600(&paths.settings_json, &to_pretty(&root))?;
+    }
+    Ok(())
+}
+
 fn invalid(path: &Path, why: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -359,5 +397,70 @@ mod tests {
             "claude.json must be byte-unchanged when settings.json is malformed"
         );
         assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::NotConnected);
+    }
+
+    #[test]
+    fn disconnect_removes_only_ours_and_keeps_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(
+            &p.claude_json,
+            br#"{"mcpServers":{"chrome":{"command":"x"}},"top":1}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node other.mjs"}]}]}}"#,
+        )
+        .unwrap();
+        connect(&p, bin(), sock()).unwrap();
+
+        disconnect(&p).unwrap();
+
+        let cj = read(&p.claude_json);
+        assert!(cj["mcpServers"][MCP_SERVER_KEY].is_null(), "our server removed");
+        assert_eq!(cj["mcpServers"]["chrome"]["command"], "x", "foreign server kept");
+        assert_eq!(cj["top"], 1, "foreign top-level key kept");
+
+        let sj = read(&p.settings_json);
+        let groups = sj["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "only the foreign hook remains");
+        assert_eq!(groups[0]["hooks"][0]["command"], "node other.mjs");
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::NotConnected);
+    }
+
+    #[test]
+    fn disconnect_is_a_noop_when_not_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"chrome":{}}}"#).unwrap();
+        disconnect(&p).unwrap(); // must not error
+        assert!(read(&p.claude_json)["mcpServers"]["chrome"].is_object());
+    }
+
+    #[test]
+    fn disconnect_refuses_malformed_without_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, b"not json {").unwrap();
+        assert!(disconnect(&p).is_err());
+        assert_eq!(std::fs::read(&p.claude_json).unwrap(), b"not json {");
+    }
+
+    #[test]
+    fn disconnect_keeps_foreign_hook_that_merely_mentions_the_marker() {
+        // A user hook whose command contains "air-memory-mcp" but NOT the nudge subcommand is NOT ours.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash air-memory-mcp-audit.sh"}]}]}}"#,
+        )
+        .unwrap();
+        disconnect(&p).unwrap();
+        let sj = read(&p.settings_json);
+        assert_eq!(sj["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "foreign hook survives");
     }
 }
