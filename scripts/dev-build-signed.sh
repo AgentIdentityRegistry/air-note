@@ -65,6 +65,15 @@ mkdir -p "${SIDECAR_DIR}"
 cp -f "target/debug/bossclawd" "${SIDECAR_PATH}"
 echo "Staged sidecar: ${SIDECAR_PATH}"
 
+# --- 1b. Build + stage the air-memory-mcp sidecar (SP2) --------------------
+# Same externalBin rail as bossclawd: Tauri copies it to Contents/MacOS/air-memory-mcp,
+# the sibling-of-exe path resolve_memory_bin_path() resolves at runtime.
+readonly MEMORY_SIDECAR_PATH="${SIDECAR_DIR}/air-memory-mcp-${TARGET_TRIPLE}"
+echo "Building air-memory-mcp (debug) for ${TARGET_TRIPLE}…"
+cargo build -p air-memory-mcp
+cp -f "target/debug/air-memory-mcp" "${MEMORY_SIDECAR_PATH}"
+echo "Staged sidecar: ${MEMORY_SIDECAR_PATH}"
+
 # --- 2. Build the .app, merging the bundle-only externalBin config -----------
 # `--config tauri.bundle.conf.json` (path relative to src-tauri, the tauri CLI's
 # cwd) merges externalBin at bundle time only, so Tauri bundles the sidecar into
@@ -82,6 +91,12 @@ codesign --force --deep --sign "$APPLE_SIGNING_IDENTITY" "$APP"
 DAEMON_BIN="${APP}/Contents/MacOS/bossclawd"
 [ -x "${DAEMON_BIN}" ] || { echo "ERROR: bundled daemon missing at ${DAEMON_BIN} (externalBin not bundled?)" >&2; exit 1; }
 codesign --force --identifier "${APP_IDENTIFIER}" --sign "$APPLE_SIGNING_IDENTITY" "${DAEMON_BIN}"
+
+# The air-memory-mcp sidecar needs no identifier override (it never reads the
+# engine DEK — it talks to bossclawd over the socket), so just assert the
+# externalBin actually bundled it next to the app exe.
+MEMORY_BIN="${APP}/Contents/MacOS/air-memory-mcp"
+[ -x "${MEMORY_BIN}" ] || { echo "ERROR: bundled air-memory-mcp missing at ${MEMORY_BIN} (externalBin not bundled?)" >&2; exit 1; }
 
 # --- 5. Verify -------------------------------------------------------------
 codesign --verify --verbose=2 "$APP"
