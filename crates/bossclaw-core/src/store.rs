@@ -21,7 +21,7 @@ impl Store {
     pub fn open(path: &Path, dek: &[u8; 32]) -> Result<Self, BossclawError> {
         let conn = Connection::open(path)?;
         let key_hex = Zeroizing::new(hex::encode(dek));
-        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\"", &*key_hex));
+        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\"", *key_hex));
         conn.execute_batch(&pragma)?;
         // Force a read so a wrong key errors here (SQLCipher is lazy otherwise).
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
