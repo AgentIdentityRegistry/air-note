@@ -308,6 +308,21 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
         Request::ModelStatus { onboarded } => {
             Response::ModelStatus(model_status_wire(engine.model_status(onboarded).await))
         }
+
+        // SP3 ops — dispatch arms land with their features (tasks A10–A13). Until then these
+        // return a typed error so the enum stays exhaustively matched (no `_` catch-all).
+        Request::CaptureNotify { .. }
+        | Request::Snapshot { .. }
+        | Request::ListSessions { .. }
+        | Request::GetSession { .. }
+        | Request::DeleteSession { .. }
+        | Request::ListNotes { .. }
+        | Request::SupersedeNote { .. }
+        | Request::RecallStats { .. }
+        | Request::SetCaptureEnabled { .. }
+        | Request::CaptureEnabled { .. } => {
+            protocol_err("not yet supported by this daemon".to_string())
+        }
     }
 }
 
