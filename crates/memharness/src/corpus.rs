@@ -46,7 +46,7 @@ pub fn manifest_sha(manifest: &CorpusManifest) -> String {
         hasher.update(e.page_id.as_bytes());
         hasher.update([0]);
         hasher.update(e.sha256.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(*b"\n");
     }
     format!("{:x}", hasher.finalize())
 }
