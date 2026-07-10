@@ -35,7 +35,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use bossclawd::{lock, server};
-use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, Request, Response, PROTO_VERSION};
+use bossclawd_proto::{
+    read_frame, write_frame, Hello, HelloOk, Request, Response, Role, PROTO_VERSION,
+};
 use tokio::net::{UnixListener, UnixStream};
 
 /// A generous per-await test bound: every op answers near-instantly against the mock providers, so
@@ -81,7 +83,7 @@ async fn second_bind_on_live_socket_is_addr_in_use() {
 
     // Sanity: the live daemon answers a real handshake (it truly owns the socket).
     let mut stream = bounded(UnixStream::connect(&sock)).await.expect("connect to live daemon");
-    let hello = Hello { proto_version: PROTO_VERSION };
+    let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
     bounded(write_frame(&mut stream, &serde_json::to_vec(&hello).unwrap()))
         .await
         .expect("send Hello");
@@ -155,7 +157,7 @@ async fn version_skew_hello_is_closed_without_hello_ok() {
     let mut stream = bounded(UnixStream::connect(&sock)).await.expect("connect");
 
     // A client from the FUTURE: one version ahead. (u32 = 1 today, so +1 = 2 — no overflow.)
-    let skewed = Hello { proto_version: PROTO_VERSION + 1 };
+    let skewed = Hello { proto_version: PROTO_VERSION + 1, role: Role::App };
     bounded(write_frame(&mut stream, &serde_json::to_vec(&skewed).unwrap()))
         .await
         .expect("send skewed Hello");
@@ -219,7 +221,7 @@ impl RawClient {
     /// Connect + do the `Hello`/`HelloOk` handshake, asserting a matching-version `HelloOk`.
     async fn connect(sock: &std::path::Path) -> Self {
         let mut stream = bounded(UnixStream::connect(sock)).await.expect("connect to daemon socket");
-        let hello = Hello { proto_version: PROTO_VERSION };
+        let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
         bounded(write_frame(&mut stream, &serde_json::to_vec(&hello).unwrap()))
             .await
             .expect("send Hello");

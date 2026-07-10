@@ -489,6 +489,8 @@ fn op_error_from_wire(kind: OpErrorKindWire, message: String) -> EngineOpError {
         OpErrorKindWire::KeystoreDbMismatch => {
             EngineOpError::Open(EngineError::KeystoreDbMismatch(message))
         }
+        // The app is always `App`, so it never receives this; the arm keeps the match exhaustive.
+        OpErrorKindWire::NotPermitted => EngineOpError::Core(message),
     }
 }
 

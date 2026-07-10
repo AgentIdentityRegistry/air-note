@@ -18,18 +18,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, PROTO_VERSION};
+use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, Role, PROTO_VERSION};
 use tokio::net::UnixStream;
 
-/// Env override for the socket path (mirrors the daemon's `BOSSCLAWD_SOCKET`). MUST resolve to the
-/// same path the daemon binds, so both sides agree without further coordination.
-const ENV_SOCKET: &str = "BOSSCLAWD_SOCKET";
 /// Env override for the daemon binary path.
 const ENV_BIN: &str = "BOSSCLAWD_BIN";
-/// The default socket file name under the app data dir (mirrors the daemon's `SOCKET_FILE`).
-const SOCKET_FILE: &str = "bossclawd.sock";
 /// The daemon binary's file name (co-bundled next to the app executable by the installer, Task 8).
 const BIN_NAME: &str = "bossclawd";
+// The socket-path consts (`BOSSCLAWD_SOCKET`, `bossclawd.sock`) live in the shared `bossclawd-paths`
+// crate, so the app resolves the SAME socket the daemon binds — by construction, not by convention.
 
 /// How long to wait, total, for a freshly-spawned daemon to bind its socket + answer the handshake.
 /// Bounded so a daemon that never comes up cannot delay app boot indefinitely.
@@ -40,13 +37,10 @@ const STARTUP_POLL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve the daemon socket path: `BOSSCLAWD_SOCKET` if set, else `<app_data_dir>/bossclawd.sock`.
-/// Pure (given `app_data_dir` + the env) so `main.rs` passes its Tauri `app_data_dir` and the rule
-/// is unit-tested. The env branch matches the daemon's `resolve_socket_path` exactly.
+/// `main.rs` passes its Tauri `app_data_dir`. Delegates to the shared `bossclawd-paths` crate so the
+/// app resolves the SAME socket the daemon binds — the two can never drift.
 pub fn resolve_socket_path(app_data_dir: &Path) -> PathBuf {
-    match std::env::var_os(ENV_SOCKET) {
-        Some(p) => PathBuf::from(p),
-        None => app_data_dir.join(SOCKET_FILE),
-    }
+    bossclawd_paths::resolve_socket_path(app_data_dir)
 }
 
 /// Resolve the daemon binary: `BOSSCLAWD_BIN` if set, else a sibling of the current executable
@@ -82,7 +76,7 @@ pub fn resolve_bin_path(current_exe: &Path) -> PathBuf {
 pub async fn probe(sock_path: &Path) -> bool {
     let attempt = async {
         let mut stream = UnixStream::connect(sock_path).await.ok()?;
-        let hello = Hello { proto_version: PROTO_VERSION };
+        let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
         let hello_bytes = serde_json::to_vec(&hello).ok()?;
         write_frame(&mut stream, &hello_bytes).await.ok()?;
         let reply = read_frame(&mut stream).await.ok()?;
@@ -209,14 +203,14 @@ mod tests {
     fn socket_path_defaults_under_app_data_dir() {
         // No env → `<app_data_dir>/bossclawd.sock`. The guard REMOVES any exported override so
         // this default-case test always runs (no silent skip).
-        let _g = EnvGuard::remove(ENV_SOCKET);
+        let _g = EnvGuard::remove(bossclawd_paths::ENV_SOCKET);
         let got = resolve_socket_path(Path::new("/data/ai.air-agent.desktop"));
         assert_eq!(got, PathBuf::from("/data/ai.air-agent.desktop/bossclawd.sock"));
     }
 
     #[test]
     fn socket_path_honours_env_override() {
-        let _g = EnvGuard::set(ENV_SOCKET, "/custom/place.sock");
+        let _g = EnvGuard::set(bossclawd_paths::ENV_SOCKET, "/custom/place.sock");
         let got = resolve_socket_path(Path::new("/data/whatever"));
         assert_eq!(got, PathBuf::from("/custom/place.sock"));
     }

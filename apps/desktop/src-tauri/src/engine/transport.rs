@@ -35,7 +35,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, Request, Response, PROTO_VERSION};
+use bossclawd_proto::{
+    read_frame, write_frame, Hello, HelloOk, Request, Response, Role, PROTO_VERSION,
+};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
@@ -89,7 +91,7 @@ impl SocketTransport {
             .map_err(|e| EngineOpError::Unavailable(format!("connect failed: {e}")))?;
         // Handshake: send Hello, expect a matching-version HelloOk. Bounded by the same timeout so a
         // daemon that accepts the socket but never answers the handshake can't hang us.
-        let hello = Hello { proto_version: PROTO_VERSION };
+        let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
         let hello_bytes = serde_json::to_vec(&hello)
             .map_err(|e| EngineOpError::Unavailable(format!("encode Hello: {e}")))?;
         let handshake = async {
@@ -187,7 +189,9 @@ pub use duplex::DuplexTransport;
 #[cfg(test)]
 mod duplex {
     use super::*;
-    use bossclawd_proto::{read_frame, write_frame, Hello, HelloOk, Request, Response, PROTO_VERSION};
+    use bossclawd_proto::{
+        read_frame, write_frame, Hello, HelloOk, Request, Response, Role, PROTO_VERSION,
+    };
     use tokio::io::DuplexStream;
 
     /// The in-process transport double. Holds the CLIENT half of one `tokio::io::duplex` pipe; the
@@ -253,7 +257,7 @@ mod duplex {
         /// The Hello/HelloOk handshake, done once on the first request (same contract as
         /// `SocketTransport::connect`): a version mismatch or garbage reply is treated as unavailable.
         async fn handshake(stream: &mut DuplexStream) -> Result<(), EngineOpError> {
-            let hello = Hello { proto_version: PROTO_VERSION };
+            let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
             let hello_bytes = serde_json::to_vec(&hello)
                 .map_err(|e| EngineOpError::Unavailable(format!("encode Hello: {e}")))?;
             let exchange = async {

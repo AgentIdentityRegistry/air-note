@@ -365,6 +365,14 @@ impl EngineHandle {
         Ok(log)
     }
 
+    /// The daemon's OWN onboarding check (`<data_dir>/identity.json` parses), used to override a
+    /// `MemoryClient`'s self-asserted `onboarded` flag so a guest-pass client can never force a
+    /// keystore mint / brain creation. `data_dir` is `db_path`'s parent (`db_path =
+    /// data_dir/brain.db`). Fail-safe false if the parent is unresolvable.
+    pub fn is_onboarded_local(&self) -> bool {
+        self.db_path.parent().map(crate::identity::is_onboarded).unwrap_or(false)
+    }
+
     /// Get-or-open + verify the chain + count, mapped to a never-erroring `EngineStatus`.
     /// Open-failure (wrong DEK / unopenable) maps to `KeystoreDbMismatch`; an opened-but-
     /// tampered log maps to `ChainFailed` — the two are kept distinct (spec failure matrix).
@@ -582,6 +590,28 @@ impl EngineHandle {
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Append a signed external-tainted `memory` (U1) and return its event id. Resolves the
+    /// active embedder (env → signed record → bundled), derives the note's vector on a blocking
+    /// thread, then invalidates the recall index so the NEXT `recall` rebuilds and surfaces it
+    /// (the same index-invalidation contract as `publish_and_invalidate`). Empty/blank text is
+    /// the engine's typed `Rejected`; any other core failure folds to `Core`.
+    pub async fn remember(&self, onboarded: bool, text: String) -> Result<String, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let embedder = self.embedder_provider.embedder_for(&log)?;
+        let id = spawn_blocking(move || -> Result<String, EngineOpError> {
+            log.remember(&*embedder, &text).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        // Force the next recall to rebuild the in-memory index so the new memory is searchable
+        // (its vector is persisted; the FTS entry is (re)built by `rebuild_indexes`).
+        *self.indexed.lock().await = false;
+        Ok(id)
     }
 
     /// Run ONE evolve tick (gated, serialized). Gate → `evolve_lock.try_lock()`

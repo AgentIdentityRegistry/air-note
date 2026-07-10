@@ -42,6 +42,39 @@ use crate::types::{
 /// reject a peer built against an incompatible protocol before any op is dispatched.
 pub const PROTO_VERSION: u32 = 1;
 
+/// The privilege a connection requests at the [`Hello`] handshake. The daemon enforces a per-role
+/// op-allowlist in `dispatch` (fail-closed: an op not explicitly allowed for the role is refused).
+///
+/// Defaults to [`Role::App`] (full access) so a peer that omits the field — including any build
+/// predating this field — connects exactly as before: the desktop app is unchanged. Only a client
+/// that OPTS INTO [`Role::MemoryClient`] is scoped down (the `air-memory-mcp` adapter). This is the
+/// "Simple" bar (least-privilege-by-default); cryptographic capability tokens ("Strict") are a
+/// deferred future hardening — a same-uid process can already forge `App`, so this does not defend
+/// against a malicious peer, only scopes a cooperative one.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Role {
+    /// Full access to every wire op (the default; the desktop app).
+    #[default]
+    App,
+    /// A scoped coding-agent client: may invoke ONLY `Recall` + `Remember`.
+    MemoryClient,
+}
+
+impl Role {
+    /// Fail-closed per-op allowlist. `App` may invoke every op. `MemoryClient` may invoke ONLY
+    /// [`Request::Recall`] + [`Request::Remember`]; **every other variant — present or future — is
+    /// refused by default** (the `matches!` denies anything not explicitly listed). A new `Request`
+    /// variant is therefore refused for `MemoryClient` until someone deliberately adds it here.
+    pub fn allows(&self, req: &Request) -> bool {
+        match self {
+            Role::App => true,
+            Role::MemoryClient => {
+                matches!(req, Request::Recall { .. } | Request::Remember { .. })
+            }
+        }
+    }
+}
+
 /// The first frame the client sends after connecting: its protocol version.
 ///
 /// Its own serde type (NOT a [`Request`] variant): the handshake runs once per
@@ -51,6 +84,10 @@ pub const PROTO_VERSION: u32 = 1;
 pub struct Hello {
     /// The protocol version the client was built against.
     pub proto_version: u32,
+    /// The privilege the connection requests. `#[serde(default)]` so a peer that omits it (any
+    /// build predating this field) is treated as [`Role::App`] — the app is unchanged (I3).
+    #[serde(default)]
+    pub role: Role,
 }
 
 /// The daemon's reply to a [`Hello`] with a matching version: its PID (so the
@@ -149,6 +186,11 @@ pub enum Request {
     /// `EngineHandle::model_status` → `engine_model_status` (rung 2). Loaded-vs-intended model state
     /// + live re-index progress. Polled by the Settings language-pack card.
     ModelStatus { onboarded: bool },
+    /// `EngineHandle::remember` → the coding-agent write op (SP1 / M1b). Appends a signed
+    /// `memory`-type event stamped `origin=external` (recallable, never auto-trusted). No
+    /// Tauri command maps to it (it is reached only via the `air-memory-mcp` adapter as a
+    /// `MemoryClient`); `onboarded` mirrors every other op.
+    Remember { onboarded: bool, text: String },
 }
 
 /// One response from the daemon to the client. Each success variant carries the
@@ -215,6 +257,8 @@ pub enum Response {
     ReasonerReady(bool),
     /// `ModelStatus` result (rung 2) — the loaded-vs-intended model state + live re-index progress.
     ModelStatus(ModelStatusWire),
+    /// `Remember` result — the id of the newly appended `memory` event.
+    Remember(String),
     /// The engine is not onboarded (mirrors `EngineError::NotOnboarded`). A signal,
     /// not a fault — the UI shows onboarding.
     NotOnboarded,
@@ -264,6 +308,11 @@ pub enum OpErrorKindWire {
     KeystoreInconsistent,
     /// `EngineError::KeystoreDbMismatch`.
     KeystoreDbMismatch,
+    /// A per-op authorization refusal (U2): the connection's [`Role`] does not allow the requested
+    /// op. A daemon-protocol fault with no in-process engine analogue (like `Core`); the client
+    /// renders it under the generic engine-error prefix. The desktop app never receives it (it is
+    /// always `App`), but the arm keeps the wire enum exhaustive.
+    NotPermitted,
 }
 
 /// A recall [`HitMirror`] paired with its hydrated snippet text, mirroring the
@@ -494,6 +543,7 @@ mod protocol_tests {
                 acknowledged_loud: true,
             },
             Request::Teardown,
+            Request::Remember { onboarded: true, text: "remember me".to_string() },
             Request::GetReasonerConfig { onboarded: true },
             Request::GetReasonerReady { onboarded: true },
             Request::SetReasonerConfig {
@@ -540,6 +590,7 @@ mod protocol_tests {
             Response::ReasonerReady(true),
             Response::NotOnboarded,
             Response::Busy("ingest".to_string()),
+            Response::Remember("01J-REMEMBERED".to_string()),
             Response::Err {
                 kind: OpErrorKindWire::Core,
                 message: "something went wrong".to_string(),
@@ -569,6 +620,7 @@ mod protocol_tests {
             OpErrorKindWire::Vault,
             OpErrorKindWire::KeystoreInconsistent,
             OpErrorKindWire::KeystoreDbMismatch,
+            OpErrorKindWire::NotPermitted,
         ];
         for kind in kinds {
             // KeystoreInconsistent is unit-shaped (empty message); every other kind carries one.
@@ -644,7 +696,7 @@ mod protocol_tests {
     /// The handshake frames round-trip and `PROTO_VERSION` is the pinned constant.
     #[test]
     fn handshake_serde_roundtrip() {
-        let hello = Hello { proto_version: PROTO_VERSION };
+        let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
         let bytes = serde_json::to_vec(&hello).unwrap();
         let back: Hello = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(hello, back);
@@ -661,9 +713,54 @@ mod protocol_tests {
     /// not accidentally deserialize as a `Request` (they travel as separate frames).
     #[test]
     fn hello_is_not_a_request() {
-        let hello_bytes = serde_json::to_vec(&Hello { proto_version: 1 }).unwrap();
+        let hello_bytes = serde_json::to_vec(&Hello { proto_version: 1, role: Role::App }).unwrap();
         // `Hello` serializes as `{"proto_version":1}`, which is not any externally
         // tagged `Request` variant, so it must fail to parse as a `Request`.
         assert!(serde_json::from_slice::<Request>(&hello_bytes).is_err());
+    }
+
+    /// Spot-checks that a representative set of destructive/egress/read ops are refused for
+    /// `MemoryClient` and that Recall+Remember are allowed. The true fail-closed guarantee is
+    /// structural: `Role::allows`'s positive `matches!` allowlist denies every non-listed variant,
+    /// present or future; this test guards against a regression that admits one of these specific ops.
+    #[test]
+    fn memory_client_allowlist_is_exactly_recall_and_remember() {
+        let allowed = [
+            Request::Recall { onboarded: true, query: "q".into(), k: 1 },
+            Request::Remember { onboarded: true, text: "t".into() },
+        ];
+        for req in &allowed {
+            assert!(Role::MemoryClient.allows(req), "MemoryClient must allow {req:?}");
+        }
+        let refused = [
+            Request::Teardown,
+            Request::EnableCloudReasoner { onboarded: true, config: serde_json::Value::Null },
+            Request::AddGrant { onboarded: true, path: std::path::PathBuf::from("/x") },
+            Request::AddMandate {
+                onboarded: true,
+                target: std::path::PathBuf::from("/t"),
+                source_scope: std::path::PathBuf::from("/s"),
+                recipe: "r".into(),
+            },
+            Request::SetActiveModel { onboarded: true, model_id: "m".into(), safetensors_sha: "s".into() },
+            Request::Status { onboarded: true },
+            Request::RunIngest { onboarded: true },
+        ];
+        for req in &refused {
+            assert!(!Role::MemoryClient.allows(req), "MemoryClient must REFUSE {req:?} (fail-closed)");
+        }
+        // App is allowed everything.
+        for req in allowed.iter().chain(refused.iter()) {
+            assert!(Role::App.allows(req), "App must allow {req:?}");
+        }
+    }
+
+    /// A `Hello` frame that omits `role` (a peer predating the field) deserializes as `App` — the
+    /// wire back-compat that keeps the app unchanged (I3).
+    #[test]
+    fn hello_role_defaults_to_app_on_missing_field() {
+        let legacy = serde_json::json!({ "proto_version": PROTO_VERSION }).to_string();
+        let hello: Hello = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(hello.role, Role::App);
     }
 }

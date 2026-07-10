@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bossclawd_proto::types::{FileRecordMirror, IngestReportMirror};
 use bossclawd_proto::{
-    read_frame, write_frame, Hello, HelloOk, HitWire, Request, Response, PROTO_VERSION,
+    read_frame, write_frame, Hello, HelloOk, HitWire, Request, Response, Role, PROTO_VERSION,
 };
 use tokio::net::UnixStream;
 
@@ -28,7 +28,7 @@ impl WireClient {
     /// Connect + Hello/HelloOk handshake; verifies the protocol version.
     pub async fn connect(sock: &Path) -> anyhow::Result<Self> {
         let mut stream = UnixStream::connect(sock).await?;
-        let hello = Hello { proto_version: PROTO_VERSION };
+        let hello = Hello { proto_version: PROTO_VERSION, role: Role::App };
         write_frame(&mut stream, &serde_json::to_vec(&hello)?).await?;
         let reply = read_frame(&mut stream).await?;
         let hello_ok: HelloOk = serde_json::from_slice(&reply)?;

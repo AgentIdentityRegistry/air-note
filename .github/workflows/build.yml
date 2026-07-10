@@ -183,6 +183,45 @@ jobs:
         env:
           BOSSCLAW_MARKITDOWN_VENV: ${{ runner.temp }}/m5b-venv
 
+  # Daemon + wire protocol + MCP adapter + shared path crate + measurement harness. The `build`
+  # job compiles ONLY the desktop tree (its cargo runs in `apps/desktop/src-tauri`, which does not
+  # depend on these), and `bossclaw-core` has its own job — so without THIS job nothing in CI would
+  # compile or test `bossclawd`, `bossclawd-proto`, `air-memory-mcp`, `bossclawd-paths`, or
+  # `memharness`, and a regression in the daemon/adapter (even a non-compiling one) would pass CI.
+  # Unix-only, like the engine job: the daemon + adapter speak Unix sockets (the daemon binary itself
+  # is an inert `#[cfg(not(unix))]` stub off-unix), so no windows-latest leg.
+  # Keychain-safe on the macOS runner: every test seeds the in-memory secret cache
+  # (`vault::seed_secret_cache_for_test`) and the real-keychain round-trip test is intentionally
+  # omitted, so no keychain-ACL prompt can hang CI (a documented project lesson).
+  daemon-crates:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-daemon-${{ hashFiles('Cargo.lock') }}
+      # `bossclawd` links `keyring` (linux-secret-service) on Linux; libsecret's dev package keeps the
+      # compile self-contained on the runner (matches the desktop `build` job). macOS uses the
+      # Security framework — no system dep. Tests never hit the real store (seeded in-memory cache).
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev
+      - name: Test daemon + adapter crates
+        run: cargo test -p bossclawd -p bossclawd-proto -p air-memory-mcp -p bossclawd-paths -p memharness
+      - name: Clippy daemon + adapter crates
+        run: cargo clippy -p bossclawd -p bossclawd-proto -p air-memory-mcp -p bossclawd-paths -p memharness --all-targets -- -D warnings
+
   # Supply-chain audit (RustSec). `cargo audit --deny warnings` fails on ANY advisory — a real
   # vulnerability OR a newly-unmaintained crate — that is NOT in the documented allowlist at
   # .cargo/audit.toml. The allowlist holds only the known ecosystem-unmaintained transitive deps

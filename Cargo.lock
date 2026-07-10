@@ -53,6 +53,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "air-memory-mcp"
+version = "0.0.1"
+dependencies = [
+ "bossclawd-paths",
+ "bossclawd-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "air-rs"
 version = "0.0.1"
 dependencies = [
@@ -91,6 +103,7 @@ dependencies = [
  "base64 0.22.1",
  "bossclaw-core",
  "bossclawd",
+ "bossclawd-paths",
  "bossclawd-proto",
  "chrono",
  "ed25519-dalek",
@@ -737,6 +750,7 @@ version = "0.0.1"
 dependencies = [
  "bossclaw-core",
  "bossclawd",
+ "bossclawd-paths",
  "bossclawd-proto",
  "chrono",
  "ed25519-dalek",
@@ -753,6 +767,10 @@ dependencies = [
  "tokio",
  "zeroize",
 ]
+
+[[package]]
+name = "bossclawd-paths"
+version = "0.0.1"
 
 [[package]]
 name = "bossclawd-proto"

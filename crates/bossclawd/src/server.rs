@@ -29,7 +29,7 @@ use bossclawd_proto::types::{
     ReindexProgressWire,
 };
 use bossclawd_proto::{
-    read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response,
+    read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response, Role,
     PROTO_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -90,6 +90,9 @@ where
         return Ok(());
     };
     write_frame(&mut write, &hello_ok_bytes).await?;
+    // The role the connection requested, captured once BEFORE the loop so no borrow of `hello`
+    // spans a `.await`. Every op on this connection is authorized against it (U2).
+    let role = hello.role;
 
     // ── Dispatch loop: one Request → one Response per frame, until the peer closes. ──
     loop {
@@ -100,7 +103,7 @@ where
         };
         // A malformed Request frame must NOT panic or kill the daemon: reply Err and keep serving.
         let response = match serde_json::from_slice::<Request>(&frame) {
-            Ok(req) => dispatch(&engine, req).await,
+            Ok(req) => dispatch(&engine, role, req).await,
             Err(e) => protocol_err(format!("malformed request frame: {e}")),
         };
         // A write error means the peer went away mid-reply → end the connection.
@@ -117,6 +120,30 @@ fn protocol_err(message: String) -> Response {
     Response::Err { kind: OpErrorKindWire::Core, message }
 }
 
+/// A per-op authorization refusal (U2). Rides the [`OpErrorKindWire::NotPermitted`] kind; the
+/// message is generic (it does not echo the op) so nothing about the refused request leaks.
+fn not_permitted_response() -> Response {
+    Response::Err {
+        kind: OpErrorKindWire::NotPermitted,
+        message: "operation not permitted for this connection's role".to_string(),
+    }
+}
+
+/// Rewrite a guest (`MemoryClient`) request's `onboarded` flag to the daemon's own onboarding
+/// truth so a guest can never assert onboarding to force a keystore mint. Returns `None` for any
+/// request that is NOT an explicitly-handled guest op — the caller then refuses it fail-closed.
+/// This deliberately does NOT pass unknown variants through: if a future task widens
+/// `Role::allows` to admit a new guest op without adding it here, that op is REFUSED (safe)
+/// rather than silently trusting the client's self-asserted `onboarded` flag. `Role::allows` and
+/// this function must stay in sync; the fail-closed `None` makes any drift safe.
+fn override_onboarding_for_guest(req: Request, onboarded: bool) -> Option<Request> {
+    match req {
+        Request::Recall { query, k, .. } => Some(Request::Recall { onboarded, query, k }),
+        Request::Remember { text, .. } => Some(Request::Remember { onboarded, text }),
+        _ => None,
+    }
+}
+
 /// Serialize a `Response` to frame bytes. `Response` is a plain serde enum of owned data, so
 /// `to_vec` cannot realistically fail; on the impossible error we fall back to an `Err` frame
 /// rather than `unwrap` (never panic on the serve path).
@@ -131,7 +158,21 @@ fn encode(resp: &Response) -> Vec<u8> {
 /// dispatch table over the Task 0 inventory (29 wire ops). Each arm calls the matching
 /// `EngineHandle` method with the `onboarded` flag the client supplied and folds the result
 /// through [`op_result`] / [`unit_result`] / a dedicated converter.
-async fn dispatch(engine: &Arc<EngineHandle>, req: Request) -> Response {
+async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Response {
+    // ── Per-op authorization (U2 / I1), fail-closed: a role may invoke only its allow-listed ops. ──
+    if !role.allows(&req) {
+        return not_permitted_response();
+    }
+    // A guest-pass (`MemoryClient`) must not be able to ASSERT onboarding — that would let it force
+    // a keystore mint / brain creation. The daemon computes onboarding itself for that role; `App`
+    // keeps its self-asserted flag (I3 — the app is unchanged).
+    let req = match role {
+        Role::App => req,
+        Role::MemoryClient => match override_onboarding_for_guest(req, engine.is_onboarded_local()) {
+            Some(req) => req,
+            None => return not_permitted_response(),
+        },
+    };
     match req {
         // ── Status (never-erroring on the engine side; always a Status response). ──
         Request::Status { onboarded } => Response::Status(status_wire(engine.status(onboarded).await)),
@@ -164,6 +205,9 @@ async fn dispatch(engine: &Arc<EngineHandle>, req: Request) -> Response {
             op_result(engine.recall(onboarded, query, k).await, |hits| {
                 Response::Recall(hits.into_iter().map(hit_wire).collect())
             })
+        }
+        Request::Remember { onboarded, text } => {
+            op_result(engine.remember(onboarded, text).await, Response::Remember)
         }
 
         // ── Evolve. ──
@@ -608,5 +652,45 @@ struct TestReasonerProvider;
 impl crate::engine::reason::ReasonerProvider for TestReasonerProvider {
     fn reasoner(&self) -> Result<Arc<dyn bossclaw_core::Reasoner>, EngineOpError> {
         Ok(Arc::new(bossclaw_core::ScriptedReasoner::new("mock-reasoner")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guest onboarding-override is fail-closed by construction: it rewrites the `onboarded`
+    /// flag for the two handled guest ops and returns `None` for anything else, so drift between
+    /// `Role::allows` and this function refuses a new op rather than trusting the client's flag.
+    #[test]
+    fn guest_onboarding_override_is_fail_closed_for_unhandled_ops() {
+        // A guest op with a client-asserted `onboarded: false` is rewritten to the daemon's truth.
+        match override_onboarding_for_guest(
+            Request::Recall { onboarded: false, query: "q".into(), k: 1 },
+            true,
+        ) {
+            Some(Request::Recall { onboarded, query, k }) => {
+                assert!(onboarded, "the daemon's onboarding truth overwrites the client flag");
+                assert_eq!(query, "q");
+                assert_eq!(k, 1);
+            }
+            other => panic!("expected Some(Recall), got {other:?}"),
+        }
+        match override_onboarding_for_guest(
+            Request::Remember { onboarded: false, text: "t".into() },
+            true,
+        ) {
+            Some(Request::Remember { onboarded, text }) => {
+                assert!(onboarded, "the daemon's onboarding truth overwrites the client flag");
+                assert_eq!(text, "t");
+            }
+            other => panic!("expected Some(Remember), got {other:?}"),
+        }
+        // A NON-guest op (not on the allowlist) returns None → the caller refuses it fail-closed,
+        // so a future allowlist widening that forgets this function can never leak a mint-forge.
+        assert!(
+            override_onboarding_for_guest(Request::Status { onboarded: false }, true).is_none(),
+            "an unhandled op must fail closed (None), not pass through with the client's flag"
+        );
     }
 }
