@@ -4,3 +4,5 @@ pub mod a2a;
 pub mod engine;
 pub mod identity;
 pub mod inbox;
+#[cfg(unix)]
+pub mod integrations;

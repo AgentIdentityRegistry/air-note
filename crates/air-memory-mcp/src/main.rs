@@ -8,6 +8,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
+    // SP2: the `nudge` subcommand prints the static SessionStart reminder and exits — no socket,
+    // no server. Claude Code's SessionStart hook runs `air-memory-mcp nudge`.
+    if std::env::args().nth(1).as_deref() == Some("nudge") {
+        print!("{}", air_memory_mcp::NUDGE_TEXT);
+        return Ok(());
+    }
+
     let sock = daemon::resolve_socket_path();
     eprintln!("air-memory-mcp: using daemon socket {}", sock.display());
 

@@ -18,10 +18,17 @@ cargo build --release -p air-memory-mcp
 # binary: target/release/air-memory-mcp
 ```
 
-## Wire it into Claude Code (manual, SP1)
+## Wire it into Claude Code
 
-Add to your project's `.mcp.json` (or Claude Code's MCP config). AIR Agent must be installed and
-onboarded (its `bossclawd` daemon running).
+**One click (recommended):** in the AIR Agent app, open **Settings ▸ Integrations** and click
+**Connect Claude Code**. This writes the `air-memory` MCP server to `~/.claude.json` and a
+SessionStart nudge to `~/.claude/settings.json` (merging with your existing config, never
+replacing it), so every Claude Code session everywhere can `recall`/`remember`. **Disconnect**
+removes exactly those entries. Takes effect on your next Claude Code session. Disconnect before
+moving or uninstalling AIR Agent (the config points at the app's bundled binary); if `~/.claude.json`
+is a symlink, connecting replaces it with a regular file. For best results, quit Claude Code first.
+
+**Manual (advanced / headless):** add to your `.mcp.json` — see the entry shape below.
 
 ```json
 {
