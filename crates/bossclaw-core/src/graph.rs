@@ -31,6 +31,10 @@ pub const PAGE_EVENT_TYPE: &str = "page";
 /// The `event_type` discriminator for a `supersede` event — single-sourced so
 /// the atomic-pair writer and the fold filter reference the same string.
 pub const SUPERSEDE_EVENT_TYPE: &str = "supersede";
+/// A captured coding-agent session (title+metadata event; body lives in <data_dir>/sessions/).
+pub const SESSION_CAPTURED_EVENT_TYPE: &str = "session_captured";
+/// Owner-commanded deletion tombstone for a captured session (honest stub — I7).
+pub const SESSION_DELETED_EVENT_TYPE: &str = "session_deleted";
 /// The neutral entity type stamped on an entity the model named ONLY as a bare
 /// relation/retraction endpoint (never listed in `entities[]`, so it carries no
 /// declared type). Single-sourced so the endpoint-mint site has no magic string.
