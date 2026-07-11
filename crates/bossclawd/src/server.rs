@@ -433,6 +433,15 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             Response::ListNotes(notes.into_iter().map(note_wire).collect())
         }),
         Request::SupersedeNote { event_id, text, .. } => {
+            // DELIBERATE asymmetry vs GetSession/DeleteSession (which use id-free reject messages):
+            // SupersedeNote lets the core primitive's typed `Rejected` message flow through WITH the
+            // App-supplied `event_id` (no-such-event / not-a-note / already-superseded). This is safe
+            // AND diagnostically useful — NOT the I4 hostile-capture surface: this is an App-only op
+            // (guest-denied at the role gate), and the `event_id` is a daemon-minted ULID the App
+            // itself obtained via `ListNotes` and echoes back over the same trusted App socket (never
+            // an attacker-influenced capture path). So the id is worth surfacing to disambiguate the
+            // reject, whereas GetSession/DeleteSession keep static messages for symmetry with the I4
+            // capture-path rejects that DO carry hostile bytes.
             op_result(engine.supersede_note(event_id, text).await, Response::Superseded)
         }
         Request::SetCaptureEnabled { onboarded, enabled, backfill } => {
