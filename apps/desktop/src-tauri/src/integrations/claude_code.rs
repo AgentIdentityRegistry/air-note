@@ -17,8 +17,14 @@ const MCP_SERVER_KEY: &str = "air-memory";
 /// removed (review Low).
 const HOOK_MARKER: &str = "air-memory-mcp";
 
-/// Read-only status: `NotFound` if Claude Code isn't detected, else `Connected` iff `~/.claude.json`
-/// parses and has `mcpServers["air-memory"]`. Lenient on malformed (→ `NotConnected`).
+/// Read-only status (SP3 R2 — three states): `NotFound` if Claude Code isn't detected; else
+/// `NotConnected` unless `~/.claude.json` parses with `mcpServers["air-memory"]`; else
+/// `Connected { capture }` where `capture` is true iff `settings.json`'s `hooks.SessionEnd[]` also
+/// holds OUR `capture-notify` group. An SP2-era connect (mcpServers present, no capture hook) is thus
+/// `Connected { capture: false }`, which Plan C surfaces as "Re-connect to enable session capture".
+/// Lenient on malformed at every layer (malformed `claude.json` → `NotConnected`; missing/malformed
+/// `settings.json` → `capture: false`) — status is a safe read; `connect()` is where a parse error
+/// fails loud.
 pub fn detect(paths: &ClaudeCodePaths) -> std::io::Result<ClaudeCodeStatus> {
     let present = paths.claude_json.exists() || paths.claude_dir.exists();
     if !present {
@@ -29,11 +35,58 @@ pub fn detect(paths: &ClaudeCodePaths) -> std::io::Result<ClaudeCodeStatus> {
         .flatten()
         .and_then(|v| v.get("mcpServers").and_then(|m| m.get(MCP_SERVER_KEY)).map(|_| ()))
         .is_some();
-    Ok(if connected {
-        ClaudeCodeStatus::Connected
-    } else {
-        ClaudeCodeStatus::NotConnected
-    })
+    if !connected {
+        return Ok(ClaudeCodeStatus::NotConnected);
+    }
+    Ok(ClaudeCodeStatus::Connected { capture: session_end_has_our_capture(&paths.settings_json) })
+}
+
+/// True iff `settings.json`'s `hooks.SessionEnd[]` contains OUR capture group — the B4 marker (a
+/// command with BOTH `air-memory-mcp` AND `capture-notify`, via [`is_our_capture_group`]). Lenient by
+/// design (this backs a read-only status, not a mutation): a missing / malformed / oddly-shaped
+/// `settings.json` → `false`. Reuses the same predicate `connect`/`disconnect` write and remove with,
+/// so detect can never disagree with what was actually installed.
+fn session_end_has_our_capture(settings_json: &Path) -> bool {
+    read_json_object(settings_json)
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            v.get("hooks")
+                .and_then(|h| h.get("SessionEnd"))
+                .and_then(|e| e.as_array())
+                .map(|groups| groups.iter().any(is_our_capture_group))
+        })
+        .unwrap_or(false)
+}
+
+/// Count Claude Code transcripts under `projects_root` for the Connect consent disclosure
+/// (spec §6a: "…including your recent sessions (~30 days, N found)"). Mirrors the daemon sweeper's
+/// walk (A9 `scan_candidates`): ONE level of project dirs, then `.jsonl` leaves directly inside each —
+/// so the disclosed N equals what the sweeper would actually scan, never an over-promise. A missing /
+/// unreadable root is `0`, NEVER an error: this is a best-effort disclosure, and a not-yet-connected
+/// user (no `~/.claude/projects`) legitimately has zero. Nested-deeper directories and stray
+/// root-level files are not transcripts here, exactly as the sweeper ignores them.
+pub fn backfill_candidate_count(projects_root: &Path) -> u64 {
+    let Ok(projects) = std::fs::read_dir(projects_root) else {
+        return 0; // absent / unreadable root → nothing to import (I10 parity with the sweeper).
+    };
+    let mut count = 0u64;
+    for project in projects.flatten() {
+        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue; // only project directories hold transcripts (stray root files are ignored).
+        }
+        let Ok(entries) = std::fs::read_dir(project.path()) else {
+            continue; // unreadable project dir — skip it, don't abort the whole count.
+        };
+        for entry in entries.flatten() {
+            let is_transcript = entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if is_transcript {
+                count += 1; // a `.jsonl` leaf directly inside a project dir (no recursion).
+            }
+        }
+    }
+    count
 }
 
 /// Build the mcpServers entry pointing Claude Code at our bundled adapter + the daemon socket.
@@ -276,7 +329,11 @@ mod tests {
             br#"{"mcpServers":{"air-memory":{"type":"stdio"}}}"#,
         )
         .unwrap();
-        assert_eq!(detect(&paths(dir.path())).unwrap(), ClaudeCodeStatus::Connected);
+        // mcpServers present but NO settings.json capture hook (SP2-era shape) → capture:false.
+        assert_eq!(
+            detect(&paths(dir.path())).unwrap(),
+            ClaudeCodeStatus::Connected { capture: false }
+        );
     }
 
     #[test]
@@ -309,7 +366,8 @@ mod tests {
         let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains(HOOK_MARKER) && cmd.contains("nudge"), "hook runs our nudge: {cmd}");
         assert_eq!(mode(&p.settings_json), 0o600);
-        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected);
+        // connect writes the SessionEnd capture hook too → the third state reports capture:true.
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: true });
     }
 
     #[test]
@@ -520,7 +578,7 @@ mod tests {
         .unwrap();
 
         connect(&p, bin(), sock()).unwrap();
-        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected);
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: true });
         assert_eq!(mode(&p.claude_json), 0o600);
         assert_eq!(mode(&p.settings_json), 0o600);
 
@@ -663,5 +721,88 @@ mod tests {
         let ends = sj["hooks"]["SessionEnd"].as_array().unwrap();
         assert_eq!(ends.len(), 1, "foreign air-memory-mcp hook without capture-notify survives");
         assert_eq!(ends[0]["hooks"][0]["command"], "air-memory-mcp status");
+    }
+
+    // ── B5 (SP3 R2): the capture-aware THIRD detect state + the app-side backfill count. ──
+
+    #[test]
+    fn detect_reports_capture_presence_as_the_third_state() {
+        // (a) mcpServers entry + SessionEnd capture hook (a full SP3 connect) → capture:true.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        connect(&p, bin(), sock()).unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: true });
+
+        // (b) mcpServers present, NO capture hook (SP2-era) → capture:false — this is the state Plan C
+        // turns into "Re-connect to enable session capture". Build it by hand: our server + only a
+        // SessionStart nudge (no SessionEnd), the exact shape an SP2 install left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"air-memory":{"type":"stdio"}}}"#).unwrap();
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        let nudge_cmd = format!("{} nudge", sh_single_quote(&bin().to_string_lossy()));
+        std::fs::write(
+            &p.settings_json,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": { "SessionStart": [
+                    { "hooks": [{ "type": "command", "command": nudge_cmd, "timeout": 5 }] }
+                ]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: false });
+
+        // (c) neither our server nor a hook → NotConnected.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"chrome":{}}}"#).unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::NotConnected);
+
+        // (d) no ~/.claude at all → NotFound.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect(&paths(dir.path())).unwrap(), ClaudeCodeStatus::NotFound);
+    }
+
+    #[test]
+    fn detect_capture_ignores_a_foreign_session_end_hook() {
+        // Connected via mcpServers, with a FOREIGN SessionEnd hook (mentions neither our marker nor
+        // capture-notify) → capture stays false: the third state keys on OUR capture group only.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"air-memory":{"type":"stdio"}}}"#).unwrap();
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"node cleanup.mjs"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: false });
+    }
+
+    #[test]
+    fn backfill_candidate_count_counts_jsonl_under_projects_root_only() {
+        // Fake `~/.claude/projects`: three project dirs holding five `.jsonl` transcripts total, plus a
+        // `.txt` (ignored), a nested-deeper dir (NOT recursed — sweeper parity), and a stray root-level
+        // `.jsonl` (NOT inside a project dir → ignored). Expect exactly 5.
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir(r.join("proj-a")).unwrap();
+        std::fs::write(r.join("proj-a/s1.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("proj-a/s2.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("proj-a/notes.txt"), b"ignore me").unwrap(); // wrong extension → ignored
+        std::fs::create_dir(r.join("proj-a/deeper")).unwrap();
+        std::fs::write(r.join("proj-a/deeper/x.jsonl"), b"{}\n").unwrap(); // nested → NOT counted
+        std::fs::create_dir(r.join("proj-b")).unwrap();
+        std::fs::write(r.join("proj-b/s3.jsonl"), b"{}\n").unwrap();
+        std::fs::create_dir(r.join("proj-c")).unwrap();
+        std::fs::write(r.join("proj-c/s4.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("proj-c/s5.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("loose.jsonl"), b"{}\n").unwrap(); // stray root file → NOT counted
+
+        assert_eq!(backfill_candidate_count(r), 5, "all project-dir .jsonl leaves, nothing else");
+
+        // A missing root is 0, never an error (a not-yet-connected user has no projects dir).
+        assert_eq!(backfill_candidate_count(&r.join("does-not-exist")), 0);
     }
 }

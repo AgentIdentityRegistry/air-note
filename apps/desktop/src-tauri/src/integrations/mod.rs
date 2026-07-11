@@ -7,6 +7,13 @@ use std::path::{Path, PathBuf};
 pub mod claude_code;
 
 /// Status of the Claude Code integration on this machine.
+///
+/// `Connected` carries `capture` (SP3 R2 third state): whether the SessionEnd `capture-notify` hook
+/// is ALSO present, not just the mcpServers entry. SP2-era installs are `Connected { capture: false }`
+/// — the Integrations panel shows "Re-connect to enable session capture" so the whole install base
+/// isn't silently left without the headline feature. Serde is externally tagged (the default), so the
+/// wire shape is `"not_found"` / `"not_connected"` / `{"connected":{"capture":true}}` — snake_case and
+/// self-describing (the frontend TS mapping updates in Plan C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeCodeStatus {
@@ -14,8 +21,9 @@ pub enum ClaudeCodeStatus {
     NotFound,
     /// Detected, but our `air-memory` MCP server is not registered.
     NotConnected,
-    /// Our `air-memory` MCP server is registered.
-    Connected,
+    /// Our `air-memory` MCP server is registered. `capture` is true iff the SessionEnd
+    /// `capture-notify` hook is present too (SP3); false for an SP2-era connect.
+    Connected { capture: bool },
 }
 
 /// The Claude Code config paths, resolved under a home dir (pure — tests pass a temp home).

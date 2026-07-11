@@ -444,4 +444,15 @@ impl Engine {
     pub async fn model_status(&self, onboarded: bool) -> Result<client::ModelStatus, EngineOpError> {
         self.client.model_status(onboarded).await
     }
+
+    /// Mirrors `EngineClient::set_capture_enabled` (SP3 B5): enable/disable ongoing capture; `backfill`
+    /// consents (or not) to the one-time history import. The caller owns the M4 guarantee via `backfill`.
+    pub async fn set_capture_enabled(&self, enabled: bool, backfill: bool) -> Result<(), EngineOpError> {
+        self.client.set_capture_enabled(enabled, backfill).await
+    }
+
+    /// Mirrors `EngineClient::capture_enabled` (SP3 B5): read the sticky ongoing-capture flag.
+    pub async fn capture_enabled(&self) -> Result<bool, EngineOpError> {
+        self.client.capture_enabled().await
+    }
 }

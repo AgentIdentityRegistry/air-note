@@ -420,6 +420,28 @@ impl<T: Transport + ?Sized> EngineClient<T> {
         }
     }
 
+    // ── Session capture (SP3 B5). App-only ops; the daemon keeps the App's self-asserted onboarded
+    //    flag for these (I3 — the app is trusted), so both send `onboarded: true` (Connect and the
+    //    Integrations toggle are consent actions on the app's own onboarded brain). ──
+
+    /// Mirrors `EngineHandle::set_capture_enabled`: enable/disable ongoing session capture, with
+    /// `backfill` additionally consenting (or not) to the one-time import of pre-existing sessions.
+    /// The CALLER owns the M4 guarantee by choosing `backfill`: Connect passes `backfill == consent`
+    /// (both flags in one call); the Integrations toggle passes `backfill: false` (forward-only). The
+    /// daemon supplies the `at` timestamp, so the wire carries only `enabled` + `backfill`.
+    pub async fn set_capture_enabled(&self, enabled: bool, backfill: bool) -> Result<(), EngineOpError> {
+        self.unit(Request::SetCaptureEnabled { onboarded: true, enabled, backfill }).await
+    }
+
+    /// Mirrors `EngineHandle::capture_enabled`: read the sticky ongoing-capture flag (default CLOSED).
+    /// Mirrors the `mandates_enabled` read shape.
+    pub async fn capture_enabled(&self) -> Result<bool, EngineOpError> {
+        match self.request(Request::CaptureEnabled { onboarded: true }).await? {
+            Response::CaptureEnabled(b) => Ok(b),
+            other => Err(unexpected(other)),
+        }
+    }
+
     // ── Internal request helpers ─────────────────────────────────────────────
 
     /// Send `req` and unwrap the daemon's non-success signals to a typed error. Success and
@@ -1109,6 +1131,18 @@ mod tests {
         // A manual evolve tick over an empty queue is a valid no-op report.
         let tick = bounded(client.evolve_once(true)).await.expect("evolve_once");
         assert_eq!(tick.memories_processed, 0, "empty-queue tick processes nothing");
+    }
+
+    #[tokio::test]
+    async fn set_and_get_capture_enabled_over_the_socket() {
+        // SP3 B5: the capture flag round-trips through the real hermetic daemon. A fresh brain has
+        // capture CLOSED (A8 default-off + boot force-off); enabling it (the Connect call shape,
+        // backfill=true) flips the read to true.
+        let daemon = TestDaemon::spawn().await;
+        let client = daemon.client();
+        assert!(!bounded(client.capture_enabled()).await.expect("capture_enabled"), "default closed");
+        bounded(client.set_capture_enabled(true, true)).await.expect("set_capture_enabled");
+        assert!(bounded(client.capture_enabled()).await.expect("capture_enabled"), "enabled reads back");
     }
 
     #[tokio::test]
