@@ -4550,10 +4550,31 @@ impl EventLog {
     /// though `Err` is returned. A caller retry could thus double-write; dedup is
     /// intentionally deferred to a later SP1 task.
     pub fn remember(&self, embedder: &dyn Embedder, text: &str) -> Result<String, BossclawError> {
+        Self::reject_blank_note_text(text)?;
+        let id = self.append(self.external_note_event(text))?;
+        self.derive_vector_for(embedder, &id)?;
+        Ok(id)
+    }
+
+    /// Reject empty/blank note text with [`BossclawError::InvalidInput`] — the
+    /// single source of the "no empty note" rule shared by [`EventLog::remember`]
+    /// and [`EventLog::supersede_note`] so the two checks can never drift.
+    fn reject_blank_note_text(text: &str) -> Result<(), BossclawError> {
         if text.trim().is_empty() {
             return Err(BossclawError::InvalidInput("cannot remember empty or blank text".into()));
         }
-        let event = Event {
+        Ok(())
+    }
+
+    /// Build the signed, external-tainted `memory` Event carrying `text` — the
+    /// exact content shape shared by [`EventLog::remember`] and the corrected note
+    /// of [`EventLog::supersede_note`]. Stamped `origin = external` (the taint
+    /// model, single-sourced via [`crate::graph::EXTERNAL_ORIGIN`]) so the note is
+    /// recallable (`memory` ∈ `EMBEDDABLE_EVENT_TYPES`) yet never auto-trusted.
+    /// Tier-A (`model_meta: None`), engine-signed. Does NOT validate `text`:
+    /// callers reject blank text via [`EventLog::reject_blank_note_text`] first.
+    fn external_note_event(&self, text: &str) -> Event {
+        Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
@@ -4567,10 +4588,74 @@ impl EventLog {
             hash: None,
             signed_by_did: self.signer_did(),
             signature: None,
-        };
-        let id = self.append(event)?;
-        self.derive_vector_for(embedder, &id)?;
-        Ok(id)
+        }
+    }
+
+    /// Supersede a [`EventLog::remember`] note: validates `target_event_id` is a
+    /// CURRENT note — an existing [`crate::graph::MEMORY_EVENT_TYPE`] event that is
+    /// not itself already retired by a `supersede` (supersede chains have a single
+    /// head) — then appends an atomic ground-truth pair: a
+    /// [`crate::graph::SUPERSEDE_EVENT_TYPE`] link retiring the old note plus a
+    /// fresh corrected note (same external-tainted, Tier-A shape as `remember`,
+    /// via [`EventLog::external_note_event`]). Returns the NEW note's event id.
+    ///
+    /// Rejects (all [`BossclawError::InvalidInput`]): blank `text` (same check as
+    /// `remember`), a target that does not exist, a non-`memory` target (e.g. a
+    /// `session_captured` event), and an already-superseded target.
+    ///
+    /// Recall does not yet exclude superseded notes — that projection lands in a
+    /// later SP3 task; this is the write primitive only. Not atomic across the
+    /// vector: `append_pair` commits before `derive_vector_for` runs, matching
+    /// `remember` and `capture_session`.
+    pub fn supersede_note(
+        &self,
+        embedder: &dyn Embedder,
+        target_event_id: &str,
+        text: &str,
+    ) -> Result<String, BossclawError> {
+        Self::reject_blank_note_text(text)?;
+
+        // Target must be a CURRENT note: it exists, is memory-kind, and is not
+        // already the head-below of a supersede.
+        let target = self.event_by_id(target_event_id)?.ok_or_else(|| {
+            BossclawError::InvalidInput(format!(
+                "cannot supersede {target_event_id}: no such event"
+            ))
+        })?;
+        if target.event_type != crate::graph::MEMORY_EVENT_TYPE {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot supersede {target_event_id}: not a remembered note (event_type = {})",
+                target.event_type
+            )));
+        }
+        if self.superseded_event_ids()?.contains(target_event_id) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot supersede {target_event_id}: already superseded (supersede chain heads only)"
+            )));
+        }
+
+        // Atomic ground-truth pair (mirrors capture_session's changed-sha arm):
+        // retire the old note, then append the corrected note.
+        let supersede = ground_truth_supersede_event(target_event_id, self.signer_did());
+        let corrected = self.external_note_event(text);
+        let (_supersede_id, new_id) = self.append_pair(supersede, corrected)?;
+        self.derive_vector_for(embedder, &new_id)?;
+        Ok(new_id)
+    }
+
+    /// The set of event ids retired by a `supersede` event, across ALL folds:
+    /// page/file/session/note supersedes share [`crate::graph::SUPERSEDE_EVENT_TYPE`]
+    /// and each targets exactly one (disjoint) id. Reads only supersede events
+    /// (`events_of_types` filters on `event_type` — never a whole-log scan). Used
+    /// by [`EventLog::supersede_note`] to reject superseding an already-retired note.
+    fn superseded_event_ids(&self) -> Result<HashSet<String>, BossclawError> {
+        let events = self.events_of_types(&[crate::graph::SUPERSEDE_EVENT_TYPE])?;
+        Ok(events
+            .iter()
+            .filter_map(|e| {
+                e.content.get("supersedes").and_then(|v| v.as_str()).map(String::from)
+            })
+            .collect())
     }
 
     /// Derive + persist the vector for a just-appended event id (M5a ingest convenience).
@@ -4640,7 +4725,7 @@ impl EventLog {
             Some(prev) if prev.sha256 == meta.sha256 => Ok(prev.event_id.clone()),
             // Same id + changed bytes → atomic supersede + new capture.
             Some(prev) => {
-                let supersede = session_supersede_event(&prev.event_id, self.signer_did());
+                let supersede = ground_truth_supersede_event(&prev.event_id, self.signer_did());
                 let event = session_captured_event(meta, self.signer_did());
                 let (_s, new_id) = self.append_pair(supersede, event)?;
                 self.derive_vector_for(embedder, &new_id)?;
@@ -7448,9 +7533,11 @@ fn session_captured_event(meta: &SessionMeta, signer_did: String) -> Event {
 
 /// A ground-truth `supersede` Event retiring `prior_id` (reuses
 /// `SUPERSEDE_EVENT_TYPE` with `model_meta: None`; cross-fold safety holds via
-/// disjoint event ids). Mirrors `ingest::ground_truth_supersede`, kept local
-/// because that helper is `#[cfg(unix)]`-private to the ingest module.
-fn session_supersede_event(prior_id: &str, signer_did: String) -> Event {
+/// disjoint event ids). Shared by [`EventLog::capture_session`] (session
+/// supersedes) and [`EventLog::supersede_note`] (note supersedes). Mirrors
+/// `ingest::ground_truth_supersede`, kept local because that helper is
+/// `#[cfg(unix)]`-private to the ingest module.
+fn ground_truth_supersede_event(prior_id: &str, signer_did: String) -> Event {
     Event {
         id: String::new(),
         ts: String::new(),
@@ -7748,6 +7835,33 @@ mod tests {
         // Embeddable: a vector was derived under the embedder's model.
         let vecs = log.vectors_for_model(embedder.model_id()).unwrap();
         assert!(vecs.iter().any(|(vid, _)| vid == &id), "a vector exists for the captured session");
+    }
+
+    #[test]
+    fn supersede_note_rejects_non_note_targets_and_blank_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        let note = log.remember(&embedder, "original").unwrap();
+
+        // Blank replacement text is rejected (same check as `remember`).
+        assert!(log.supersede_note(&embedder, &note, "  ").is_err());
+
+        // Only memory-kind events can be superseded: a captured session is rejected.
+        log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        let sess = log.current_sessions().unwrap()[0].event_id.clone();
+        assert!(log.supersede_note(&embedder, &sess, "nope").is_err());
+
+        // Unknown target id is rejected.
+        assert!(log.supersede_note(&embedder, "no-such-id", "x").is_err());
+
+        // Superseding a current note succeeds and yields a NEW event id.
+        let newer = log.supersede_note(&embedder, &note, "corrected").unwrap();
+        assert_ne!(newer, note);
+
+        // Superseding an ALREADY-superseded note is rejected (chain heads only).
+        assert!(log.supersede_note(&embedder, &note, "again").is_err());
     }
 
     #[test]
