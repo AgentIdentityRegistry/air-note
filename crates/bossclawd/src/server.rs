@@ -37,24 +37,25 @@ use bossclawd_proto::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::capture::paths::{claude_projects_root, open_transcript_confined, valid_session_id};
-use crate::capture::render::render_transcript;
-use crate::capture::store::{store_capture, CaptureIdentity, CaptureStoreError};
-use crate::capture::sweeper::{render_bounds, CAPTURE_TOOL};
+use crate::capture::render::{render_bounds, render_transcript};
+use crate::capture::store::{store_capture, CaptureIdentity, CaptureStoreError, CAPTURE_TOOL};
 use crate::engine::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use crate::engine::{
     ApplyResult, EngineError, EngineHandle, EngineOpError, EngineStatus, EvolveTelemetry, HitWithText,
     MandateSummary, MandateWriteSummary, PreviewData, ProposalSummary,
 };
 
-/// Per-connection budget for the two expensive guest capture pokes (`CaptureNotify` + `Snapshot`):
-/// at most [`GUEST_OP_RATE`] of them per [`GUEST_OP_WINDOW`]. The cheap, frequently-expected
+/// Per-connection budget for the two expensive capture pokes (`CaptureNotify` + `Snapshot`): at
+/// most [`CAPTURE_POKE_RATE`] of them per [`CAPTURE_POKE_WINDOW`]. The cheap, frequently-expected
 /// `Recall`/`Remember` are NOT counted. See [`CaptureRateLimiter`].
-const GUEST_OP_RATE: usize = 10;
-/// The fixed window over which [`GUEST_OP_RATE`] is measured.
-const GUEST_OP_WINDOW: Duration = Duration::from_secs(60);
+const CAPTURE_POKE_RATE: usize = 10;
+/// The fixed window over which [`CAPTURE_POKE_RATE`] is measured.
+const CAPTURE_POKE_WINDOW: Duration = Duration::from_secs(60);
 
 /// A per-connection fixed-window token bucket for the capture pokes. Each [`serve_connection`] owns
-/// one, so the budget bounds a SINGLE misbehaving connection.
+/// one, so the budget bounds a SINGLE misbehaving connection — of ANY role. The limiter runs BEFORE
+/// the role gate, so it also caps an `App` connection (the `GUEST_`-scoped framing would overstate
+/// it); in practice only the `MemoryClient` guest fires these ops in a loop.
 ///
 /// LIMITATION (documented on purpose): production MCP clients (the `air-memory-mcp` adapter)
 /// reconnect per call, so a fresh connection gets a fresh bucket — this does NOT bound
@@ -73,14 +74,14 @@ impl CaptureRateLimiter {
 
     /// Record one capture poke at `now`. Returns `true` if it is within the per-window cap (so the
     /// caller dispatches it), `false` if it exceeds the cap (so the caller refuses it). The window
-    /// is a simple fixed window: once [`GUEST_OP_WINDOW`] has elapsed the count resets.
+    /// is a simple fixed window: once [`CAPTURE_POKE_WINDOW`] has elapsed the count resets.
     fn check(&mut self, now: Instant) -> bool {
-        if now.duration_since(self.window_start) >= GUEST_OP_WINDOW {
+        if now.duration_since(self.window_start) >= CAPTURE_POKE_WINDOW {
             self.window_start = now;
             self.count = 0;
         }
         self.count += 1;
-        self.count <= GUEST_OP_RATE
+        self.count <= CAPTURE_POKE_RATE
     }
 }
 
@@ -438,6 +439,15 @@ async fn capture_notify(engine: &EngineHandle, session_id: String, transcript_pa
         Ok(f) => f,
         Err(_) => return capture_rejected("transcript path rejected by capture-path discipline"),
     };
+    // Enforce the notify-vs-sweep-agree invariant: the sweeper keys a capture by the transcript
+    // filename STEM (and derives `project` from the path too), so a request whose `session_id`
+    // disagrees with the stem would store a phantom keyed by the request id that the stem-keyed
+    // sweeper never supersedes. Reject the mismatched pair (a buggy hook) cleanly — this is what
+    // makes "notify + sweep produce byte-identical captures for one file" an ENFORCED invariant,
+    // not just a doc claim. `session_id` is already ASCII-validated, so the `to_str` compare is exact.
+    if Path::new(&transcript_path).file_stem().and_then(|s| s.to_str()) != Some(session_id.as_str()) {
+        return capture_rejected("session id does not match the transcript filename");
+    }
     // A6: render (the D2 size cap lives here). Any render failure → a clean rejection.
     let rendered = match render_transcript(file, &render_bounds()) {
         Ok(r) => r,

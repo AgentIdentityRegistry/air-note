@@ -38,6 +38,12 @@ use bossclaw_core::log::{CurrentSession, SessionMeta};
 // config-writer; it lives ONCE in `bossclawd-paths` (single source of truth, no drift).
 use bossclawd_paths::{atomic_write_0600, make_private_dir};
 
+/// The coding agent that produces the captured transcripts — the canonical value for
+/// [`CaptureIdentity::tool`]. Lives here (beside the field it fills) so BOTH capture paths — the
+/// sweeper (A9) and the immediate `CaptureNotify` dispatch (A10) — tag `tool` identically, without
+/// either path importing the const from the other.
+pub const CAPTURE_TOOL: &str = "claude-code";
+
 /// Session identity the renderer never sees (derived by the caller: the sweeper from the
 /// transcript path, dispatch from the `CaptureNotify` request). `session_id` is A5-validated
 /// at every store entry point (defense in depth; A5 contract D1).
@@ -46,7 +52,7 @@ pub struct CaptureIdentity {
     pub session_id: String,
     /// The project/repo the session ran against.
     pub project: String,
-    /// The coding agent that produced the session (e.g. `claude-code`).
+    /// The coding agent that produced the session (e.g. [`CAPTURE_TOOL`]).
     pub tool: String,
 }
 

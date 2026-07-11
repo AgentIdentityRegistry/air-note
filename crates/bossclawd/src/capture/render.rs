@@ -63,9 +63,8 @@ const TITLE_MAX_CHARS: usize = 120;
 /// this keeps the safety valve cheap without touching output determinism.
 const WALL_CLOCK_CHECK_EVERY: usize = 1024;
 
-/// Input bounds mirroring ingest's discipline (spec §4a). Constructed by the
-/// caller from `CAPTURE_MAX_TRANSCRIPT_BYTES` / `CAPTURE_MAX_LINE_BYTES` /
-/// `CAPTURE_WALL_CLOCK`.
+/// Input bounds mirroring ingest's discipline (spec §4a). Built by [`render_bounds`] from the
+/// `CAPTURE_MAX_*` / `CAPTURE_WALL_CLOCK` constants below.
 pub struct RenderBounds {
     /// Whole-file cap (D2): a transcript larger than this is refused loudly
     /// (`TooLarge`) rather than read into memory. Default 64 MiB.
@@ -74,6 +73,24 @@ pub struct RenderBounds {
     pub max_line_bytes: usize,
     /// Coarse per-render wall-clock budget (safety valve). Default 30 s.
     pub wall_clock: Duration,
+}
+
+/// The shared render bounds (spec §4a) — the D2 cap point A5's cap-free confined open delegates
+/// here. Both capture paths use these SAME caps: the sweeper (A9) and the immediate `CaptureNotify`
+/// dispatch (A10). They live HERE, beside [`RenderBounds`] / [`render_transcript`] they configure,
+/// so neither the backstop (sweeper) nor the primary path owns the numbers the other depends on.
+const CAPTURE_MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
+const CAPTURE_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
+const CAPTURE_WALL_CLOCK: Duration = Duration::from_secs(30);
+
+/// Construct the shared [`RenderBounds`] — one source of truth for the D2 numbers, no drift between
+/// the sweeper and the immediate-notify path.
+pub fn render_bounds() -> RenderBounds {
+    RenderBounds {
+        max_transcript_bytes: CAPTURE_MAX_TRANSCRIPT_BYTES,
+        max_line_bytes: CAPTURE_MAX_LINE_BYTES,
+        wall_clock: CAPTURE_WALL_CLOCK,
+    }
 }
 
 /// Why a render could not complete. `TooLarge` is the loud D2 refusal the caller

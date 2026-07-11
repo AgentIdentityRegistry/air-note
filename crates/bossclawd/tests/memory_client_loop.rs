@@ -288,6 +288,53 @@ async fn capture_notify_rejects_traversal_and_bad_session_id() {
     std::env::remove_var("AIR_CLAUDE_PROJECTS_ROOT");
 }
 
+/// A10 (review fold-in #1): the notify-vs-sweep-agree invariant is ENFORCED — a `CaptureNotify`
+/// whose `session_id` disagrees with the transcript filename STEM (a buggy hook) is refused, so it
+/// can never store a phantom capture keyed by the request id that the stem-keyed sweeper would never
+/// supersede. A clean `Rejected`, and NO file/event for either the claimed id or the real stem.
+#[tokio::test]
+async fn capture_notify_rejects_session_id_stem_mismatch() {
+    let _env = env_lock().lock().await; // serialize AIR_CLAUDE_PROJECTS_ROOT use.
+    let (dir, sock, engine) = spawn_daemon_with_engine().await;
+    engine.set_capture_enabled(true, true, false, now_epoch()).await.unwrap();
+
+    let projects = tempfile::tempdir().unwrap();
+    let proj_dir = projects.path().join("-Users-tester-repo");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    // The transcript's stem is `real-stem`, but the request claims `mismatched-id` — both are VALID
+    // ids and the path is confined, so the ONLY reason to refuse is the stem/id disagreement.
+    let transcript = proj_dir.join("real-stem.jsonl");
+    write_transcript(&transcript, "a buggy hook sent the wrong session id");
+    std::env::set_var("AIR_CLAUDE_PROJECTS_ROOT", projects.path());
+
+    let mut guest = Guest::connect(&sock).await;
+    let resp = guest
+        .call(Request::CaptureNotify {
+            onboarded: true,
+            session_id: "mismatched-id".into(),
+            transcript_path: transcript.to_string_lossy().into_owned(),
+        })
+        .await;
+    assert!(
+        matches!(resp, Response::Err { kind: OpErrorKindWire::Rejected, .. }),
+        "a session_id that disagrees with the transcript stem → Rejected, got {resp:?}"
+    );
+    // Neither the claimed id nor the real stem was captured (the invariant blocks the phantom).
+    let sessions = dir.path().join("sessions");
+    let files = if sessions.exists() {
+        std::fs::read_dir(&sessions).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(files, 0, "a stem-mismatch writes no session file");
+    assert!(
+        engine.current_sessions().await.unwrap().is_empty(),
+        "no signed event for a mismatched pair"
+    );
+
+    std::env::remove_var("AIR_CLAUDE_PROJECTS_ROOT");
+}
+
 /// A10 I10: a `CaptureNotify` on a brain that has NOT consented to capture is a SILENT no-op success
 /// — even with a perfectly VALID, confined transcript, NOTHING is written (no `sessions/` dir, no
 /// signed event). Isolates the capture-disabled gate: the transcript is real and in-root, so absence
@@ -327,7 +374,7 @@ async fn capture_notify_disabled_is_a_silent_no_op() {
     std::env::remove_var("AIR_CLAUDE_PROJECTS_ROOT");
 }
 
-/// A10: a single connection may fire at most `GUEST_OP_RATE` capture pokes per window; the next is
+/// A10: a single connection may fire at most `CAPTURE_POKE_RATE` capture pokes per window; the next is
 /// refused with the rate-limit rejection, and a FRESH connection resets the bucket. Capture is left
 /// DISABLED — the limiter runs BEFORE dispatch, so it fires regardless of the I10 capture gate (each
 /// allowed poke is a clean OK no-op). DOCUMENTED LIMITATION: production MCP clients reconnect per
@@ -336,7 +383,7 @@ async fn capture_notify_disabled_is_a_silent_no_op() {
 #[tokio::test]
 async fn capture_notify_rate_limited_per_connection() {
     let (_dir, sock, _engine) = spawn_daemon_with_engine().await;
-    // GUEST_OP_RATE = 10 (the daemon's const). Capture disabled → each allowed poke is an OK no-op.
+    // CAPTURE_POKE_RATE = 10 (the daemon's const). Capture disabled → each allowed poke is an OK no-op.
     let cap = 10;
 
     let mut guest = Guest::connect(&sock).await;

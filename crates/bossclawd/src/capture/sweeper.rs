@@ -40,8 +40,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::capture::paths::{claude_projects_root, open_transcript_confined, valid_session_id};
-use crate::capture::render::{render_transcript, RenderBounds};
-use crate::capture::store::{heal_orphans, store_capture, CaptureIdentity, HealReport};
+use crate::capture::render::{render_bounds, render_transcript};
+use crate::capture::store::{heal_orphans, store_capture, CaptureIdentity, HealReport, CAPTURE_TOOL};
 use crate::engine::EngineHandle;
 
 /// How often the loop wakes to consider a sweep (~5 min) — mirrors `EVOLVE_INTERVAL`.
@@ -57,24 +57,6 @@ pub const QUIET_SECS: i64 = 600;
 /// thundering herd on first connect; the backfill backlog spreads across successive sweeps;
 /// index invalidation is batched (each `store_capture` invalidates once, already).
 pub const CAPTURE_PER_SWEEP: usize = 8;
-
-/// Render bounds (spec §4a) — the D2 cap point A5's cap-free confined open delegates here.
-const CAPTURE_MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
-const CAPTURE_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
-const CAPTURE_WALL_CLOCK: Duration = Duration::from_secs(30);
-/// The coding agent that produces the swept transcripts. `pub` so the IMMEDIATE `CaptureNotify`
-/// dispatch path (A10) tags the identical `tool`, keeping notify + sweep captures byte-identical.
-pub const CAPTURE_TOOL: &str = "claude-code";
-
-/// The shared render bounds (spec §4a). `pub` so the immediate `CaptureNotify` dispatch (A10) renders
-/// with the SAME caps the sweeper uses — one source of truth for the D2 numbers, no drift.
-pub fn render_bounds() -> RenderBounds {
-    RenderBounds {
-        max_transcript_bytes: CAPTURE_MAX_TRANSCRIPT_BYTES,
-        max_line_bytes: CAPTURE_MAX_LINE_BYTES,
-        wall_clock: CAPTURE_WALL_CLOCK,
-    }
-}
 
 /// One transcript the scan found under the Claude projects root. `session_id` is the file
 /// STEM (A5-validated); `project` is the parent slug directory NAME — Claude Code's
