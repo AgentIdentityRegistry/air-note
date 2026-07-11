@@ -28,7 +28,7 @@ use bossclawd_proto::types::{
     ApplyResultWire, CloudProviderWire, EngineStateWire, EngineStatusWire, EvolveStatusMirror,
     EvolveTelemetryWire, MandateSummaryWire, MandateWriteSummaryWire, ModelStateWire,
     ModelStatusWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
-    ReindexProgressWire,
+    RecallStatsWire, ReindexProgressWire,
 };
 use bossclawd_proto::{
     read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response, Role,
@@ -281,9 +281,16 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             op_result(engine.run_ingest(onboarded).await, |r| Response::RunIngest(r.into()))
         }
         Request::Recall { onboarded, query, k } => {
-            op_result(engine.recall(onboarded, query, k).await, |hits| {
-                Response::Recall(hits.into_iter().map(hit_wire).collect())
-            })
+            // Keep the query for best-effort telemetry (the engine call consumes it). A short-string
+            // clone is negligible next to the embed + ANN + SQL the recall itself does.
+            let telemetry_query = query.clone();
+            match engine.recall(onboarded, query, k).await {
+                Ok(hits) => {
+                    record_recall_telemetry(engine, &telemetry_query, &hits);
+                    Response::Recall(hits.into_iter().map(hit_wire).collect())
+                }
+                Err(e) => op_error_response(e),
+            }
         }
         Request::Remember { onboarded, text } => {
             op_result(engine.remember(onboarded, text).await, Response::Remember)
@@ -405,14 +412,25 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             )
         }
 
-        // Remaining SP3 ops — dispatch arms land with their features (tasks A12–A13). Until then
-        // these return a typed error so the enum stays exhaustively matched (no `_` catch-all).
+        // ── SP3 §8: recall-miss telemetry read (A12). App-only — `Role::allows` denies it for a
+        // guest (`MemoryClient`), so no guest onboarding plumbing is needed here. Best-effort: any
+        // telemetry-store error yields EMPTY stats (`0/0/[]`) rather than a failed op, so the
+        // read-only tuning panel degrades to zeros, never an error. ──
+        Request::RecallStats { .. } => Response::RecallStats(
+            engine
+                .data_dir()
+                .and_then(|d| crate::telemetry::Telemetry::open(d).ok())
+                .and_then(|t| t.stats().ok())
+                .unwrap_or_else(|| RecallStatsWire { total: 0, misses: 0, recent_misses: Vec::new() }),
+        ),
+
+        // Remaining SP3 ops — dispatch arms land with their features (task A13). Until then these
+        // return a typed error so the enum stays exhaustively matched (no `_` catch-all).
         Request::ListSessions { .. }
         | Request::GetSession { .. }
         | Request::DeleteSession { .. }
         | Request::ListNotes { .. }
         | Request::SupersedeNote { .. }
-        | Request::RecallStats { .. }
         | Request::SetCaptureEnabled { .. }
         | Request::CaptureEnabled { .. } => {
             protocol_err("not yet supported by this daemon".to_string())
@@ -634,6 +652,17 @@ fn model_status_wire(
 /// `From`; the snippet pairs alongside it exactly as the desktop's `HitWithText` does.
 fn hit_wire(h: HitWithText) -> HitWire {
     HitWire { hit: h.hit.into(), text: h.text }
+}
+
+/// Record one recall's outcome to the best-effort telemetry store (spec §8 tuning signal), AFTER
+/// the recall itself has completed. Built per-call from the daemon's data dir (`Telemetry` just
+/// holds a path); ANY failure is swallowed inside [`crate::telemetry::Telemetry::record`] — plus an
+/// unresolvable data dir or an un-openable store here is skipped — so telemetry can NEVER fail a
+/// recall (critic m2). Records the QUERY + hit count + top score only; never any result text.
+fn record_recall_telemetry(engine: &EngineHandle, query: &str, hits: &[HitWithText]) {
+    let Some(data_dir) = engine.data_dir() else { return };
+    let Ok(telemetry) = crate::telemetry::Telemetry::open(data_dir) else { return };
+    telemetry.record(query, hits.len(), hits.first().map(|h| h.hit.score));
 }
 
 fn telemetry_wire(t: EvolveTelemetry) -> EvolveTelemetryWire {

@@ -16,6 +16,7 @@
 //!   the app open the identical engine keystore + provider-key blob (the vault-key seam).
 //! - [`identity`] — the daemon-local onboarding check (mirrors the app's `is_onboarded`).
 //! - [`net_guard`] — the SSRF address screen the cloud reasoner's connect-time DNS pin uses.
+//! - [`telemetry`] — best-effort recall-miss telemetry backing the App-only `RecallStats` op (SP3).
 //!
 //! # Safety
 //! The crate forbids `unsafe`. The PID-liveness probe (signal 0) is done via the
@@ -42,5 +43,11 @@ pub mod net_guard;
 pub mod secrets;
 #[cfg(unix)]
 pub mod server;
+// Recall-miss telemetry (SP3 A12): the rung-1/2 retrieval-floor tuning signal. Records every
+// recall's hit/miss outcome under `<data_dir>/telemetry/` (best-effort, rotation-proof counters,
+// queries-only recent-miss ring) and backs the App-only `RecallStats` op. Unix-only to reuse
+// `bossclawd-paths`' 0600/0700 primitives, matching the capture siblings.
+#[cfg(unix)]
+pub mod telemetry;
 #[cfg(unix)]
 pub mod vault;
