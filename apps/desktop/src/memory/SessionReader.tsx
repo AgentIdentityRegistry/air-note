@@ -1,15 +1,7 @@
 import { SlidePanel } from "../components/ui/SlidePanel";
 import { Button } from "../components/Button";
+import { formatDay } from "./format";
 import type { SessionDetailDto } from "../api/engine";
-
-/**
- * Epoch seconds → a short, locale-formatted date. A deliberate tiny local copy of LibraryPanel's
- * helper: sharing it would need either a new util module (out of this task's file scope) or a
- * circular sibling↔parent import, both worse than one trivial one-liner.
- */
-function formatDay(epochSeconds: number): string {
-  return new Date(epochSeconds * 1000).toLocaleDateString();
-}
 
 /**
  * The session reader: a slide-over panel showing one captured session's summary and its

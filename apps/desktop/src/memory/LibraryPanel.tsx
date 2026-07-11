@@ -7,6 +7,7 @@ import {
 } from "../api/engine";
 import { HitList } from "./HitList";
 import { SessionReader } from "./SessionReader";
+import { formatDay } from "./format";
 
 /** The daemon's bare-string rejection when a session no longer exists (delete race — spec §3). */
 const SESSION_GONE = "session not found or deleted";
@@ -15,11 +16,6 @@ const isGone = (e: unknown) => String(e).includes(SESSION_GONE);
 
 /** How many hits to request when the user runs a full-memory search. */
 const RECALL_K = 10;
-
-/** Epoch seconds → a short, locale-formatted date (date only). */
-function formatDay(epochSeconds: number): string {
-  return new Date(epochSeconds * 1000).toLocaleDateString();
-}
 
 /** Case-insensitive "contains" — the primitive behind the client-side filter. */
 function matches(haystack: string, needle: string): boolean {

@@ -181,6 +181,25 @@ describe("LibraryPanel", () => {
     expect(getSession).toHaveBeenCalledWith("s-new");
   });
 
+  it("renders session markdown as literal text — HTML/script content never becomes markup", async () => {
+    // Locks in the #1 security guarantee: captured content is external-tainted and must render as
+    // TEXT (a <pre>), never via dangerouslySetInnerHTML / an HTML renderer. If someone swaps the <pre>
+    // for a markdown-to-HTML renderer, this fails.
+    const evil = '<img src=x onerror=alert(1)> <b>bold</b>';
+    primeArchive([S_NEW], []);
+    vi.mocked(getSession).mockResolvedValue({ summary: S_NEW, markdown: evil });
+    const { container } = render(<LibraryPanel />);
+    await screen.findByText("Design memory hub");
+
+    fireEvent.click(screen.getByRole("button", { name: "View" }));
+
+    // The raw tag string is present in the DOM as visible text…
+    expect(await screen.findByText(/<img src=x onerror=alert\(1\)> <b>bold<\/b>/)).toBeInTheDocument();
+    // …and NOT parsed into real elements.
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("b")).toBeNull();
+  });
+
   it("Delete asks for confirmation quoting the honesty note, then removes the row on confirm", async () => {
     primeArchive([S_OLD, S_NEW], []);
     vi.mocked(deleteSession).mockResolvedValue(undefined);
