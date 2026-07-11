@@ -246,6 +246,25 @@ const CLOUD_REASONER_CONSENT_KEY: &str = "cloud_reasoner_consent";
 /// only by [`EventLog::set_language_pack_record`]; absence means the English default (I7).
 const LANGUAGE_PACK_KEY: &str = "language_pack";
 
+/// The `content` key carrying the SP3 ongoing-capture on/off switch in a control `config` event
+/// (spec §6a). Single-sourced so the ONE writer ([`EventLog::set_capture_enabled`]) and the reader
+/// ([`EventLog::capture_enabled`]) can never drift the key apart, exactly like
+/// [`MANDATES_ENABLED_KEY`]. UNLIKE mandates the DEFAULT is CLOSED (`false` when never set) —
+/// capture must never run for a user who never consented (critic Critical C1 / I10).
+const CAPTURE_ENABLED_KEY: &str = "capture_enabled";
+
+/// The `content` key carrying the SP3 one-time backfill (historical-sweep) consent in a control
+/// `config` event (spec §6a). Default CLOSED: a user who declined history at Connect — or never
+/// connected — never has their pre-[`CAPTURE_ENABLED_AT_KEY`] backlog imported (critic Major M4).
+const BACKFILL_CONSENTED_KEY: &str = "backfill_consented";
+
+/// The `content` key carrying the wall-clock instant (supplied by the daemon — core stays
+/// clock-free) at which capture most recently flipped ON (spec §6a). A VALUED (i64) key read via
+/// [`EventLog::latest_config_value`], NOT a bool flag, so it has no [`ConfigFlag`] variant. The
+/// sweeper's forward-only window is `mtime >= capture_enabled_at`; the disable path leaves it
+/// sticky (capture is off, so it is not consulted).
+const CAPTURE_ENABLED_AT_KEY: &str = "capture_enabled_at";
+
 /// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
 /// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
 /// reference a compile-checked variant instead of a stringly-typed key that could drift on a
@@ -264,6 +283,10 @@ pub enum ConfigFlag {
     CloudReasonerConsent,
     /// The signed opt-in multilingual language-pack record ([`LANGUAGE_PACK_KEY`]).
     LanguagePack,
+    /// The SP3 ongoing-capture on/off switch ([`CAPTURE_ENABLED_KEY`]). Default CLOSED.
+    CaptureEnabled,
+    /// The SP3 one-time backfill consent ([`BACKFILL_CONSENTED_KEY`]). Default CLOSED.
+    BackfillConsented,
 }
 
 impl ConfigFlag {
@@ -276,6 +299,8 @@ impl ConfigFlag {
             ConfigFlag::ReasonerConfig => REASONER_CONFIG_KEY,
             ConfigFlag::CloudReasonerConsent => CLOUD_REASONER_CONSENT_KEY,
             ConfigFlag::LanguagePack => LANGUAGE_PACK_KEY,
+            ConfigFlag::CaptureEnabled => CAPTURE_ENABLED_KEY,
+            ConfigFlag::BackfillConsented => BACKFILL_CONSENTED_KEY,
         }
     }
 }
@@ -5911,6 +5936,96 @@ impl EventLog {
         Ok(true) // flag never set → default open
     }
 
+    /// Whether ongoing session capture is enabled (spec §6a — critic Critical C1's default-CLOSED
+    /// flag). STICKY / fail-closed, reusing [`EventLog::latest_config_value`]'s newest-first scan:
+    /// the newest `config` event carrying an explicit `capture_enabled` bool wins. UNLIKE
+    /// [`EventLog::mandates_enabled`] (default-OPEN), the default here is CLOSED — a never-set flag
+    /// returns `false`, so capture never runs for a user who never consented (I10) even if the boot
+    /// force-off cascade never ran. Because [`EventLog::set_capture_enabled`] is the only writer of
+    /// the key and always writes a bool, the value is never absent-but-present.
+    pub fn capture_enabled(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(CAPTURE_ENABLED_KEY)?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// Whether the one-time historical-backfill consent was granted (spec §6a — critic Major M4).
+    /// Default CLOSED, mirroring [`EventLog::capture_enabled`]: a user who declined history at
+    /// Connect — or never connected — reads `false` here, so the sweeper never imports the backlog
+    /// that predates [`EventLog::capture_enabled_at`]. Disabling capture clears this back to `false`
+    /// (the consent is one-time and spent — see [`EventLog::set_capture_enabled`]), so a later
+    /// forward-only re-enable cannot silently resurrect the backlog.
+    pub fn backfill_consented(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(BACKFILL_CONSENTED_KEY)?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// The wall-clock instant capture most recently flipped ON, or `None` if capture was never
+    /// enabled (spec §6a). Written by [`EventLog::set_capture_enabled`] on every ON transition; the
+    /// disable path leaves it sticky (capture is off, so it is not consulted). Backs the sweeper's
+    /// forward-only window (`mtime >= capture_enabled_at`).
+    pub fn capture_enabled_at(&self) -> Result<Option<i64>, BossclawError> {
+        Ok(self
+            .latest_config_value(CAPTURE_ENABLED_AT_KEY)?
+            .and_then(|v| v.as_i64()))
+    }
+
+    /// Flip the SP3 capture flags by appending ONE signed + hash-chained control `config` event
+    /// (spec §6a). ATOMIC by construction — `capture_enabled` and its `capture_enabled_at` timestamp
+    /// can never be persisted apart. `at` is supplied by the daemon so core stays clock-free
+    /// (mirrors how the sweeper passes time in).
+    ///
+    /// Semantics (the C1 + M4 resolution):
+    /// - `enabled` is written explicitly every call → [`EventLog::explicitly_set`]
+    ///   `(ConfigFlag::CaptureEnabled)` becomes true (what the boot cascade keys off).
+    /// - On enable (`enabled == true`) the `capture_enabled_at` timestamp is (re)recorded.
+    /// - `backfill_consented` is written **true** ONLY when enabling WITH `backfill` (the Connect
+    ///   checkbox). Enabling WITHOUT backfill (the Integrations toggle) does NOT touch the key, so a
+    ///   just-granted Connect consent survives and a never-granted one stays `false` (forward-only,
+    ///   M4).
+    /// - DISABLING (`enabled == false`) clears `backfill_consented` to **false**: the historical
+    ///   consent is one-time and spent, so a later forward-only re-enable must NOT silently re-import
+    ///   the declined backlog (M4). `at` is inert on disable (no ON transition to timestamp).
+    ///
+    /// The single writer of all three keys, so the readers above can never drift the shape apart.
+    pub fn set_capture_enabled(
+        &self,
+        enabled: bool,
+        backfill: bool,
+        at: i64,
+    ) -> Result<(), BossclawError> {
+        // Explicit map so keys are the named consts (json!{} cannot take a const identifier as an
+        // object key). One event ⇒ the enabled bit and its timestamp land atomically.
+        let mut content = serde_json::Map::new();
+        content.insert(CAPTURE_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+        if enabled {
+            content.insert(CAPTURE_ENABLED_AT_KEY.to_string(), serde_json::Value::from(at));
+            if backfill {
+                content.insert(BACKFILL_CONSENTED_KEY.to_string(), serde_json::Value::Bool(true));
+            }
+        } else {
+            // Spend the one-time historical consent so a later forward-only enable cannot
+            // resurrect the declined backlog (critic M4).
+            content.insert(BACKFILL_CONSENTED_KEY.to_string(), serde_json::Value::Bool(false));
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            content: serde_json::Value::Object(content),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
     /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
     ///
@@ -8158,6 +8273,81 @@ mod tests {
         assert_eq!(log.cloud_reasoner_consent_json().unwrap().unwrap(), consent);
 
         // Newest write wins (sticky) and the whole chain still verifies (signed).
+        log.verify_chain().unwrap();
+    }
+
+    /// SP3 §6a (critic Critical C1): both capture flags are default-CLOSED at the engine — a fresh
+    /// log has capture OFF, backfill un-consented, and `CaptureEnabled` never explicitly set, so a
+    /// user who never connected has capture no-op with zero files (I10).
+    #[test]
+    fn capture_flags_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        assert!(!log.capture_enabled().unwrap(), "capture default OFF");
+        assert!(!log.backfill_consented().unwrap(), "backfill default OFF");
+        assert!(
+            !log.explicitly_set(ConfigFlag::CaptureEnabled).unwrap(),
+            "never-set means explicitly_set is false (the boot cascade keys off this)"
+        );
+        assert_eq!(log.capture_enabled_at().unwrap(), None, "no ON transition yet ⇒ no timestamp");
+    }
+
+    /// SP3 §6a: the Integrations-toggle path — enable ongoing capture WITHOUT backfill. Records the
+    /// `capture_enabled_at` timestamp, marks the flag explicitly set, and leaves backfill un-granted
+    /// (a later plain toggle is NOT history consent — critic M4).
+    #[test]
+    fn set_capture_enabled_records_timestamp_and_is_forward_only_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        log.set_capture_enabled(true, /*backfill=*/ false, /*at=*/ 1_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert_eq!(log.capture_enabled_at().unwrap(), Some(1_000));
+        assert!(!log.backfill_consented().unwrap(), "a later toggle is NOT history consent (M4)");
+        assert!(log.explicitly_set(ConfigFlag::CaptureEnabled).unwrap());
+        log.verify_chain().unwrap(); // the flag event is signed + hash-chained
+    }
+
+    /// SP3 §6a: the Connect-checkbox path — enable + backfill in one atomic call sets BOTH flags and
+    /// the timestamp.
+    #[test]
+    fn connect_path_sets_both_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        log.set_capture_enabled(true, /*backfill=*/ true, /*at=*/ 2_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert!(log.backfill_consented().unwrap());
+        assert_eq!(log.capture_enabled_at().unwrap(), Some(2_000));
+    }
+
+    /// SP3 §6a (critic M4 — the disable/re-enable invariant). CHOSEN semantics: disabling clears
+    /// the one-time backfill consent (it is spent), so a later forward-only re-enable gets a FRESH
+    /// timestamp and does NOT silently re-import the declined backlog. Proven purely at the flag
+    /// layer (no dependence on the sweeper's window logic).
+    #[test]
+    fn disabling_capture_clears_enabled_but_records_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+
+        // Connect grants ongoing capture + historical backfill.
+        log.set_capture_enabled(true, /*backfill=*/ true, /*at=*/ 1_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert!(log.backfill_consented().unwrap());
+
+        // Disable: capture off, and the spent backfill consent is cleared.
+        log.set_capture_enabled(false, /*backfill=*/ false, /*at=*/ 2_000).unwrap();
+        assert!(!log.capture_enabled().unwrap(), "disable turns capture off");
+        assert!(!log.backfill_consented().unwrap(), "disable spends/clears the one-time backfill");
+        // The flag stays explicitly set (disable is a real choice, not a return to never-set).
+        assert!(log.explicitly_set(ConfigFlag::CaptureEnabled).unwrap());
+
+        // Re-enable forward-only: fresh timestamp, backfill STAYS cleared → no silent re-import (M4).
+        log.set_capture_enabled(true, /*backfill=*/ false, /*at=*/ 3_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert_eq!(log.capture_enabled_at().unwrap(), Some(3_000), "forward-only window moves to re-enable");
+        assert!(
+            !log.backfill_consented().unwrap(),
+            "a forward-only re-enable must NOT resurrect the spent backfill consent (M4)"
+        );
         log.verify_chain().unwrap();
     }
 

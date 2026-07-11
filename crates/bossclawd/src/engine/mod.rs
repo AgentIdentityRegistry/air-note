@@ -532,6 +532,15 @@ impl EngineHandle {
         if !log.explicitly_set(ConfigFlag::Mandates)? && log.mandates_enabled()? {
             log.set_mandates_enabled(false)?;
         }
+        // SP3 §6a (critic C1): capture is default-CLOSED — its getter already returns false when
+        // unset — so, UNLIKE the flags above, the force-off is NOT gated on the getter being true
+        // (that half would never fire). We persist an EXPLICIT OFF the first time it was never set:
+        // belt-and-suspenders parity with the mandates precedent and a tamper-evident I10 record
+        // ("this brain has capture off"). Idempotent — `explicitly_set` is true afterward, so a
+        // re-open writes nothing. The timestamp arg is inert on the disable (off) path.
+        if !log.explicitly_set(ConfigFlag::CaptureEnabled)? {
+            log.set_capture_enabled(false, false, 0)?;
+        }
         Ok(())
     }
 
@@ -674,6 +683,60 @@ impl EngineHandle {
         spawn_blocking(move || log.current_sessions().map_err(|e| EngineOpError::Core(e.to_string())))
             .await
             .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// SP3 §6a: flip the capture flags (the Connect checkbox → `enabled=true, backfill=true`; the
+    /// Integrations toggle → `enabled=true, backfill=false`; off → `enabled=false`). Mirrors
+    /// [`Self::set_mandates_enabled`]; the daemon supplies `at` so core stays clock-free. The
+    /// sweeper (A9) and the dispatch arms (A10/A13) drive this. Gated.
+    pub async fn set_capture_enabled(
+        &self,
+        onboarded: bool,
+        enabled: bool,
+        backfill: bool,
+        at: i64,
+    ) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_capture_enabled(enabled, backfill, at)
+                .map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// SP3 §6a: read the sticky ongoing-capture flag (default CLOSED — critic C1). The sweeper (A9)
+    /// gates every candidate on this; the `CaptureEnabled` dispatch (A10/A13) surfaces it to the
+    /// app. Mirrors [`Self::mandates_enabled`]. Gated.
+    pub async fn capture_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.capture_enabled().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// SP3 §6a: read the sticky one-time backfill consent (default CLOSED — critic M4). The sweeper
+    /// (A9) reads it to decide the backfill-vs-forward-only window. Gated.
+    pub async fn backfill_consented(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.backfill_consented().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// SP3 §6a: read the instant capture last flipped ON (`None` if never), backing the sweeper's
+    /// forward-only window (`mtime >= capture_enabled_at`). Gated.
+    pub async fn capture_enabled_at(&self, onboarded: bool) -> Result<Option<i64>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.capture_enabled_at().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
     /// Run ONE evolve tick (gated, serialized). Gate → `evolve_lock.try_lock()`
@@ -1695,9 +1758,10 @@ mod tests {
         let h = EngineHandle::new(vault, dir.path().to_path_buf(), std::sync::Arc::new(embed::MockEmbedderProvider::new(8)), std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")));
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
-        // First open primes the three autonomy switches OFF (SP3 `prime_switches`), so a
-        // fresh brain holds exactly those 3 sticky `config` events — not zero.
-        assert_eq!(st.event_count, 3);
+        // First open primes the autonomy switches OFF (SP3 `prime_switches`): the three original
+        // flags (evolve/proposals/mandates) plus the SP3 capture force-off — so a fresh brain holds
+        // exactly those 4 sticky `config` events, not zero.
+        assert_eq!(st.event_count, 4);
         assert!(st.chain_ok);
         // Second call reuses the same instance (Arc ptr identical).
         let a = h.get_or_open(true).await.unwrap();
@@ -1838,6 +1902,71 @@ mod tests {
         let log2 = handle2.get_or_open(true).await.unwrap();
         assert!(log2.proposals_enabled().unwrap(), "an explicit proposals true MUST persist across opens");
         assert!(log2.mandates_enabled().unwrap(), "an explicit mandates true MUST persist across opens (SP5)");
+    }
+
+    /// SP3 A8 §6a (critic Critical C1): a fresh engine reports capture OFF, and the boot cascade
+    /// persists an EXPLICIT OFF (`explicitly_set` true) so the getter-default can never later flip
+    /// it on. An explicit user ON must then survive a re-open (never clobbered by priming).
+    #[tokio::test]
+    async fn first_open_forces_capture_off_and_persists_explicit_off() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault.clone(), &dir);
+        let log = handle.get_or_open(true).await.expect("opens");
+
+        // Default CLOSED at the getter AND persisted as an explicit OFF at boot.
+        assert!(!log.capture_enabled().unwrap(), "capture off on a fresh brain (I10)");
+        assert!(!log.backfill_consented().unwrap(), "backfill un-consented on a fresh brain");
+        assert!(
+            log.explicitly_set(bossclaw_core::ConfigFlag::CaptureEnabled).unwrap(),
+            "boot force-off persists an EXPLICIT OFF (the getter-default can't later flip it on)"
+        );
+
+        // Idempotent: a second open (cell cleared) writes no new config events.
+        let n1 = log.count().unwrap();
+        drop(log);
+        *handle.cell.lock().await = None;
+        let log2 = handle.get_or_open(true).await.expect("re-opens");
+        assert_eq!(log2.count().unwrap(), n1, "capture priming is idempotent (no duplicate off event)");
+
+        // The user explicitly enables capture; a fresh handle's prime must NOT clobber it.
+        log2.set_capture_enabled(true, false, 5_000).unwrap();
+        drop(log2);
+        let handle2 = new_test_handle(vault, &dir);
+        let log3 = handle2.get_or_open(true).await.unwrap();
+        assert!(log3.capture_enabled().unwrap(), "an explicit capture ON MUST persist across opens");
+    }
+
+    /// SP3 A8: the EngineHandle wrappers mirror the mandates wrappers end to end, and carry the
+    /// forward-only invariant (a disable clears the spent backfill; a later forward-only enable does
+    /// not resurrect it) across the async seam. Also proves the not-onboarded gate surfaces `Open`.
+    #[tokio::test]
+    async fn capture_wrappers_roundtrip_and_stay_forward_only() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle = new_test_handle(vault, &dir);
+
+        // Defaults through the wrappers.
+        assert!(!handle.capture_enabled(true).await.unwrap(), "default off");
+        assert!(!handle.backfill_consented(true).await.unwrap(), "default off");
+        assert_eq!(handle.capture_enabled_at(true).await.unwrap(), None);
+
+        // Connect: both flags via one wrapper call.
+        handle.set_capture_enabled(true, true, true, 1_000).await.unwrap();
+        assert!(handle.capture_enabled(true).await.unwrap());
+        assert!(handle.backfill_consented(true).await.unwrap());
+        assert_eq!(handle.capture_enabled_at(true).await.unwrap(), Some(1_000));
+
+        // Disable then re-enable forward-only: backfill stays cleared, timestamp advances.
+        handle.set_capture_enabled(true, false, false, 2_000).await.unwrap();
+        handle.set_capture_enabled(true, true, false, 3_000).await.unwrap();
+        assert!(handle.capture_enabled(true).await.unwrap());
+        assert!(!handle.backfill_consented(true).await.unwrap(), "forward-only re-enable does not re-import (M4)");
+        assert_eq!(handle.capture_enabled_at(true).await.unwrap(), Some(3_000));
+
+        // Not-onboarded → the gate surfaces Open(NotOnboarded), like the mandates wrappers.
+        assert!(matches!(
+            handle.capture_enabled(false).await,
+            Err(EngineOpError::Open(EngineError::NotOnboarded))
+        ));
     }
 
     /// Tasks 5 + 6: `run_ingest` marks the index current, then `recall` round-trips through
