@@ -49,6 +49,32 @@ is a symlink, connecting replaces it with a regular file. For best results, quit
 - If AIR Agent isn't running, the tools return a clean "memory service unavailable" message (they
   never crash the session).
 
+## Session hooks (auto-capture + orientation snapshot)
+
+Beyond the two MCP tools, the binary has two hook subcommands that Claude Code runs around each
+session. The one-click **Connect Claude Code** wires both automatically — a SessionStart `nudge`
+hook and a SessionEnd `capture-notify` hook — and **Disconnect** removes them.
+
+```bash
+air-memory-mcp nudge           # SessionStart hook
+air-memory-mcp capture-notify  # SessionEnd hook
+```
+
+- **`nudge`** (SessionStart) — reads Claude Code's hook JSON from stdin, derives the project from
+  the transcript path's parent-directory slug, and asks the daemon for a live orientation snapshot
+  of this repo's recent memory (bounded to ~2s, well under Claude Code's 5s hook kill). On ANY
+  failure — daemon down, timeout, brain not onboarded, or no transcript path — it prints the static
+  reminder (the same text the SP2 nudge injected) instead, so session start never breaks.
+- **`capture-notify`** (SessionEnd) — reads the hook JSON from stdin and pokes the daemon to render
+  the just-ended session now (fire-and-forget, ~2s timeout). It fires only when both `session_id`
+  and `transcript_path` are present, and it **always exits 0**: if the poke fails or is skipped
+  (daemon down, capture disabled, missing fields), the daemon's own sweeper still backfills the
+  session later, so a failed poke never breaks the SessionEnd hook.
+
+Both hooks are fail-quiet by contract. They parse stdin defensively (bounded read, every field
+optional, control characters stripped) and degrade gracefully — the sweeper backs up capture, the
+static reminder backs up the snapshot — so neither hook can block or break a Claude Code session.
+
 ## Security
 
 The adapter connects as `MemoryClient`; the daemon enforces a fail-closed allowlist (`recall`,
