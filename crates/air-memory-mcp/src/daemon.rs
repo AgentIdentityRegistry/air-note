@@ -17,6 +17,12 @@ use tokio::net::UnixStream;
 /// hang a tool call.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The SHORT bound for the fire-and-forget capture poke ([`tool_capture_notify`]). Deliberately a
+/// couple of seconds — NOT [`CALL_TIMEOUT`] — so a wedged daemon can never hang the millisecond
+/// SessionEnd hook. On timeout the poke simply fails (discarded → exit 0 at the caller); the sweeper
+/// backfills the missed session, so the immediacy is an optimization, never the durability path.
+const CAPTURE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A daemon-call failure, rendered by the MCP layer as a clean tool error (never a panic).
 #[derive(Debug)]
 pub enum DaemonError {
@@ -66,6 +72,19 @@ pub fn resolve_socket_path() -> PathBuf {
 /// Open a fresh connection, handshake as [`Role::MemoryClient`], send `req`, read the `Response`.
 /// Bounded by [`CALL_TIMEOUT`]; any failure is a [`DaemonError`] (never a panic).
 pub async fn call_daemon(sock: &Path, req: Request) -> Result<Response, DaemonError> {
+    call_daemon_bounded(sock, req, CALL_TIMEOUT).await
+}
+
+/// The shared connect + handshake + one round-trip, bounded by an explicit `timeout`. Factored out
+/// so the 30s tool calls ([`call_daemon`]) and the SHORT-timeout capture poke
+/// ([`tool_capture_notify`]) run the exact same exchange with different bounds — the poke must never
+/// inherit the 30s bound and hang the SessionEnd hook. Any failure is a [`DaemonError`] (never a
+/// panic).
+async fn call_daemon_bounded(
+    sock: &Path,
+    req: Request,
+    timeout: Duration,
+) -> Result<Response, DaemonError> {
     let exchange = async {
         let mut stream = UnixStream::connect(sock)
             .await
@@ -101,7 +120,7 @@ pub async fn call_daemon(sock: &Path, req: Request) -> Result<Response, DaemonEr
         serde_json::from_slice::<Response>(&frame)
             .map_err(|e| DaemonError::Protocol(format!("decode response: {e}")))
     };
-    tokio::time::timeout(CALL_TIMEOUT, exchange)
+    tokio::time::timeout(timeout, exchange)
         .await
         .map_err(|_| DaemonError::Unavailable("daemon call timed out".to_string()))?
 }
@@ -137,6 +156,29 @@ pub async fn tool_remember(sock: &Path, text: &str) -> Result<String, DaemonErro
     }
     match call_daemon(sock, Request::Remember { onboarded: true, text: text.to_string() }).await? {
         Response::Remember(id) => Ok(format!("Remembered. (event {id})")),
+        other => Err(map_error_response(other)),
+    }
+}
+
+/// Fire-and-forget capture poke (B2): a SHORT-timeout single round-trip asking the daemon to render
+/// the just-ended Claude Code session now. All failures map to Ok(()) at the CALLER (the
+/// `capture-notify` subcommand exits 0 regardless — the sweeper is the durability guarantee, I1/§6).
+/// Uses [`CAPTURE_NOTIFY_TIMEOUT`], NOT the 30s [`CALL_TIMEOUT`], so a wedged daemon can never hang
+/// the SessionEnd hook. The daemon validates `session_id` + confines `transcript_path` and may
+/// cleanly reject (capture disabled, rate-limited, bad id/path); any non-`Ok` becomes an error the
+/// caller discards.
+pub async fn tool_capture_notify(
+    sock: &Path,
+    session_id: &str,
+    transcript_path: &str,
+) -> Result<(), DaemonError> {
+    let req = Request::CaptureNotify {
+        onboarded: true,
+        session_id: session_id.to_string(),
+        transcript_path: transcript_path.to_string(),
+    };
+    match call_daemon_bounded(sock, req, CAPTURE_NOTIFY_TIMEOUT).await? {
+        Response::Ok => Ok(()),
         other => Err(map_error_response(other)),
     }
 }

@@ -79,6 +79,20 @@ impl HookInput {
     }
 }
 
+/// Decide whether the SessionEnd capture poke should fire, returning the
+/// `(session_id, transcript_path)` pair ONLY when BOTH fields are present AND non-empty.
+///
+/// This is the load-bearing B1-contract filter: [`HookInput::read_from_stdin`] surfaces a
+/// present-but-empty field as `Some("")` (and a control-only value strips to `""`), so an empty value
+/// here means "the harness gave us nothing usable" and MUST be treated as ABSENT — we skip the poke
+/// rather than send the daemon a blank id or path it would only reject. The `capture-notify`
+/// subcommand pokes iff this returns `Some`.
+pub fn capture_target(h: &HookInput) -> Option<(String, String)> {
+    let session_id = h.session_id.as_deref().filter(|s| !s.is_empty())?;
+    let transcript_path = h.transcript_path.as_deref().filter(|s| !s.is_empty())?;
+    Some((session_id.to_string(), transcript_path.to_string()))
+}
+
 /// Drop every Unicode control character (C0 incl. `\n`/`\r`/`\t`, `DEL`, and the C1 range) from a
 /// string field so it is safe to place in a log line or a wire frame. This is a *strip* (the char is
 /// removed), not a map-to-space: `"a b\nc"` → `"a bc"` — ordinary spaces are preserved, controls
