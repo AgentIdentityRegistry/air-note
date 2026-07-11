@@ -1203,6 +1203,38 @@ mod containment_tests {
         let cf = careful_open_file(&dfd, std::ffi::OsStr::new("big.txt")).unwrap();
         assert!(matches!(cf.read_all_capped(10), Err(IngestError::TooLarge)));
     }
+
+    // Pins `open_beneath_confined`'s own defensive contract (its `..`/absolute/empty
+    // rejections), independent of any caller's pre-validation — callers like the
+    // bossclawd capture module hand it an already-clean path, so without this test
+    // those branches would be dead-untested.
+    #[test]
+    fn open_beneath_confined_pins_its_defensive_contract() {
+        use std::io::Read as _;
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("f.txt"), b"contained").unwrap();
+
+        // Accept a normal nested root-relative path (and read through the handle).
+        let mut file =
+            open_beneath_confined(root.path(), std::path::Path::new("a/b/f.txt")).unwrap();
+        let mut body = String::new();
+        file.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "contained");
+
+        // Reject ANY `..` component — even one that would lexically resolve back
+        // inside the root (strictest reading: rejection, never normalization).
+        assert!(open_beneath_confined(root.path(), std::path::Path::new("../x")).is_err());
+        assert!(
+            open_beneath_confined(root.path(), std::path::Path::new("a/../a/b/f.txt")).is_err(),
+            "a `..` that stays under root must still be rejected outright"
+        );
+        // Reject an absolute path passed where a root-relative one is required.
+        assert!(open_beneath_confined(root.path(), &nested.join("f.txt")).is_err());
+        // Reject an empty relative path (no file component under root).
+        assert!(open_beneath_confined(root.path(), std::path::Path::new("")).is_err());
+    }
 }
 
 #[cfg(all(test, unix))]

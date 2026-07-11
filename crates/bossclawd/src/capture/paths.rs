@@ -29,20 +29,32 @@ pub fn valid_session_id(id: &str) -> bool {
 
 /// Claude Code projects root: the [`ENV_CLAUDE_PROJECTS_ROOT`] override (tests/dev),
 /// else `<home>/.claude/projects`. Home is read from `HOME`; if unset it falls back
-/// to the current directory (mirroring the crate's other home resolvers), so the
-/// returned path still ends with `.claude/projects`.
+/// to the current directory with a loud log line (same style as `resolve_data_dir`'s
+/// degraded fallback in main.rs), so the returned path still ends with
+/// `.claude/projects` and a headless launchd/systemd environment stays diagnosable.
 pub fn claude_projects_root() -> std::path::PathBuf {
     if let Some(over) = std::env::var_os(ENV_CLAUDE_PROJECTS_ROOT) {
         return std::path::PathBuf::from(over);
     }
     std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| {
+            // Visible in launchd/systemd logs so a degraded environment is diagnosable, not silent.
+            eprintln!(
+                "bossclawd: HOME is unset; falling back to the current directory for the \
+                 Claude projects root (degraded environment — set {ENV_CLAUDE_PROJECTS_ROOT} \
+                 to pin it)"
+            );
+            std::path::PathBuf::from(".")
+        })
         .join(".claude")
         .join("projects")
 }
 
-/// Open a transcript with ingest-grade containment (I4). Two lexical policy checks
+/// Open a transcript with ingest-grade containment (I4). `candidate` is the FULL
+/// transcript path, of which `root` must be a lexical prefix — this fn derives the
+/// root-relative path itself (contrast `bossclaw_core::ingest::open_beneath_confined`,
+/// which takes a root-RELATIVE path). Two lexical policy checks
 /// run BEFORE any filesystem syscall — (1) the final component's extension must be
 /// `.jsonl`; (2) the path must be lexically under `root` with no `..` component
 /// (strictest: a single `..` is a rejection, never a normalization) — and then the
@@ -141,6 +153,15 @@ mod tests {
         assert!(open_transcript_confined(root.path(), &sibling).is_err());
         // traversal that textually stays under root but uses `..`:
         assert!(open_transcript_confined(root.path(), &proj.join("../outside.txt")).is_err());
+        // ISOLATE the `..` branch: `../outside.txt` above is also caught by the
+        // extension gate, so on its own it wouldn't fail if the `..` check were
+        // deleted. This input PASSES the extension gate, its target EXISTS at the
+        // resolved location (so the rejection is provably containment, not ENOENT),
+        // and the error message must name the `..` component:
+        std::fs::write(root.path().join("outside.jsonl"), b"{}\n").unwrap();
+        let err = open_transcript_confined(root.path(), &proj.join("../outside.jsonl"))
+            .expect_err("a `..` traversal to an existing .jsonl must be refused");
+        assert!(err.to_string().contains(".."), "rejection must come from the `..` check, got: {err}");
         // symlinked DIRECTORY component escaping the root:
         let evil_dir = proj.join("evil_dir");
         std::os::unix::fs::symlink(root.path().parent().unwrap(), &evil_dir).unwrap();
