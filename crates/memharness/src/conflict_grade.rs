@@ -87,6 +87,56 @@ fn ratio(n: usize, d: usize) -> f64 {
     }
 }
 
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng; // the crate's portable RNG — StdRng is NOT reproducible across
+                             // versions/platforms, wrong for a reproducible-measurement harness.
+
+/// The DEFERRED binding gate (spec §9) — applied on the larger owner-sourced set, NOT the tiny
+/// seed (a precision CI over ~5 flags is degenerate; see the plan preamble). Built now so it's
+/// ready. Phase 0's real EXIT is the raw-count smoke (Task 7 `smoke_ok`).
+pub const GATE_PRECISION_CI_LOWER: f64 = 0.90;
+pub const GATE_RECALL_MIN: f64 = 0.30;
+/// Bootstrap CI confidence level = `bootstrap_ci_mean`'s 3rd arg (stats.rs debug-asserts 0<conf<1).
+pub const GATE_CI_CONF: f64 = 0.90;
+
+#[derive(Debug, Clone)]
+pub struct GradeResult {
+    pub metrics: Metrics,
+    pub precision_ci_lower: f64,
+    /// The DEFERRED statistical gate — meaningful only on the larger set. On the seed, read
+    /// `smoke_ok(&result.metrics)` instead (Task 7).
+    pub passes: bool,
+}
+
+/// Grade a set of outcomes: compute metrics, bootstrap the precision CI lower bound
+/// (over the per-FLAG correctness indicators), and apply the deferred §9 gate. `seed` makes
+/// the bootstrap deterministic for hermetic tests.
+pub fn grade(outcomes: &[Outcome], seed: u64) -> GradeResult {
+    let metrics = Metrics::from_outcomes(outcomes);
+    // Precision = mean of {1 if a flagged pair was a true contradiction else 0}.
+    let flagged_correct: Vec<f64> = outcomes
+        .iter()
+        .filter(|o| o.flagged)
+        .map(|o| if o.truly_contradicts { 1.0 } else { 0.0 })
+        .collect();
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let ci = if flagged_correct.is_empty() {
+        (0.0, 0.0)
+    } else {
+        crate::stats::bootstrap_ci_mean(&flagged_correct, 2000, GATE_CI_CONF, &mut rng)
+    };
+    let precision_ci_lower = ci.0;
+    let passes = precision_ci_lower >= GATE_PRECISION_CI_LOWER && metrics.recall >= GATE_RECALL_MIN;
+    GradeResult { metrics, precision_ci_lower, passes }
+}
+
+/// Phase-0 EXIT gate (the honest raw-count smoke on the tiny seed — spec-review re-scope):
+/// the judge raised NO false alarms and caught at least a couple of the real contradictions.
+/// This is what Task 7/8 assert; `grade().passes` is the deferred statistical gate for the big set.
+pub fn smoke_ok(m: &Metrics) -> bool {
+    m.false_positives == 0 && m.true_positives >= 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,7 +150,7 @@ mod tests {
         let pairs = parse_pairs(jsonl).expect("parse");
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].label, PairLabel::Contradicts);
-        assert!(matches!(pairs[0].winner, Some(_)));
+        assert!(pairs[0].winner.is_some());
         assert_eq!(pairs[1].label, PairLabel::Coexist);
         // empty input is a loud error, never a silent zero-case run (memharness convention)
         assert!(parse_pairs("   \n").is_err());
@@ -125,5 +175,25 @@ mod tests {
         assert!((m.precision - 2.0 / 3.0).abs() < 1e-9);
         // cry-wolf = 1 - precision = 1/3
         assert!((m.cry_wolf_rate - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gate_passes_only_when_precision_ci_lower_and_recall_clear_the_bar() {
+        // 20 flags, all correct → precision 1.0, tight CI well above 0.90; recall high.
+        let all_good: Vec<Outcome> = (0..20)
+            .map(|_| Outcome { flagged: true, truly_contradicts: true })
+            .chain((0..5).map(|_| Outcome { flagged: false, truly_contradicts: false }))
+            .collect();
+        let g = grade(&all_good, /*seed*/ 42);
+        assert!(g.passes, "clean judge clears the gate");
+        assert!(g.precision_ci_lower >= 0.90);
+        assert!(g.metrics.recall >= 0.30);
+
+        // Half the flags are wrong → precision ~0.5 → gate fails.
+        let noisy: Vec<Outcome> = (0..10)
+            .map(|_| Outcome { flagged: true, truly_contradicts: true })
+            .chain((0..10).map(|_| Outcome { flagged: true, truly_contradicts: false }))
+            .collect();
+        assert!(!grade(&noisy, 42).passes, "cry-wolf judge fails the gate");
     }
 }
