@@ -407,6 +407,24 @@ pub struct CurrentSession {
     pub approx_bytes: u64,
 }
 
+/// One CURRENT remembered note, folded from the log: a `memory`-kind event
+/// ([`EventLog::remember`] / the corrected note of [`EventLog::supersede_note`])
+/// that is NOT itself retired by a `supersede`. The projection behind
+/// [`EventLog::current_notes`] and the Memory-browser notes list (SP3 §7/§9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentNote {
+    /// The note event's id.
+    pub event_id: String,
+    /// The note text (`content["text"]`; empty if the payload lacks it).
+    pub text: String,
+    /// Creation time (the event `ts` parsed to Unix seconds; 0 if absent/unparseable).
+    pub created_at: i64,
+    /// Always `None` in the current-only fold (a superseded note is EXCLUDED, so any
+    /// note returned is a live head). Carried to mirror `NoteWire`'s shape for a
+    /// possible future edit-history view; this projection never populates it.
+    pub superseded_by: Option<String>,
+}
+
 /// The serialized, signed event log.
 pub struct EventLog {
     inner: Mutex<Store>,
@@ -4900,6 +4918,22 @@ impl EventLog {
         Ok(fold_sessions(&events).current)
     }
 
+    /// The CURRENT remembered notes (SP3 §7/§9): every `memory`-kind event
+    /// ([`EventLog::remember`] / the corrected note of [`EventLog::supersede_note`])
+    /// NOT retired by a `supersede`, newest-first. A deterministic read (no vector,
+    /// no embedder) backing the Memory-browser notes list — mirrors
+    /// [`EventLog::current_sessions`]. "Note" is defined by event-kind EXACTLY as
+    /// [`EventLog::supersede_note`] validates its target (memory-kind), so the list
+    /// and the edit primitive can never disagree on what counts as a note. Reads
+    /// only `memory` + `supersede` events (never a whole-log scan).
+    pub fn current_notes(&self) -> Result<Vec<CurrentNote>, BossclawError> {
+        let events = self.events_of_types(&[
+            crate::graph::MEMORY_EVENT_TYPE,
+            crate::graph::SUPERSEDE_EVENT_TYPE,
+        ])?;
+        Ok(fold_notes(&events))
+    }
+
     /// The tombstoned (owner-deleted) `session_id`s — the same set
     /// [`EventLog::capture_session`] consults to enforce I9. A deterministic,
     /// sorted read over the session fold (no vector, no embedder). The sweeper
@@ -7857,6 +7891,52 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
         }
     }
     SessionFold { current: current.into_values().collect(), deleted, superseded }
+}
+
+/// Pure note fold (SP3 §7/§9): given `memory` + `supersede` events in `seq ASC`
+/// order, returns the CURRENT notes — every `memory`-kind event NOT retired by a
+/// `supersede` — sorted NEWEST-FIRST (`created_at` desc, then `event_id` desc as a
+/// deterministic tie-break; ULIDs are monotonic + lexicographically sortable, so
+/// `event_id` desc IS newest-first within a same-second group).
+///
+/// A returned note's `superseded_by` is ALWAYS `None`: a superseded note is
+/// EXCLUDED from the fold (only live heads survive), mirroring [`fold_sessions`]'s
+/// current-only projection — so the Library shows an edited note in place (old text
+/// gone, new text present) and recall/list stay consistent. `created_at` is the
+/// event `ts` (RFC 3339) parsed to Unix seconds, or 0 if absent/unparseable
+/// (deterministic fallback — no clock read).
+fn fold_notes(events: &[Event]) -> Vec<CurrentNote> {
+    use std::collections::HashSet;
+    let mut superseded: HashSet<&str> = HashSet::new();
+    for ev in events {
+        if ev.event_type == crate::graph::SUPERSEDE_EVENT_TYPE {
+            if let Some(p) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
+                superseded.insert(p);
+            }
+        }
+    }
+    let mut notes: Vec<CurrentNote> = events
+        .iter()
+        .filter(|ev| {
+            ev.event_type == crate::graph::MEMORY_EVENT_TYPE
+                && !superseded.contains(ev.id.as_str())
+        })
+        .map(|ev| CurrentNote {
+            event_id: ev.id.clone(),
+            text: ev
+                .content
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            created_at: DateTime::parse_from_rfc3339(&ev.ts).map(|dt| dt.timestamp()).unwrap_or(0),
+            superseded_by: None,
+        })
+        .collect();
+    notes.sort_by(|a, b| {
+        b.created_at.cmp(&a.created_at).then_with(|| b.event_id.cmp(&a.event_id))
+    });
+    notes
 }
 
 /// TEST-ONLY seams for the N-deep undo store (M6a, T5). Compiled out of every

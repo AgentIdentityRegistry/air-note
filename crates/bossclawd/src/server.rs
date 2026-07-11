@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use bossclawd_proto::types::{
     ApplyResultWire, CloudProviderWire, EngineStateWire, EngineStatusWire, EvolveStatusMirror,
     EvolveTelemetryWire, MandateSummaryWire, MandateWriteSummaryWire, ModelStateWire,
-    ModelStatusWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
-    RecallStatsWire, ReindexProgressWire,
+    ModelStatusWire, NoteWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire,
+    ReasonerModeWire, RecallStatsWire, ReindexProgressWire, SessionDetailWire, SessionSummaryWire,
 };
 use bossclawd_proto::{
     read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response, Role,
@@ -38,7 +38,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::capture::paths::{claude_projects_root, open_transcript_confined, valid_session_id};
 use crate::capture::render::{render_bounds, render_transcript};
-use crate::capture::store::{store_capture, CaptureIdentity, CaptureStoreError, CAPTURE_TOOL};
+use crate::capture::store::{
+    delete_capture, read_capture_markdown, store_capture, CaptureIdentity, CaptureStoreError,
+    CAPTURE_TOOL,
+};
 use crate::engine::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use crate::engine::{
     ApplyResult, EngineError, EngineHandle, EngineOpError, EngineStatus, EvolveTelemetry, HitWithText,
@@ -416,18 +419,95 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
         // guest (`MemoryClient`), so no guest onboarding plumbing is needed here. ──
         Request::RecallStats { .. } => Response::RecallStats(recall_stats(engine)),
 
-        // Remaining SP3 ops — dispatch arms land with their features (task A13). Until then these
-        // return a typed error so the enum stays exhaustively matched (no `_` catch-all).
-        Request::ListSessions { .. }
-        | Request::GetSession { .. }
-        | Request::DeleteSession { .. }
-        | Request::ListNotes { .. }
-        | Request::SupersedeNote { .. }
-        | Request::SetCaptureEnabled { .. }
-        | Request::CaptureEnabled { .. } => {
-            protocol_err("not yet supported by this daemon".to_string())
+        // ── SP3 §7/§9: forget + listing (A13). ALL App-only — `Role::allows` denies each of
+        // these for a `MemoryClient` BEFORE dispatch (the guest never reaches here), so no guest
+        // onboarding plumbing is needed. The SP3 read/mutate family resolves onboarding from the
+        // daemon's OWN identity (never a client flag); the two capture-flag ops keep the App's
+        // self-asserted flag (I3 — the app is trusted/unchanged). ──
+        Request::ListSessions { .. } => op_result(engine.current_sessions().await, |sessions| {
+            Response::ListSessions(sessions.into_iter().map(session_summary_wire).collect())
+        }),
+        Request::GetSession { session_id, .. } => get_session(engine, session_id).await,
+        Request::DeleteSession { session_id, .. } => delete_session(engine, session_id).await,
+        Request::ListNotes { .. } => op_result(engine.current_notes().await, |notes| {
+            Response::ListNotes(notes.into_iter().map(note_wire).collect())
+        }),
+        Request::SupersedeNote { event_id, text, .. } => {
+            op_result(engine.supersede_note(event_id, text).await, Response::Superseded)
+        }
+        Request::SetCaptureEnabled { onboarded, enabled, backfill } => {
+            // `at` is the ONLY clock read on the dispatch core — the daemon boundary supplies it so
+            // core stays clock-free (the Integrations toggle path carries `backfill` from the App).
+            unit_result(engine.set_capture_enabled(onboarded, enabled, backfill, now_unix_secs()).await)
+        }
+        Request::CaptureEnabled { onboarded } => {
+            op_result(engine.capture_enabled(onboarded).await, Response::CaptureEnabled)
         }
     }
+}
+
+/// SP3 §9 (A13) — the App-only `GetSession` detail read. Validates the App-supplied `session_id`
+/// (defense in depth, A5), folds the CURRENT sessions to find it, then reads its daemon-authored
+/// `.md` (bounded) to assemble the [`SessionDetailWire`]. A `session_id` that is not a CURRENT
+/// session (never captured, superseded away, or owner-DELETED) is a clean `Rejected` — the UI
+/// needs to tell "already deleted" from a real fault (spec §3). Never echoes the session id.
+async fn get_session(engine: &EngineHandle, session_id: String) -> Response {
+    // Validate BEFORE building any path (A5 D1), even though App-supplied. A hostile id can never
+    // match a folded (validated) capture anyway, but rejecting here keeps the id out of any path.
+    if !valid_session_id(&session_id) {
+        return capture_rejected("session not found or deleted");
+    }
+    let sessions = match engine.current_sessions().await {
+        Ok(s) => s,
+        Err(e) => return op_error_response(e),
+    };
+    let Some(cs) = sessions.into_iter().find(|c| c.session_id == session_id) else {
+        // Not current (deleted / superseded / never captured) → the specced clean Rejected.
+        return capture_rejected("session not found or deleted");
+    };
+    // Read the daemon-authored body (bounded). A read failure is our OWN i/o (e.g. an out-of-band
+    // deletion racing the fold) → a clean, path-free Core fault (never the OS path).
+    let markdown = match read_capture_markdown(Path::new(&cs.path)) {
+        Ok(m) => m,
+        Err(_) => {
+            return Response::Err {
+                kind: OpErrorKindWire::Core,
+                message: "capture body could not be read".to_string(),
+            }
+        }
+    };
+    Response::Session(SessionDetailWire { summary: session_summary_wire(cs), markdown })
+}
+
+/// SP3 §7 (A13) — the App-only `DeleteSession` (honest, durable forget, I7). Validates the id then
+/// delegates to [`delete_capture`], which removes the `.md` AND appends the `session_deleted`
+/// tombstone (both recall arms then exclude it; it survives a daemon restart). Idempotent by
+/// construction (A7): deleting a missing/unknown session removes nothing and tombstones nothing
+/// current → still `Ok`. Never echoes the session id.
+async fn delete_session(engine: &EngineHandle, session_id: String) -> Response {
+    if !valid_session_id(&session_id) {
+        return capture_rejected("invalid session id");
+    }
+    let Some(data_dir) = engine.data_dir() else {
+        return Response::Err {
+            kind: OpErrorKindWire::Core,
+            message: "capture store data dir unresolvable".to_string(),
+        };
+    };
+    match delete_capture(engine, data_dir, &session_id).await {
+        Ok(()) => Response::Ok,
+        Err(e) => capture_store_error_response(e),
+    }
+}
+
+/// The daemon-boundary wall-clock read (Unix seconds) for `SetCaptureEnabled`'s `at`. This is the
+/// ONLY clock read on the dispatch core; core stays clock-free (it takes the timestamp as an arg).
+/// A pre-epoch clock (impossible in practice) folds to 0 rather than panicking.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// SP3 §4c — the IMMEDIATE capture path (the `CaptureNotify` poke, guest-reachable). An explicit
@@ -669,6 +749,32 @@ fn recall_stats(engine: &EngineHandle) -> RecallStatsWire {
         .unwrap_or_default()
 }
 
+/// Map one folded `CurrentSession` to its wire summary (the fields match 1:1; the on-disk `path`
+/// + `sha256` + `event_id` stay daemon-internal and are deliberately NOT surfaced).
+fn session_summary_wire(cs: bossclaw_core::log::CurrentSession) -> SessionSummaryWire {
+    SessionSummaryWire {
+        session_id: cs.session_id,
+        title: cs.title,
+        project: cs.project,
+        tool: cs.tool,
+        started_at: cs.started_at,
+        ended_at: cs.ended_at,
+        approx_bytes: cs.approx_bytes,
+    }
+}
+
+/// Map one folded `CurrentNote` to its wire form. `superseded_by` is always `None` in the
+/// current-only fold (a superseded note is excluded); the field mirrors the wire shape for a
+/// possible future edit-history view.
+fn note_wire(n: bossclaw_core::log::CurrentNote) -> NoteWire {
+    NoteWire {
+        event_id: n.event_id,
+        text: n.text,
+        created_at: n.created_at,
+        superseded_by: n.superseded_by,
+    }
+}
+
 fn telemetry_wire(t: EvolveTelemetry) -> EvolveTelemetryWire {
     EvolveTelemetryWire {
         last_tick_ms: t.last_tick_ms,
@@ -852,6 +958,30 @@ pub fn test_engine_with_embedder(
     embedder: Arc<dyn crate::engine::embed::EmbedderProvider>,
 ) -> EngineHandle {
     EngineHandle::new(Arc::new(TestVault::default()), home, embedder, Arc::new(TestReasonerProvider))
+}
+
+/// A fresh, shareable in-memory vault handle for tests that must reopen an engine on the SAME
+/// `home`/data_dir across a simulated daemon RESTART. The keystore persists the brain signing key
+/// and the DEK in this vault, so a genuine reopen MUST reuse the same vault instance — a fresh
+/// [`test_engine`] mints a fresh empty vault and would re-mint keys that can't decrypt the existing
+/// DB (`KeystoreDbMismatch`). Returned as an opaque `Arc<dyn SecretsVault>` the caller clones into
+/// two [`test_engine_with_vault`] handles. `TestVault` itself stays crate-private; this is the
+/// integration-test seam the forget-suite daemon-restart test needs (`memory_client_loop` and
+/// `language_pack` document the same crate-private limitation).
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn shared_test_vault() -> Arc<dyn crate::secrets::SecretsVault> {
+    Arc::new(TestVault::default())
+}
+
+/// Like [`test_engine`] but with a CALLER-SUPPLIED vault (see [`shared_test_vault`]) so two engines
+/// can share ONE keystore across a reopen — the daemon-level companion to core's engine-level
+/// reopen tests. Mock embedder + scripted reasoner, exactly like [`test_engine`].
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn test_engine_with_vault(
+    home: std::path::PathBuf,
+    vault: Arc<dyn crate::secrets::SecretsVault>,
+) -> EngineHandle {
+    EngineHandle::new(vault, home, Arc::new(TestEmbedderProvider), Arc::new(TestReasonerProvider))
 }
 
 /// An in-memory `SecretsVault` for tests — NEVER touches the OS keychain.

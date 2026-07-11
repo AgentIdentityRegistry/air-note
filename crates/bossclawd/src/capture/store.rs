@@ -85,6 +85,24 @@ fn sessions_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("sessions")
 }
 
+/// Upper bound on the bytes [`read_capture_markdown`] returns for the `GetSession` detail
+/// view. Comfortably above any realistic rendered session yet well under the 32 MiB wire
+/// frame cap, so the `SessionDetailWire` always encodes — a pathologically large `.md`
+/// (e.g. a tampered file) is truncated (lossy) rather than allowed to blow the frame/memory.
+const MAX_CAPTURE_MD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a capture `.md` in full (bounded to [`MAX_CAPTURE_MD_BYTES`]) for the App-only
+/// `GetSession` detail view. The path is daemon-authored ([`store_capture`]/[`heal_orphans`]
+/// write it under the `0700` `sessions/` dir) and the caller has A5-validated the session id,
+/// so this is a plain bounded read — NOT a confinement boundary (that is `open_transcript_confined`
+/// for attacker-supplied transcript paths). Lossy-UTF8 so a byte-mangled file still renders.
+pub fn read_capture_markdown(md_path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(md_path)?.take(MAX_CAPTURE_MD_BYTES).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Store a rendered capture: validate → compose → atomic-write `0600` under a `0700` dir →
 /// signed event (file-THEN-event, spec §4b). Idempotent: A2's same-`sha256` dedup makes a
 /// repeat store a no-op (the atomic rename is safe to redo). See the module docs.

@@ -693,6 +693,47 @@ impl EngineHandle {
             .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// SP3 §7/§9: the CURRENT (non-superseded) `remember` notes, newest-first — the read
+    /// behind the App-only `ListNotes` op (the Memory-browser notes list). A pure read;
+    /// gated + `spawn_blocking` like [`Self::current_sessions`]. Onboarding is the daemon's
+    /// OWN verdict (App-only op; the SP3 read family never trusts a client `onboarded` flag).
+    pub async fn current_notes(
+        &self,
+    ) -> Result<Vec<bossclaw_core::log::CurrentNote>, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || log.current_notes().map_err(|e| EngineOpError::Core(e.to_string())))
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// SP3 §7: supersede a `remember` note with new text (the App-only `SupersedeNote` edit),
+    /// returning the NEW note's event id. Appends the atomic `supersede`+corrected-note pair
+    /// then invalidates the recall index so the next `recall` surfaces the NEW text and drops
+    /// the old (the same index-invalidation contract as [`Self::remember`]). A blank text, a
+    /// non-note / missing target, or an already-superseded target folds to the typed `Rejected`
+    /// (the engine reports all four as `InvalidInput`); any other core failure folds to `Core`.
+    /// Onboarding is the daemon's OWN verdict (App-only, mirrors [`Self::delete_session`]).
+    pub async fn supersede_note(
+        &self,
+        target_event_id: String,
+        text: String,
+    ) -> Result<String, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let embedder = self.embedder_provider.embedder_for(&log)?;
+        let id = spawn_blocking(move || -> Result<String, EngineOpError> {
+            log.supersede_note(&*embedder, &target_event_id, &text).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        *self.indexed.lock().await = false;
+        Ok(id)
+    }
+
     /// SP3 A9/I9: the tombstoned (owner-deleted) `session_id`s. The sweeper reads this so a
     /// deleted session's still-present transcript is never re-captured (never resurrected) — the
     /// engine's `capture_session` reject is the backstop, this is the cheap decision-time filter.
