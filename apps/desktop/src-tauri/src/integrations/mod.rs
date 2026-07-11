@@ -66,51 +66,12 @@ pub(crate) fn to_pretty(v: &serde_json::Value) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// Atomically write `bytes` to `target` at mode 0600 with NO world-readable window: create a temp
-/// file in the SAME dir **born 0600** (`mode(0o600)` is the `O_CREAT` creation mode — NOT a
-/// chmod-after, so the file is never briefly world-readable), fsync, then `rename` over the target
-/// (atomic within one filesystem; symlink-safe — `rename` replaces a symlinked target with our
-/// regular file, it does not write through the link) — I2. Std-only, zero new deps.
-pub(crate) fn atomic_write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("cfg");
-    let tmp = dir.join(format!(
-        ".{name}.air-tmp.{}.{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true) // fail if the temp name exists → never write into another file
-            .mode(0o600) // born 0600, not chmod-after
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()
-    };
-    if let Err(e) = write().and_then(|()| std::fs::rename(&tmp, target)) {
-        let _ = std::fs::remove_file(&tmp); // best-effort: never leave a temp behind
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Create `dir` (and parents) at mode 0700 **only if we create it**; a pre-existing dir keeps its
-/// perms untouched. For `~/.claude` on a fresh-file connect (review Low — the default umask would
-/// otherwise make a fresh `~/.claude` 0755). `DirBuilder`'s `mode` applies to the components it makes.
-pub(crate) fn make_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    if dir.exists() {
-        return Ok(());
-    }
-    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(dir)
-}
+// The born-0600 atomic write (`~/.claude.json`, `~/.claude/settings.json`) + born-0700 private dir
+// are a SECURITY-critical primitive (no world-readable window) also used by the daemon's SP3
+// capture store. They live in ONE place — `bossclawd-paths`, whose charter is exactly "single
+// source of truth so the two can't drift" — and are re-exported here so every existing
+// `super::{atomic_write_0600, make_private_dir}` call site (and the SP2 test below) is unchanged.
+pub(crate) use bossclawd_paths::{atomic_write_0600, make_private_dir};
 
 #[cfg(test)]
 mod tests {

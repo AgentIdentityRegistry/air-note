@@ -88,6 +88,65 @@ fn socket_path_from(env_socket: Option<OsString>, data_dir: &Path) -> PathBuf {
     env_socket.map(PathBuf::from).unwrap_or_else(|| data_dir.join(SOCKET_FILE))
 }
 
+// ── Owner-only (0600/0700) filesystem primitives ────────────────────────────────────────────────
+//
+// A SINGLE source of truth for the born-0600 atomic write + born-0700 private dir, shared by the
+// desktop SP2 config-writer (`~/.claude.json`, `~/.claude/settings.json`) and the daemon's SP3
+// capture store (`<data_dir>/sessions/<sid>.md`). This is a SECURITY-critical primitive (no
+// world-readable window) — keeping ONE copy is exactly this crate's charter, so the two callers
+// can never drift. Unix-only (POSIX mode bits); the callers that need it are unix-only too.
+
+/// Atomically write `bytes` to `target` at mode `0600` with NO world-readable window: create a temp
+/// file in the SAME dir **born 0600** (the `O_CREAT` creation mode — NOT a chmod-after, so the file
+/// is never briefly world-readable), fsync, then `rename` over the target (atomic within one
+/// filesystem; symlink-safe — `rename` replaces the target, it does not write through a link). The
+/// temp name is `.{target-filename}.air-tmp.{pid}.{seq}` in the target's own dir (a unique sibling,
+/// removed on any failure so no temp is ever left behind). Std-only, zero dependencies.
+#[cfg(unix)]
+pub fn atomic_write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    // The temp name derives from the target's own filename; the fallback is only reachable for a
+    // target with no filename (never in practice — both callers pass a real file path).
+    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("air");
+    let tmp = dir.join(format!(
+        ".{name}.air-tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // fail if the temp name exists → never write into another file
+            .mode(0o600) // born 0600, not chmod-after
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    };
+    if let Err(e) = write().and_then(|()| std::fs::rename(&tmp, target)) {
+        let _ = std::fs::remove_file(&tmp); // best-effort: never leave a temp behind
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Create `dir` (and parents) at mode `0700` **only when we create it**; a pre-existing dir keeps
+/// its perms untouched (so we never loosen — or clobber — an existing directory). `DirBuilder`'s
+/// `mode` applies to the components it makes. Std-only, zero dependencies.
+#[cfg(unix)]
+pub fn make_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    if dir.exists() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +229,44 @@ mod tests {
         );
         // Neither set → None.
         assert_eq!(app_data_dir_from(None, None), None);
+    }
+
+    // The 0600/0700 primitive at its canonical home. Std-only (no tempfile dev-dep, keeping the
+    // crate dependency-free): a unique dir under the OS temp dir, cleaned up at the end.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_is_born_0600_and_private_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+
+        let base = std::env::temp_dir().join(format!(
+            "bossclawd-paths-test.{}.{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        // make_private_dir creates a fresh dir born 0700.
+        make_private_dir(&base).unwrap();
+        assert_eq!(base.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+
+        // atomic_write_0600 writes born 0600; an overwrite stays 0600 (never a looser window).
+        let target = base.join("secret.md");
+        atomic_write_0600(&target, b"one").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"one");
+        assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        atomic_write_0600(&target, b"two").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"two");
+        assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        // A pre-existing dir keeps its perms — make_private_dir never loosens or clobbers.
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        make_private_dir(&base).unwrap();
+        assert_eq!(
+            base.metadata().unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an existing dir is left untouched"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

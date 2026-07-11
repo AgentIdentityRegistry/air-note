@@ -214,6 +214,77 @@ async fn heal_orphans_covers_both_crash_windows() {
     assert_eq!(again.dangling_events_regenerated, 0);
 }
 
+/// Injection round-trip regression (the property the reviewer traced by hand): a HOSTILE title —
+/// one that tries to smuggle extra front-matter keys via embedded newlines — must NOT be able to
+/// forge a `sha256` or `session_id` when the file is later parsed back by orphan healing.
+///
+/// The test drives the REAL composer AND the REAL parser end-to-end: engine A's `store_capture`
+/// writes the on-disk bytes (its composer flattens the title via `one_line`), then a FRESH engine B
+/// (no event for this session) heals from those exact bytes — the window-(a) parse path. If the
+/// composer's flattening were removed, the hostile title's newlines would become real
+/// `sha256:`/`session_id:` lines that overwrite the honest keys, and these assertions would fail.
+#[tokio::test]
+async fn heal_does_not_let_a_hostile_title_inject_front_matter_keys() {
+    for (sid, hostile_title) in [
+        ("inj1", "evil\nsha256: deadbeef\nsession_id: hijacked"),
+        ("inj2", "a\n---\nb: injected"),
+    ] {
+        // Engine A: produce the real on-disk bytes with a known-good, distinctive sha256.
+        let (engine_a, dir_a) = hermetic_engine();
+        let mut r = sample_rendered();
+        r.title = hostile_title.into();
+        r.sha256 = "cafe".repeat(16); // 64 hex chars — the value the healed event MUST keep
+        store_capture(&engine_a, dir_a.path(), &id(sid), &r).await.unwrap();
+        let honest_bytes =
+            std::fs::read(dir_a.path().join(format!("sessions/{sid}.md"))).unwrap();
+
+        // Engine B: fresh, no events. Place the exact composed bytes as an orphan and heal them.
+        let (engine_b, dir_b) = hermetic_engine();
+        let sessions_b = dir_b.path().join("sessions");
+        std::fs::create_dir_all(&sessions_b).unwrap();
+        std::fs::write(sessions_b.join(format!("{sid}.md")), &honest_bytes).unwrap();
+        let report = heal_orphans(&engine_b, dir_b.path()).await.unwrap();
+        assert_eq!(report.orphan_files_captured, 1, "the orphan healed into exactly one event");
+
+        let cur = engine_b.current_sessions().await.unwrap();
+        assert_eq!(cur.len(), 1, "no injected phantom session");
+        assert_eq!(cur[0].session_id, sid, "session_id NOT hijacked by the title ({sid})");
+        assert_eq!(cur[0].sha256, r.sha256, "sha256 NOT overwritten by the title ({sid})");
+    }
+}
+
+#[tokio::test]
+async fn delete_capture_rejects_invalid_session_id() {
+    let (engine, data_dir) = hermetic_engine();
+    let r = delete_capture(&engine, data_dir.path(), "../evil").await;
+    assert!(r.is_err(), "a traversal id must be refused");
+    // Refused BEFORE any fs touch — no sessions dir, no tombstone.
+    assert!(!data_dir.path().join("sessions").exists(), "no fs touch on a rejected id");
+    assert!(engine.current_sessions().await.unwrap().is_empty(), "no tombstone appended");
+}
+
+/// Window-(a)'s owner-deleted branch: a `sessions/*.md` whose session was tombstoned is a stale
+/// leftover — heal REMOVES the file (converging to `no event ⇔ no file`) and resurrects nothing.
+#[tokio::test]
+async fn heal_removes_stale_md_for_an_owner_deleted_session() {
+    let (engine, data_dir) = hermetic_engine();
+    store_capture(&engine, data_dir.path(), &id("gone1"), &sample_rendered()).await.unwrap();
+    let md = data_dir.path().join("sessions/gone1.md");
+    assert!(md.exists());
+
+    // Tombstone via the engine directly, LEAVING the .md on disk (simulates a crash between the
+    // tombstone append and the file removal — the reverse of delete_capture's own order).
+    engine.delete_session("gone1".to_string()).await.unwrap();
+    assert!(md.exists(), "the raw tombstone does not touch the file");
+    assert!(engine.current_sessions().await.unwrap().is_empty(), "session is tombstoned");
+
+    let report = heal_orphans(&engine, data_dir.path()).await.unwrap();
+    assert_eq!(report.orphan_files_captured, 0, "an owner-deleted session is NOT resurrected");
+    assert_eq!(report.dangling_events_regenerated, 0);
+    assert!(!md.exists(), "the stale .md was removed");
+    assert!(engine.current_sessions().await.unwrap().is_empty(), "still no current session (I9)");
+}
+
 fn write_file(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }

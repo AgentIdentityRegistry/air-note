@@ -20,9 +20,10 @@
 //!
 //! # Plaintext at rest
 //! The `.md` body is written in the clear (spec §4b — the deliberate, later-disclosed
-//! decision). The confidentiality control here is the `0600`/`0700` owner-only discipline,
-//! re-implemented std-only (no dependency on the desktop crate, mirroring the SP2
-//! `atomic_write_0600`/`make_private_dir` semantics).
+//! decision). The confidentiality control here is the `0600`/`0700` owner-only discipline via
+//! `bossclawd_paths::{atomic_write_0600, make_private_dir}` — the SINGLE shared copy of that
+//! security-critical primitive (the desktop SP2 config-writer uses the same one, so the two
+//! can never drift).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,9 @@ use crate::capture::paths::valid_session_id;
 use crate::capture::render::Rendered;
 use crate::engine::{EngineHandle, EngineOpError};
 use bossclaw_core::log::{CurrentSession, SessionMeta};
+// The 0600/0700 discipline is a SECURITY-critical primitive shared with the desktop SP2
+// config-writer; it lives ONCE in `bossclawd-paths` (single source of truth, no drift).
+use bossclawd_paths::{atomic_write_0600, make_private_dir};
 
 /// Session identity the renderer never sees (derived by the caller: the sweeper from the
 /// transcript path, dispatch from the `CaptureNotify` request). `session_id` is A5-validated
@@ -242,6 +246,11 @@ pub async fn heal_orphans(
 /// reproducible. `project`/`title`/`tool` are flattened to a single line so a value can never
 /// inject a fake front-matter key (`session_id`/`sha256` are already line-safe by construction —
 /// A5-validated / hex).
+///
+/// Note: the on-disk `title` is a lossy [`one_line`] projection — the signed event stores the raw
+/// title, so a crash-heal that reconstructs `SessionMeta` from this file gets the FLATTENED title.
+/// This is negligible: dedup/supersede is keyed on `sha256` (never the title), and the title only
+/// feeds the recall embedding, where CR/LF → space is inconsequential.
 #[allow(clippy::too_many_arguments)]
 fn compose_document(
     session_id: &str,
@@ -344,52 +353,4 @@ fn front_matter_block(md: &str) -> Option<&str> {
     let rest = md.strip_prefix("---\n")?;
     let end = rest.find("\n---\n")?;
     Some(&rest[..end])
-}
-
-// ── 0600/0700 discipline, re-implemented std-only (mirrors SP2 integrations::mod) ────────────
-
-/// Atomically write `bytes` to `target` at mode `0600` with NO world-readable window: create a
-/// temp file in the SAME dir **born 0600** (the `O_CREAT` creation mode — NOT a chmod-after, so
-/// the file is never briefly world-readable), fsync, then `rename` over the target (atomic within
-/// one filesystem; symlink-safe — `rename` replaces the target, it does not write through a link).
-/// I2. Std-only, zero new deps — mirrors the reviewed SP2 `atomic_write_0600`.
-fn atomic_write_0600(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("capture");
-    let tmp = dir.join(format!(
-        ".{name}.air-tmp.{}.{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true) // fail if the temp name exists → never write into another file
-            .mode(0o600) // born 0600, not chmod-after
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()
-    };
-    if let Err(e) = write().and_then(|()| std::fs::rename(&tmp, target)) {
-        let _ = std::fs::remove_file(&tmp); // best-effort: never leave a temp behind
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Create `dir` (and parents) at mode `0700` **only when we create it**; a pre-existing dir keeps
-/// its perms untouched (mirrors SP2 `make_private_dir`). The daemon owns the data dir, so the
-/// `sessions/` subdir is born `0700` on the first capture.
-fn make_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    if dir.exists() {
-        return Ok(());
-    }
-    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(dir)
 }
