@@ -21,3 +21,11 @@ pub mod render;
 // POSIX 0600/0700 mode bits, exactly like `#[cfg(unix)] mod engine`.
 #[cfg(unix)]
 pub mod store;
+
+// The capture SWEEPER (SP3 A9): the durability guarantee (crash/SIGKILL/missed poke →
+// captured within one sweep) AND the backfill engine (first sweep after Connect imports
+// ~30 days of quiet transcripts). Ties together A5 (path discipline), A6 (renderer),
+// A7 (store), A8 (consent flags). Unix-only to match its store/paths siblings — it opens
+// transcripts via the confined careful-open and drives the Unix-only `EngineHandle`.
+#[cfg(unix)]
+pub mod sweeper;

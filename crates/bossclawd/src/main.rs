@@ -151,8 +151,12 @@ mod unix_main {
         // signed InProgress record exists. Runs in the background; the UI polls model_state.
         engine.resume_migration_if_pending(onboarded).await;
 
-        // (6) Spawn the evolve scheduler (OFF by default; every gate re-read per wake).
+        // (6) Spawn the two background loops as siblings, each OFF by default with every gate
+        // re-read per wake: the evolve scheduler, and the capture sweeper (SP3 A9 — the
+        // durability guarantee + backfill engine; sweeps immediately on boot to heal crash
+        // windows and import quiet transcripts, then every SWEEP_INTERVAL).
         scheduler::spawn(engine.clone(), data_dir.clone());
+        bossclawd::capture::sweeper::spawn(engine.clone(), data_dir.clone());
 
         eprintln!(
             "bossclawd: serving on {} (pid {})",

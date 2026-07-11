@@ -685,6 +685,20 @@ impl EngineHandle {
             .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// SP3 A9/I9: the tombstoned (owner-deleted) `session_id`s. The sweeper reads this so a
+    /// deleted session's still-present transcript is never re-captured (never resurrected) — the
+    /// engine's `capture_session` reject is the backstop, this is the cheap decision-time filter.
+    /// A pure read; gated + `spawn_blocking` like [`Self::current_sessions`].
+    pub async fn deleted_session_ids(&self) -> Result<Vec<String>, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.deleted_session_ids().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// SP3 §6a: flip the capture flags (the Connect checkbox → `enabled=true, backfill=true`; the
     /// Integrations toggle → `enabled=true, backfill=false`; off → `enabled=false`). Mirrors
     /// [`Self::set_mandates_enabled`]; the daemon supplies `at` so core stays clock-free. The

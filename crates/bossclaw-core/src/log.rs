@@ -4900,6 +4900,21 @@ impl EventLog {
         Ok(fold_sessions(&events).current)
     }
 
+    /// The tombstoned (owner-deleted) `session_id`s — the same set
+    /// [`EventLog::capture_session`] consults to enforce I9. A deterministic,
+    /// sorted read over the session fold (no vector, no embedder). The sweeper
+    /// (SP3 A9) uses this to EXCLUDE a deleted session's still-present transcript
+    /// from re-capture at decision time, so it never re-renders — and never
+    /// transiently rewrites the `.md` of — a session the owner deleted (I9). The
+    /// engine's `capture_session` reject remains the durable backstop; this is
+    /// the cheap pre-filter that keeps the per-sweep cap for live sessions.
+    pub fn deleted_session_ids(&self) -> Result<Vec<String>, BossclawError> {
+        let events = self.session_events_ordered()?;
+        let mut ids: Vec<String> = fold_sessions(&events).deleted.into_iter().collect();
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Rebuild the persisted `edges`/`nodes` tables as a deterministic fold over
     /// every `link`/`invalidate` event (`ORDER BY seq ASC`). Tier-A: byte-
     /// identical across rebuilds (spec §4/§9). Wipes both tables and re-inserts
