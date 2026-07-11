@@ -88,12 +88,16 @@ pub struct TranscriptCandidate {
     pub sha_if_known: Option<String>,
 }
 
-/// A currently-captured session as the decision core sees it: the stored transcript sha (from
-/// the signed `session_captured` event) and whether its `.md` view exists on disk right now.
+/// A currently-captured session as the decision core sees it: the stored transcript sha (from the
+/// signed `session_captured` event), whether its `.md` view exists on disk right now, and whether
+/// that `.md` is a RECOVERY STUB (A7 heal-(b) placeholder, marked `recovered: false`). A stub
+/// carries the event's real sha and a fresh mtime, so it is sha- and mtime-indistinguishable from
+/// a real render — `md_is_stub` is the ONLY signal that forces the sweeper to re-render it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CurrentCapture {
     pub sha256: String,
     pub md_exists: bool,
+    pub md_is_stub: bool,
 }
 
 /// Everything [`decide_sweep`] needs, as plain data — NO filesystem, NO engine, NO clock
@@ -175,13 +179,15 @@ fn include_candidate(c: &TranscriptCandidate, input: &SweepDecisionInput) -> boo
     }
     match input.already_current.get(&c.session_id) {
         // Already captured → MAINTENANCE, not a new import, so the backfill/forward window does
-        // NOT apply. Contract 1: skip the re-render ONLY when the .md exists AND the content is
-        // unchanged (adopted-same sha). A MISSING .md (out-of-band delete, crash heal window, or
-        // a placeholder that lacks the real body) MUST re-render so store writes the real body —
-        // the engine then dedups the event to a no-op.
+        // NOT apply. Contract 1: skip the re-render ONLY when the .md exists, is a REAL render
+        // (NOT a recovery stub), AND the content is unchanged (adopted-same sha). A MISSING .md
+        // (out-of-band delete, crash heal window) OR a recovery STUB (present but a placeholder
+        // body carrying the real sha) MUST re-render so store writes the real body — the engine
+        // then dedups the event to a no-op. Without the stub check a stub is sha-indistinguishable
+        // from a real render and would be skipped forever (cap-starved disaster restore).
         Some(cur) => {
             let same_sha = c.sha_if_known.as_deref() == Some(cur.sha256.as_str());
-            !(cur.md_exists && same_sha)
+            !(cur.md_exists && !cur.md_is_stub && same_sha)
         }
         // New (never-captured, non-tombstoned): the M4 backfill window. Import iff it was written
         // after capture was enabled (forward capture) OR the owner consented to backfill history.
@@ -388,9 +394,14 @@ async fn build_current_map(
     let mut map: BTreeMap<String, CurrentCapture> = BTreeMap::new();
     for cs in &current {
         let md_path = sessions_dir.join(format!("{}.md", cs.session_id));
+        let md_exists = md_path.exists();
+        // A present .md that is a RECOVERY STUB (heal-(b) placeholder) is treated as "not a real
+        // render" for the skip decision, so its still-present transcript re-renders next sweep.
+        // Cheap bounded front-matter read; only for the sessions that actually have a .md.
+        let md_is_stub = md_exists && crate::capture::store::is_recovery_stub(&md_path);
         map.insert(
             cs.session_id.clone(),
-            CurrentCapture { sha256: cs.sha256.clone(), md_exists: md_path.exists() },
+            CurrentCapture { sha256: cs.sha256.clone(), md_exists, md_is_stub },
         );
     }
     for cand in candidates.iter_mut() {
@@ -505,18 +516,22 @@ mod tests {
         tomb.tombstoned = BTreeSet::from(["dead".to_string()]);
         assert!(decide_sweep(&tomb).is_empty(), "a tombstoned session is never re-captured");
 
-        // ── Contract 1, cheap skip: current + SAME sha + md_exists → excluded (no re-render).
+        // ── Contract 1, cheap skip: current + SAME sha + md_exists + REAL render → excluded.
         let mut skip = base_input();
         skip.candidates = vec![cand("cur", 9_000, Some("aa"))];
-        skip.already_current =
-            BTreeMap::from([("cur".to_string(), CurrentCapture { sha256: "aa".into(), md_exists: true })]);
-        assert!(decide_sweep(&skip).is_empty(), "an unchanged, on-disk capture is skipped");
+        skip.already_current = BTreeMap::from([(
+            "cur".to_string(),
+            CurrentCapture { sha256: "aa".into(), md_exists: true, md_is_stub: false },
+        )]);
+        assert!(decide_sweep(&skip).is_empty(), "an unchanged, on-disk real render is skipped");
 
         // ── Contract 1, changed content: current + DIFFERENT sha (still md_exists) → re-render.
         let mut changed = base_input();
         changed.candidates = vec![cand("cur", 9_000, Some("bb"))];
-        changed.already_current =
-            BTreeMap::from([("cur".to_string(), CurrentCapture { sha256: "aa".into(), md_exists: true })]);
+        changed.already_current = BTreeMap::from([(
+            "cur".to_string(),
+            CurrentCapture { sha256: "aa".into(), md_exists: true, md_is_stub: false },
+        )]);
         assert_eq!(ids(&decide_sweep(&changed)), vec!["cur"], "changed bytes supersede — re-rendered");
 
         // ── Contract 1, PLACEHOLDER HEAL: current + SAME sha but md MISSING → INCLUDED. This is
@@ -524,9 +539,23 @@ mod tests {
         // re-render so store writes the real body first, even though the event will dedup.
         let mut heal = base_input();
         heal.candidates = vec![cand("cur", 9_000, Some("aa"))];
-        heal.already_current =
-            BTreeMap::from([("cur".to_string(), CurrentCapture { sha256: "aa".into(), md_exists: false })]);
+        heal.already_current = BTreeMap::from([(
+            "cur".to_string(),
+            CurrentCapture { sha256: "aa".into(), md_exists: false, md_is_stub: false },
+        )]);
         assert_eq!(ids(&decide_sweep(&heal)), vec!["cur"], "a missing .md re-renders to heal the body (Contract 1!)");
+
+        // ── Contract 1, RECOVERY STUB: current + SAME sha + md_exists BUT the .md is a heal STUB
+        // (real sha, placeholder body) → INCLUDED. Mirrors the md-missing case: a stub is
+        // sha-indistinguishable from a real render, so without this it would be skipped forever
+        // (cap-starved disaster restore). The next sweep re-renders the real body over it.
+        let mut stub = base_input();
+        stub.candidates = vec![cand("cur", 9_000, Some("aa"))];
+        stub.already_current = BTreeMap::from([(
+            "cur".to_string(),
+            CurrentCapture { sha256: "aa".into(), md_exists: true, md_is_stub: true },
+        )]);
+        assert_eq!(ids(&decide_sweep(&stub)), vec!["cur"], "an unrecovered stub re-renders (self-heal across sweeps)");
 
         // ── Cap: the selection never exceeds `cap`, and is oldest-transcript-first (fair backfill).
         let mut capped = base_input();

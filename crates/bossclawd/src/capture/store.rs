@@ -108,6 +108,7 @@ pub async fn store_capture(
         r.oversized_lines,
         r.skipped_unknown,
         r.dropped_torn_tail,
+        /*recovered_stub=*/ false, // a real render — omit the `recovered` key.
         &r.body,
     );
 
@@ -251,6 +252,15 @@ pub async fn heal_orphans(
 /// title, so a crash-heal that reconstructs `SessionMeta` from this file gets the FLATTENED title.
 /// This is negligible: dedup/supersede is keyed on `sha256` (never the title), and the title only
 /// feeds the recall embedding, where CR/LF → space is inconsequential.
+/// The front-matter marker A7's heal-(b) stamps on a RECOVERY STUB — a `.md` regenerated from
+/// the signed event when the body was lost. A real [`store_capture`] render OMITS this key
+/// entirely (omission ⇔ recovered). A stub carries the event's REAL `sha256` (so dedup/supersede
+/// keep working) and gets a fresh mtime from the atomic write, which makes it
+/// sha-AND-mtime-indistinguishable from a real render — so this marker is the ONLY signal that
+/// tells the sweeper "this body is a placeholder, re-render it when the transcript is present"
+/// (SP3 A9). Keyed `recovered` so it sorts between `project` and `session_id` in the one block.
+const RECOVERED_STUB_MARKER: &str = "recovered: false";
+
 #[allow(clippy::too_many_arguments)]
 fn compose_document(
     session_id: &str,
@@ -264,6 +274,7 @@ fn compose_document(
     oversized_lines: u32,
     skipped_unknown: u32,
     torn_tail: bool,
+    recovered_stub: bool,
     body: &str,
 ) -> String {
     let mut md = String::with_capacity(body.len() + 320);
@@ -273,6 +284,12 @@ fn compose_document(
     md.push_str(&format!("lines_oversized: {oversized_lines}\n"));
     md.push_str(&format!("lines_skipped: {skipped_unknown}\n"));
     md.push_str(&format!("project: {}\n", one_line(project)));
+    // A recovery stub declares `recovered: false` (a real render omits the key); in sorted
+    // position so the block stays ONE reproducible alphabetically-keyed frame.
+    if recovered_stub {
+        md.push_str(RECOVERED_STUB_MARKER);
+        md.push('\n');
+    }
     md.push_str(&format!("session_id: {session_id}\n"));
     md.push_str(&format!("sha256: {sha256}\n"));
     md.push_str(&format!("started_at: {started_at}\n"));
@@ -284,10 +301,46 @@ fn compose_document(
     md
 }
 
+/// True iff `md_path` is a RECOVERY STUB — its front-matter carries [`RECOVERED_STUB_MARKER`].
+/// A cheap, BOUNDED read of only the front-matter block (never the possibly-large body): the
+/// sweeper (A9) calls this so a stub whose transcript is still present re-renders on the next
+/// sweep instead of being skipped forever (a stub is sha-indistinguishable from a real render).
+/// Any read error, an unframed file, or an absent marker → `false` (treat it as a real render;
+/// the worst case is a redundant re-render, never a skipped heal — fail toward re-rendering).
+pub fn is_recovery_stub(md_path: &Path) -> bool {
+    let Ok(prefix) = read_front_matter_prefix(md_path) else {
+        return false;
+    };
+    match front_matter_block(&prefix) {
+        Some(block) => block.lines().any(|line| line == RECOVERED_STUB_MARKER),
+        None => false,
+    }
+}
+
+/// The bytes needed to hold any capture's front-matter block with room to spare — the keys are
+/// fixed and short, so the closing `\n---\n` fence always lands well within this prefix. A larger
+/// (malformed / non-stub) header simply misses the fence and reads as "not a stub".
+const FRONT_MATTER_SCAN_BYTES: u64 = 8 * 1024;
+
+/// Read at most [`FRONT_MATTER_SCAN_BYTES`] from the head of `md_path` (lossy-UTF8) — enough to
+/// contain the whole front-matter frame without ever slurping a large body.
+fn read_front_matter_prefix(md_path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(md_path)?
+        .take(FRONT_MATTER_SCAN_BYTES)
+        .read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// The recovery stub for heal window (b): the same front-matter schema, rebuilt from the signed
 /// event's metadata, with a body that HONESTLY marks the transcript as unrecovered (it invents no
-/// content). Render-only diagnostics (`lines_oversized`/`lines_skipped`/`torn_tail`) aren't carried
-/// on the event, so they default here; the next sweep replaces the whole file if the source exists.
+/// content) AND a `recovered: false` front-matter marker ([`RECOVERED_STUB_MARKER`]). The marker
+/// is load-bearing: the stub carries the event's REAL `sha256` and a fresh mtime, so without it the
+/// sweeper (A9) could not tell the placeholder from a real render and would skip it forever — the
+/// marker is what makes "the next sweep replaces this with the full rendering" actually true.
+/// Render-only diagnostics (`lines_oversized`/`lines_skipped`/`torn_tail`) aren't carried on the
+/// event, so they default here; the next sweep replaces the whole file if the source exists.
 fn regenerated_document(cs: &CurrentSession) -> String {
     let body = "_(session body was not recovered from disk; metadata restored from the signed \
                 event. If the source transcript is still present, the next sweep replaces this \
@@ -304,6 +357,7 @@ fn regenerated_document(cs: &CurrentSession) -> String {
         0,
         0,
         false,
+        /*recovered_stub=*/ true, // a placeholder body → mark it so the sweeper re-renders it.
         body,
     )
 }
