@@ -808,11 +808,12 @@ mod tests {
     async fn status_shape_parity_over_socket() {
         let daemon = TestDaemon::spawn().await;
         let client = daemon.client();
-        // Onboarded → fresh brain opens Ready with exactly the 3 primed config events + intact chain,
+        // Onboarded → fresh brain opens Ready with exactly the 4 primed config events + intact chain,
         // IDENTICAL to `EngineHandle::status` (see `mod.rs::onboarded_opens_fresh_brain_and_memoizes`).
+        // (SP3 A8 added the capture-enabled boot force-off, so prime_switches now writes 4, not 3.)
         let st = bounded(client.status(true)).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
-        assert_eq!(st.event_count, 3, "prime_switches wrote 3 sticky config events");
+        assert_eq!(st.event_count, 4, "prime_switches wrote the 4 sticky config events");
         assert!(st.chain_ok, "fresh brain chain verifies");
         // Not-onboarded → the NotOnboarded state (never-erroring), same as the in-process Engine.
         let st = bounded(client.status(false)).await;
