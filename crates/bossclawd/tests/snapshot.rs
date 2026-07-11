@@ -355,6 +355,128 @@ async fn snapshot_compact_rejects_unconfined_transcript_path() {
 }
 
 #[tokio::test]
+async fn snapshot_compact_over_256kb_drops_torn_head_and_digests_tail() {
+    let _env = env_lock().lock().await;
+    let (_dir, sock, _engine) = spawn_daemon_with_engine().await;
+
+    let projects = tempfile::tempdir().unwrap();
+    let slug = "-repo";
+    let proj_dir = projects.path().join(slug);
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let sid = "compact-big-1";
+    let transcript = proj_dir.join(format!("{sid}.jsonl"));
+
+    // A transcript LARGER than COMPACT_TAIL_BYTES (256 KB): the daemon seeks to len-256KB, lands
+    // mid-way through the giant first line, and drops that torn HEAD segment (skip=1). The HEAD marker
+    // (in that dropped first line) must NOT survive; the fresh TAIL prompt must still be digested.
+    let mut body = String::new();
+    let giant = format!("{} HEADMARKER-should-be-dropped", "x".repeat(400 * 1024));
+    for (i, (kind, content)) in [
+        ("user", serde_json::Value::String(giant)),
+        ("assistant", serde_json::json!([{"type": "text", "text": "ok"}])),
+        ("user", serde_json::Value::String("TAILKEPT-distinctive-last-prompt".into())),
+        ("assistant", serde_json::json!([{"type": "text", "text": "done"}])),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        body.push_str(
+            &serde_json::json!({
+                "type": kind,
+                "message": {"role": kind, "content": content},
+                "timestamp": format!("2026-07-11T10:00:{:02}.000Z", i)
+            })
+            .to_string(),
+        );
+        body.push('\n');
+    }
+    assert!(body.len() > 256 * 1024, "fixture must exceed the 256 KB compact tail window");
+    std::fs::write(&transcript, &body).unwrap();
+    std::env::set_var("AIR_CLAUDE_PROJECTS_ROOT", projects.path());
+    let mut guest = Guest::connect(&sock).await;
+
+    let text = guest
+        .snapshot(Request::Snapshot {
+            onboarded: true,
+            project: slug.into(),
+            source: "compact".into(),
+            session_id: Some(sid.into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+        })
+        .await;
+
+    assert!(text.contains("TAILKEPT-distinctive-last-prompt"), "the tail past 256 KB still digests: {text}");
+    assert!(!text.contains("HEADMARKER"), "the torn head line is dropped, not digested: {text}");
+    assert!(text.len() <= SNAPSHOT_MAX_BYTES, "I8 budget even for a huge transcript: {} bytes", text.len());
+    assert!(text.contains("not instructions") || text.contains("DATA, not"), "fenced");
+}
+
+#[tokio::test]
+async fn snapshot_compact_surfaces_tool_file_paths_and_last_assistant() {
+    let _env = env_lock().lock().await;
+    let (_dir, sock, _engine) = spawn_daemon_with_engine().await;
+
+    let projects = tempfile::tempdir().unwrap();
+    let slug = "-repo";
+    let proj_dir = projects.path().join(slug);
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let sid = "compact-tools-1";
+    let transcript = proj_dir.join(format!("{sid}.jsonl"));
+
+    // An assistant turn with `tool_use` blocks carrying file paths (one path REPEATED → deduped, plus
+    // a `path`-keyed grep), then a final assistant text → exercises the `file:` + `last:` digest lines
+    // that a text-only fixture never reaches.
+    let body = format!(
+        "{}\n{}\n{}\n{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "start work"},
+            "timestamp": "2026-07-11T10:00:00.000Z"
+        }),
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "reading files"},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/repo/src/main.rs"}},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/repo/src/main.rs"}},
+                {"type": "tool_use", "name": "Grep", "input": {"path": "/repo/src/lib.rs"}}
+            ]},
+            "timestamp": "2026-07-11T10:00:01.000Z"
+        }),
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": "continue"},
+            "timestamp": "2026-07-11T10:00:02.000Z"
+        }),
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "FINAL-ASSISTANT-SUMMARY-marker"}]},
+            "timestamp": "2026-07-11T10:00:03.000Z"
+        }),
+    );
+    std::fs::write(&transcript, body).unwrap();
+    std::env::set_var("AIR_CLAUDE_PROJECTS_ROOT", projects.path());
+    let mut guest = Guest::connect(&sock).await;
+
+    let text = guest
+        .snapshot(Request::Snapshot {
+            onboarded: true,
+            project: slug.into(),
+            source: "compact".into(),
+            session_id: Some(sid.into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+        })
+        .await;
+
+    assert!(text.contains("file:"), "a file-path digest line is present: {text}");
+    assert!(text.contains("/repo/src/main.rs"), "the tool_use file_path is surfaced: {text}");
+    assert!(text.contains("/repo/src/lib.rs"), "the `path`-keyed tool file is surfaced too: {text}");
+    assert_eq!(text.matches("/repo/src/main.rs").count(), 1, "the repeated file path is de-duped: {text}");
+    assert!(text.contains("last: FINAL-ASSISTANT-SUMMARY-marker"), "the last assistant message is surfaced: {text}");
+    assert!(text.len() <= SNAPSHOT_MAX_BYTES);
+}
+
+#[tokio::test]
 async fn snapshot_empty_memory_is_a_clean_short_snapshot() {
     let (_dir, sock, _engine) = spawn_daemon_with_engine().await;
     let mut guest = Guest::connect(&sock).await;
