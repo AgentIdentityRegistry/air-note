@@ -146,10 +146,11 @@ fn retain_out_group(
     })
 }
 
-/// Write the `air-memory` MCP server + SessionStart nudge into the Claude Code config, merging
-/// (never replacing) and idempotently. **Both files are parsed + shape-validated BEFORE either is
-/// written** (I5): a malformed / oddly-shaped `settings.json` fails loud with `claude.json` left
-/// byte-unchanged — no partial write, no lying "nothing changed" (review MAJOR M3).
+/// Write the `air-memory` MCP server + SessionStart nudge + SessionEnd `capture-notify` hook into the
+/// Claude Code config, merging (never replacing) and idempotently. **Both files are parsed +
+/// shape-validated BEFORE either is written** (I5): a malformed / oddly-shaped `settings.json` fails
+/// loud with `claude.json` left byte-unchanged — no partial write, no lying "nothing changed" (review
+/// MAJOR M3).
 pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io::Result<()> {
     // ── Phase 1: parse + validate + mutate IN MEMORY (no writes yet). ──
     let mut claude = read_json_object(&paths.claude_json)?.unwrap_or_else(|| serde_json::json!({}));
@@ -181,9 +182,10 @@ pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io
     Ok(())
 }
 
-/// Remove ONLY our `air-memory` MCP server + our SessionStart nudge group(s), preserving everything
-/// else. **Both files are parsed BEFORE either is written** (I5) — a malformed file fails loud with
-/// nothing clobbered. Absent files → nothing to do; only files we actually change are rewritten.
+/// Remove ONLY our `air-memory` MCP server + our SessionStart nudge group(s) + our SessionEnd
+/// `capture-notify` group(s), preserving everything else. **Both files are parsed BEFORE either is
+/// written** (I5) — a malformed file fails loud with nothing clobbered. Absent files → nothing to do;
+/// only files we actually change are rewritten.
 pub fn disconnect(paths: &ClaudeCodePaths) -> std::io::Result<()> {
     // Parse both up front — a malformed file errors here, before any write.
     let claude = read_json_object(&paths.claude_json)?;
