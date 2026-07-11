@@ -58,7 +58,7 @@ describe("LibraryPanel", () => {
   it("the search box filters sessions and notes client-side (case-insensitive)", async () => {
     primeArchive([S_OLD, S_NEW], [NOTE]);
     render(<LibraryPanel />);
-    const input = await screen.findByLabelText("Filter your library");
+    const input = await screen.findByLabelText(/Filter your library/);
 
     // A title match (lowercase query, mixed-case title) keeps only that session; hides the other + the note.
     fireEvent.change(input, { target: { value: "design" } });
@@ -81,7 +81,7 @@ describe("LibraryPanel", () => {
     };
     vi.mocked(recall).mockResolvedValue([hit]);
     render(<LibraryPanel />);
-    const input = await screen.findByLabelText("Filter your library");
+    const input = await screen.findByLabelText(/Filter your library/);
 
     // "daemon" matches no loaded session/note, so any match came from recall, not the client filter.
     fireEvent.change(input, { target: { value: "daemon" } });
@@ -89,8 +89,60 @@ describe("LibraryPanel", () => {
 
     await screen.findByText("Recalled: the daemon excludes superseded notes");
     expect(recall).toHaveBeenCalledWith("daemon", 10);
-    // Hits live in a distinct "Memory" group, separate from the Sessions/Notes lists.
-    expect(screen.getByRole("heading", { name: "Memory" })).toBeInTheDocument();
+    // Hits live in a distinct Memory group, labeled with the searched term so it can't be
+    // mistaken for the live client-side filter as the box keeps re-filtering.
+    expect(screen.getByRole("heading", { name: /Memory · .daemon./ })).toBeInTheDocument();
+  });
+
+  it("pressing Enter in the search box runs recall (not just the button)", async () => {
+    primeArchive([S_OLD, S_NEW], [NOTE]);
+    const hit: HitDto = {
+      event_id: "h2", score: 0.5, kind: "memory", sources: ["keyword"], text: "Recalled via Enter",
+    };
+    vi.mocked(recall).mockResolvedValue([hit]);
+    render(<LibraryPanel />);
+    const input = await screen.findByLabelText(/Filter your library/);
+
+    fireEvent.change(input, { target: { value: "auth" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await screen.findByText("Recalled via Enter");
+    expect(recall).toHaveBeenCalledWith("auth", 10);
+  });
+
+  it("a search that finds nothing shows the 'Nothing found in memory' notice", async () => {
+    primeArchive([S_OLD, S_NEW], [NOTE]);
+    vi.mocked(recall).mockResolvedValue([]);
+    render(<LibraryPanel />);
+    const input = await screen.findByLabelText(/Filter your library/);
+
+    fireEvent.change(input, { target: { value: "nonexistent-term" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search memory" }));
+
+    expect(await screen.findByText(/Nothing found in memory/i)).toBeInTheDocument();
+  });
+
+  it("a recall failure surfaces the error (caught as a bare string, not e.message)", async () => {
+    primeArchive([S_OLD, S_NEW], [NOTE]);
+    vi.mocked(recall).mockRejectedValue("recall exploded");
+    render(<LibraryPanel />);
+    const input = await screen.findByLabelText(/Filter your library/);
+
+    fireEvent.change(input, { target: { value: "boom" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search memory" }));
+
+    expect(await screen.findByText(/recall exploded/)).toBeInTheDocument();
+  });
+
+  it("sessions-but-no-notes shows a neutral 'No notes yet.', not empty-quote filter copy", async () => {
+    // The landing/common early state: some sessions, zero notes, no active filter. The Notes
+    // section must NOT render `No notes match "".` (empty quotes) — it must read "No notes yet.".
+    primeArchive([S_NEW], []);
+    render(<LibraryPanel />);
+    await screen.findByText("Design memory hub");
+
+    expect(screen.getByText("No notes yet.")).toBeInTheDocument();
+    expect(screen.queryByText(/No notes match/)).toBeNull();
   });
 
   it("empty archive shows a neutral empty state", async () => {

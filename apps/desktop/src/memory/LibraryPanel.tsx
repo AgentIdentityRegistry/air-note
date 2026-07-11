@@ -40,6 +40,9 @@ export function LibraryPanel() {
   // Full-brain recall (the daemon search), kept separate from the client-side filter.
   const [hits, setHits] = useState<HitDto[]>([]);
   const [searched, setSearched] = useState(false);
+  // The term the shown hits are FOR — the live filter keeps re-filtering as you type, so the recall
+  // group labels itself with the searched term to make clear its hits aren't the live filter.
+  const [searchedTerm, setSearchedTerm] = useState("");
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
 
@@ -68,6 +71,7 @@ export function LibraryPanel() {
     setSearchError(null);
     try {
       setHits(await recall(q, RECALL_K));
+      setSearchedTerm(q);
       setSearched(true);
     } catch (e) {
       setSearchError(String(e));
@@ -114,26 +118,29 @@ export function LibraryPanel() {
         Everything your agent remembers, in one place — filter what’s loaded, or search your whole memory.
       </p>
 
-      <div style={{ display: "flex", gap: 8, margin: "12px 0" }}>
+      <div style={{ display: "flex", gap: 8, margin: "12px 0 4px" }}>
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") void onSearchMemory(); }}
           placeholder="Filter sessions & notes…"
-          aria-label="Filter your library"
+          aria-label="Filter your library, or press Enter to search all memory"
           style={{ flex: 1, padding: "8px 12px", borderRadius: 6, fontFamily: "inherit", fontSize: 14 }}
         />
         <Button variant="primary" onClick={onSearchMemory} disabled={searching || query.trim() === ""}>
           {searching ? "Searching…" : "Search memory"}
         </Button>
       </div>
+      <p style={{ color: "var(--text-tertiary)", fontSize: 12, margin: "0 0 12px" }}>
+        Typing filters what’s loaded; press Enter or “Search memory” to search your whole memory.
+      </p>
 
       {searchError ? <p style={{ fontSize: 13, color: "var(--error)" }}>{searchError}</p> : null}
 
       {/* Full-brain recall results — a SEPARATE group from the client-side-filtered lists below. */}
       {searched && !searchError ? (
         <section style={{ marginBottom: 20 }}>
-          <h3 style={{ fontSize: 13, margin: "0 0 8px" }}>Memory</h3>
+          <h3 style={{ fontSize: 13, margin: "0 0 8px" }}>Memory · “{searchedTerm}”</h3>
           {hits.length === 0 ? (
             <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>Nothing found in memory — try different words.</p>
           ) : (
@@ -151,7 +158,9 @@ export function LibraryPanel() {
           <section style={{ marginBottom: 20 }}>
             <h3 style={{ fontSize: 13, margin: "0 0 8px" }}>Sessions</h3>
             {visibleSessions.length === 0 ? (
-              <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No sessions match “{query.trim()}”.</p>
+              <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
+                {needle === "" ? "No sessions yet." : `No sessions match “${query.trim()}”.`}
+              </p>
             ) : (
               <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
                 {visibleSessions.map((s) => (
@@ -174,7 +183,9 @@ export function LibraryPanel() {
           <section>
             <h3 style={{ fontSize: 13, margin: "0 0 8px" }}>Notes</h3>
             {visibleNotes.length === 0 ? (
-              <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>No notes match “{query.trim()}”.</p>
+              <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
+                {needle === "" ? "No notes yet." : `No notes match “${query.trim()}”.`}
+              </p>
             ) : (
               <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
                 {visibleNotes.map((n) => (
