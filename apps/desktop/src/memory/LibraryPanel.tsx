@@ -2,10 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import {
-  listSessions, listNotes, recall,
-  type SessionSummaryDto, type NoteDto, type HitDto,
+  listSessions, listNotes, recall, getSession, deleteSession,
+  type SessionSummaryDto, type SessionDetailDto, type NoteDto, type HitDto,
 } from "../api/engine";
 import { HitList } from "./HitList";
+import { SessionReader } from "./SessionReader";
+
+/** The daemon's bare-string rejection when a session no longer exists (delete race — spec §3). */
+const SESSION_GONE = "session not found or deleted";
+/** Tauri rejects Result<_, String> with a BARE STRING; match the gone-race arm on its text. */
+const isGone = (e: unknown) => String(e).includes(SESSION_GONE);
 
 /** How many hits to request when the user runs a full-memory search. */
 const RECALL_K = 10;
@@ -80,6 +86,80 @@ export function LibraryPanel() {
     }
   };
 
+  // ---- C5: session reader (a slide-over showing one session's rendered Markdown) ----
+  const [openSessionId, setOpenSessionId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<SessionDetailDto | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailGone, setDetailGone] = useState(false);
+
+  // ---- C5: honest Delete flow (confirm gate + already-deleted notice) ----
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const closeReader = () => {
+    setOpenSessionId(null);
+    setDetail(null);
+    setDetailError(null);
+    setDetailGone(false);
+  };
+
+  const openReader = async (sessionId: string) => {
+    setNotice(null);
+    setOpenSessionId(sessionId);
+    setDetail(null);
+    setDetailError(null);
+    setDetailGone(false);
+    setDetailLoading(true);
+    try {
+      setDetail(await getSession(sessionId));
+    } catch (e) {
+      if (isGone(e)) {
+        // Deleted elsewhere between listing and opening → friendly reader state + authoritative refresh.
+        setDetailGone(true);
+        void loadRef.current();
+      } else {
+        setDetailError(String(e));
+      }
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const askDelete = (sessionId: string) => {
+    setNotice(null);
+    setDeleteError(null);
+    setConfirmDeleteId(sessionId);
+  };
+
+  const confirmDelete = async () => {
+    const sessionId = confirmDeleteId;
+    if (!sessionId) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteSession(sessionId);
+      // Drop the row locally; close the reader if it was showing this session.
+      setSessions((prev) => prev.filter((s) => s.session_id !== sessionId));
+      if (openSessionId === sessionId) closeReader();
+      setConfirmDeleteId(null);
+    } catch (e) {
+      if (isGone(e)) {
+        // deleteSession is idempotent, but the race arm is honest either way: friendly notice + refresh.
+        setNotice("That session was already deleted.");
+        if (openSessionId === sessionId) closeReader();
+        setConfirmDeleteId(null);
+        void loadRef.current();
+      } else {
+        setDeleteError(String(e));
+      }
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   if (loading) {
     return (
       <Card>
@@ -117,6 +197,10 @@ export function LibraryPanel() {
       <p style={{ color: "var(--text-secondary)", fontSize: 13, margin: "0 0 12px", lineHeight: 1.5 }}>
         Everything your agent remembers, in one place — filter what’s loaded, or search your whole memory.
       </p>
+
+      {notice ? (
+        <p style={{ fontSize: 13, color: "var(--text-secondary)", margin: "0 0 12px" }}>{notice}</p>
+      ) : null}
 
       <div style={{ display: "flex", gap: 8, margin: "12px 0 4px" }}>
         <input
@@ -172,7 +256,11 @@ export function LibraryPanel() {
                           <span>{s.project}</span> · <span>{formatDay(s.started_at)}</span>
                         </div>
                       </div>
-                      {/* C5 seam: session View / Delete row actions attach here. */}
+                      {/* C5: session View (opens the reader) / Delete (honest confirm) row actions. */}
+                      <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                        <Button variant="secondary" onClick={() => void openReader(s.session_id)}>View</Button>
+                        <Button variant="secondary" className="danger-btn" onClick={() => askDelete(s.session_id)}>Delete</Button>
+                      </div>
                     </div>
                   </li>
                 ))}
@@ -204,6 +292,52 @@ export function LibraryPanel() {
           </section>
         </>
       )}
+
+      <SessionReader
+        isOpen={openSessionId !== null}
+        detail={detail}
+        loading={detailLoading}
+        error={detailError}
+        gone={detailGone}
+        onClose={closeReader}
+        onDelete={() => { if (openSessionId) askDelete(openSessionId); }}
+      />
+
+      {/* Honest Delete confirm — an overlay (z above the reader) quoting §7b: the readable body is
+          destroyed, but the session's title stays in the append-only signed chain (not erasable yet). */}
+      {confirmDeleteId !== null ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={() => { if (!deleting) setConfirmDeleteId(null); }}
+        >
+          <div
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete session"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ color: "var(--error)" }}>Delete this session?</h3>
+            <p style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.5, margin: 0 }}>
+              Its saved text — the readable note stored on your Mac — will be permanently deleted.
+              The session’s title remains in the encrypted log: the signed history chain can’t be
+              erased yet, so the title can’t be fully forgotten today.
+            </p>
+            {deleteError ? (
+              <p style={{ fontSize: 13, color: "var(--error)", margin: 0 }}>{deleteError}</p>
+            ) : null}
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button variant="secondary" className="danger-btn" disabled={deleting} onClick={() => void confirmDelete()}>
+                {deleting ? "Deleting…" : "Delete session"}
+              </Button>
+              <Button variant="secondary" disabled={deleting} onClick={() => setConfirmDeleteId(null)}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </Card>
   );
 }
