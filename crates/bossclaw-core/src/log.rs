@@ -1596,8 +1596,8 @@ impl EventLog {
         ) = if kinds.values().any(|k| {
             k == crate::graph::SESSION_CAPTURED_EVENT_TYPE || k == crate::graph::MEMORY_EVENT_TYPE
         }) {
-            let (current, _deleted, superseded) = fold_sessions(&self.session_events_ordered()?);
-            (current.values().map(|cs| cs.event_id.clone()).collect(), superseded)
+            let fold = fold_sessions(&self.session_events_ordered()?);
+            (fold.current.into_iter().map(|cs| cs.event_id).collect(), fold.superseded)
         } else {
             (std::collections::HashSet::new(), std::collections::HashSet::new())
         };
@@ -1731,6 +1731,12 @@ impl EventLog {
                 // only the current fold head; a deleted session (tombstoned) or a
                 // superseded capture is not in `current`, so it is dropped even
                 // after a reopen re-adds its persisted vector (rebuild-proof).
+                // Do NOT "symmetrize" this to the memory arm's exclusion shape:
+                // `!superseded_ids.contains(&h.event_id)` would MISS owner-deleted
+                // sessions — the `session_deleted` tombstone keys on session_id,
+                // not event id, so a deleted session's capture event is absent
+                // from the supersede set. Inclusion-by-fold-head is the only
+                // shape that covers both retirement paths here.
                 return current_session_event_ids.contains(&h.event_id);
             }
             if h.kind == crate::graph::MEMORY_EVENT_TYPE {
@@ -4720,19 +4726,22 @@ impl EventLog {
     }
 
     /// Event ids that the model-facing BATCH paths must treat as GONE — the union
-    /// of (1) every id retired by a `supersede` (superseded notes and superseded
-    /// session heads; `fold_sessions` accumulates these while scanning the shared
-    /// supersede stream) and (2) every `session_captured` event whose `session_id`
-    /// carries a `session_deleted` tombstone (the tombstone keys on `session_id`,
-    /// so the capture event id is NOT in the supersede set). One
-    /// [`EventLog::session_events_ordered`] scan feeds both. Used to gate
-    /// re-embedding ([`EventLog::collect_pending`]) AND the migration completeness
-    /// denominator ([`EventLog::reembed_prepare`]) so a deleted session neither
-    /// re-vectorizes on rebuild/migration nor (by being counted "missing") blocks
-    /// a migration from ever completing.
+    /// of (1) every id retired by a `supersede`: superseded notes, session heads,
+    /// and page/file versions (`session_events_ordered` pulls ALL supersede
+    /// events, which are shared across the folds — and gating retired page/file
+    /// versions out of re-embedding is beneficial, not inert: only the CURRENT
+    /// version of anything should ever re-vectorize) and (2) every
+    /// `session_captured` event whose `session_id` carries a `session_deleted`
+    /// tombstone (the tombstone keys on `session_id`, so the capture event id is
+    /// NOT in the supersede set). One [`EventLog::session_events_ordered`] scan
+    /// feeds both. Used to gate re-embedding ([`EventLog::collect_pending`]) AND
+    /// the migration completeness denominator ([`EventLog::reembed_prepare`]) so
+    /// a deleted session neither re-vectorizes on rebuild/migration nor (by being
+    /// counted "missing") blocks a migration from ever completing.
     fn embed_excluded_event_ids(&self) -> Result<HashSet<String>, BossclawError> {
         let events = self.session_events_ordered()?;
-        let (_current, deleted, mut excluded) = fold_sessions(&events);
+        let fold = fold_sessions(&events);
+        let (deleted, mut excluded) = (fold.deleted, fold.superseded);
         for ev in &events {
             if ev.event_type == crate::graph::SESSION_CAPTURED_EVENT_TYPE {
                 if let Some(sid) = ev.content.get("session_id").and_then(|v| v.as_str()) {
@@ -4796,17 +4805,17 @@ impl EventLog {
     /// `derive_vector_for` runs, matching [`EventLog::remember`] and the M5a ingest path.
     pub fn capture_session(&self, embedder: &dyn Embedder, meta: &SessionMeta) -> Result<String, BossclawError> {
         let events = self.session_events_ordered()?;
-        let (current, deleted, _superseded) = fold_sessions(&events);
+        let fold = fold_sessions(&events);
 
         // I9: a tombstoned session is gone forever — never recapturable.
-        if deleted.contains(&meta.session_id) {
+        if fold.deleted.contains(&meta.session_id) {
             return Err(BossclawError::InvalidInput(format!(
                 "session {} was deleted and cannot be recaptured (I9)",
                 meta.session_id
             )));
         }
 
-        match current.get(&meta.session_id) {
+        match fold.current.iter().find(|cs| cs.session_id == meta.session_id) {
             // Same id + same bytes → no-op (return the existing current event id).
             // The sweeper's steady-state hot path: no event is even constructed.
             Some(prev) if prev.sha256 == meta.sha256 => Ok(prev.event_id.clone()),
@@ -4836,8 +4845,8 @@ impl EventLog {
     /// (nothing to delete: already gone, superseded away, or never captured).
     pub fn delete_session(&self, session_id: &str) -> Result<String, BossclawError> {
         let events = self.session_events_ordered()?;
-        let (current, _deleted, _superseded) = fold_sessions(&events);
-        if !current.contains_key(session_id) {
+        let fold = fold_sessions(&events);
+        if !fold.current.iter().any(|cs| cs.session_id == session_id) {
             return Err(BossclawError::InvalidInput(format!(
                 "cannot delete session {session_id}: no current captured session with that id"
             )));
@@ -4863,8 +4872,7 @@ impl EventLog {
     /// against so deleted/superseded sessions never surface.
     pub fn current_sessions(&self) -> Result<Vec<CurrentSession>, BossclawError> {
         let events = self.session_events_ordered()?;
-        let (current, _deleted, _superseded) = fold_sessions(&events);
-        Ok(current.into_values().collect())
+        Ok(fold_sessions(&events).current)
     }
 
     /// Rebuild the persisted `edges`/`nodes` tables as a deterministic fold over
@@ -7658,27 +7666,33 @@ fn parse_session_content(ev: &Event) -> Option<CurrentSession> {
     })
 }
 
+/// The projection produced by [`fold_sessions`]. A named struct (not a tuple)
+/// because `deleted` and `superseded` share a type but NOT a meaning —
+/// `deleted` holds `session_id`s, `superseded` holds EVENT ids — so a
+/// positional swap would compile silently. House-consistent with the other
+/// folds returning named projections.
+struct SessionFold {
+    /// The CURRENT sessions: the latest `session_captured` per `session_id`
+    /// NOT retired by a `supersede` and whose `session_id` has NO
+    /// `session_deleted` tombstone. Sorted by `session_id` (deterministic).
+    current: Vec<CurrentSession>,
+    /// Tombstoned `session_id`s (NOT event ids) — so `capture_session` can
+    /// enforce I9 (a deleted session is never recapturable).
+    deleted: std::collections::HashSet<String>,
+    /// EVENT ids retired by a `supersede`. Because the fold's input carries
+    /// EVERY `supersede` event (they are shared across the page/file/session/
+    /// note folds), this is the complete retired-id universe — the recall
+    /// exclusion (A3) reuses it instead of a second scan.
+    superseded: std::collections::HashSet<String>,
+}
+
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
 /// `session_captured` + `session_deleted` + `supersede` events in `seq ASC`
-/// order, returns:
-/// - the CURRENT session per `session_id` — the latest `session_captured` NOT
-///   retired by a `supersede` and whose `session_id` has NO `session_deleted`
-///   tombstone (keyed by `session_id`, `BTreeMap` for a deterministic order);
-/// - the set of tombstoned `session_id`s (so `capture_session` can enforce I9);
-/// - the set of `supersede`-retired EVENT ids seen while scanning the stream.
-///   Because the input carries EVERY `supersede` event (they are shared across
-///   the page/file/session/note folds), this third set is the complete retired-id
-///   universe — the recall exclusion (A3) reuses it instead of a second scan.
+/// order, projects them into a [`SessionFold`] (see its field docs).
 ///
 /// Deterministic → byte-identical rebuild. Cross-fold-safe: a page/file
 /// `supersede` targets a disjoint event id, so it never retires a session event.
-fn fold_sessions(
-    events: &[Event],
-) -> (
-    std::collections::BTreeMap<String, CurrentSession>,
-    std::collections::HashSet<String>,
-    std::collections::HashSet<String>,
-) {
+fn fold_sessions(events: &[Event]) -> SessionFold {
     use std::collections::{BTreeMap, HashSet};
     let mut superseded: HashSet<String> = HashSet::new();
     let mut deleted: HashSet<String> = HashSet::new();
@@ -7698,6 +7712,8 @@ fn fold_sessions(
         }
     }
     // Latest non-superseded, non-tombstoned session per id (last write wins).
+    // Built as a BTreeMap keyed on session_id so the last capture per id wins
+    // and the returned Vec is deterministically sorted by session_id.
     let mut current: BTreeMap<String, CurrentSession> = BTreeMap::new();
     for ev in events {
         if ev.event_type != crate::graph::SESSION_CAPTURED_EVENT_TYPE || superseded.contains(&ev.id) {
@@ -7710,7 +7726,7 @@ fn fold_sessions(
             current.insert(cs.session_id.clone(), cs);
         }
     }
-    (current, deleted, superseded)
+    SessionFold { current: current.into_values().collect(), deleted, superseded }
 }
 
 /// TEST-ONLY seams for the N-deep undo store (M6a, T5). Compiled out of every
