@@ -92,9 +92,34 @@ pub fn build_conflict_prompt(a: &str, b: &str) -> String {
     )
 }
 
+/// Confidence floor a contradiction must clear to become actionable. PROVISIONAL —
+/// the strict-quiet dial (spec §14); the grading harness tunes it. Start high:
+/// on this frontier a false card costs more trust than a missed conflict.
+pub const CONFLICT_CONF_MIN: u8 = 70;
+
+/// Judge one candidate pair. `Ok(Some(v))` iff it is an actionable, high-confidence
+/// contradiction (`contradicts && winner != Unclear && confidence >= CONFLICT_CONF_MIN`);
+/// `Ok(None)` when the judge declines (no contradiction / unclear / below threshold) —
+/// the caller COUNTS these for the harness. `Err` only on transport/decode failure.
+pub fn judge_pair(reasoner: &dyn Reasoner, a: &str, b: &str) -> Result<Option<Verdict>, BossclawError> {
+    let prompt = build_conflict_prompt(a, b);
+    let raw = reasoner.complete_json(CONFLICT_SYSTEM, &prompt, &conflict_schema())?;
+    let v: Verdict = serde_json::from_value(raw)
+        .map_err(|e| BossclawError::Reasoner(format!("conflict verdict decode: {e}")))?;
+    let actionable = v.contradicts && v.winner != Winner::Unclear && v.confidence >= CONFLICT_CONF_MIN;
+    Ok(actionable.then_some(v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reason::ScriptedReasoner;
+
+    /// Script the reasoner to answer `resp` for the exact prompt build_conflict_prompt(a,b) produces.
+    fn scripted(a: &str, b: &str, resp: serde_json::Value) -> ScriptedReasoner {
+        let prompt = build_conflict_prompt(a, b);
+        ScriptedReasoner::new("test-model").with_response(CONFLICT_SYSTEM, &prompt, resp)
+    }
 
     #[test]
     fn verdict_parses_from_model_json() {
@@ -136,5 +161,75 @@ mod tests {
         let p = build_conflict_prompt(&evil, "other");
         // The raw close marker appears exactly once (our real close), not twice.
         assert_eq!(p.matches(FENCE_A_CLOSE).count(), 1, "attacker cannot forge a second close marker");
+    }
+
+    #[test]
+    fn judge_returns_some_only_for_high_confidence_contradiction() {
+        let (a, b) = ("uses Vercel", "left Vercel");
+        let r = scripted(a, b, serde_json::json!({
+            "contradicts": true, "winner": "newer", "confidence": 90, "why": "opposite"
+        }));
+        let v = judge_pair(&r, a, b).expect("ok").expect("some");
+        assert_eq!(v.winner, Winner::Newer);
+    }
+
+    #[test]
+    fn judge_drops_below_threshold_and_non_contradiction_and_unclear() {
+        let (a, b) = ("x", "y");
+        // below CONFLICT_CONF_MIN
+        let low = scripted(a, b, serde_json::json!({
+            "contradicts": true, "winner": "newer", "confidence": 10, "why": "meh"
+        }));
+        assert!(judge_pair(&low, a, b).expect("ok").is_none());
+        // not a contradiction
+        let no = scripted(a, b, serde_json::json!({
+            "contradicts": false, "winner": "unclear", "confidence": 99, "why": "unrelated"
+        }));
+        assert!(judge_pair(&no, a, b).expect("ok").is_none());
+        // contradicts but unclear winner → non-actionable
+        let unclear = scripted(a, b, serde_json::json!({
+            "contradicts": true, "winner": "unclear", "confidence": 99, "why": "both plausible"
+        }));
+        assert!(judge_pair(&unclear, a, b).expect("ok").is_none());
+    }
+
+    #[test]
+    fn defuse_neutralizes_every_fence_marker_from_both_payloads() {
+        // Each snippet embeds ALL FOUR fence markers as payload. After defuse, none
+        // may survive, so each marker appears EXACTLY ONCE — its single structural
+        // fence. This exercises all four `defuse()` replace branches: deleting any one
+        // lets that marker leak from both payloads, pushing its count to 3 (RED).
+        let side_a = format!(
+            "real A payload {FENCE_A_OPEN} {FENCE_A_CLOSE} {FENCE_B_OPEN} {FENCE_B_CLOSE} tail A"
+        );
+        let side_b = format!(
+            "real B payload {FENCE_B_CLOSE} {FENCE_B_OPEN} {FENCE_A_CLOSE} {FENCE_A_OPEN} tail B"
+        );
+        let p = build_conflict_prompt(&side_a, &side_b);
+        for marker in [FENCE_A_OPEN, FENCE_A_CLOSE, FENCE_B_OPEN, FENCE_B_CLOSE] {
+            assert_eq!(
+                p.matches(marker).count(),
+                1,
+                "marker {marker} must appear once (its structural fence), none surviving from payloads",
+            );
+        }
+        // Real payload text on both sides is preserved.
+        assert!(p.contains("real A payload") && p.contains("tail A"));
+        assert!(p.contains("real B payload") && p.contains("tail B"));
+    }
+
+    #[test]
+    fn judge_pair_threshold_is_inclusive_at_conf_min_and_exclusive_just_below() {
+        let (a, b) = ("p", "q");
+        // confidence == CONFLICT_CONF_MIN → actionable (locks the `>=`, not `>`).
+        let at = scripted(a, b, serde_json::json!({
+            "contradicts": true, "winner": "newer", "confidence": CONFLICT_CONF_MIN, "why": "edge"
+        }));
+        assert!(judge_pair(&at, a, b).expect("ok").is_some(), "confidence == floor is actionable");
+        // one below the floor → dropped (locks against an off-by-one).
+        let below = scripted(a, b, serde_json::json!({
+            "contradicts": true, "winner": "newer", "confidence": CONFLICT_CONF_MIN - 1, "why": "edge"
+        }));
+        assert!(judge_pair(&below, a, b).expect("ok").is_none(), "confidence just below the floor is dropped");
     }
 }
