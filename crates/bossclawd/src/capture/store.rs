@@ -199,12 +199,26 @@ pub async fn heal_orphans(
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            // Cheap pre-filter: a capture file is `<session_id>.md`, so a stem already in the
+            // current fold is a consistent capture — skip it WITHOUT any read (the common,
+            // already-consistent case that dominates the now-timered heal; store_capture always
+            // names a file by its own session_id, so the stem IS that session_id).
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if current_ids.contains(stem) {
+                    continue;
+                }
+            }
+            // Reconciliation needs ONLY the front-matter (the session_id), so read a BOUNDED
+            // prefix — never the up-to-64-MiB body (window-(a) does not touch body content).
+            let Ok(text) = read_front_matter_prefix(&path) else {
                 continue; // unreadable — leave it, don't abort the heal
             };
             let Some(meta) = parse_captured_meta(&text, &path) else {
                 continue; // malformed front-matter — not a healable orphan, skip
             };
+            // Defensive re-check on the file's OWN front-matter session_id: a stem⇄front-matter
+            // mismatch is only reachable by out-of-band tampering, and this keeps the outcome
+            // byte-identical to the pre-optimization read-everything path.
             if current_ids.contains(meta.session_id.as_str()) {
                 continue; // already consistent (has an event)
             }
@@ -305,8 +319,12 @@ fn compose_document(
 /// A cheap, BOUNDED read of only the front-matter block (never the possibly-large body): the
 /// sweeper (A9) calls this so a stub whose transcript is still present re-renders on the next
 /// sweep instead of being skipped forever (a stub is sha-indistinguishable from a real render).
-/// Any read error, an unframed file, or an absent marker → `false` (treat it as a real render;
-/// the worst case is a redundant re-render, never a skipped heal — fail toward re-rendering).
+/// Returns `true` ONLY on a positively-confirmed marker; any read error, an unframed file, or an
+/// absent marker → `false` = "treat it as a real render", which makes the file ELIGIBLE for the
+/// cheap skip (it does NOT force a re-render). That is safe because the only file that must read
+/// as a stub is one this daemon itself just wrote via [`regenerated_document`] — always framed,
+/// readable, and carrying the marker — so the `false` branches never hide a genuine stub, and a
+/// real render (which has no marker) correctly reads as `false`.
 pub fn is_recovery_stub(md_path: &Path) -> bool {
     let Ok(prefix) = read_front_matter_prefix(md_path) else {
         return false;

@@ -78,7 +78,7 @@ fn render_bounds() -> RenderBounds {
 /// cwd-encoding, used verbatim as a stable per-repo key (decoding it to a real filesystem
 /// path is unofficial and NOT required for snapshot/project-scoping). `mtime` is the file's
 /// last-modified epoch second. `sha_if_known` is the stored transcript sha ADOPTED via a
-/// cheap mtime pre-filter (see [`build_current_map`]) — `None` means "unknown, must render".
+/// cheap mtime pre-filter (see `build_current_map`) — `None` means "unknown, must render".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptCandidate {
     pub session_id: String,
@@ -172,8 +172,8 @@ fn include_candidate(c: &TranscriptCandidate, input: &SweepDecisionInput) -> boo
         return false;
     }
     // Quiet floor: a file modified within QUIET_SECS of now is still being written; skip it
-    // this sweep. `saturating_sub` means a future mtime (clock skew) reads as "fresh" (0) and
-    // is excluded too — the safe direction.
+    // this sweep. `saturating_sub` yields a NEGATIVE value for a future mtime (clock skew) —
+    // still < QUIET_SECS, so such a file is excluded too — the safe direction.
     if input.now.saturating_sub(c.mtime) < QUIET_SECS {
         return false;
     }
@@ -465,11 +465,19 @@ mod tests {
         v.iter().map(|c| c.session_id.clone()).collect()
     }
 
+    /// The A5-validated `cur` capture as a `(sha, md_exists, md_is_stub)` current-fold entry.
+    fn current(sha: &str, md_exists: bool, md_is_stub: bool) -> BTreeMap<String, CurrentCapture> {
+        BTreeMap::from([(
+            "cur".to_string(),
+            CurrentCapture { sha256: sha.to_string(), md_exists, md_is_stub },
+        )])
+    }
+
     #[test]
-    fn decide_sweep_gates_quiet_cap_window_tombstones_and_placeholder_heal() {
-        // ── Gate (I10 + Contract 2): not onboarded OR capture disabled → empty, and
-        // `capture_enabled_at` is POISONED so a regression that reads it would misbehave — the
-        // empty result proves it is never consulted behind the gate.
+    fn decide_gate_off_selects_nothing() {
+        // I10 + Contract 2: not onboarded OR capture disabled → empty, and `capture_enabled_at`
+        // is POISONED so a regression that reads it behind the gate would misbehave — the empty
+        // result proves the timestamp is never consulted.
         for (onboarded, enabled) in [(false, true), (true, false), (false, false)] {
             let input = SweepDecisionInput {
                 onboarded,
@@ -479,10 +487,16 @@ mod tests {
                 candidates: vec![cand("s1", 9_000, None)], // would import if the gate leaked
                 ..base_input()
             };
-            assert!(decide_sweep(&input).is_empty(), "gated off → nothing (onboarded={onboarded}, enabled={enabled})");
+            assert!(
+                decide_sweep(&input).is_empty(),
+                "gated off → nothing (onboarded={onboarded}, enabled={enabled})"
+            );
         }
+    }
 
-        // ── Quiet floor: a file modified within QUIET_SECS of now is still being written → excluded.
+    #[test]
+    fn decide_quiet_floor_excludes_still_fresh_files() {
+        // A file modified within QUIET_SECS of now is still being written → excluded this sweep.
         let mut input = base_input();
         input.now = 10_000;
         input.backfill_consented = true;
@@ -491,9 +505,13 @@ mod tests {
             cand("quiet", 10_000 - QUIET_SECS, None),       // exactly 600 s old → captured
         ];
         assert_eq!(ids(&decide_sweep(&input)), vec!["quiet"], "the still-fresh file is skipped this sweep");
+    }
 
-        // ── Backfill window (M4): a transcript older than capture_enabled_at is imported IFF backfill.
+    #[test]
+    fn decide_backfill_window_gates_pre_enable_history() {
+        // M4: a transcript older than capture_enabled_at is imported IFF backfill was consented.
         let old = cand("old", 4_000, None); // mtime 4_000 < capture_enabled_at 5_000
+
         let mut declined = base_input();
         declined.backfill_consented = false;
         declined.candidates = vec![old.clone()];
@@ -503,61 +521,65 @@ mod tests {
         consented.backfill_consented = true;
         consented.candidates = vec![old];
         assert_eq!(ids(&decide_sweep(&consented)), vec!["old"], "backfill consent imports the pre-enable transcript");
+    }
 
-        // ── Forward capture: mtime >= capture_enabled_at is imported regardless of backfill.
+    #[test]
+    fn decide_forward_capture_ignores_backfill() {
+        // mtime >= capture_enabled_at is imported regardless of backfill (a going-forward capture).
         let mut forward = base_input();
         forward.backfill_consented = false;
         forward.candidates = vec![cand("fwd", 5_000, None)]; // exactly at the enable instant
         assert_eq!(ids(&decide_sweep(&forward)), vec!["fwd"], "a post-enable transcript is forward-captured");
+    }
 
-        // ── Tombstone (I9): an owner-deleted session is never resurrected, even mid forward window.
+    #[test]
+    fn decide_tombstone_never_resurrects() {
+        // I9: an owner-deleted session is never re-captured, even mid forward window.
         let mut tomb = base_input();
         tomb.candidates = vec![cand("dead", 9_000, None)];
         tomb.tombstoned = BTreeSet::from(["dead".to_string()]);
         assert!(decide_sweep(&tomb).is_empty(), "a tombstoned session is never re-captured");
+    }
 
-        // ── Contract 1, cheap skip: current + SAME sha + md_exists + REAL render → excluded.
+    #[test]
+    fn decide_contract1_skips_unchanged_real_render() {
+        // Cheap skip: current + SAME sha + md_exists + REAL render (not a stub) → excluded.
         let mut skip = base_input();
         skip.candidates = vec![cand("cur", 9_000, Some("aa"))];
-        skip.already_current = BTreeMap::from([(
-            "cur".to_string(),
-            CurrentCapture { sha256: "aa".into(), md_exists: true, md_is_stub: false },
-        )]);
+        skip.already_current = current("aa", /*md_exists=*/ true, /*md_is_stub=*/ false);
         assert!(decide_sweep(&skip).is_empty(), "an unchanged, on-disk real render is skipped");
+    }
 
-        // ── Contract 1, changed content: current + DIFFERENT sha (still md_exists) → re-render.
+    #[test]
+    fn decide_contract1_rerenders_changed_missing_or_stub() {
+        // Contract 1's three re-render cases — each must be (re)captured so store writes the real
+        // body first (the engine then dedups the event to a no-op where the sha is unchanged).
+
+        // (a) Changed content: current + DIFFERENT sha (still md_exists) → supersede + re-render.
         let mut changed = base_input();
         changed.candidates = vec![cand("cur", 9_000, Some("bb"))];
-        changed.already_current = BTreeMap::from([(
-            "cur".to_string(),
-            CurrentCapture { sha256: "aa".into(), md_exists: true, md_is_stub: false },
-        )]);
+        changed.already_current = current("aa", true, false);
         assert_eq!(ids(&decide_sweep(&changed)), vec!["cur"], "changed bytes supersede — re-rendered");
 
-        // ── Contract 1, PLACEHOLDER HEAL: current + SAME sha but md MISSING → INCLUDED. This is
-        // the load-bearing case: a regenerated placeholder .md (or an out-of-band deletion) must
-        // re-render so store writes the real body first, even though the event will dedup.
+        // (b) PLACEHOLDER HEAL: current + SAME sha but md MISSING → INCLUDED (out-of-band deletion
+        // or a crash heal window). The re-render lets store write the real body first.
         let mut heal = base_input();
         heal.candidates = vec![cand("cur", 9_000, Some("aa"))];
-        heal.already_current = BTreeMap::from([(
-            "cur".to_string(),
-            CurrentCapture { sha256: "aa".into(), md_exists: false, md_is_stub: false },
-        )]);
+        heal.already_current = current("aa", /*md_exists=*/ false, false);
         assert_eq!(ids(&decide_sweep(&heal)), vec!["cur"], "a missing .md re-renders to heal the body (Contract 1!)");
 
-        // ── Contract 1, RECOVERY STUB: current + SAME sha + md_exists BUT the .md is a heal STUB
-        // (real sha, placeholder body) → INCLUDED. Mirrors the md-missing case: a stub is
-        // sha-indistinguishable from a real render, so without this it would be skipped forever
-        // (cap-starved disaster restore). The next sweep re-renders the real body over it.
+        // (c) RECOVERY STUB: current + SAME sha + md_exists BUT the .md is a heal STUB (real sha,
+        // placeholder body) → INCLUDED. A stub is sha-indistinguishable from a real render, so
+        // without this it would be skipped forever (cap-starved disaster restore).
         let mut stub = base_input();
         stub.candidates = vec![cand("cur", 9_000, Some("aa"))];
-        stub.already_current = BTreeMap::from([(
-            "cur".to_string(),
-            CurrentCapture { sha256: "aa".into(), md_exists: true, md_is_stub: true },
-        )]);
+        stub.already_current = current("aa", true, /*md_is_stub=*/ true);
         assert_eq!(ids(&decide_sweep(&stub)), vec!["cur"], "an unrecovered stub re-renders (self-heal across sweeps)");
+    }
 
-        // ── Cap: the selection never exceeds `cap`, and is oldest-transcript-first (fair backfill).
+    #[test]
+    fn decide_caps_at_cap_oldest_first() {
+        // The selection never exceeds `cap`, and is oldest-transcript-first (fair backfill).
         let mut capped = base_input();
         capped.backfill_consented = true;
         capped.cap = 2;
