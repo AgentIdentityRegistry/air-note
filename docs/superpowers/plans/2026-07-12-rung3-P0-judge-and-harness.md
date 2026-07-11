@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-12-rung3-conflict-resolution-design.md` (§4d judge, §9 harness, §14 constants, I7 taint-fencing). **Branch:** `feat-rung3-conflict-resolution`.
 
-**Ship gate this phase proves (spec §9):** precision ≥ 0.90 (bootstrap-CI lower bound) at recall ≥ 0.30 on the frozen set. Provisional; tuned via `CONFLICT_CONF_MIN`.
+**What this phase proves (revised after review — the 10-row seed is too small for a statistical gate):** Phase 0 builds the judge + grading *plumbing* and gets the FIRST real signal from the local model. Its EXIT gate is honest raw counts on the seed set — **0 false positives AND ≥ 2/5 true contradictions caught** — plus recording the live judge's actual numbers (Task 8). The binding statistical gate (precision ≥ 0.90 CI-lower at recall ≥ 0.30, spec §9) is DEFERRED to a larger owner-sourced frozen set (50+ true-contradiction pairs + matched same-topic hard negatives), built next, only if the smoke signal is promising. The `grade()`/precision-CI machinery (Tasks 5–6) is built now so it's ready for that larger set. *(Owner decision 2026-07-12: smoke-now-real-gate-later; don't hand-label 50+ pairs before the model shows it can judge contradictions at all.)*
 
 ---
 
@@ -68,7 +68,10 @@ Expected: FAIL — `Verdict`, `Winner`, `conflict_schema` not found.
 //! graded by `memharness conflict-grade` (Phase 0). The judge only ever produces
 //! a Verdict — never a mutation (spec I1).
 
-use crate::reason::{BossclawError, Reasoner};
+// NB: BossclawError is re-exported at the crate root (lib.rs `pub use`), NOT via
+// crate::reason (its import there is private → `crate::reason::BossclawError` is E0603).
+use crate::BossclawError;
+use crate::reason::Reasoner;
 
 /// Which side of a contradiction the judge believes is correct. `Unclear` and a
 /// `false` `contradicts` are both non-actionable (see [`judge_pair`]).
@@ -317,9 +320,20 @@ git commit -m "feat(rung3): judge_pair + CONFLICT_CONF_MIN threshold gate"
 ### Task 4: Labelled-pair dataset + loader (memharness)
 
 **Files:**
+- Modify: `crates/memharness/Cargo.toml` (add the `bossclaw-core` dependency — memharness does NOT depend on it today)
 - Create: `crates/memharness/src/conflict_grade.rs`
 - Modify: `crates/memharness/src/lib.rs` (add `pub mod conflict_grade;`)
 - Test: inline `#[cfg(test)]`
+
+- [ ] **Step 0: Add the crate dependency (BLOCKER — nothing in Tasks 4/6/7 compiles without it)**
+
+`crates/memharness/Cargo.toml` currently depends on `bossclawd` + `bossclawd-proto` but NOT `bossclaw-core`, and `bossclawd` does not re-export it. Add to `[dependencies]`:
+
+```toml
+bossclaw-core = { path = "../bossclaw-core", features = ["ollama"] }
+```
+
+The `ollama` feature is needed for the live judge in Task 7 (`bossclaw_core::ollama::OllamaReasoner`); `ScriptedReasoner` (all unit tests) is un-gated. This is an in-workspace path dep and `bossclawd` already pulls `bossclaw-core` with `features=["ollama"]`, so **zero new crate versions / no `Cargo.lock` churn** (preserves memharness's "zero new crate versions" guardrail). Verify: `cargo tree -p memharness -i bossclaw-core` shows the path dep and `git diff Cargo.lock` is empty.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -551,20 +565,28 @@ Expected: FAIL — `grade`, `GradeResult` not found.
 ```rust
 // add to conflict_grade.rs
 use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng; // the crate's portable RNG — StdRng is NOT reproducible across
+                             // versions/platforms, wrong for a reproducible-measurement harness.
 
-/// The provisional ship-gate (spec §9): precision CI-lower ≥ 0.90 at recall ≥ 0.30.
+/// The DEFERRED binding gate (spec §9) — applied on the larger owner-sourced set, NOT the tiny
+/// seed (a precision CI over ~5 flags is degenerate; see the plan preamble). Built now so it's
+/// ready. Phase 0's real EXIT is the raw-count smoke (Task 7 `smoke_ok`).
 pub const GATE_PRECISION_CI_LOWER: f64 = 0.90;
 pub const GATE_RECALL_MIN: f64 = 0.30;
+/// Bootstrap CI confidence level = `bootstrap_ci_mean`'s 3rd arg (stats.rs debug-asserts 0<conf<1).
+pub const GATE_CI_CONF: f64 = 0.90;
 
 #[derive(Debug, Clone)]
 pub struct GradeResult {
     pub metrics: Metrics,
     pub precision_ci_lower: f64,
+    /// The DEFERRED statistical gate — meaningful only on the larger set. On the seed, read
+    /// `smoke_ok(&result.metrics)` instead (Task 7).
     pub passes: bool,
 }
 
 /// Grade a set of outcomes: compute metrics, bootstrap the precision CI lower bound
-/// (over the per-FLAG correctness indicators), and apply the §9 gate. `seed` makes
+/// (over the per-FLAG correctness indicators), and apply the deferred §9 gate. `seed` makes
 /// the bootstrap deterministic for hermetic tests.
 pub fn grade(outcomes: &[Outcome], seed: u64) -> GradeResult {
     let metrics = Metrics::from_outcomes(outcomes);
@@ -573,19 +595,26 @@ pub fn grade(outcomes: &[Outcome], seed: u64) -> GradeResult {
         .filter(|o| o.flagged)
         .map(|o| if o.truly_contradicts { 1.0 } else { 0.0 })
         .collect();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let ci = if flagged_correct.is_empty() {
         (0.0, 0.0)
     } else {
-        crate::stats::bootstrap_ci_mean(&flagged_correct, 2000, &mut rng)
+        crate::stats::bootstrap_ci_mean(&flagged_correct, 2000, GATE_CI_CONF, &mut rng)
     };
     let precision_ci_lower = ci.0;
     let passes = precision_ci_lower >= GATE_PRECISION_CI_LOWER && metrics.recall >= GATE_RECALL_MIN;
     GradeResult { metrics, precision_ci_lower, passes }
 }
+
+/// Phase-0 EXIT gate (the honest raw-count smoke on the tiny seed — spec-review re-scope):
+/// the judge raised NO false alarms and caught at least a couple of the real contradictions.
+/// This is what Task 7/8 assert; `grade().passes` is the deferred statistical gate for the big set.
+pub fn smoke_ok(m: &Metrics) -> bool {
+    m.false_positives == 0 && m.true_positives >= 2
+}
 ```
 
-> Confirm `stats::bootstrap_ci_mean(&[f64], iters, &mut R) -> (f64, f64)` returns `(lower, upper)`; if its signature differs (grep `pub fn bootstrap_ci_mean` in `crates/memharness/src/stats.rs`), adapt the call and the `ci.0` lower-bound read. Add `rand` to `memharness/Cargo.toml` only if not already present (it is used by `stats`).
+> `bootstrap_ci_mean`'s real signature (verified) is `bootstrap_ci_mean<R: Rng>(data: &[f64], iters: usize, conf: f64, rng: &mut R) -> (f64, f64)` (`crates/memharness/src/stats.rs:43`), returning `(low, high)` — hence the 4-arg call above and `ci.0` for the lower bound. `rand` + `rand_chacha` are already memharness deps.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -650,10 +679,32 @@ fn run_grade_over_scripted_judge_on_the_seed_fixture() {
         r = r.with_response(CONFLICT_SYSTEM, &prompt, resp);
     }
     let g = run_grade(&pairs, &r, 42).expect("grade ok");
-    // A perfect judge on this set clears the gate.
-    assert!(g.passes, "perfect judge passes: {:?}", g.metrics);
+    // A perfect judge clears the Phase-0 raw-count SMOKE (0 FP, ≥2 caught).
+    assert!(smoke_ok(&g.metrics), "perfect judge passes the smoke: {:?}", g.metrics);
     assert_eq!(g.metrics.false_positives, 0);
-    assert!(g.metrics.recall >= 0.30);
+    assert_eq!(g.metrics.true_positives, 5, "all 5 true contradictions flagged");
+}
+
+#[test]
+fn run_grade_fails_the_smoke_when_the_judge_cries_wolf() {
+    // Exercises the real pipeline's FAIL path (not just synthetic Outcomes): a judge that
+    // ALSO flags a coexist pair as a contradiction must trip the smoke (false_positives > 0).
+    let body = include_str!("../fixtures/conflict-seed.jsonl");
+    let pairs = parse_pairs(body).expect("seed parses");
+    let mut r = ScriptedReasoner::new("crywolf");
+    for p in &pairs {
+        let prompt = build_conflict_prompt(&p.a, &p.b);
+        // Flag every contradicts pair AND every coexist pair (the false alarms).
+        let flag = matches!(p.label, PairLabel::Contradicts | PairLabel::Coexist);
+        let resp = serde_json::json!({
+            "contradicts": flag, "winner": if flag { "newer" } else { "unclear" },
+            "confidence": 95, "why": "x"
+        });
+        r = r.with_response(CONFLICT_SYSTEM, &prompt, resp);
+    }
+    let g = run_grade(&pairs, &r, 42).expect("grade ok");
+    assert_eq!(g.metrics.false_positives, 2, "both coexist pairs falsely flagged");
+    assert!(!smoke_ok(&g.metrics), "a cry-wolf judge FAILS the smoke");
 }
 ```
 
@@ -693,9 +744,13 @@ Add the args struct (near `RunArgs` ~:44) and the dispatch arm (in `main`'s matc
 ```rust
 #[derive(clap::Args)]
 struct ConflictGradeArgs {
-    /// Path to the frozen labelled-pair JSONL (defaults to the committed seed).
+    /// Path to the frozen labelled-pair JSONL. NOTE: the default is workspace-root-relative —
+    /// run `conflict-grade` from the repo root, or pass an absolute --cases path.
     #[arg(long, default_value = "crates/memharness/fixtures/conflict-seed.jsonl")]
     cases: std::path::PathBuf,
+    /// Ollama model tag for the local judge (mirrors RunArgs' model arg).
+    #[arg(long, default_value = memharness::ollama::DEFAULT_OLLAMA_MODEL)]
+    model: String,
     /// Bootstrap seed (deterministic CI).
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -709,21 +764,27 @@ Add the command body (a real Ollama-backed run; the unit test above covers the s
 
 ```rust
 fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
+    use memharness::conflict_grade::{parse_pairs, run_grade, smoke_ok};
     let body = std::fs::read_to_string(&args.cases)?;
-    let pairs = memharness::conflict_grade::parse_pairs(&body)?;
-    // Real local judge = the daemon's model via Ollama (same seam Phase 2 uses).
-    let judge = memharness::ollama::OllamaReasoner::from_env()?; // match the existing ollama.rs constructor
-    let g = memharness::conflict_grade::run_grade(&pairs, &judge, args.seed)?;
+    let pairs = parse_pairs(&body)?;
+    // Real local judge = the daemon's model via Ollama — the SAME `Reasoner` seam Phase 2 uses.
+    // `OllamaReasoner::new` POSTs /api/chat with `format = schema` + a system channel, so the
+    // verdict schema is actually enforced (unlike memharness::ollama::generate → /api/generate).
+    let judge = bossclaw_core::ollama::OllamaReasoner::new(&args.model);
+    let g = run_grade(&pairs, &judge, args.seed)?;
+    let smoke = smoke_ok(&g.metrics);
     println!(
-        "conflict-grade: n={} recall={:.3} precision={:.3} (ci_lower={:.3}) cry_wolf={:.3} → {}",
-        pairs.len(), g.metrics.recall, g.metrics.precision, g.precision_ci_lower,
-        g.metrics.cry_wolf_rate, if g.passes { "PASS" } else { "FAIL" },
+        "conflict-grade: n={} TP={} FP={} FN={} recall={:.3} precision={:.3} \
+         (ci_lower={:.3} — DEFERRED gate, tiny-N) cry_wolf={:.3} → SMOKE {}",
+        pairs.len(), g.metrics.true_positives, g.metrics.false_positives, g.metrics.false_negatives,
+        g.metrics.recall, g.metrics.precision, g.precision_ci_lower, g.metrics.cry_wolf_rate,
+        if smoke { "PASS (0 FP, ≥2 caught)" } else { "FAIL" },
     );
     Ok(())
 }
 ```
 
-> `memharness::ollama::OllamaReasoner` is illustrative — use whatever local-Reasoner constructor `crates/memharness/src/ollama.rs` already exposes (grep `impl Reasoner` / `pub fn` in `ollama.rs`). It must implement `bossclaw_core::reason::Reasoner`. If the existing type implements memharness's `PairJudge` but not `Reasoner`, add a thin `Reasoner` impl or a small adapter — the judge core requires `Reasoner`.
+> `bossclaw_core::ollama::OllamaReasoner::new(model_tag: &str)` is the real `impl Reasoner` (`crates/bossclaw-core/src/ollama.rs:51,71`), available because Task 4 Step 0 added the dep with `features = ["ollama"]`. It is NOT `memharness::ollama::OllamaReasoner` (that type does not exist — memharness's ollama.rs is free functions + a `PairJudge`, not a `Reasoner`).
 
 - [ ] **Step 5: Run to verify it passes + the CLI parses**
 
@@ -760,8 +821,7 @@ Expected: all green.
 Run: `git diff main...HEAD -- crates/ | grep -nE '^\+' | grep -iE 'todo|unimplemented!|todo!\(|\.unwrap\(\)\s*//\s*fixme' || echo "clean"`
 Expected: `clean` (test `.unwrap()`s are fine; production-path unwraps on external input are not).
 
-- [ ] **Step 4:** Live judge smoke (Peter-gated, `#[ignore]`/manual — NOT in CI): with Ollama running,
-`cargo run -p memharness -- conflict-grade` and eyeball the metrics line. This is the first real signal of whether the local model can judge contradictions at all — the input to tuning `CONFLICT_CONF_MIN` and deciding if Phase 1+ is worth building. **Record the numbers in the P1 plan's preamble.**
+- [ ] **Step 4: Live judge smoke — the Phase-0 EXIT (Peter-gated, manual, NOT in CI).** From the **workspace root**, with Ollama running: `cargo run -p memharness -- conflict-grade`. The printed line shows TP/FP/FN + `SMOKE PASS/FAIL`. **Phase-0 exit = SMOKE PASS on the seed (0 FP, ≥2/5 caught)** — the honest raw-count check (the precision-CI is DEFERRED to the larger set). This is the first real signal of whether the local model can judge contradictions at all: the input to tuning `CONFLICT_CONF_MIN`, to deciding whether to build the 50+-pair binding set, and to deciding if Phase 1+ is worth building. **Record the actual numbers in the P1 plan's preamble.** If SMOKE FAILs, do NOT proceed to P1 — tune the prompt/threshold first (or reconsider the local model).
 
 - [ ] **Step 5:** No commit needed (verification). If Step 1–3 surfaced fixes, commit them:
 

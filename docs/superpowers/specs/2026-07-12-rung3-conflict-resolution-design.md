@@ -164,10 +164,18 @@ Rung-0 discipline in `memharness` (reuses the frozen-corpus scaffolding):
   contradictions + synthetic. Also measures, for sessions, **passage-index vs title-only catch rate**
   (proves §7.1 earns its cost).
 - Metrics, paired per-case (Wilcoxon + CIs): **catch rate (recall)** and **cry-wolf rate (1−precision)**.
-- **Ship gate (provisional, owner-tunable):** **precision ≥ 0.90 (Wilcoxon-CI lower bound) at recall ≥
-  0.30** on the frozen set, tuned via `CONFLICT_CONF_MIN`. If it flunks: tune, or fall back to a
-  deterministic temporal-only mode (retire only where an explicit bi-temporal edge already retired the
-  fact — no judge). A number, not "we'll know it when we see it" (critic M2).
+- **Ship gate (provisional, owner-tunable):** **precision ≥ 0.90 (bootstrap-CI lower bound, conf 0.90)
+  at recall ≥ 0.30** on the frozen set, tuned via `CONFLICT_CONF_MIN`. (A single-arm precision
+  *proportion* → a bootstrap/Wilson interval is the right tool; "Wilcoxon" is *paired*, used only for
+  the passage-vs-title comparison.) If it flunks: tune, or fall back to a deterministic temporal-only
+  mode (retire only where an explicit bi-temporal edge already retired the fact — no judge). A number,
+  not "we'll know it when we see it" (critic M2).
+- **The binding gate needs a big-enough set (post-review, owner decision 2026-07-12).** A precision CI
+  over the tiny plumbing seed is degenerate (~5 flags → pass↔fail on one example). So **Phase 0 is a
+  plumbing + first-signal SMOKE** (exit = 0 false positives AND ≥ 2/5 caught on the seed, + record the
+  live judge's raw numbers); the binding ≥0.90-CI gate above applies only after a **50+ true-
+  contradiction + matched-hard-negative** owner-sourced frozen set is assembled — built next, only if
+  the smoke signal is promising (don't hand-label 50+ pairs before the model shows it can judge at all).
 
 ## 10. Volume / flood control (cry-wolf by count, not just rate)
 I4 bounds *compute*; these bound *cards* and *judge calls* (critic M3, security Finding 3):
