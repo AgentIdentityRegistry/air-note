@@ -39,6 +39,9 @@
 
 use std::fs::File;
 use std::io::Read;
+// `Path` is only used by the test-only `render_transcript_path`, so the import is
+// gated the same way to avoid an unused-import warning in production builds.
+#[cfg(any(test, feature = "test-helpers"))]
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -50,8 +53,10 @@ use thiserror::Error;
 /// a single body line while still showing the call's shape.
 const TOOL_DETAIL_MAX_BYTES: usize = 160;
 
-/// Max bytes of the derived title (first user prompt, whitespace-collapsed).
-const TITLE_MAX_BYTES: usize = 120;
+/// Max CHARS of the derived title (first user prompt, whitespace-collapsed). This
+/// is a multilingual-first product, so the title caps at 120 *visible characters*,
+/// not bytes — a Korean/CJK title keeps 120 glyphs rather than ~40.
+const TITLE_MAX_CHARS: usize = 120;
 
 /// Coarse wall-clock cadence: check the elapsed budget every N processed lines.
 /// The input is already size-capped, so a per-line clock read would be wasteful;
@@ -91,7 +96,7 @@ pub enum RenderError {
 /// front-matter/fields here are what's derivable from it; the STORE task (A7)
 /// adds `session_id` / project / path when it writes the file.
 pub struct Rendered {
-    /// First user prompt, whitespace-collapsed, ≤ [`TITLE_MAX_BYTES`] bytes
+    /// First user prompt, whitespace-collapsed, ≤ [`TITLE_MAX_CHARS`] chars
     /// (empty if the transcript has no user prompt).
     pub title: String,
     /// The full Markdown document: stable front-matter block then the body.
@@ -119,6 +124,11 @@ pub struct Rendered {
 /// point — does NO confinement). Production code with an attacker-influenceable
 /// path must open via A5's `open_transcript_confined` and call
 /// [`render_transcript`] on the resulting handle instead.
+///
+/// Test-only surface: gated behind `cfg(test)` / the `test-helpers` feature (the
+/// same idiom as `server::spawn_for_test`) so the unconfined path can never be
+/// reached from production code.
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn render_transcript_path(path: &Path, bounds: &RenderBounds) -> Result<Rendered, RenderError> {
     let file = File::open(path)?;
     render_transcript(file, bounds)
@@ -162,7 +172,7 @@ pub fn render_transcript(file: File, bounds: &RenderBounds) -> Result<Rendered, 
 /// (identical bytes ⇒ identical `markdown`). `WallClock` is the only reason it can
 /// stop early, and that never depends on the CONTENT.
 fn render_bytes(buf: &[u8], bounds: &RenderBounds) -> Result<Rendered, RenderError> {
-    let deadline = Instant::now();
+    let render_start = Instant::now();
     let sha256 = hex_sha256(buf);
     let approx_bytes = buf.len() as u64;
 
@@ -186,7 +196,7 @@ fn render_bytes(buf: &[u8], bounds: &RenderBounds) -> Result<Rendered, RenderErr
     let mut body = String::new();
 
     for (i, seg) in segments.iter().enumerate() {
-        if i % WALL_CLOCK_CHECK_EVERY == 0 && deadline.elapsed() > bounds.wall_clock {
+        if i % WALL_CLOCK_CHECK_EVERY == 0 && render_start.elapsed() > bounds.wall_clock {
             return Err(RenderError::WallClock);
         }
         if seg.is_empty() {
@@ -294,7 +304,8 @@ fn render_message(val: &serde_json::Value, role: Role, body: &mut String, title:
 /// A11 fences them later). Seeds the title from the first user text only.
 fn emit_text(role: Role, text: &str, body: &mut String, title: &mut Option<String>) {
     if matches!(role, Role::User) && title.is_none() {
-        let t = collapse_and_cap(text, TITLE_MAX_BYTES);
+        // Char-based cap: keep up to TITLE_MAX_CHARS visible glyphs (multilingual).
+        let t: String = collapse_ws(text).chars().take(TITLE_MAX_CHARS).collect();
         if !t.is_empty() {
             *title = Some(t);
         }
@@ -313,7 +324,7 @@ fn emit_tool_use(block: &serde_json::Value, body: &mut String) {
     let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
     let detail = match block.get("input") {
         Some(input) if !input.is_null() => {
-            collapse_and_cap(&input.to_string(), TOOL_DETAIL_MAX_BYTES)
+            truncate_on_boundary(collapse_ws(&input.to_string()), TOOL_DETAIL_MAX_BYTES)
         }
         _ => String::new(),
     };
@@ -379,11 +390,12 @@ fn parse_epoch(s: &str) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
-/// Collapse every run of ASCII/Unicode whitespace to a single space, trim, and
-/// truncate to at most `max_bytes` on a char boundary. Non-whitespace control
-/// characters are preserved (they're data). Used for the title and tool-call
-/// one-liners, never for body prose.
-fn collapse_and_cap(s: &str, max_bytes: usize) -> String {
+/// Collapse every run of ASCII/Unicode whitespace to a single space and trim.
+/// Non-whitespace control characters are preserved (they're data). The caller
+/// applies its own cap (char-based for the title, byte-based for tool one-liners),
+/// so this never caps on its own. Used for the title and tool-call one-liners,
+/// never for body prose.
+fn collapse_ws(s: &str) -> String {
     let mut out = String::new();
     let mut prev_ws = false;
     for ch in s.chars() {
@@ -400,7 +412,7 @@ fn collapse_and_cap(s: &str, max_bytes: usize) -> String {
     while out.ends_with(' ') {
         out.pop();
     }
-    truncate_on_boundary(out, max_bytes)
+    out
 }
 
 /// Truncate `s` to at most `max_bytes` bytes without splitting a UTF-8 char.
