@@ -4634,19 +4634,21 @@ impl EventLog {
             )));
         }
 
-        let event = session_captured_event(meta, self.signer_did());
         match current.get(&meta.session_id) {
             // Same id + same bytes → no-op (return the existing current event id).
+            // The sweeper's steady-state hot path: no event is even constructed.
             Some(prev) if prev.sha256 == meta.sha256 => Ok(prev.event_id.clone()),
             // Same id + changed bytes → atomic supersede + new capture.
             Some(prev) => {
                 let supersede = session_supersede_event(&prev.event_id, self.signer_did());
+                let event = session_captured_event(meta, self.signer_did());
                 let (_s, new_id) = self.append_pair(supersede, event)?;
                 self.derive_vector_for(embedder, &new_id)?;
                 Ok(new_id)
             }
             // New session → plain append.
             None => {
+                let event = session_captured_event(meta, self.signer_did());
                 let new_id = self.append(event)?;
                 self.derive_vector_for(embedder, &new_id)?;
                 Ok(new_id)
@@ -7307,10 +7309,9 @@ impl EventLog {
 /// The text fed to the embedder for an event, or `None` if the event is not
 /// embeddable.
 ///
-/// Only `memory` and `page` events carry embeddable prose; both expose it at
-/// `content["text"]`. `config`, `grant`, and other control events return
-/// `None`. (`page` is reserved for M4 and produces nothing today, since no such
-/// events exist yet — listing it here keeps the derive seam forward-compatible.)
+/// The kinds listed in [`EMBEDDABLE_EVENT_TYPES`] carry embeddable prose at
+/// `content["text"]` (single-sourced there so this comment cannot go stale).
+/// `config`, `grant`, and other control events return `None`.
 fn embeddable_text(event: &Event) -> Option<String> {
     if !EMBEDDABLE_EVENT_TYPES.contains(&event.event_type.as_str()) {
         return None;
