@@ -40,10 +40,10 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /Brain/ })).toHaveClass("active");
   });
 
-  it("calls onNavigate when a nav item is clicked", () => {
+  it("calls onNavigate when a nav item is clicked (Brain opens at its Library landing)", () => {
     const { onNavigate } = renderSidebar();
     fireEvent.click(screen.getByRole("button", { name: /Brain/ }));
-    expect(onNavigate).toHaveBeenCalledWith("memory");
+    expect(onNavigate).toHaveBeenCalledWith("library");
   });
 
   it("toggles the theme from the footer icon button", () => {

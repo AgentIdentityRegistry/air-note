@@ -1,11 +1,13 @@
+import { LibraryPanel } from "./LibraryPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { ReviewPanel } from "../review/ReviewPanel";
 import { MandatesPanel } from "../mandates/MandatesPanel";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { type View, isBrainView } from "../shell/nav";
 
-/** The Brain hub's sub-tabs, in display order. */
-const SUBTABS: { view: View; label: string }[] = [
+/** The Brain hub's sub-tabs, in display order. Library leads (it's the onboarded landing). */
+export const SUBTABS: { view: View; label: string }[] = [
+  { view: "library", label: "Library" },
   { view: "memory", label: "Search & Evolve" },
   { view: "review", label: "Review" },
   { view: "mandates", label: "Mandates" },
@@ -26,9 +28,9 @@ export function BrainPanel({
   onSubNav: (v: View) => void;
   reviewCount: number;
 }) {
-  // The hub only ever receives Brain views, but default to Search & Evolve if the
-  // shell ever routes a non-Brain view here.
-  const active: View = isBrainView(view) ? view : "memory";
+  // The hub only ever receives Brain views, but default to the Library (the landing sub-tab)
+  // if the shell ever routes a non-Brain view here.
+  const active: View = isBrainView(view) ? view : "library";
   return (
     <div>
       <nav className="chat-subtabs" aria-label="Brain sections">
@@ -48,7 +50,15 @@ export function BrainPanel({
         ))}
       </nav>
       <div style={{ marginTop: 12 }}>
-        {active === "memory" ? <MemoryPanel /> : active === "review" ? <ReviewPanel /> : <MandatesPanel />}
+        {active === "library" ? (
+          <LibraryPanel />
+        ) : active === "memory" ? (
+          <MemoryPanel />
+        ) : active === "review" ? (
+          <ReviewPanel />
+        ) : (
+          <MandatesPanel />
+        )}
       </div>
     </div>
   );
