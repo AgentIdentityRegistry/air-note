@@ -3,7 +3,7 @@
 //! snapshot `nudge` (SessionStart → `{source, session_id, cwd, transcript_path}`). Both call
 //! [`HookInput::read_from_stdin`] and degrade gracefully on any failure (the snapshot falls back to
 //! the static nudge, the capture-notify silently skips), so this module never panics and never
-//! blocks unbounded on stdin.
+//! reads unbounded from stdin (the read is BYTE-capped at 1 MiB).
 //!
 //! The harness owns this schema and may change it, so every field is `Option` and the parse is
 //! purely defensive (spec §2). String fields are control-char-stripped on parse (spec §6) so nothing
@@ -61,10 +61,14 @@ impl HookInput {
         })
     }
 
-    /// Read ALL of stdin (bounded to [`MAX_STDIN_BYTES`]) and parse it. On ANY failure — read error,
-    /// truncation past the bound, non-UTF-8, non-JSON, non-object — return [`HookInput::default`] so
-    /// the hook paths degrade gracefully. Uses [`Read::take`] so an empty or never-closing stdin
-    /// cannot make us read forever.
+    /// Read ALL of stdin (BYTE-bounded to [`MAX_STDIN_BYTES`]) and parse it. On ANY failure — read
+    /// error, truncation past the bound, non-UTF-8, non-JSON, non-object — return
+    /// [`HookInput::default`] so the hook paths degrade gracefully. [`Read::take`] caps the read at 1
+    /// MiB so a hostile/wedged writer can never make us slurp unbounded *memory*. Note this bounds
+    /// BYTES, not TIME: a writer that holds the pipe open, trickles a few bytes, then stalls without
+    /// EOF would still block `read_to_string`. That is a non-issue in deployment — the hook pipe is
+    /// harness-owned and closed after the tiny payload — so no timeout is warranted for a millisecond
+    /// hook subprocess.
     pub fn read_from_stdin() -> Self {
         let mut buf = String::new();
         let stdin = std::io::stdin();
@@ -123,11 +127,23 @@ mod tests {
 
     #[test]
     fn control_chars_stripped_from_string_fields() {
-        // hostile control chars (incl newline) stripped BEFORE the values reach logs/wire (spec §6):
-        let h = HookInput::parse("{\"session_id\":\"a b\\nc\",\"transcript_path\":\"/x\\r.jsonl\"}").unwrap();
+        // hostile control chars (incl newline) stripped BEFORE the values reach logs/wire (spec §6).
+        // ALL FIVE string fields go through the same strip closure — pin every one so a future
+        // refactor that special-cases a single field can't silently reopen the hole.
+        let h = HookInput::parse(
+            "{\"session_id\":\"a b\\nc\",\"transcript_path\":\"/x\\r.jsonl\",\
+             \"cwd\":\"/re\\tpo\",\"source\":\"comp\\u0000act\",\"reason\":\"cle\\u0007ar\"}",
+        )
+        .unwrap();
         assert_eq!(h.session_id.as_deref(), Some("a bc")); // \n dropped (strip, not map-to-space)
-        assert_eq!(h.transcript_path.as_deref(), Some("/x.jsonl"));
-        assert!(!h.session_id.as_deref().unwrap().contains('\n'));
+        assert_eq!(h.transcript_path.as_deref(), Some("/x.jsonl")); // \r dropped
+        assert_eq!(h.cwd.as_deref(), Some("/repo")); // \t dropped
+        assert_eq!(h.source.as_deref(), Some("compact")); // NUL dropped
+        assert_eq!(h.reason.as_deref(), Some("clear")); // BEL dropped
+        // No control char survives on any field.
+        for field in [&h.session_id, &h.transcript_path, &h.cwd, &h.source, &h.reason] {
+            assert!(!field.as_deref().unwrap().chars().any(|c| c.is_control()));
+        }
     }
 
     #[test]
