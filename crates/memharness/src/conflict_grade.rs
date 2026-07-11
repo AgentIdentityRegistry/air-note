@@ -139,9 +139,29 @@ pub fn smoke_ok(m: &Metrics) -> bool {
     m.false_positives == 0 && m.true_positives >= 2
 }
 
+use bossclaw_core::conflict::judge_pair;
+use bossclaw_core::reason::Reasoner;
+
+/// Run the judge over every labelled pair and grade it. A judge transport error on
+/// any pair fails the whole run loudly (a partial grade is a misleading grade).
+pub fn run_grade(
+    pairs: &[LabelledPair],
+    judge: &dyn Reasoner,
+    seed: u64,
+) -> anyhow::Result<GradeResult> {
+    let mut outcomes = Vec::with_capacity(pairs.len());
+    for p in pairs {
+        let flagged = judge_pair(judge, &p.a, &p.b)?.is_some();
+        outcomes.push(Outcome { flagged, truly_contradicts: p.label == PairLabel::Contradicts });
+    }
+    Ok(grade(&outcomes, seed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bossclaw_core::conflict::{build_conflict_prompt, CONFLICT_SYSTEM};
+    use bossclaw_core::reason::ScriptedReasoner;
 
     #[test]
     fn loads_jsonl_pairs_and_fails_loud_on_empty() {
@@ -227,5 +247,52 @@ mod tests {
         assert!(!g.passes);
         assert!(!smoke_ok(&g.metrics));
         assert_eq!(g.metrics.cry_wolf_rate, 0.0, "no flags → no false alarms, not 100%");
+    }
+
+    #[test]
+    fn run_grade_over_scripted_judge_on_the_seed_fixture() {
+        let body = include_str!("../fixtures/conflict-seed.jsonl");
+        let pairs = parse_pairs(body).expect("seed parses");
+        // Script a PERFECT judge: flag exactly the `contradicts` pairs at high confidence.
+        let mut r = ScriptedReasoner::new("scripted");
+        for p in &pairs {
+            let prompt = build_conflict_prompt(&p.a, &p.b);
+            let resp = match p.label {
+                PairLabel::Contradicts => serde_json::json!({
+                    "contradicts": true, "winner": "newer", "confidence": 95, "why": "opposite claims"
+                }),
+                _ => serde_json::json!({
+                    "contradicts": false, "winner": "unclear", "confidence": 95, "why": "not a conflict"
+                }),
+            };
+            r = r.with_response(CONFLICT_SYSTEM, &prompt, resp);
+        }
+        let g = run_grade(&pairs, &r, 42).expect("grade ok");
+        // A perfect judge clears the Phase-0 raw-count SMOKE (0 FP, ≥2 caught).
+        assert!(smoke_ok(&g.metrics), "perfect judge passes the smoke: {:?}", g.metrics);
+        assert_eq!(g.metrics.false_positives, 0);
+        assert_eq!(g.metrics.true_positives, 5, "all 5 true contradictions flagged");
+    }
+
+    #[test]
+    fn run_grade_fails_the_smoke_when_the_judge_cries_wolf() {
+        // Exercises the real pipeline's FAIL path (not just synthetic Outcomes): a judge that
+        // ALSO flags a coexist pair as a contradiction must trip the smoke (false_positives > 0).
+        let body = include_str!("../fixtures/conflict-seed.jsonl");
+        let pairs = parse_pairs(body).expect("seed parses");
+        let mut r = ScriptedReasoner::new("crywolf");
+        for p in &pairs {
+            let prompt = build_conflict_prompt(&p.a, &p.b);
+            // Flag every contradicts pair AND every coexist pair (the false alarms).
+            let flag = matches!(p.label, PairLabel::Contradicts | PairLabel::Coexist);
+            let resp = serde_json::json!({
+                "contradicts": flag, "winner": if flag { "newer" } else { "unclear" },
+                "confidence": 95, "why": "x"
+            });
+            r = r.with_response(CONFLICT_SYSTEM, &prompt, resp);
+        }
+        let g = run_grade(&pairs, &r, 42).expect("grade ok");
+        assert_eq!(g.metrics.false_positives, 2, "both coexist pairs falsely flagged");
+        assert!(!smoke_ok(&g.metrics), "a cry-wolf judge FAILS the smoke");
     }
 }

@@ -1,0 +1,10 @@
+{"a":"We deploy the app on Vercel.","b":"We migrated off Vercel to Fly.io last week.","label":"contradicts","winner":"newer"}
+{"a":"Use Postgres for the primary datastore.","b":"We switched the primary datastore to SQLite.","label":"contradicts","winner":"newer"}
+{"a":"The API base URL is api.example.com.","b":"The API base URL is now api-v2.example.com.","label":"contradicts","winner":"newer"}
+{"a":"Peter prefers tabs for indentation everywhere.","b":"We standardized the whole repo on spaces.","label":"contradicts","winner":"newer"}
+{"a":"Run tests with `npm test`.","b":"Tests now run with `cargo test` after the rewrite.","label":"contradicts","winner":"newer"}
+{"a":"Indent Python with 4 spaces.","b":"Indent Go with tabs.","label":"coexist"}
+{"a":"Staging deploys to Fly.","b":"Production deploys to AWS.","label":"coexist"}
+{"a":"The mascot is a bear.","b":"The office plant needs watering on Fridays.","label":"unrelated"}
+{"a":"Use feature flags for risky rollouts.","b":"Prefer small PRs for reviewability.","label":"unrelated"}
+{"a":"The daemon socket lives under the data dir.","b":"The daemon reconnects with backoff.","label":"unrelated"}

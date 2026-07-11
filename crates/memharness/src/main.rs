@@ -28,6 +28,8 @@ enum Command {
     Run(RunArgs),
     /// Compare two frozen runs PAIRED (per-case, same case-list sha) — the rung-gate stats.
     Compare(CompareArgs),
+    /// Grade the rung-3 conflict judge on a frozen labelled set (spec §9).
+    ConflictGrade(ConflictGradeArgs),
 }
 
 /// Which model judges open-query answer quality (known-item scoring is mechanical, no judge).
@@ -80,6 +82,20 @@ struct RunArgs {
 }
 
 #[derive(clap::Args)]
+struct ConflictGradeArgs {
+    /// Path to the frozen labelled-pair JSONL. NOTE: the default is workspace-root-relative —
+    /// run `conflict-grade` from the repo root, or pass an absolute --cases path.
+    #[arg(long, default_value = "crates/memharness/fixtures/conflict-seed.jsonl")]
+    cases: std::path::PathBuf,
+    /// Ollama model tag for the local judge (mirrors RunArgs' model arg).
+    #[arg(long, default_value = memharness::ollama::DEFAULT_OLLAMA_MODEL)]
+    model: String,
+    /// Bootstrap seed (deterministic CI).
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+}
+
+#[derive(clap::Args)]
 struct CompareArgs {
     /// Baseline run's scores.json (e.g. the frozen Phase 1 baseline).
     #[arg(long)]
@@ -97,7 +113,38 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Compare(args) => compare(args),
+        Command::ConflictGrade(args) => conflict_grade_cmd(args),
     }
+}
+
+/// Grade the rung-3 conflict judge on a frozen labelled set (spec §9). Drives the real local
+/// judge (Ollama over the daemon's `Reasoner` seam) and prints TP/FP/FN + the Phase-0 SMOKE
+/// verdict. The precision CI is DEFERRED (tiny-N seed); `smoke_ok` is the honest Phase-0 gate.
+fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
+    use memharness::conflict_grade::{parse_pairs, run_grade, smoke_ok};
+    let body = std::fs::read_to_string(&args.cases)
+        .with_context(|| format!("reading conflict cases {}", args.cases.display()))?;
+    let pairs = parse_pairs(&body)?;
+    // Real local judge = the daemon's model via Ollama — the SAME `Reasoner` seam Phase 2 uses.
+    // `OllamaReasoner::new` POSTs /api/chat with `format = schema` + a system channel, so the
+    // verdict schema is actually enforced (unlike memharness::ollama::generate → /api/generate).
+    let judge = bossclaw_core::ollama::OllamaReasoner::new(&args.model);
+    let g = run_grade(&pairs, &judge, args.seed)?;
+    let smoke = smoke_ok(&g.metrics);
+    println!(
+        "conflict-grade: n={} TP={} FP={} FN={} recall={:.3} precision={:.3} \
+         (ci_lower={:.3} — DEFERRED gate, tiny-N) cry_wolf={:.3} → SMOKE {}",
+        pairs.len(),
+        g.metrics.true_positives,
+        g.metrics.false_positives,
+        g.metrics.false_negatives,
+        g.metrics.recall,
+        g.metrics.precision,
+        g.precision_ci_lower,
+        g.metrics.cry_wolf_rate,
+        if smoke { "PASS (0 FP, ≥2 caught)" } else { "FAIL" },
+    );
+    Ok(())
 }
 
 /// Print the paired comparison table (spec §3.0.3). The GATE read: only the two gating
