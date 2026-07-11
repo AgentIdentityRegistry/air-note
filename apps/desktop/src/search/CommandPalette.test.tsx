@@ -11,7 +11,8 @@ const grouped: GroupedResults = {
   memory: [{ id: "mem:1", kind: "memory", title: "Memory", snippet: "alpha memory", target: { view: "memory" } }],
   conversations: [{ id: "conv:1", kind: "conversation", title: "did:key:bob", snippet: "alpha chat", target: { view: "inbox", convKey: "did:key:bob" } }],
   files: [],
-  errors: { memory: false, conversations: false, files: false },
+  sessions: [],
+  errors: { memory: false, conversations: false, files: false, sessions: false },
 };
 const search = vi.fn(async () => grouped);
 
@@ -54,6 +55,40 @@ describe("CommandPalette", () => {
   it("Esc closes", () => {
     const { onClose } = setup();
     fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("renders the Library group and navigates to the library view when a session hit is chosen", async () => {
+    const withSession: GroupedResults = {
+      ...grouped,
+      sessions: [{ id: "session:s1", kind: "session", title: "Redesign spec", snippet: "work", target: { view: "library" } }],
+    };
+    search.mockResolvedValueOnce(withSession);
+    const { onNavigate, onClose } = setup();
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "redesign" } });
+    expect(await screen.findByText("Library")).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByText("Redesign spec"));
+    expect(onNavigate).toHaveBeenCalledWith({ view: "library" });
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  // Locks the one hard invariant: the palette's `groups` render order must match
+  // rankResults.flattenResults' order. Memory + Library + Conversations are all populated,
+  // so the flat list is [memory[0], session[0], conversation[0]]. One ArrowDown must land on
+  // the session row (flat index 1); Enter then navigates to the library view. If someone
+  // reorders only one of the two lists, flat[1] stops being the Library hit and this fails.
+  it("keyboard-selects the Library row across populated groups (flatten order === render order)", async () => {
+    const allPopulated: GroupedResults = {
+      ...grouped,
+      sessions: [{ id: "session:s1", kind: "session", title: "Redesign spec", snippet: "work", target: { view: "library" } }],
+    };
+    search.mockResolvedValueOnce(allPopulated);
+    const { onNavigate, onClose } = setup();
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "redesign" } });
+    await screen.findByText("alpha memory"); // memory[0] rendered → results are in
+    fireEvent.keyDown(window, { key: "ArrowDown" }); // flat index 0 (memory) → 1 (session)
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(onNavigate).toHaveBeenCalledWith({ view: "library" });
     expect(onClose).toHaveBeenCalled();
   });
 });

@@ -78,8 +78,11 @@ export function CommandPalette({
 
   if (!open) return null;
 
+  // Order MUST match flattenResults (memory → sessions → conversations → files); arrow-key
+  // selection indexes into that flat list, so a mismatch would highlight the wrong row.
   const groups: Array<{ label: string; items: SearchResult[]; error: boolean; source: string }> = [
     { label: "Memory", items: state.results.memory, error: state.results.errors.memory, source: "memory" },
+    { label: "Library", items: state.results.sessions, error: state.results.errors.sessions, source: "sessions" },
     { label: "Conversations", items: state.results.conversations, error: state.results.errors.conversations, source: "conversations" },
     { label: "Files", items: state.results.files, error: state.results.errors.files, source: "files" },
   ];
@@ -95,13 +98,13 @@ export function CommandPalette({
         <input
           ref={inputRef}
           className="command-palette-input"
-          placeholder="Search memory, conversations, files…"
+          placeholder="Search memory, library, conversations, files…"
           value={state.query}
           onChange={(e) => dispatch({ type: "setQuery", query: e.target.value })}
         />
         <div className="command-palette-results">
           {!state.query.trim() ? (
-            <p className="command-palette-empty">Type to search across memory, conversations, and files.</p>
+            <p className="command-palette-empty">Type to search across memory, library, conversations, and files.</p>
           ) : !hasAny && state.status === "ready" ? (
             <p className="command-palette-empty">No results for “{state.query}”.</p>
           ) : (
