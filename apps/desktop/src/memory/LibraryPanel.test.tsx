@@ -2,7 +2,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, within, waitFor } from "@testing-library/react";
 import { LibraryPanel } from "./LibraryPanel";
-import { listSessions, listNotes, recall, getSession, deleteSession } from "../api/engine";
+import {
+  listSessions, listNotes, recall, getSession, deleteSession, supersedeNote, recallStats,
+} from "../api/engine";
 import type { SessionSummaryDto, NoteDto, HitDto } from "../api/engine";
 
 // LibraryPanel drives the engine through the api module directly (the MemoryPanel/LanguagePackCard
@@ -13,6 +15,7 @@ vi.mock("../api/engine", async (importOriginal) => {
     ...actual,
     listSessions: vi.fn(), listNotes: vi.fn(), recall: vi.fn(),
     getSession: vi.fn(), deleteSession: vi.fn(),
+    supersedeNote: vi.fn(), recallStats: vi.fn(),
   };
 });
 
@@ -36,6 +39,9 @@ function primeArchive(sessions: SessionSummaryDto[], notes: NoteDto[]) {
   vi.mocked(listSessions).mockResolvedValue(sessions);
   vi.mocked(listNotes).mockResolvedValue(notes);
   vi.mocked(recall).mockResolvedValue([]);
+  // No recalls yet by default → the stats strip stays hidden and out of these tests' way.
+  vi.mocked(recallStats).mockResolvedValue({ total: 0, misses: 0, recent_misses: [] });
+  vi.mocked(supersedeNote).mockResolvedValue("n-new");
 }
 
 describe("LibraryPanel", () => {
@@ -282,5 +288,126 @@ describe("LibraryPanel", () => {
 
     expect(await screen.findByText(/already deleted/i)).toBeInTheDocument();
     await waitFor(() => expect(vi.mocked(listSessions).mock.calls.length).toBeGreaterThan(1));
+  });
+
+  // ---- C6: note Supersede (edit-in-place) + recall-miss stats strip ----
+
+  it("Supersede opens an edit-in-place prefilled with the note, and Save writes the corrected text", async () => {
+    primeArchive([], [NOTE]);
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    // Turn the row into an editor prefilled with the note's current text.
+    fireEvent.click(screen.getByRole("button", { name: "Supersede" }));
+    const textarea = screen.getByRole("textbox", { name: /edit note/i }) as HTMLTextAreaElement;
+    expect(textarea.value).toBe("Prefer tokens over hardcoded colors");
+
+    // The daemon returns the new current note on re-list (old excluded, replacement present).
+    const CORRECTED: NoteDto = {
+      event_id: "n2", text: "Prefer design tokens; never hardcode colors",
+      created_at: 1_750_000_500, superseded_by: null,
+    };
+    vi.mocked(listNotes).mockResolvedValue([CORRECTED]);
+
+    fireEvent.change(textarea, { target: { value: "Prefer design tokens; never hardcode colors" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(supersedeNote).toHaveBeenCalledWith("n1", "Prefer design tokens; never hardcode colors"),
+    );
+    // Refresh reflects the replacement; the old text is gone.
+    expect(await screen.findByText("Prefer design tokens; never hardcode colors")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("Prefer tokens over hardcoded colors")).toBeNull());
+  });
+
+  it("Supersede can be cancelled (no supersedeNote call, note unchanged)", async () => {
+    primeArchive([], [NOTE]);
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    fireEvent.click(screen.getByRole("button", { name: "Supersede" }));
+    const textarea = screen.getByRole("textbox", { name: /edit note/i });
+    fireEvent.change(textarea, { target: { value: "something else entirely" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(supersedeNote).not.toHaveBeenCalled();
+    // Back to view mode with the original text; the editor is gone.
+    expect(screen.getByText("Prefer tokens over hardcoded colors")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /edit note/i })).toBeNull();
+  });
+
+  it("Save is disabled/blocked for empty or unchanged text", async () => {
+    primeArchive([], [NOTE]);
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    fireEvent.click(screen.getByRole("button", { name: "Supersede" }));
+    const textarea = screen.getByRole("textbox", { name: /edit note/i });
+    const save = () => screen.getByRole("button", { name: "Save" });
+
+    // Prefilled = unchanged → Save disabled.
+    expect(save()).toBeDisabled();
+
+    // Whitespace-only (blank after trim) → still disabled; clicking does nothing.
+    fireEvent.change(textarea, { target: { value: "   " } });
+    expect(save()).toBeDisabled();
+    fireEvent.click(save());
+    expect(supersedeNote).not.toHaveBeenCalled();
+
+    // A genuine change enables it.
+    fireEvent.change(textarea, { target: { value: "A genuinely different note" } });
+    expect(save()).toBeEnabled();
+  });
+
+  it("the stats strip shows totals and recent miss queries", async () => {
+    primeArchive([S_NEW], [NOTE]);
+    vi.mocked(recallStats).mockResolvedValue({
+      total: 10, misses: 3,
+      recent_misses: [
+        { query: "quantum tunnelling", at: 1_750_000_000 },
+        { query: "where did I park", at: 1_750_100_000 },
+      ],
+    });
+    render(<LibraryPanel />);
+    await screen.findByText("Design memory hub");
+
+    // Totals — lifetime recalls and how many found nothing.
+    expect(await screen.findByText(/10 recalls/)).toBeInTheDocument();
+    expect(screen.getByText(/3 found nothing/)).toBeInTheDocument();
+    // The recent-miss QUERIES are listed (queries only — never result text, spec §8).
+    expect(screen.getByText(/quantum tunnelling/)).toBeInTheDocument();
+    expect(screen.getByText(/where did I park/)).toBeInTheDocument();
+  });
+
+  it("a supersede error surfaces (caught as a bare string), no crash", async () => {
+    // Tauri rejects Result<_, String> with a BARE STRING; the row must show it, not read .message.
+    primeArchive([], [NOTE]);
+    vi.mocked(supersedeNote).mockRejectedValue("supersede exploded");
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    fireEvent.click(screen.getByRole("button", { name: "Supersede" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /edit note/i }), {
+      target: { value: "corrected but will fail" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText(/supersede exploded/)).toBeInTheDocument();
+    // No crash — the editor stays open with the error inline.
+    expect(screen.getByRole("textbox", { name: /edit note/i })).toBeInTheDocument();
+  });
+
+  it("a recall-stats failure degrades quietly (no strip, Library still works)", async () => {
+    // A stats hiccup must never break the Library — the strip simply doesn't render.
+    primeArchive([S_NEW], [NOTE]);
+    vi.mocked(recallStats).mockRejectedValue("stats unavailable");
+    render(<LibraryPanel />);
+
+    // The archive still renders fine.
+    await screen.findByText("Design memory hub");
+    expect(screen.getByText("Prefer tokens over hardcoded colors")).toBeInTheDocument();
+    // No stats error leaks into the UI, and no strip.
+    expect(screen.queryByText(/stats unavailable/)).toBeNull();
+    expect(screen.queryByText(/found nothing/)).toBeNull();
   });
 });

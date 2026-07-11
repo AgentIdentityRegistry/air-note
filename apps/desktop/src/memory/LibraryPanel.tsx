@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import {
-  listSessions, listNotes, recall, getSession, deleteSession,
-  type SessionSummaryDto, type SessionDetailDto, type NoteDto, type HitDto,
+  listSessions, listNotes, recall, getSession, deleteSession, recallStats,
+  type SessionSummaryDto, type SessionDetailDto, type NoteDto, type HitDto, type RecallStatsDto,
 } from "../api/engine";
 import { HitList } from "./HitList";
 import { SessionReader } from "./SessionReader";
+import { NoteRow } from "./NoteRow";
 import { formatDay } from "./format";
 
 /** The daemon's bare-string rejection when a session no longer exists (delete race — spec §3). */
@@ -36,6 +37,10 @@ export function LibraryPanel() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  // C6: recall telemetry (queries-only miss log — spec §8). A read-only status strip; a stats hiccup
+  // must never break the Library, so it loads on its own and degrades to a hidden strip on failure.
+  const [stats, setStats] = useState<RecallStatsDto | null>(null);
+
   // One search box: `query` drives the instant client-side filter AND is the recall query.
   const [query, setQuery] = useState("");
 
@@ -64,7 +69,31 @@ export function LibraryPanel() {
   };
   const loadRef = useRef(load);
   loadRef.current = load;
-  useEffect(() => { void loadRef.current(); }, []);
+
+  // Re-list notes after a supersede: the daemon returns the new current note and drops the old one.
+  const refreshNotes = async () => {
+    try {
+      setNotes(await listNotes());
+    } catch (e) {
+      setLoadError(String(e));
+    }
+  };
+
+  const loadStats = async () => {
+    // Degrade quietly — a failed stats read hides the strip, it never breaks the Library.
+    try {
+      setStats(await recallStats());
+    } catch {
+      setStats(null);
+    }
+  };
+  const loadStatsRef = useRef(loadStats);
+  loadStatsRef.current = loadStats;
+
+  useEffect(() => {
+    void loadRef.current();
+    void loadStatsRef.current();
+  }, []);
 
   const onSearchMemory = async () => {
     const q = query.trim();
@@ -215,6 +244,34 @@ export function LibraryPanel() {
         Typing filters what’s loaded; press Enter or “Search memory” to search your whole memory.
       </p>
 
+      {/* C6: recall-miss stats strip — a compact, read-only status line. Only past search QUERIES that
+          found nothing are shown (never result text — spec §8; the daemon guarantees queries-only). */}
+      {stats && stats.total > 0 ? (
+        <div style={{ margin: "0 0 16px", fontSize: 12, color: "var(--text-tertiary)", lineHeight: 1.5 }}>
+          <div>
+            <span>{stats.total} recalls</span>
+            {" · "}
+            <span>{stats.misses} found nothing</span>
+          </div>
+          {stats.recent_misses.length > 0 ? (
+            <div style={{ marginTop: 4 }}>
+              <span>Recent searches that found nothing:</span>
+              <ul style={{ listStyle: "none", padding: 0, margin: "4px 0 0", display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {stats.recent_misses.slice(0, 5).map((m) => (
+                  <li
+                    key={`${m.query} ${m.at}`}
+                    style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid var(--border-soft)" }}
+                  >
+                    <span>“{m.query}”</span>
+                    <span style={{ marginLeft: 6 }}>{formatDay(m.at)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       {searchError ? <p style={{ fontSize: 13, color: "var(--error)" }}>{searchError}</p> : null}
 
       {/* Full-brain recall results — a SEPARATE group from the client-side-filtered lists below. */}
@@ -272,16 +329,10 @@ export function LibraryPanel() {
               </p>
             ) : (
               <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                {/* C6: each note is editable in place (Supersede). A saved edit re-lists notes so the
+                    replacement shows and the old text vanishes (the daemon returns current notes only). */}
                 {visibleNotes.map((n) => (
-                  <li key={n.event_id} style={{ padding: "10px 0", borderBottom: "1px solid var(--border-soft)" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                      <div>
-                        <div style={{ fontSize: 14, lineHeight: 1.4 }}>{n.text}</div>
-                        <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{formatDay(n.created_at)}</div>
-                      </div>
-                      {/* C6 seam: per-note Supersede row action attaches here. */}
-                    </div>
-                  </li>
+                  <NoteRow key={n.event_id} note={n} onSaved={refreshNotes} />
                 ))}
               </ul>
             )}
