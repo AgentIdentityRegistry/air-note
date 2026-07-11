@@ -13,3 +13,11 @@ pub mod paths;
 /// defensively, and emits stable front-matter + a readable body with NO LLM and
 /// NO clock reads in the output (spec §4a, I5). See [`render`].
 pub mod render;
+
+// The capture STORE (SP3 A7): writes the rendered Markdown to disk (0600 under a
+// 0700 dir, atomic temp+rename) THEN records the signed `session_captured` event
+// (file-then-event, spec §4b), with `heal_orphans` reconciling both crash windows.
+// Unix-only: it drives the `EngineHandle` (bossclaw-core is Unix-only) and pins
+// POSIX 0600/0700 mode bits, exactly like `#[cfg(unix)] mod engine`.
+#[cfg(unix)]
+pub mod store;

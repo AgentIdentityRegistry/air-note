@@ -614,6 +614,68 @@ impl EngineHandle {
         Ok(id)
     }
 
+    /// SP3 A7: record a captured coding-agent session as a signed, external-tainted,
+    /// embeddable `session_captured` event (the `.md` body file is written separately by the
+    /// capture store — this records only the event). Resolves the active embedder (env → signed
+    /// record → bundled), derives the title vector on a blocking thread, then invalidates the
+    /// recall index so the next `recall` surfaces it (the same index-invalidation contract as
+    /// [`Self::remember`]). A tombstoned session (I9) or other reject folds to the typed
+    /// `Rejected`; any other core failure folds to `Core`.
+    ///
+    /// Onboarding is resolved from the daemon's OWN [`Self::is_onboarded_local`] (the capture
+    /// path is daemon-internal — sweeper/dispatch — never a client-asserted `onboarded` flag).
+    pub async fn capture_session(
+        &self,
+        meta: bossclaw_core::log::SessionMeta,
+    ) -> Result<String, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let embedder = self.embedder_provider.embedder_for(&log)?;
+        let id = spawn_blocking(move || -> Result<String, EngineOpError> {
+            log.capture_session(&*embedder, &meta).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        *self.indexed.lock().await = false;
+        Ok(id)
+    }
+
+    /// SP3 A7/I7: append the owner-commanded `session_deleted` tombstone so the session leaves
+    /// the fold + recall (the `.md` file itself is removed by the capture store). A delete of a
+    /// session that is NOT current (already gone / superseded away / never captured) is the
+    /// engine's typed `Rejected` — the capture store treats that as an idempotent no-op (the
+    /// session is already tombstoned). Invalidates the recall index like [`Self::remember`].
+    pub async fn delete_session(&self, session_id: String) -> Result<String, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let id = spawn_blocking(move || -> Result<String, EngineOpError> {
+            log.delete_session(&session_id).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))??;
+        *self.indexed.lock().await = false;
+        Ok(id)
+    }
+
+    /// SP3 A7: the CURRENT captured sessions (the latest non-superseded, non-tombstoned capture
+    /// per `session_id`) — the fold the capture store reconciles against during orphan healing.
+    /// A pure read; gated + `spawn_blocking` like the other reads.
+    pub async fn current_sessions(
+        &self,
+    ) -> Result<Vec<bossclaw_core::log::CurrentSession>, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || log.current_sessions().map_err(|e| EngineOpError::Core(e.to_string())))
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// Run ONE evolve tick (gated, serialized). Gate → `evolve_lock.try_lock()`
     /// (`Busy("evolve")` if a manual + scheduled tick overlap) → `ensure_indexed` (yields
     /// the embedder) → build the reasoner → `spawn_blocking`: `evolve_once` THEN

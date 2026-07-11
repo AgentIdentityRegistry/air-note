@@ -101,6 +101,11 @@ pub struct Rendered {
     pub title: String,
     /// The full Markdown document: stable front-matter block then the body.
     pub markdown: String,
+    /// The body ALONE — the rendered conversation without the renderer's front-matter
+    /// block. The store (A7) composes ONE coherent front-matter block (its session
+    /// fields merged with these raw parts) and appends this body, so it never has to
+    /// re-parse `markdown`'s front-matter back off. `markdown == <front-matter> + body`.
+    pub body: String,
     /// Lowercase hex SHA-256 over the bytes actually read (the size-capped EOF
     /// snapshot). The signed capture event mirrors this (single source of truth).
     pub sha256: String,
@@ -240,6 +245,7 @@ fn render_bytes(buf: &[u8], bounds: &RenderBounds) -> Result<Rendered, RenderErr
     Ok(Rendered {
         title: title.unwrap_or_default(),
         markdown,
+        body,
         sha256,
         started_at: started_at.unwrap_or(0),
         ended_at,
