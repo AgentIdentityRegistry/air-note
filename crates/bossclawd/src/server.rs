@@ -20,7 +20,9 @@
 //!   The inner messages are already user-facing-safe (no DEK/key material, no other-user paths —
 //!   they embed only the op name, an engine message, or a path the caller itself supplied).
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bossclawd_proto::types::{
     ApplyResultWire, CloudProviderWire, EngineStateWire, EngineStatusWire, EvolveStatusMirror,
@@ -34,11 +36,69 @@ use bossclawd_proto::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::capture::paths::{claude_projects_root, open_transcript_confined, valid_session_id};
+use crate::capture::render::render_transcript;
+use crate::capture::store::{store_capture, CaptureIdentity, CaptureStoreError};
+use crate::capture::sweeper::{render_bounds, CAPTURE_TOOL};
 use crate::engine::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use crate::engine::{
     ApplyResult, EngineError, EngineHandle, EngineOpError, EngineStatus, EvolveTelemetry, HitWithText,
     MandateSummary, MandateWriteSummary, PreviewData, ProposalSummary,
 };
+
+/// Per-connection budget for the two expensive guest capture pokes (`CaptureNotify` + `Snapshot`):
+/// at most [`GUEST_OP_RATE`] of them per [`GUEST_OP_WINDOW`]. The cheap, frequently-expected
+/// `Recall`/`Remember` are NOT counted. See [`CaptureRateLimiter`].
+const GUEST_OP_RATE: usize = 10;
+/// The fixed window over which [`GUEST_OP_RATE`] is measured.
+const GUEST_OP_WINDOW: Duration = Duration::from_secs(60);
+
+/// A per-connection fixed-window token bucket for the capture pokes. Each [`serve_connection`] owns
+/// one, so the budget bounds a SINGLE misbehaving connection.
+///
+/// LIMITATION (documented on purpose): production MCP clients (the `air-memory-mcp` adapter)
+/// reconnect per call, so a fresh connection gets a fresh bucket — this does NOT bound
+/// reconnect-spam, which is scoped by the same-uid trust boundary + the socket's `0600` mode, not by
+/// this limiter. It is a cheap guard against one chatty/looping connection, checked at the daemon
+/// boundary (a clock read here is fine — the dispatch core stays clock-free).
+struct CaptureRateLimiter {
+    window_start: Instant,
+    count: usize,
+}
+
+impl CaptureRateLimiter {
+    fn new(now: Instant) -> Self {
+        Self { window_start: now, count: 0 }
+    }
+
+    /// Record one capture poke at `now`. Returns `true` if it is within the per-window cap (so the
+    /// caller dispatches it), `false` if it exceeds the cap (so the caller refuses it). The window
+    /// is a simple fixed window: once [`GUEST_OP_WINDOW`] has elapsed the count resets.
+    fn check(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.window_start) >= GUEST_OP_WINDOW {
+            self.window_start = now;
+            self.count = 0;
+        }
+        self.count += 1;
+        self.count <= GUEST_OP_RATE
+    }
+}
+
+/// The two capture pokes the rate limiter counts (the expensive/side-effect-ish guest ops). Kept as
+/// a tiny predicate so the loop reads cleanly and A11's `Snapshot` handler shares the exact set.
+fn is_rate_limited_op(req: &Request) -> bool {
+    matches!(req, Request::CaptureNotify { .. } | Request::Snapshot { .. })
+}
+
+/// The clean per-connection rate-limit refusal. Rides the [`OpErrorKindWire::Rejected`] kind (a
+/// policy refusal, like the path/id rejects) with a message that names the rate limit; it echoes no
+/// request content.
+fn rate_limited_response() -> Response {
+    Response::Err {
+        kind: OpErrorKindWire::Rejected,
+        message: "rate limit exceeded for capture pokes on this connection".to_string(),
+    }
+}
 
 /// Run one connection to completion over any framed byte stream (a real `UnixStream` in
 /// production, an in-process duplex in tests). Owns the read/write halves; the shared engine
@@ -93,6 +153,8 @@ where
     // The role the connection requested, captured once BEFORE the loop so no borrow of `hello`
     // spans a `.await`. Every op on this connection is authorized against it (U2).
     let role = hello.role;
+    // Per-connection capture-poke budget (reset by construction on every new connection).
+    let mut rate_limiter = CaptureRateLimiter::new(Instant::now());
 
     // ── Dispatch loop: one Request → one Response per frame, until the peer closes. ──
     loop {
@@ -103,6 +165,11 @@ where
         };
         // A malformed Request frame must NOT panic or kill the daemon: reply Err and keep serving.
         let response = match serde_json::from_slice::<Request>(&frame) {
+            // Rate-limit the two expensive capture pokes BEFORE dispatch (a clock read here is fine —
+            // the daemon boundary). Non-capture ops never touch the bucket (short-circuit).
+            Ok(req) if is_rate_limited_op(&req) && !rate_limiter.check(Instant::now()) => {
+                rate_limited_response()
+            }
             Ok(req) => dispatch(&engine, role, req).await,
             Err(e) => protocol_err(format!("malformed request frame: {e}")),
         };
@@ -140,6 +207,17 @@ fn override_onboarding_for_guest(req: Request, onboarded: bool) -> Option<Reques
     match req {
         Request::Recall { query, k, .. } => Some(Request::Recall { onboarded, query, k }),
         Request::Remember { text, .. } => Some(Request::Remember { onboarded, text }),
+        // SP3 session-capture pokes — the guest surface widens by EXACTLY these two (`Role::allows`
+        // already admits them). Rewrite `onboarded` to the daemon's OWN truth so a guest can never
+        // assert onboarding to force a keystore mint — identical treatment to Recall/Remember. A10
+        // lands the `CaptureNotify` dispatch arm; A11 lands `Snapshot`'s (the guest plumbing is done
+        // here for both so A11 reuses it).
+        Request::CaptureNotify { session_id, transcript_path, .. } => {
+            Some(Request::CaptureNotify { onboarded, session_id, transcript_path })
+        }
+        Request::Snapshot { project, source, session_id, transcript_path, .. } => {
+            Some(Request::Snapshot { onboarded, project, source, session_id, transcript_path })
+        }
         _ => None,
     }
 }
@@ -309,10 +387,14 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             Response::ModelStatus(model_status_wire(engine.model_status(onboarded).await))
         }
 
-        // SP3 ops — dispatch arms land with their features (tasks A10–A13). Until then these
-        // return a typed error so the enum stays exhaustively matched (no `_` catch-all).
-        Request::CaptureNotify { .. }
-        | Request::Snapshot { .. }
+        // ── SP3 §4c: IMMEDIATE capture (A10). Guest-reachable, capture-gated, confined render. ──
+        Request::CaptureNotify { session_id, transcript_path, .. } => {
+            capture_notify(engine, session_id, transcript_path).await
+        }
+
+        // Remaining SP3 ops — dispatch arms land with their features (tasks A11–A13). Until then
+        // these return a typed error so the enum stays exhaustively matched (no `_` catch-all).
+        Request::Snapshot { .. }
         | Request::ListSessions { .. }
         | Request::GetSession { .. }
         | Request::DeleteSession { .. }
@@ -323,6 +405,98 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
         | Request::CaptureEnabled { .. } => {
             protocol_err("not yet supported by this daemon".to_string())
         }
+    }
+}
+
+/// SP3 §4c — the IMMEDIATE capture path (the `CaptureNotify` poke, guest-reachable). An explicit
+/// SessionEnd hook fires this: render the just-ended transcript to a signed capture NOW, bypassing
+/// the sweeper's quiet-mtime floor (the explicit poke IS the quiet signal). Confinement, the D2
+/// size cap, the identity, and the signed `session_captured` event all reuse the SAME primitives the
+/// sweeper (A9) uses, so notify + sweep produce byte-identical captures for one file.
+///
+/// I10: gated on `capture_enabled`. A poke on a brain that has NOT consented to capture is a silent
+/// no-op success — the hook fired, but nothing is written (no `sessions/` dir, no event). Onboarding
+/// is the daemon's OWN verdict (never a client flag), exactly like [`EngineHandle::capture_session`].
+///
+/// Every rejection is a CLEAN typed error that NEVER echoes the attacker-influenced session id /
+/// transcript path (spec I4).
+async fn capture_notify(engine: &EngineHandle, session_id: String, transcript_path: String) -> Response {
+    // I10 gate FIRST: capture disabled (or not onboarded → capture_enabled is false) → no side
+    // effects, clean Ok. The daemon computes onboarding itself; a guest can never assert it.
+    let onboarded = engine.is_onboarded_local();
+    if !engine.capture_enabled(onboarded).await.unwrap_or(false) {
+        return Response::Ok;
+    }
+    // A5 D1: validate the session id BEFORE any path is built from it.
+    if !valid_session_id(&session_id) {
+        return capture_rejected("invalid session id");
+    }
+    // A5 D3: confine + open the transcript under the Claude projects root (careful-open: O_NOFOLLOW
+    // per component, no canonicalize). A rejection maps to a clean error — never the hostile bytes.
+    let root = claude_projects_root();
+    let file = match open_transcript_confined(&root, Path::new(&transcript_path)) {
+        Ok(f) => f,
+        Err(_) => return capture_rejected("transcript path rejected by capture-path discipline"),
+    };
+    // A6: render (the D2 size cap lives here). Any render failure → a clean rejection.
+    let rendered = match render_transcript(file, &render_bounds()) {
+        Ok(r) => r,
+        Err(_) => return capture_rejected("transcript could not be rendered"),
+    };
+    // Identity mirrors the sweeper: session_id from the (validated) request, project = the parent
+    // slug dir of the confined path, tool = claude-code — so notify + sweep agree for one file.
+    let id = CaptureIdentity {
+        session_id,
+        project: transcript_project_slug(&transcript_path),
+        tool: CAPTURE_TOOL.to_string(),
+    };
+    // The data dir is db_path's parent (single-sourced with is_onboarded_local); unresolvable → a
+    // clean Core fault rather than an unwrap.
+    let Some(data_dir) = engine.data_dir() else {
+        return Response::Err {
+            kind: OpErrorKindWire::Core,
+            message: "capture store data dir unresolvable".to_string(),
+        };
+    };
+    // A7: atomic 0600 write under the 0700 sessions dir THEN the signed event (file-then-event).
+    match store_capture(engine, data_dir, &id, &rendered).await {
+        Ok(()) => Response::Ok,
+        Err(e) => capture_store_error_response(e),
+    }
+}
+
+/// A clean capture-path rejection (`Rejected` kind) whose message is a STATIC check name — it never
+/// echoes the attacker-influenced session id / transcript path (spec I4).
+fn capture_rejected(message: &str) -> Response {
+    Response::Err { kind: OpErrorKindWire::Rejected, message: message.to_string() }
+}
+
+/// The project slug = the transcript's parent DIRECTORY name (Claude Code's cwd-encoding), used
+/// verbatim as a stable per-repo key — exactly as the sweeper derives it from its scan (so notify +
+/// sweep tag one file identically). Empty if the path has no parent dir (degenerate; the store still
+/// writes, keyed by session_id).
+fn transcript_project_slug(transcript_path: &str) -> String {
+    Path::new(transcript_path)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Map a [`CaptureStoreError`] to a clean wire error. The store collapses its underlying
+/// `EngineOpError` into a String (so the typed engine kind is already gone by here); a store fault
+/// therefore rides the generic `Core` kind, and no attacker-influenced path is ever echoed.
+fn capture_store_error_response(e: CaptureStoreError) -> Response {
+    match e {
+        // The id was already A5-validated in the handler; a reject here is still clean (no bytes).
+        CaptureStoreError::InvalidSessionId => capture_rejected("invalid session id"),
+        // Our OWN sessions-dir I/O — surface a clean, path-free Core fault (never the OS path).
+        CaptureStoreError::Io(_) => {
+            Response::Err { kind: OpErrorKindWire::Core, message: "capture store i/o error".to_string() }
+        }
+        // The engine refused/failed to record the signed event; its message is engine-internal
+        // (op name / engine message — no attacker path). Ride the generic Core kind.
+        CaptureStoreError::Engine(m) => Response::Err { kind: OpErrorKindWire::Core, message: m },
     }
 }
 
@@ -700,6 +874,37 @@ mod tests {
                 assert_eq!(text, "t");
             }
             other => panic!("expected Some(Remember), got {other:?}"),
+        }
+        // The SP3 capture pokes (A10) are admitted for the guest with the daemon's onboarding truth.
+        match override_onboarding_for_guest(
+            Request::CaptureNotify {
+                onboarded: false,
+                session_id: "s".into(),
+                transcript_path: "/p.jsonl".into(),
+            },
+            true,
+        ) {
+            Some(Request::CaptureNotify { onboarded, session_id, transcript_path }) => {
+                assert!(onboarded, "the daemon's onboarding truth overwrites the client flag");
+                assert_eq!(session_id, "s");
+                assert_eq!(transcript_path, "/p.jsonl");
+            }
+            other => panic!("expected Some(CaptureNotify), got {other:?}"),
+        }
+        match override_onboarding_for_guest(
+            Request::Snapshot {
+                onboarded: false,
+                project: "/r".into(),
+                source: "startup".into(),
+                session_id: None,
+                transcript_path: None,
+            },
+            true,
+        ) {
+            Some(Request::Snapshot { onboarded, .. }) => {
+                assert!(onboarded, "the daemon's onboarding truth overwrites the client flag");
+            }
+            other => panic!("expected Some(Snapshot), got {other:?}"),
         }
         // A NON-guest op (not on the allowlist) returns None → the caller refuses it fail-closed,
         // so a future allowlist widening that forgets this function can never leak a mint-forge.

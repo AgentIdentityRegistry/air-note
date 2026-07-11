@@ -373,6 +373,14 @@ impl EngineHandle {
         self.db_path.parent().map(crate::identity::is_onboarded).unwrap_or(false)
     }
 
+    /// The daemon's data dir — `db_path`'s parent (`db_path = <data_dir>/brain.db`). The SP3
+    /// capture dispatch (A10+) needs it to drive `capture::store::store_capture`; deriving it here
+    /// keeps it single-sourced with [`Self::is_onboarded_local`] rather than threading `data_dir`
+    /// through the shared accept loop. `None` if the parent is unresolvable (fail-safe).
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.db_path.parent()
+    }
+
     /// Get-or-open + verify the chain + count, mapped to a never-erroring `EngineStatus`.
     /// Open-failure (wrong DEK / unopenable) maps to `KeystoreDbMismatch`; an opened-but-
     /// tampered log maps to `ChainFailed` — the two are kept distinct (spec failure matrix).

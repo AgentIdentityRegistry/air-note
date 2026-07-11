@@ -62,10 +62,13 @@ pub const CAPTURE_PER_SWEEP: usize = 8;
 const CAPTURE_MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024 * 1024;
 const CAPTURE_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const CAPTURE_WALL_CLOCK: Duration = Duration::from_secs(30);
-/// The coding agent that produces the swept transcripts.
-const CAPTURE_TOOL: &str = "claude-code";
+/// The coding agent that produces the swept transcripts. `pub` so the IMMEDIATE `CaptureNotify`
+/// dispatch path (A10) tags the identical `tool`, keeping notify + sweep captures byte-identical.
+pub const CAPTURE_TOOL: &str = "claude-code";
 
-fn render_bounds() -> RenderBounds {
+/// The shared render bounds (spec §4a). `pub` so the immediate `CaptureNotify` dispatch (A10) renders
+/// with the SAME caps the sweeper uses — one source of truth for the D2 numbers, no drift.
+pub fn render_bounds() -> RenderBounds {
     RenderBounds {
         max_transcript_bytes: CAPTURE_MAX_TRANSCRIPT_BYTES,
         max_line_bytes: CAPTURE_MAX_LINE_BYTES,
