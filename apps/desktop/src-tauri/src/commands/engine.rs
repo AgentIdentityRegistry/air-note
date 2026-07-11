@@ -674,6 +674,146 @@ pub async fn engine_model_status(state: State<'_, AppState>) -> Result<ModelStat
     })
 }
 
+// ---- SP3 C1: Memory-browser Library (sessions / notes / forget / recall stats) ----
+//
+// Six App-only bridge commands the Plan C Library UI (C2) consumes. Each obtains `onboarded` from
+// state and delegates to the engine facade; the DTOs are snake_case + serde-Serialize (the frontend
+// contract). Registered `#[cfg(unix)]` in main.rs alongside the sibling engine commands.
+
+/// One captured-session Library row. Mirrors the TS twin the C2 wrapper consumes (snake_case keys).
+#[derive(Serialize)]
+pub struct SessionSummaryDto {
+    pub session_id: String,
+    pub title: String,
+    pub project: String,
+    pub tool: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub approx_bytes: u64,
+}
+impl From<crate::engine::SessionSummary> for SessionSummaryDto {
+    fn from(s: crate::engine::SessionSummary) -> Self {
+        Self {
+            session_id: s.session_id,
+            title: s.title,
+            project: s.project,
+            tool: s.tool,
+            started_at: s.started_at,
+            ended_at: s.ended_at,
+            approx_bytes: s.approx_bytes,
+        }
+    }
+}
+
+/// One captured session's detail: its summary + the daemon-rendered Markdown body.
+#[derive(Serialize)]
+pub struct SessionDetailDto {
+    pub summary: SessionSummaryDto,
+    pub markdown: String,
+}
+impl From<crate::engine::SessionDetail> for SessionDetailDto {
+    fn from(d: crate::engine::SessionDetail) -> Self {
+        Self { summary: SessionSummaryDto::from(d.summary), markdown: d.markdown }
+    }
+}
+
+/// One `remember` note for the notes list. `superseded_by` is set once the note has been edited.
+#[derive(Serialize)]
+pub struct NoteDto {
+    pub event_id: String,
+    pub text: String,
+    pub created_at: i64,
+    pub superseded_by: Option<String>,
+}
+impl From<crate::engine::Note> for NoteDto {
+    fn from(n: crate::engine::Note) -> Self {
+        Self {
+            event_id: n.event_id,
+            text: n.text,
+            created_at: n.created_at,
+            superseded_by: n.superseded_by,
+        }
+    }
+}
+
+/// One recorded recall miss (a recall that found nothing) for the tuning UI.
+#[derive(Serialize)]
+pub struct RecallMissDto {
+    pub query: String,
+    pub at: i64,
+}
+impl From<crate::engine::RecallMiss> for RecallMissDto {
+    fn from(m: crate::engine::RecallMiss) -> Self {
+        Self { query: m.query, at: m.at }
+    }
+}
+
+/// Recall hit/miss telemetry: lifetime `total` recalls, how many were `misses`, and recent misses.
+#[derive(Serialize)]
+pub struct RecallStatsDto {
+    pub total: u64,
+    pub misses: u64,
+    pub recent_misses: Vec<RecallMissDto>,
+}
+impl From<crate::engine::RecallStats> for RecallStatsDto {
+    fn from(s: crate::engine::RecallStats) -> Self {
+        Self {
+            total: s.total,
+            misses: s.misses,
+            recent_misses: s.recent_misses.into_iter().map(RecallMissDto::from).collect(),
+        }
+    }
+}
+
+/// List the captured-session summaries for the Library.
+#[tauri::command]
+pub async fn engine_list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionSummaryDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let sessions = state.engine.list_sessions(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(sessions.into_iter().map(SessionSummaryDto::from).collect())
+}
+
+/// Read one captured session's summary + rendered Markdown. An unknown/deleted `session_id`
+/// surfaces the daemon's clean "session not found or deleted" string (via `EngineOpError::Rejected`,
+/// whose Display is the bare message), so the UI can distinguish "already deleted" from a real fault.
+#[tauri::command]
+pub async fn engine_get_session(session_id: String, state: State<'_, AppState>) -> Result<SessionDetailDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let detail = state.engine.get_session(onboarded, session_id).await.map_err(|e| e.to_string())?;
+    Ok(SessionDetailDto::from(detail))
+}
+
+/// Tombstone a captured session (honest, durable forget). Idempotent — deleting an unknown id is Ok.
+#[tauri::command]
+pub async fn engine_delete_session(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.delete_session(onboarded, session_id).await.map_err(|e| e.to_string())
+}
+
+/// List the current (non-superseded) `remember` notes.
+#[tauri::command]
+pub async fn engine_list_notes(state: State<'_, AppState>) -> Result<Vec<NoteDto>, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let notes = state.engine.list_notes(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(notes.into_iter().map(NoteDto::from).collect())
+}
+
+/// Supersede a note with new text; returns the new (superseding) event id. A bad `event_id`
+/// (unknown / not-a-note / already-superseded) surfaces the typed reject as a validation string.
+#[tauri::command]
+pub async fn engine_supersede_note(event_id: String, text: String, state: State<'_, AppState>) -> Result<String, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.supersede_note(onboarded, event_id, text).await.map_err(|e| e.to_string())
+}
+
+/// Recall hit/miss telemetry for the retrieval-floor tuning UI.
+#[tauri::command]
+pub async fn engine_recall_stats(state: State<'_, AppState>) -> Result<RecallStatsDto, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    let stats = state.engine.recall_stats(onboarded).await.map_err(|e| e.to_string())?;
+    Ok(RecallStatsDto::from(stats))
+}
+
 /// Copy the bundled English model from `resource_models_dir` into `<data_dir>/models/potion-base-8M`
 /// if the destination is missing (idempotent). This makes the daemon's DEFAULT resolution
 /// (`<data_dir>/models/potion-base-8M`) work WITHOUT the app pushing `BOSSCLAWD_MODEL_DIR` (I1), so a
@@ -802,6 +942,117 @@ mod tests {
         assert_eq!(dto.invalidates_emitted, 1);
         assert_eq!(dto.pages_emitted, 4);
         assert_eq!(dto.memories_processed, 5);
+    }
+
+    // ---- SP3 C1 Library DTO mapping (pure fns, snake_case frontend contract) ----
+
+    #[test]
+    fn session_summary_dto_maps_all_fields() {
+        let dto = SessionSummaryDto::from(crate::engine::SessionSummary {
+            session_id: "s1".into(),
+            title: "T".into(),
+            project: "p".into(),
+            tool: "claude-code".into(),
+            started_at: 100,
+            ended_at: 200,
+            approx_bytes: 4096,
+        });
+        assert_eq!(dto.session_id, "s1");
+        assert_eq!(dto.title, "T");
+        assert_eq!(dto.project, "p");
+        assert_eq!(dto.tool, "claude-code");
+        assert_eq!(dto.started_at, 100);
+        assert_eq!(dto.ended_at, 200);
+        assert_eq!(dto.approx_bytes, 4096);
+    }
+
+    #[test]
+    fn session_detail_dto_maps_summary_and_markdown() {
+        let dto = SessionDetailDto::from(crate::engine::SessionDetail {
+            summary: crate::engine::SessionSummary {
+                session_id: "s2".into(),
+                title: "T".into(),
+                project: "p".into(),
+                tool: "claude-code".into(),
+                started_at: 1,
+                ended_at: 2,
+                approx_bytes: 8,
+            },
+            markdown: "# body\n".into(),
+        });
+        assert_eq!(dto.summary.session_id, "s2");
+        assert_eq!(dto.markdown, "# body\n");
+    }
+
+    #[test]
+    fn note_dto_maps_all_fields() {
+        let dto = NoteDto::from(crate::engine::Note {
+            event_id: "n1".into(),
+            text: "hi".into(),
+            created_at: 42,
+            superseded_by: Some("n2".into()),
+        });
+        assert_eq!(dto.event_id, "n1");
+        assert_eq!(dto.text, "hi");
+        assert_eq!(dto.created_at, 42);
+        assert_eq!(dto.superseded_by.as_deref(), Some("n2"));
+    }
+
+    #[test]
+    fn recall_stats_dto_maps_nested_recent_misses() {
+        let dto = RecallStatsDto::from(crate::engine::RecallStats {
+            total: 7,
+            misses: 2,
+            recent_misses: vec![
+                crate::engine::RecallMiss { query: "q1".into(), at: 10 },
+                crate::engine::RecallMiss { query: "q2".into(), at: 20 },
+            ],
+        });
+        assert_eq!(dto.total, 7);
+        assert_eq!(dto.misses, 2);
+        assert_eq!(dto.recent_misses.len(), 2);
+        assert_eq!(dto.recent_misses[0].query, "q1");
+        assert_eq!(dto.recent_misses[0].at, 10);
+        assert_eq!(dto.recent_misses[1].query, "q2");
+        assert_eq!(dto.recent_misses[1].at, 20);
+    }
+
+    /// The C2 frontend consumes these keys literally — they MUST serialize snake_case (no camelCase
+    /// rename). Asserts the load-bearing keys across the summary + the nested recall-miss shape.
+    #[test]
+    fn library_dtos_serialize_snake_case() {
+        let summary = SessionSummaryDto::from(crate::engine::SessionSummary {
+            session_id: "s".into(),
+            title: "t".into(),
+            project: "p".into(),
+            tool: "cc".into(),
+            started_at: 1,
+            ended_at: 2,
+            approx_bytes: 3,
+        });
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("session_id").is_some(), "session_id key present, got {json}");
+        assert!(json.get("started_at").is_some(), "started_at key present, got {json}");
+        assert!(json.get("ended_at").is_some(), "ended_at key present, got {json}");
+        assert!(json.get("approx_bytes").is_some(), "approx_bytes key present, got {json}");
+
+        let stats = RecallStatsDto::from(crate::engine::RecallStats {
+            total: 1,
+            misses: 1,
+            recent_misses: vec![crate::engine::RecallMiss { query: "q".into(), at: 5 }],
+        });
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(json.get("recent_misses").is_some(), "recent_misses key present, got {json}");
+        let note = NoteDto::from(crate::engine::Note {
+            event_id: "n".into(),
+            text: "x".into(),
+            created_at: 9,
+            superseded_by: None,
+        });
+        let json = serde_json::to_value(&note).unwrap();
+        assert!(json.get("event_id").is_some(), "event_id key present, got {json}");
+        assert!(json.get("created_at").is_some(), "created_at key present, got {json}");
+        assert!(json.get("superseded_by").is_some(), "superseded_by key present, got {json}");
     }
 
     use crate::commands::identity::AppState;

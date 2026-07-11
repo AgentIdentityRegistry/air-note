@@ -224,6 +224,18 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_model_status,
             #[cfg(unix)]
+            commands::engine::engine_list_sessions,
+            #[cfg(unix)]
+            commands::engine::engine_get_session,
+            #[cfg(unix)]
+            commands::engine::engine_delete_session,
+            #[cfg(unix)]
+            commands::engine::engine_list_notes,
+            #[cfg(unix)]
+            commands::engine::engine_supersede_note,
+            #[cfg(unix)]
+            commands::engine::engine_recall_stats,
+            #[cfg(unix)]
             commands::integrations::integrations_status,
             #[cfg(unix)]
             commands::integrations::integrations_connect_claude_code,

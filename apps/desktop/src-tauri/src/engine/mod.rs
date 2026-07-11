@@ -178,6 +178,57 @@ pub struct PreviewData {
     pub taint: String,
 }
 
+/// One Memory-browser Library row (SP3 C1): the desktop mirror of `SessionSummaryWire`. Like the
+/// other Family-2 summary structs, the wire type has no core equivalent and no proto `From` (proto
+/// isn't a desktop dep), so the client fills this field-by-field. `started_at`/`ended_at` are
+/// unix-epoch seconds; `approx_bytes` is the rendered `.md` size (a cheap "how big" hint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub project: String,
+    pub tool: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub approx_bytes: u64,
+}
+
+/// One captured session's detail (SP3 C1): its [`SessionSummary`] plus the daemon-rendered Markdown
+/// body. The desktop mirror of `SessionDetailWire`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDetail {
+    pub summary: SessionSummary,
+    pub markdown: String,
+}
+
+/// One `remember` note projected for the Memory-browser notes list (SP3 C1). The desktop mirror of
+/// `NoteWire`. `superseded_by` is `Some(new_event_id)` once the note has been edited, else `None`;
+/// `created_at` is unix-epoch seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub event_id: String,
+    pub text: String,
+    pub created_at: i64,
+    pub superseded_by: Option<String>,
+}
+
+/// One recorded recall miss — a recall that found nothing — for the retrieval-floor tuning UI
+/// (SP3 C1). The desktop mirror of `RecallMissWire`. `at` is unix-epoch seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallMiss {
+    pub query: String,
+    pub at: i64,
+}
+
+/// Recall hit/miss telemetry (SP3 C1): the desktop mirror of `RecallStatsWire` — lifetime `total`
+/// recalls, how many were `misses`, and the most `recent_misses` (bounded daemon-side).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecallStats {
+    pub total: u64,
+    pub misses: u64,
+    pub recent_misses: Vec<RecallMiss>,
+}
+
 /// The coarse engine state surfaced to the UI (distinguishes setup states from faults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -460,5 +511,40 @@ impl Engine {
     /// Mirrors `EngineClient::capture_enabled` (SP3 B5): read the sticky ongoing-capture flag.
     pub async fn capture_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
         self.client.capture_enabled(onboarded).await
+    }
+
+    // ── Memory-browser Library (SP3 C1). App-only ops (the daemon's role gate denies MemoryClient);
+    //    `onboarded` is threaded from the caller like every sibling. ──
+
+    /// Mirrors `EngineClient::list_sessions`: the captured-session summaries for the Library.
+    pub async fn list_sessions(&self, onboarded: bool) -> Result<Vec<SessionSummary>, EngineOpError> {
+        self.client.list_sessions(onboarded).await
+    }
+
+    /// Mirrors `EngineClient::get_session`: one captured session's summary + rendered Markdown. An
+    /// unknown/deleted `session_id` surfaces as [`EngineOpError::Rejected`] ("session not found or
+    /// deleted") so the UI can distinguish "already deleted" from a real fault.
+    pub async fn get_session(&self, onboarded: bool, session_id: String) -> Result<SessionDetail, EngineOpError> {
+        self.client.get_session(onboarded, session_id).await
+    }
+
+    /// Mirrors `EngineClient::delete_session`: tombstone a captured session (honest, durable forget).
+    pub async fn delete_session(&self, onboarded: bool, session_id: String) -> Result<(), EngineOpError> {
+        self.client.delete_session(onboarded, session_id).await
+    }
+
+    /// Mirrors `EngineClient::list_notes`: the current (non-superseded) `remember` notes.
+    pub async fn list_notes(&self, onboarded: bool) -> Result<Vec<Note>, EngineOpError> {
+        self.client.list_notes(onboarded).await
+    }
+
+    /// Mirrors `EngineClient::supersede_note`: replace a note's text, yielding the new event id.
+    pub async fn supersede_note(&self, onboarded: bool, event_id: String, text: String) -> Result<String, EngineOpError> {
+        self.client.supersede_note(onboarded, event_id, text).await
+    }
+
+    /// Mirrors `EngineClient::recall_stats`: recall hit/miss telemetry for the tuning UI.
+    pub async fn recall_stats(&self, onboarded: bool) -> Result<RecallStats, EngineOpError> {
+        self.client.recall_stats(onboarded).await
     }
 }
