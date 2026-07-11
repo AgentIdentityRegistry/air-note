@@ -105,6 +105,39 @@ fn telemetry_files_are_0600_under_0700_dir() {
     assert_eq!(mode_of(&tel_dir.join("recent_misses.json")), 0o600);
 }
 
+/// The raw `recall.jsonl` line carries exactly `{at, query, hits, top_score}` with the right values.
+/// `top_score` is written ONLY to the line log (never the counters or ring), so this is its sole
+/// serialization coverage — a future low-`top_score` miss-definition depends on it. The exact-key
+/// assertion ALSO turns the documented "queries only, never result/note text" privacy claim on the
+/// line log into an ENFORCED one: no result/title/body field can silently join the line.
+#[test]
+fn line_log_records_query_hits_and_top_score_and_leaks_no_result_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Telemetry::open(dir.path()).unwrap();
+    t.record("who is aria", 2, Some(0.5)); // a hit, with a top score
+    t.record("nothing matches", 0, None); // a miss, no top score
+
+    let raw = std::fs::read_to_string(dir.path().join("telemetry").join("recall.jsonl")).unwrap();
+    let mut lines = raw.lines();
+
+    // The hit line: query + hit count + the top score (top_score lives ONLY here).
+    let hit: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(hit["query"], "who is aria");
+    assert_eq!(hit["hits"], 2);
+    assert_eq!(hit["top_score"], 0.5);
+    assert!(hit["at"].as_i64().is_some());
+    // Exactly these four fields — nothing that could carry result/note text ever joins the line.
+    let mut keys: Vec<&str> = hit.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["at", "hits", "query", "top_score"]);
+
+    // The miss line: no score (None → JSON null), hits == 0.
+    let miss: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(miss["query"], "nothing matches");
+    assert_eq!(miss["hits"], 0);
+    assert!(miss["top_score"].is_null());
+}
+
 // ── Integration: a real daemon over its socket. ──────────────────────────────────────────────────
 
 /// A framed client that can handshake in either role, mirroring `tests/memory_client_loop.rs`.

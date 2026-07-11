@@ -93,15 +93,21 @@ impl Telemetry {
         let _guard = WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
 
         // Durable counters FIRST (the headline tuning signal): bump total, and on a miss bump
-        // misses + push the query onto the recent-miss ring. Both live in their own atomically-
-        // rewritten files, so rotating the raw line log below never resets them (critic m1).
+        // misses. Both live in their own atomically-rewritten files, so rotating the raw line log
+        // below never resets them (critic m1).
+        let is_miss = hits == 0;
         let mut counters = self.read_counters();
         counters.total = counters.total.saturating_add(1);
-        if hits == 0 {
+        if is_miss {
             counters.misses = counters.misses.saturating_add(1);
+        }
+        // Write the counters BEFORE the recent-miss ring: a crash between the two then leaves the
+        // more-durable headline number "counted but not yet ringed" rather than "ringed but
+        // uncounted" (the ring is a best-effort recent view; the counters are the signal).
+        self.write_counters(&counters)?;
+        if is_miss {
             self.push_recent_miss(query, at)?;
         }
-        self.write_counters(&counters)?;
 
         // Then the raw forensic line (append-only, born 0600, O_APPEND), and finally best-effort
         // rotation once it grows past the cap.

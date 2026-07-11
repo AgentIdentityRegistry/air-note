@@ -413,16 +413,8 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
         }
 
         // ── SP3 §8: recall-miss telemetry read (A12). App-only — `Role::allows` denies it for a
-        // guest (`MemoryClient`), so no guest onboarding plumbing is needed here. Best-effort: any
-        // telemetry-store error yields EMPTY stats (`0/0/[]`) rather than a failed op, so the
-        // read-only tuning panel degrades to zeros, never an error. ──
-        Request::RecallStats { .. } => Response::RecallStats(
-            engine
-                .data_dir()
-                .and_then(|d| crate::telemetry::Telemetry::open(d).ok())
-                .and_then(|t| t.stats().ok())
-                .unwrap_or_else(|| RecallStatsWire { total: 0, misses: 0, recent_misses: Vec::new() }),
-        ),
+        // guest (`MemoryClient`), so no guest onboarding plumbing is needed here. ──
+        Request::RecallStats { .. } => Response::RecallStats(recall_stats(engine)),
 
         // Remaining SP3 ops — dispatch arms land with their features (task A13). Until then these
         // return a typed error so the enum stays exhaustively matched (no `_` catch-all).
@@ -663,6 +655,18 @@ fn record_recall_telemetry(engine: &EngineHandle, query: &str, hits: &[HitWithTe
     let Some(data_dir) = engine.data_dir() else { return };
     let Ok(telemetry) = crate::telemetry::Telemetry::open(data_dir) else { return };
     telemetry.record(query, hits.len(), hits.first().map(|h| h.hit.score));
+}
+
+/// Read the recall telemetry back for the App-only `RecallStats` op — the symmetric READ to
+/// [`record_recall_telemetry`]'s write. Best-effort: an unresolvable data dir, an un-openable store,
+/// or a stats-read error all fold to the EMPTY default (`0/0/[]`), so the read-only tuning panel
+/// degrades to zeros rather than a failed op.
+fn recall_stats(engine: &EngineHandle) -> RecallStatsWire {
+    engine
+        .data_dir()
+        .and_then(|d| crate::telemetry::Telemetry::open(d).ok())
+        .and_then(|t| t.stats().ok())
+        .unwrap_or_default()
 }
 
 fn telemetry_wire(t: EvolveTelemetry) -> EvolveTelemetryWire {

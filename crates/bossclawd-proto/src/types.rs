@@ -722,7 +722,7 @@ pub struct RecallMissWire {
 
 /// Wire form of the recall-miss telemetry the `RecallStats` op returns: lifetime `total` recalls,
 /// how many were `misses`, and the most `recent_misses` (bounded daemon-side) for the tuning UI.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
 pub struct RecallStatsWire {
     pub total: u64,
     pub misses: u64,
