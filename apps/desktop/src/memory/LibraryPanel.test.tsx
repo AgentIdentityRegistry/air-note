@@ -397,6 +397,32 @@ describe("LibraryPanel", () => {
     expect(screen.getByRole("textbox", { name: /edit note/i })).toBeInTheDocument();
   });
 
+  it("a failed re-list after a successful save keeps the panel up (localized notice, not the fatal card)", async () => {
+    // The supersede SAVED; only the follow-up listNotes() failed. The Library must stay fully
+    // rendered with a localized non-fatal notice — NOT the full-screen "Couldn't load" error card.
+    primeArchive([S_NEW], [NOTE]);
+    vi.mocked(supersedeNote).mockResolvedValue("n2");
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    fireEvent.click(screen.getByRole("button", { name: "Supersede" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /edit note/i }), {
+      target: { value: "corrected text that saves fine" },
+    });
+    // The save resolves, but the very next listNotes() (the refresh) rejects once.
+    vi.mocked(listNotes).mockRejectedValueOnce("listNotes hiccup");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(supersedeNote).toHaveBeenCalled());
+    // Localized, non-fatal notice — and the rest of the panel (a session) is still on screen.
+    expect(await screen.findByText(/reload to see the update/i)).toBeInTheDocument();
+    expect(screen.getByText("Design memory hub")).toBeInTheDocument();
+    // NOT the full-screen error card.
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    // The raw refresh error string never leaks to the UI.
+    expect(screen.queryByText(/listNotes hiccup/)).toBeNull();
+  });
+
   it("a recall-stats failure degrades quietly (no strip, Library still works)", async () => {
     // A stats hiccup must never break the Library — the strip simply doesn't render.
     primeArchive([S_NEW], [NOTE]);

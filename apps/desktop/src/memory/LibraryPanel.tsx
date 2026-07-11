@@ -74,8 +74,11 @@ export function LibraryPanel() {
   const refreshNotes = async () => {
     try {
       setNotes(await listNotes());
-    } catch (e) {
-      setLoadError(String(e));
+    } catch {
+      // The supersede already SAVED — only the re-list failed. Keep the whole panel up with a
+      // localized, non-fatal notice (never the fatal loadError card that would blank the Library);
+      // the honest message is "saved, couldn't refresh," not "couldn't load."
+      setNotice("Saved — reload to see the update.");
     }
   };
 
@@ -104,6 +107,9 @@ export function LibraryPanel() {
       setHits(await recall(q, RECALL_K));
       setSearchedTerm(q);
       setSearched(true);
+      // An in-panel recall may have recorded a miss — refresh the strip so it reflects it now,
+      // not only after a remount. Best-effort and quiet-on-failure, like the mount load.
+      void loadStats();
     } catch (e) {
       setSearchError(String(e));
     } finally {
@@ -257,9 +263,11 @@ export function LibraryPanel() {
             <div style={{ marginTop: 4 }}>
               <span>Recent searches that found nothing:</span>
               <ul style={{ listStyle: "none", padding: 0, margin: "4px 0 0", display: "flex", flexWrap: "wrap", gap: 6 }}>
-                {stats.recent_misses.slice(0, 5).map((m) => (
+                {stats.recent_misses.slice(0, 5).map((m, i) => (
                   <li
-                    key={`${m.query} ${m.at}`}
+                    // Query+time can repeat if the same term misses twice within a second; the
+                    // index makes the key unique (avoids React's duplicate-key warning).
+                    key={`${m.query} ${m.at} ${i}`}
                     style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid var(--border-soft)" }}
                   >
                     <span>“{m.query}”</span>
