@@ -68,15 +68,41 @@ fn nudge_hook_group(binary: &Path) -> serde_json::Value {
     })
 }
 
+/// The SessionEnd hook group that runs `<binary> capture-notify` — Claude Code's end-of-session poke
+/// that asks the daemon to snapshot the just-finished session (SP3/B2). Same shell-executed command,
+/// so the path is single-quote-escaped exactly like the nudge; the only new token is a static literal.
+fn capture_hook_group(binary: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": format!("{} capture-notify", sh_single_quote(&binary.to_string_lossy())),
+            "timeout": 5,
+        }]
+    })
+}
+
 /// True iff a SessionStart group is ONE OF OURS: an inner command that BOTH references our binary
 /// (`HOOK_MARKER`) AND invokes `nudge`. Requiring both keeps disconnect from deleting a foreign hook
 /// that merely mentions the string (review Low).
 fn is_our_hook_group(group: &serde_json::Value) -> bool {
+    group_has_command_with(group, "nudge")
+}
+
+/// True iff a SessionEnd group is ONE OF OURS: an inner command that BOTH references our binary
+/// (`HOOK_MARKER`) AND invokes `capture-notify`. DISJOINT from `is_our_hook_group`'s nudge marker —
+/// a `capture-notify` command never contains `nudge` and vice versa — so the two never cross-match,
+/// and a foreign hook that merely mentions `air-memory-mcp` (without `capture-notify`) survives.
+fn is_our_capture_group(group: &serde_json::Value) -> bool {
+    group_has_command_with(group, "capture-notify")
+}
+
+/// Shared marker predicate: some inner hook command contains BOTH `HOOK_MARKER` AND `subcommand`.
+fn group_has_command_with(group: &serde_json::Value, subcommand: &str) -> bool {
     group.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
         hooks.iter().any(|h| {
             h.get("command")
                 .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains(HOOK_MARKER) && c.contains("nudge"))
+                .is_some_and(|c| c.contains(HOOK_MARKER) && c.contains(subcommand))
         })
     })
 }
@@ -105,6 +131,21 @@ fn ensure_array<'a>(
         .ok_or_else(|| invalid(path, &format!("\"{key}\" is not an array")))
 }
 
+/// Drop OUR groups from `hooks[kind]` (matched by `is_ours`), leaving foreign groups in place.
+/// Returns whether anything was removed (so the caller only rewrites a file it actually changed). A
+/// missing / non-array `hooks[kind]` is a no-op — nothing of ours to remove there.
+fn retain_out_group(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+    is_ours: fn(&serde_json::Value) -> bool,
+) -> bool {
+    hooks.get_mut(kind).and_then(|v| v.as_array_mut()).is_some_and(|groups| {
+        let before = groups.len();
+        groups.retain(|g| !is_ours(g));
+        groups.len() != before
+    })
+}
+
 /// Write the `air-memory` MCP server + SessionStart nudge into the Claude Code config, merging
 /// (never replacing) and idempotently. **Both files are parsed + shape-validated BEFORE either is
 /// written** (I5): a malformed / oddly-shaped `settings.json` fails loud with `claude.json` left
@@ -127,6 +168,11 @@ pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io
     let starts = ensure_array(hooks, "SessionStart", &paths.settings_json)?;
     starts.retain(|g| !is_our_hook_group(g)); // idempotent: drop a prior nudge, then re-add.
     starts.push(nudge_hook_group(binary));
+    // The SessionEnd capture hook joins the SAME in-memory transaction (heals an SP2-era config that
+    // has the nudge but no SessionEnd): retain-out any prior capture, then re-add exactly one.
+    let ends = ensure_array(hooks, "SessionEnd", &paths.settings_json)?;
+    ends.retain(|g| !is_our_capture_group(g));
+    ends.push(capture_hook_group(binary));
 
     // ── Phase 2: both parsed cleanly → create dir + write both (0600, atomic). ──
     make_private_dir(&paths.claude_dir)?;
@@ -151,15 +197,13 @@ pub fn disconnect(paths: &ClaudeCodePaths) -> std::io::Result<()> {
         removed.then_some(root)
     });
     let settings_out = settings.and_then(|mut root| {
-        let changed = root
-            .get_mut("hooks")
-            .and_then(|h| h.get_mut("SessionStart"))
-            .and_then(|s| s.as_array_mut())
-            .is_some_and(|starts| {
-                let before = starts.len();
-                starts.retain(|g| !is_our_hook_group(g));
-                starts.len() != before
-            });
+        // Retain-out BOTH our hook kinds; a foreign group in EITHER array survives. `|` (not `||`) so
+        // both removals always run — a changed SessionEnd must still be written even if SessionStart
+        // was untouched (short-circuit would skip it).
+        let changed = root.get_mut("hooks").and_then(|h| h.as_object_mut()).is_some_and(|hooks| {
+            retain_out_group(hooks, "SessionStart", is_our_hook_group)
+                | retain_out_group(hooks, "SessionEnd", is_our_capture_group)
+        });
         changed.then_some(root)
     });
 
@@ -487,5 +531,135 @@ mod tests {
         let groups = sj["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 1, "only the foreign hook remains");
         assert_eq!(groups[0]["hooks"][0]["command"], "node keep.mjs");
+    }
+
+    // ── B4 (SP3): the SessionEnd `capture-notify` hook, disjoint from the nudge marker. ──
+
+    /// Count OUR groups in a hook array: an inner command with BOTH the marker AND the subcommand.
+    fn count_ours(sj: &serde_json::Value, kind: &str, sub: &str) -> usize {
+        sj["hooks"][kind]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter(|g| {
+                        g["hooks"][0]["command"]
+                            .as_str()
+                            .is_some_and(|c| c.contains(HOOK_MARKER) && c.contains(sub))
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn connect_writes_the_session_end_capture_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        connect(&p, bin(), sock()).unwrap();
+
+        let sj = read(&p.settings_json);
+        let ends = sj["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1, "exactly our capture group");
+        assert_eq!(
+            ends[0]["hooks"][0]["command"],
+            format!("{} capture-notify", sh_single_quote(&bin().to_string_lossy())),
+            "SessionEnd runs our capture-notify"
+        );
+        assert_eq!(ends[0]["hooks"][0]["timeout"], 5);
+
+        // The SessionStart nudge group is STILL present (both hook kinds coexist).
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 1, "nudge group untouched");
+        assert_eq!(mode(&p.settings_json), 0o600);
+    }
+
+    #[test]
+    fn disconnect_removes_our_capture_hook_but_keeps_foreign_session_end_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        // A FOREIGN SessionEnd group (someone else's hook) is present before we connect.
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"node cleanup.mjs"}]}]}}"#,
+        )
+        .unwrap();
+
+        connect(&p, bin(), sock()).unwrap(); // adds our capture (+ nudge)
+        disconnect(&p).unwrap();
+
+        let sj = read(&p.settings_json);
+        let ends = sj["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1, "foreign SessionEnd group survives; ours is gone");
+        assert_eq!(ends[0]["hooks"][0]["command"], "node cleanup.mjs");
+        assert_eq!(count_ours(&sj, "SessionEnd", "capture-notify"), 0, "our capture removed");
+        // disconnect removes BOTH our hook kinds — the SessionStart nudge is gone too.
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 0, "our nudge removed too");
+    }
+
+    #[test]
+    fn connect_is_idempotent_and_heals_a_sp2_era_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        // SP2-era state: the SessionStart nudge group exists, but NO SessionEnd at all.
+        let nudge_cmd = format!("{} nudge", sh_single_quote(&bin().to_string_lossy()));
+        std::fs::write(
+            &p.settings_json,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": { "SessionStart": [
+                    { "hooks": [{ "type": "command", "command": nudge_cmd, "timeout": 5 }] }
+                ]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        connect(&p, bin(), sock()).unwrap();
+        let sj = read(&p.settings_json);
+        assert_eq!(count_ours(&sj, "SessionEnd", "capture-notify"), 1, "capture added exactly once");
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 1, "nudge healed, not duped");
+
+        connect(&p, bin(), sock()).unwrap(); // idempotent second run
+        let sj = read(&p.settings_json);
+        assert_eq!(count_ours(&sj, "SessionEnd", "capture-notify"), 1, "still one capture group");
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 1, "still one nudge group");
+    }
+
+    #[test]
+    fn capture_hook_command_is_single_quoted_against_a_hostile_binary_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let evil = Path::new("/t/a'b $(id) `x` air-memory-mcp");
+        connect(&p, evil, sock()).unwrap();
+
+        let sj = read(&p.settings_json);
+        let cmd = sj["hooks"]["SessionEnd"][0]["hooks"][0]["command"].as_str().unwrap();
+        // Exactly the single-quote-escaped path + the static subcommand — no injection surface.
+        assert_eq!(cmd, format!("{} capture-notify", sh_single_quote(&evil.to_string_lossy())));
+        assert!(cmd.starts_with('\''), "path is single-quoted: {cmd}");
+        assert!(cmd.ends_with("' capture-notify"), "only ` capture-notify` is outside quotes: {cmd}");
+        assert!(cmd.contains("'\\''"), "embedded single quote escaped as '\\'': {cmd}");
+    }
+
+    #[test]
+    fn disconnect_marker_does_not_remove_a_foreign_hook_that_merely_mentions_air_memory_mcp() {
+        // A foreign SessionEnd hook whose command has "air-memory-mcp" but NOT "capture-notify"
+        // (e.g. someone's own "air-memory-mcp status") must SURVIVE — our capture marker needs BOTH.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"air-memory-mcp status"}]}]}}"#,
+        )
+        .unwrap();
+
+        disconnect(&p).unwrap();
+
+        let sj = read(&p.settings_json);
+        let ends = sj["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1, "foreign air-memory-mcp hook without capture-notify survives");
+        assert_eq!(ends[0]["hooks"][0]["command"], "air-memory-mcp status");
     }
 }
