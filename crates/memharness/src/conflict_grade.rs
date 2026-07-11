@@ -35,6 +35,58 @@ pub fn parse_pairs(body: &str) -> anyhow::Result<Vec<LabelledPair>> {
     Ok(pairs)
 }
 
+/// One graded pair: did the judge flag it (Some verdict), and was it truly a conflict?
+#[derive(Debug, Clone, Copy)]
+pub struct Outcome {
+    pub flagged: bool,
+    pub truly_contradicts: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Metrics {
+    pub true_positives: usize,
+    pub false_positives: usize,
+    pub false_negatives: usize,
+    pub true_negatives: usize,
+    pub recall: f64,        // catch rate = TP / (TP + FN)
+    pub precision: f64,     // TP / (TP + FP)
+    pub cry_wolf_rate: f64, // 1 - precision
+}
+
+impl Metrics {
+    pub fn from_outcomes(o: &[Outcome]) -> Self {
+        let (mut tp, mut fp, mut fn_, mut tn) = (0, 0, 0, 0);
+        for x in o {
+            match (x.flagged, x.truly_contradicts) {
+                (true, true) => tp += 1,
+                (true, false) => fp += 1,
+                (false, true) => fn_ += 1,
+                (false, false) => tn += 1,
+            }
+        }
+        let recall = ratio(tp, tp + fn_);
+        let precision = ratio(tp, tp + fp);
+        Self {
+            true_positives: tp,
+            false_positives: fp,
+            false_negatives: fn_,
+            true_negatives: tn,
+            recall,
+            precision,
+            cry_wolf_rate: 1.0 - precision,
+        }
+    }
+}
+
+/// n/d as f64, with 0/0 → 0.0 (no flags or no positives → the metric is 0, not NaN).
+fn ratio(n: usize, d: usize) -> f64 {
+    if d == 0 {
+        0.0
+    } else {
+        n as f64 / d as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +104,26 @@ mod tests {
         assert_eq!(pairs[1].label, PairLabel::Coexist);
         // empty input is a loud error, never a silent zero-case run (memharness convention)
         assert!(parse_pairs("   \n").is_err());
+    }
+
+    #[test]
+    fn metrics_from_a_known_confusion_matrix() {
+        // flagged? (Some) × truly-contradicts?  →  TP FP FN TN
+        let outcomes = vec![
+            Outcome { flagged: true,  truly_contradicts: true  }, // TP
+            Outcome { flagged: true,  truly_contradicts: true  }, // TP
+            Outcome { flagged: true,  truly_contradicts: false }, // FP (cry wolf)
+            Outcome { flagged: false, truly_contradicts: true  }, // FN (miss)
+            Outcome { flagged: false, truly_contradicts: false }, // TN
+        ];
+        let m = Metrics::from_outcomes(&outcomes);
+        assert_eq!(m.true_positives, 2);
+        assert_eq!(m.false_positives, 1);
+        assert_eq!(m.false_negatives, 1);
+        // recall (catch) = TP/(TP+FN) = 2/3 ; precision = TP/(TP+FP) = 2/3
+        assert!((m.recall - 2.0 / 3.0).abs() < 1e-9);
+        assert!((m.precision - 2.0 / 3.0).abs() < 1e-9);
+        // cry-wolf = 1 - precision = 1/3
+        assert!((m.cry_wolf_rate - 1.0 / 3.0).abs() < 1e-9);
     }
 }
