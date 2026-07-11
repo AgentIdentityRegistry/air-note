@@ -60,12 +60,19 @@ fn session_end_has_our_capture(settings_json: &Path) -> bool {
 }
 
 /// Count Claude Code transcripts under `projects_root` for the Connect consent disclosure
-/// (spec §6a: "…including your recent sessions (~30 days, N found)"). Mirrors the daemon sweeper's
-/// walk (A9 `scan_candidates`): ONE level of project dirs, then `.jsonl` leaves directly inside each —
-/// so the disclosed N equals what the sweeper would actually scan, never an over-promise. A missing /
-/// unreadable root is `0`, NEVER an error: this is a best-effort disclosure, and a not-yet-connected
-/// user (no `~/.claude/projects`) legitimately has zero. Nested-deeper directories and stray
-/// root-level files are not transcripts here, exactly as the sweeper ignores them.
+/// (spec §6a: "…including your recent sessions (~30 days, N found)"). Follows the daemon sweeper's
+/// walk SHAPE (A9 `scan_candidates`): ONE level of project dirs, then `.jsonl` leaves directly inside
+/// each; nested-deeper directories and stray root-level files are ignored, exactly as the sweeper
+/// ignores them. A missing / unreadable root is `0`, NEVER an error: this is a best-effort disclosure,
+/// and a not-yet-connected user (no `~/.claude/projects`) legitimately has zero.
+///
+/// N is a best-effort **UPPER BOUND**, not an exact import count: the sweeper additionally rejects any
+/// `.jsonl` whose file-stem fails `valid_session_id` (`[A-Za-z0-9_-]`, ≤128 bytes) before importing,
+/// which this plain `.jsonl` walk does NOT apply — so the real import count is ≤ N (in practice equal,
+/// since Claude Code transcripts are UUID-named). We deliberately do NOT hoist `valid_session_id`
+/// here: it lives in A5's security-reviewed capture module, and the honest upper-bound comment plus
+/// Plan C's non-exact consent copy ("~N found") is the right scope. True parity (sharing
+/// `valid_session_id` via `bossclawd-paths`) is a possible follow-up.
 pub fn backfill_candidate_count(projects_root: &Path) -> u64 {
     let Ok(projects) = std::fs::read_dir(projects_root) else {
         return 0; // absent / unreadable root → nothing to import (I10 parity with the sweeper).
