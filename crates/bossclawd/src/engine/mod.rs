@@ -1929,7 +1929,7 @@ mod tests {
         assert_eq!(log2.count().unwrap(), n1, "capture priming is idempotent (no duplicate off event)");
 
         // The user explicitly enables capture; a fresh handle's prime must NOT clobber it.
-        log2.set_capture_enabled(true, false, 5_000).unwrap();
+        log2.set_capture_enabled(/*enabled=*/ true, /*backfill=*/ false, /*at=*/ 5_000).unwrap();
         drop(log2);
         let handle2 = new_test_handle(vault, &dir);
         let log3 = handle2.get_or_open(true).await.unwrap();
@@ -1950,14 +1950,14 @@ mod tests {
         assert_eq!(handle.capture_enabled_at(true).await.unwrap(), None);
 
         // Connect: both flags via one wrapper call.
-        handle.set_capture_enabled(true, true, true, 1_000).await.unwrap();
+        handle.set_capture_enabled(/*onboarded=*/ true, /*enabled=*/ true, /*backfill=*/ true, /*at=*/ 1_000).await.unwrap();
         assert!(handle.capture_enabled(true).await.unwrap());
         assert!(handle.backfill_consented(true).await.unwrap());
         assert_eq!(handle.capture_enabled_at(true).await.unwrap(), Some(1_000));
 
         // Disable then re-enable forward-only: backfill stays cleared, timestamp advances.
-        handle.set_capture_enabled(true, false, false, 2_000).await.unwrap();
-        handle.set_capture_enabled(true, true, false, 3_000).await.unwrap();
+        handle.set_capture_enabled(/*onboarded=*/ true, /*enabled=*/ false, /*backfill=*/ false, /*at=*/ 2_000).await.unwrap();
+        handle.set_capture_enabled(/*onboarded=*/ true, /*enabled=*/ true, /*backfill=*/ false, /*at=*/ 3_000).await.unwrap();
         assert!(handle.capture_enabled(true).await.unwrap());
         assert!(!handle.backfill_consented(true).await.unwrap(), "forward-only re-enable does not re-import (M4)");
         assert_eq!(handle.capture_enabled_at(true).await.unwrap(), Some(3_000));

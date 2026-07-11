@@ -265,10 +265,10 @@ const BACKFILL_CONSENTED_KEY: &str = "backfill_consented";
 /// sticky (capture is off, so it is not consulted).
 const CAPTURE_ENABLED_AT_KEY: &str = "capture_enabled_at";
 
-/// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
-/// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
-/// reference a compile-checked variant instead of a stringly-typed key that could drift on a
-/// rename (M2). `#[cfg(unix)]` is unnecessary — config flags exist on all platforms.
+/// A typed identifier for a control-`config` key, mapping to the private `*_KEY` consts. Used by
+/// `EventLog::explicitly_set` (and the capture getters) so callers (e.g. the desktop
+/// `prime_switches`) reference a compile-checked variant instead of a stringly-typed key that could
+/// drift on a rename (M2). `#[cfg(unix)]` is unnecessary — config flags exist on all platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFlag {
     /// The evolve on/off switch ([`EVOLVE_ENABLED_KEY`]).
@@ -5945,7 +5945,7 @@ impl EventLog {
     /// the key and always writes a bool, the value is never absent-but-present.
     pub fn capture_enabled(&self) -> Result<bool, BossclawError> {
         Ok(self
-            .latest_config_value(CAPTURE_ENABLED_KEY)?
+            .latest_config_value(ConfigFlag::CaptureEnabled.key())?
             .and_then(|v| v.as_bool())
             .unwrap_or(false))
     }
@@ -5958,7 +5958,7 @@ impl EventLog {
     /// forward-only re-enable cannot silently resurrect the backlog.
     pub fn backfill_consented(&self) -> Result<bool, BossclawError> {
         Ok(self
-            .latest_config_value(BACKFILL_CONSENTED_KEY)?
+            .latest_config_value(ConfigFlag::BackfillConsented.key())?
             .and_then(|v| v.as_bool())
             .unwrap_or(false))
     }
