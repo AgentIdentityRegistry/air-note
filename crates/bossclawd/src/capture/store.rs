@@ -160,11 +160,25 @@ pub async fn store_capture(
     Ok(())
 }
 
-/// Delete a capture (I7, app-only — the caller enforces that at dispatch, not here): remove
-/// `<data_dir>/sessions/<sid>.md` (a missing file is OK — already healed / never written) AND
-/// append the `session_deleted` tombstone. A tombstone for a session with no current capture
-/// (already gone / superseded / never captured) is the engine's `Rejected` — benign here, so
-/// deleting twice is an idempotent no-op.
+/// Delete a capture (I7, app-only — the caller enforces that at dispatch, not here): append the
+/// `session_deleted` tombstone THEN remove `<data_dir>/sessions/<sid>.md`.
+///
+/// # Tombstone-BEFORE-file (crash-safe forget — the forget-safe order)
+/// The durable signed tombstone is appended FIRST so a crash anywhere around the file removal can
+/// never resurrect a deleted session. The reverse order (file-then-tombstone) is unsafe: a crash
+/// after removing the `.md` but before recording the tombstone would leave the session CURRENT but
+/// fileless, and [`heal_orphans`] window (b) would then REGENERATE a stub `.md` from the still-live
+/// event — resurrecting the memory the owner asked to forget. Appending the tombstone first closes
+/// that window: the instant it lands the session is excluded everywhere (recall both arms, snapshot,
+/// sweeper pre-filter, the fold), so window (b) never sees a current event to regenerate. The worst a
+/// crash can leave is an orphan `.md` whose session is already tombstoned; [`heal_orphans`] window (a)
+/// removes it on the next pass (`capture_session` rejects the tombstoned recapture — I9).
+///
+/// Idempotent: a tombstone for a session with no current capture (already gone / superseded / never
+/// captured) is the engine's `Rejected` — treated as success-to-continue here, so deleting twice is a
+/// no-op. A real engine error aborts BEFORE the file is touched: we never remove the `.md` when the
+/// deletion could not be durably recorded. A missing `.md` on removal (already healed / never written)
+/// is likewise fine.
 pub async fn delete_capture(
     engine: &EngineHandle,
     data_dir: &Path,
@@ -173,17 +187,24 @@ pub async fn delete_capture(
     if !valid_session_id(session_id) {
         return Err(CaptureStoreError::InvalidSessionId);
     }
+    // (1) Tombstone FIRST — the durable record of the deletion. `Ok` (freshly tombstoned) AND
+    // `Rejected` (no current session with that id — already tombstoned/gone, idempotent) both mean
+    // "the session is now excluded everywhere; continue to file removal". Any OTHER engine error
+    // aborts before we touch the file: never remove a `.md` whose deletion couldn't be recorded.
+    match engine.delete_session(session_id.to_string()).await {
+        Ok(_) => {}
+        Err(EngineOpError::Rejected(_)) => {}
+        Err(e) => return Err(CaptureStoreError::Engine(e.to_string())),
+    }
+    // (2) THEN remove the `.md`. The tombstone is already durable, so the session is already
+    // excluded everywhere; if this removal fails (or the process dies here) the leftover `.md` is an
+    // orphan of an already-tombstoned session, which `heal_orphans` window (a) cleans on the next
+    // sweep. A missing file is fine — already healed / never written (idempotent).
     let md_path = sessions_dir(data_dir).join(format!("{session_id}.md"));
     match std::fs::remove_file(&md_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // already gone — fine
-        Err(e) => return Err(CaptureStoreError::Io(e)),
-    }
-    match engine.delete_session(session_id.to_string()).await {
-        Ok(_) => Ok(()),
-        // No current capture with that id → already tombstoned/gone. Idempotent no-op.
-        Err(EngineOpError::Rejected(_)) => Ok(()),
-        Err(e) => Err(CaptureStoreError::Engine(e.to_string())),
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // already gone — fine
+        Err(e) => Err(CaptureStoreError::Io(e)),
     }
 }
 

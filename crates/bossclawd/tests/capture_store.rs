@@ -285,6 +285,44 @@ async fn heal_removes_stale_md_for_an_owner_deleted_session() {
     assert!(engine.current_sessions().await.unwrap().is_empty(), "still no current session (I9)");
 }
 
+/// I7 crash-safety of `delete_capture`'s tombstone-BEFORE-file order: a crash AFTER the tombstone is
+/// appended but BEFORE (or during) the `.md` removal must NOT resurrect the session. We model that
+/// exact window — append the tombstone via the engine directly, LEAVE the `.md` on disk — then boot
+/// the heal and prove no resurrection. The regression this guards: under the reverse (file-first)
+/// order the crash window instead left the session CURRENT-but-fileless, and heal window (b) would
+/// REGENERATE a stub `.md` from the still-live event — resurrecting a forgotten memory.
+#[tokio::test]
+async fn delete_capture_crash_after_tombstone_before_file_removal_does_not_resurrect() {
+    let (engine, data_dir) = hermetic_engine();
+    store_capture(&engine, data_dir.path(), &id("crash1"), &sample_rendered()).await.unwrap();
+    let md = data_dir.path().join("sessions/crash1.md");
+    assert!(md.exists());
+
+    // The crash window of the tombstone-first order: tombstone durably appended, `.md` NOT yet
+    // removed. The instant the tombstone lands the session leaves the fold — so it is already
+    // excluded everywhere, with the `.md` merely a soon-to-be-cleaned orphan.
+    engine.delete_session("crash1".to_string()).await.unwrap();
+    assert!(md.exists(), "the tombstone alone does not remove the file (this is the crash state)");
+    assert!(
+        engine.current_sessions().await.unwrap().is_empty(),
+        "the session is already excluded from the fold before the file is even gone"
+    );
+
+    // Boot the heal (as on the next daemon start). No resurrection: window (b) never regenerates a
+    // stub (the session is not current), and window (a) removes the orphan `.md` (I9 — the
+    // tombstoned recapture is rejected). Converges to `no event ⇔ no file`.
+    let report = heal_orphans(&engine, data_dir.path()).await.unwrap();
+    assert_eq!(report.dangling_events_regenerated, 0, "window (b) does NOT regenerate a stub (no resurrection)");
+    assert_eq!(report.orphan_files_captured, 0, "the tombstoned orphan is NOT re-captured");
+    assert!(!md.exists(), "heal window (a) removed the orphan .md");
+    assert!(engine.current_sessions().await.unwrap().is_empty(), "still gone after the heal (I9)");
+
+    // Idempotent: a second heal on the now-consistent store changes nothing.
+    let again = heal_orphans(&engine, data_dir.path()).await.unwrap();
+    assert_eq!(again.dangling_events_regenerated, 0);
+    assert_eq!(again.orphan_files_captured, 0);
+}
+
 fn write_file(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }

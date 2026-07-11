@@ -474,6 +474,14 @@ async fn get_session(engine: &EngineHandle, session_id: String) -> Response {
         // Not current (deleted / superseded / never captured) → the specced clean Rejected.
         return capture_rejected("session not found or deleted");
     };
+    // Defense in depth: the folded path is always daemon-constructed as `<data_dir>/sessions/<sid>.md`
+    // (store_capture + heal both build it that way), so enforce that confinement invariant explicitly
+    // rather than trust it implicitly before reading the body off disk.
+    if let Some(data_dir) = engine.data_dir() {
+        if !Path::new(&cs.path).starts_with(data_dir.join("sessions")) {
+            return capture_rejected("session not found or deleted");
+        }
+    }
     // Read the daemon-authored body (bounded). A read failure is our OWN i/o (e.g. an out-of-band
     // deletion racing the fold) → a clean, path-free Core fault (never the OS path).
     let markdown = match read_capture_markdown(Path::new(&cs.path)) {
