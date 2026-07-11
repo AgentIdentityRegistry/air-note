@@ -60,15 +60,31 @@ pub async fn integrations_connect_claude_code(
     }
     let socket = bossclawd_paths::resolve_socket_path(&bossclawd_paths::resolve_data_dir());
     claude_code::connect(&paths, &binary, &socket).map_err(|e| e.to_string())?;
-    connect_capture_wiring(state.engine.as_ref(), capture_consent).await.map_err(|e| e.to_string())?;
+    let onboarded = state.identity_store.is_onboarded();
+    connect_capture_wiring(state.engine.as_ref(), onboarded, capture_consent)
+        .await
+        .map_err(|e| e.to_string())?;
     let claude_code = claude_code::detect(&paths).map_err(|e| e.to_string())?;
     Ok(IntegrationsStatusDto { claude_code })
 }
 
+/// Disconnect Claude Code: remove the config (hooks + mcpServers) AND disable capture. The capture
+/// disable is LOAD-BEARING, not cosmetic: the daemon sweeper (A9) runs on the `capture_enabled` flag
+/// ALONE — it rescans `~/.claude/projects` every ~5 min independent of the hooks — so removing only
+/// the hooks would leave the sweeper silently importing new sessions while the panel reads
+/// NotConnected. `set_capture_enabled(onboarded, false, false)` disables capture AND clears
+/// `backfill_consented` (the M4-safe direction). Archived sessions are KEPT — Disconnect means stop
+/// capturing, not forget; the memory-browser delete UI is the eraser.
 #[tauri::command]
-pub fn integrations_disconnect_claude_code() -> Result<IntegrationsStatusDto, String> {
+pub async fn integrations_disconnect_claude_code(
+    state: State<'_, AppState>,
+) -> Result<IntegrationsStatusDto, String> {
     let paths = ClaudeCodePaths::under(&home_dir()?);
     claude_code::disconnect(&paths).map_err(|e| e.to_string())?;
+    let onboarded = state.identity_store.is_onboarded();
+    toggle_capture_wiring(state.engine.as_ref(), onboarded, false)
+        .await
+        .map_err(|e| e.to_string())?;
     let claude_code = claude_code::detect(&paths).map_err(|e| e.to_string())?;
     Ok(IntegrationsStatusDto { claude_code })
 }
@@ -89,7 +105,10 @@ pub async fn integrations_set_capture_enabled(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<IntegrationsStatusDto, String> {
-    toggle_capture_wiring(state.engine.as_ref(), enabled).await.map_err(|e| e.to_string())?;
+    let onboarded = state.identity_store.is_onboarded();
+    toggle_capture_wiring(state.engine.as_ref(), onboarded, enabled)
+        .await
+        .map_err(|e| e.to_string())?;
     let claude_code = claude_code::detect(&ClaudeCodePaths::under(&home_dir()?)).map_err(|e| e.to_string())?;
     Ok(IntegrationsStatusDto { claude_code })
 }
@@ -101,7 +120,8 @@ pub async fn integrations_set_capture_enabled(
 /// read must never hard-fail, and "off" is the safe default to show.
 #[tauri::command]
 pub async fn integrations_capture_enabled(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.engine.capture_enabled().await.unwrap_or(false))
+    let onboarded = state.identity_store.is_onboarded();
+    Ok(state.engine.capture_enabled(onboarded).await.unwrap_or(false))
 }
 
 // ── Consent wiring (the M4 guarantee lives in the `backfill` value each path chooses). Split out as
@@ -111,14 +131,24 @@ pub async fn integrations_capture_enabled(state: State<'_, AppState>) -> Result<
 /// Connect wiring (spec §6a): Connect consents to ongoing capture AND the one-time backfill together,
 /// so BOTH the enable flag and the backfill flag equal `capture_consent`. A `false` consent leaves
 /// capture off and imports nothing; A8's engine records the one-time history consent only when
-/// `backfill` is true.
-async fn connect_capture_wiring(engine: &Engine, capture_consent: bool) -> Result<(), EngineOpError> {
-    engine.set_capture_enabled(capture_consent, capture_consent).await
+/// `backfill` is true. `onboarded` is the caller's real flag (a pre-onboarding Connect cleanly
+/// `NotOnboarded`s here with no brain minted).
+async fn connect_capture_wiring(
+    engine: &Engine,
+    onboarded: bool,
+    capture_consent: bool,
+) -> Result<(), EngineOpError> {
+    engine.set_capture_enabled(onboarded, capture_consent, capture_consent).await
 }
 
-/// Toggle wiring (M4): a later enable is forward-only — `backfill: false` ALWAYS.
-async fn toggle_capture_wiring(engine: &Engine, enabled: bool) -> Result<(), EngineOpError> {
-    engine.set_capture_enabled(enabled, false).await
+/// Toggle / Disconnect wiring (M4): `backfill: false` ALWAYS — a later enable is forward-only, and
+/// disabling clears `backfill_consented`. Used by both the Integrations toggle and Disconnect.
+async fn toggle_capture_wiring(
+    engine: &Engine,
+    onboarded: bool,
+    enabled: bool,
+) -> Result<(), EngineOpError> {
+    engine.set_capture_enabled(onboarded, enabled, false).await
 }
 
 // Codex: SP2 follow-up — a sibling `*_codex` command trio + a `crate::integrations::codex` adapter
@@ -174,7 +204,7 @@ mod tests {
         let engine = engine_over(t.clone());
 
         // consent=true → SetCaptureEnabled { enabled:true, backfill:true } (Connect sets BOTH flags).
-        connect_capture_wiring(&engine, true).await.expect("wiring ok");
+        connect_capture_wiring(&engine, true, true).await.expect("wiring ok");
         match t.last() {
             Request::SetCaptureEnabled { enabled, backfill, .. } => {
                 assert!(enabled, "consent enables capture");
@@ -184,7 +214,7 @@ mod tests {
         }
 
         // consent=false → { enabled:false, backfill:false } — connects (config) but capture stays OFF.
-        connect_capture_wiring(&engine, false).await.expect("wiring ok");
+        connect_capture_wiring(&engine, true, false).await.expect("wiring ok");
         match t.last() {
             Request::SetCaptureEnabled { enabled, backfill, .. } => {
                 assert!(!enabled, "declined consent leaves capture off");
@@ -196,12 +226,12 @@ mod tests {
 
     #[tokio::test]
     async fn toggle_wiring_is_forward_only_backfill_always_false() {
-        // The M4 guarantee at the toggle: backfill=false for BOTH enable and disable, so a later enable
-        // can never re-import declined history.
+        // The M4 guarantee at the toggle/disconnect: backfill=false for BOTH enable and disable, so a
+        // later enable can never re-import declined history.
         let t = RecordingTransport::new();
         let engine = engine_over(t.clone());
 
-        toggle_capture_wiring(&engine, true).await.expect("toggle on");
+        toggle_capture_wiring(&engine, true, true).await.expect("toggle on");
         match t.last() {
             Request::SetCaptureEnabled { enabled, backfill, .. } => {
                 assert!(enabled, "toggle on enables capture");
@@ -210,7 +240,7 @@ mod tests {
             other => panic!("expected SetCaptureEnabled, got {other:?}"),
         }
 
-        toggle_capture_wiring(&engine, false).await.expect("toggle off");
+        toggle_capture_wiring(&engine, true, false).await.expect("toggle off");
         match t.last() {
             Request::SetCaptureEnabled { enabled, backfill, .. } => {
                 assert!(!enabled);
@@ -218,5 +248,85 @@ mod tests {
             }
             other => panic!("expected SetCaptureEnabled, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn capture_wiring_threads_the_real_onboarded_flag() {
+        // LOW fix: `onboarded` is threaded from the caller, not hardcoded true — so the daemon can
+        // cleanly reject a pre-onboarding call (and never mint a brain.db). Assert the wire carries
+        // whatever the caller passed, in BOTH directions.
+        let t = RecordingTransport::new();
+        let engine = engine_over(t.clone());
+
+        connect_capture_wiring(&engine, false, true).await.expect("wiring ok");
+        match t.last() {
+            Request::SetCaptureEnabled { onboarded, .. } => {
+                assert!(!onboarded, "onboarded=false threaded through (not hardcoded true)")
+            }
+            other => panic!("expected SetCaptureEnabled, got {other:?}"),
+        }
+        toggle_capture_wiring(&engine, true, true).await.expect("wiring ok");
+        match t.last() {
+            Request::SetCaptureEnabled { onboarded, .. } => {
+                assert!(onboarded, "onboarded=true threaded through")
+            }
+            other => panic!("expected SetCaptureEnabled, got {other:?}"),
+        }
+    }
+
+    // ── Fix 1 (MEDIUM consent bug): Disconnect must DISABLE capture, not just remove hooks — the
+    //    sweeper (A9) runs on `capture_enabled` alone. Full flow over a REAL hermetic daemon + real
+    //    `~/.claude` config files, mirroring exactly what `integrations_disconnect_claude_code`
+    //    composes (config disconnect + `toggle_capture_wiring(.., false)`). ──
+
+    /// Spin a hermetic `bossclawd` on a temp socket and return an [`Engine`] wired to it. Slim (no
+    /// kill/restart harness — this test never drops the daemon): bind is synchronous before the accept
+    /// loop is spawned, so the lazily-connecting transport can't race it.
+    async fn spawn_capture_daemon() -> (tempfile::TempDir, Engine) {
+        use crate::engine::transport::SocketTransport;
+        // Seed the process-global provider-key cache EMPTY so no op touches the OS keychain (CI hang).
+        bossclawd::vault::seed_secret_cache_for_test(std::collections::HashMap::new());
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("bossclawd.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind test socket");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let daemon_engine = Arc::new(bossclawd::server::test_engine(home));
+        tokio::spawn(async move {
+            bossclawd::server::run_accept_loop(daemon_engine, listener).await;
+        });
+        let transport: Arc<dyn Transport> = Arc::new(SocketTransport::new(sock));
+        (dir, Engine::new(transport))
+    }
+
+    #[tokio::test]
+    async fn disconnect_disables_capture_and_removes_hooks() {
+        let (_daemon_dir, engine) = spawn_capture_daemon().await;
+        let home = tempfile::tempdir().unwrap();
+        let paths = ClaudeCodePaths::under(home.path());
+        let bin = std::path::Path::new("/Applications/AIR Agent.app/Contents/MacOS/air-memory-mcp");
+        let sock = std::path::Path::new("/tmp/bossclawd.sock");
+
+        // Connect (consent=true): writes the hooks AND enables capture (backfill == consent).
+        claude_code::connect(&paths, bin, sock).unwrap();
+        connect_capture_wiring(&engine, true, true).await.expect("connect wiring");
+        assert!(engine.capture_enabled(true).await.expect("read"), "capture ON after connect");
+        assert_eq!(
+            claude_code::detect(&paths).unwrap(),
+            ClaudeCodeStatus::Connected { capture: true }
+        );
+
+        // Disconnect: removes the hooks AND disables capture → the sweeper is now gated OFF.
+        claude_code::disconnect(&paths).unwrap();
+        toggle_capture_wiring(&engine, true, false).await.expect("disconnect wiring");
+        assert!(
+            !engine.capture_enabled(true).await.expect("read"),
+            "capture OFF after disconnect → sweeper stops importing"
+        );
+        assert_eq!(
+            claude_code::detect(&paths).unwrap(),
+            ClaudeCodeStatus::NotConnected,
+            "hooks + mcpServers gone"
+        );
     }
 }

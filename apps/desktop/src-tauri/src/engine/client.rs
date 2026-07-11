@@ -420,23 +420,30 @@ impl<T: Transport + ?Sized> EngineClient<T> {
         }
     }
 
-    // ── Session capture (SP3 B5). App-only ops; the daemon keeps the App's self-asserted onboarded
-    //    flag for these (I3 — the app is trusted), so both send `onboarded: true` (Connect and the
-    //    Integrations toggle are consent actions on the app's own onboarded brain). ──
+    // ── Session capture (SP3 B5). App-only ops. Like every sibling, `onboarded` is THREADED from the
+    //    caller (the command layer's real `is_onboarded()`), NOT hardcoded true: the daemon's App role
+    //    trusts the wire flag, so a hardcoded true would `get_or_open(true)` and mint a brain.db even
+    //    pre-onboarding. Threading the real flag makes a pre-onboarding call cleanly `NotOnboarded`
+    //    with zero side effects. ──
 
     /// Mirrors `EngineHandle::set_capture_enabled`: enable/disable ongoing session capture, with
     /// `backfill` additionally consenting (or not) to the one-time import of pre-existing sessions.
     /// The CALLER owns the M4 guarantee by choosing `backfill`: Connect passes `backfill == consent`
-    /// (both flags in one call); the Integrations toggle passes `backfill: false` (forward-only). The
-    /// daemon supplies the `at` timestamp, so the wire carries only `enabled` + `backfill`.
-    pub async fn set_capture_enabled(&self, enabled: bool, backfill: bool) -> Result<(), EngineOpError> {
-        self.unit(Request::SetCaptureEnabled { onboarded: true, enabled, backfill }).await
+    /// (both flags in one call); the Integrations toggle + Disconnect pass `backfill: false`
+    /// (forward-only). The daemon supplies the `at` timestamp, so the wire carries only the flags.
+    pub async fn set_capture_enabled(
+        &self,
+        onboarded: bool,
+        enabled: bool,
+        backfill: bool,
+    ) -> Result<(), EngineOpError> {
+        self.unit(Request::SetCaptureEnabled { onboarded, enabled, backfill }).await
     }
 
     /// Mirrors `EngineHandle::capture_enabled`: read the sticky ongoing-capture flag (default CLOSED).
     /// Mirrors the `mandates_enabled` read shape.
-    pub async fn capture_enabled(&self) -> Result<bool, EngineOpError> {
-        match self.request(Request::CaptureEnabled { onboarded: true }).await? {
+    pub async fn capture_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        match self.request(Request::CaptureEnabled { onboarded }).await? {
             Response::CaptureEnabled(b) => Ok(b),
             other => Err(unexpected(other)),
         }
@@ -1140,9 +1147,9 @@ mod tests {
         // backfill=true) flips the read to true.
         let daemon = TestDaemon::spawn().await;
         let client = daemon.client();
-        assert!(!bounded(client.capture_enabled()).await.expect("capture_enabled"), "default closed");
-        bounded(client.set_capture_enabled(true, true)).await.expect("set_capture_enabled");
-        assert!(bounded(client.capture_enabled()).await.expect("capture_enabled"), "enabled reads back");
+        assert!(!bounded(client.capture_enabled(true)).await.expect("capture_enabled"), "default closed");
+        bounded(client.set_capture_enabled(true, true, true)).await.expect("set_capture_enabled");
+        assert!(bounded(client.capture_enabled(true)).await.expect("capture_enabled"), "enabled reads back");
     }
 
     #[tokio::test]

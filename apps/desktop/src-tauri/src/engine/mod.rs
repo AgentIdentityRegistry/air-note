@@ -446,13 +446,19 @@ impl Engine {
     }
 
     /// Mirrors `EngineClient::set_capture_enabled` (SP3 B5): enable/disable ongoing capture; `backfill`
-    /// consents (or not) to the one-time history import. The caller owns the M4 guarantee via `backfill`.
-    pub async fn set_capture_enabled(&self, enabled: bool, backfill: bool) -> Result<(), EngineOpError> {
-        self.client.set_capture_enabled(enabled, backfill).await
+    /// consents (or not) to the one-time history import. The caller owns the M4 guarantee via `backfill`
+    /// and threads the real `onboarded` flag (so a pre-onboarding call cleanly `NotOnboarded`s).
+    pub async fn set_capture_enabled(
+        &self,
+        onboarded: bool,
+        enabled: bool,
+        backfill: bool,
+    ) -> Result<(), EngineOpError> {
+        self.client.set_capture_enabled(onboarded, enabled, backfill).await
     }
 
     /// Mirrors `EngineClient::capture_enabled` (SP3 B5): read the sticky ongoing-capture flag.
-    pub async fn capture_enabled(&self) -> Result<bool, EngineOpError> {
-        self.client.capture_enabled().await
+    pub async fn capture_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        self.client.capture_enabled(onboarded).await
     }
 }
