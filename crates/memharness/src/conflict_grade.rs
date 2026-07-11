@@ -73,7 +73,9 @@ impl Metrics {
             true_negatives: tn,
             recall,
             precision,
-            cry_wolf_rate: 1.0 - precision,
+            // No flags at all → no false alarms (FP=0), not "100% false alarms". Only 1 - precision
+            // once something has actually been flagged.
+            cry_wolf_rate: if tp + fp == 0 { 0.0 } else { 1.0 - precision },
         }
     }
 }
@@ -195,5 +197,35 @@ mod tests {
             .chain((0..10).map(|_| Outcome { flagged: true, truly_contradicts: false }))
             .collect();
         assert!(!grade(&noisy, 42).passes, "cry-wolf judge fails the gate");
+    }
+
+    #[test]
+    fn gate_fails_on_low_recall_even_with_perfect_precision() {
+        // 20 correct flags (precision 1.0, ci_lower ≥ 0.90) but 60 missed true contradictions
+        // → recall = 20 / (20 + 60) = 0.25 < GATE_RECALL_MIN. The precision arm ALONE would pass;
+        // only the recall conjunct in `grade()` fails it. Guards that arm against silent deletion.
+        let low_recall: Vec<Outcome> = (0..20)
+            .map(|_| Outcome { flagged: true, truly_contradicts: true })
+            .chain((0..60).map(|_| Outcome { flagged: false, truly_contradicts: true }))
+            .collect();
+        let g = grade(&low_recall, 42);
+        assert!(g.precision_ci_lower >= 0.90, "precision arm alone would pass");
+        assert!((g.metrics.recall - 0.25).abs() < 1e-9);
+        assert!(!g.passes, "low recall must fail the gate even at perfect precision");
+    }
+
+    #[test]
+    fn grade_zero_flagged_branch_is_honest() {
+        // Judge flags nothing, yet some pairs truly contradict: the empty-flag branch must report
+        // ci_lower 0.0, fail the gate, fail the smoke — and NOT cry "100% false alarms" (FP=0).
+        let none_flagged: Vec<Outcome> = (0..5)
+            .map(|_| Outcome { flagged: false, truly_contradicts: true })
+            .chain((0..3).map(|_| Outcome { flagged: false, truly_contradicts: false }))
+            .collect();
+        let g = grade(&none_flagged, 42);
+        assert_eq!(g.precision_ci_lower, 0.0);
+        assert!(!g.passes);
+        assert!(!smoke_ok(&g.metrics));
+        assert_eq!(g.metrics.cry_wolf_rate, 0.0, "no flags → no false alarms, not 100%");
     }
 }
