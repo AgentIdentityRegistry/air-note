@@ -186,9 +186,12 @@ fn is_neutralized(c: char) -> bool {
             | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO (bidi embeddings/overrides)
             | '\u{2060}'..='\u{2064}' // word joiner + invisible math operators
             | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI (bidi isolates)
+            | '\u{206A}'..='\u{206F}' // deprecated bidi/shaping format controls (Cf)
+            | '\u{FE00}'..='\u{FE0F}' // variation selectors VS1–16
             | '\u{FEFF}'              // BOM / zero-width no-break space
             | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation anchors (Cf)
             | '\u{E0000}'..='\u{E007F}' // Unicode TAG block — ASCII smuggling (mandatory)
+            | '\u{E0100}'..='\u{E01EF}' // variation selectors supplement — VS byte-smuggling
         )
 }
 
@@ -507,6 +510,15 @@ mod tests {
         );
         assert_eq!(out.replace(' ', ""), "startend", "300 invisible TAG chars vanish; visible text intact: {out:?}");
         assert!(out.chars().count() <= SNAPSHOT_FIELD_MAX);
+
+        // Variation selectors (VS1–16, VS supplement) + deprecated bidi/shaping Cf close the last of
+        // the invisible-char family — none may survive, and the visible skeleton is intact.
+        let vs = "a\u{E0100}\u{E0101}b\u{FE0F}c\u{FE00}d\u{206C}e";
+        let clean_vs = sanitize_injected(vs);
+        for bad in ['\u{E0100}', '\u{E0101}', '\u{FE0F}', '\u{FE00}', '\u{206C}'] {
+            assert!(!clean_vs.contains(bad), "variation-selector/deprecated Cf {bad:?} must vanish: {clean_vs:?}");
+        }
+        assert_eq!(clean_vs.replace(' ', ""), "abcde", "visible skeleton intact after VS neutralize: {clean_vs:?}");
     }
 
     #[test]
