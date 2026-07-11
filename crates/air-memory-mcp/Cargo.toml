@@ -32,3 +32,11 @@ tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "io-std",
 
 [dev-dependencies]
 tempfile = "3"
+# B6 e2e integration test (`tests/e2e_capture_loop.rs`) ONLY: a REAL, hermetic `bossclawd` daemon
+# (in-memory vault + mock embedder/reasoner — NEVER the OS keychain) so the test can prove Plan A
+# (capture/snapshot/forget in the daemon) and Plan B (this adapter + the Claude Code hooks) COMPOSE
+# over a live socket. `test-helpers` exposes `server::spawn_for_test`/`test_engine`. A workspace-
+# internal sibling — it depends on `bossclawd-proto`/`bossclawd-paths` (which THIS crate already
+# uses), so it adds no external crate the workspace didn't already build, and no dependency cycle
+# (`bossclawd` never depends on `air-memory-mcp`). Dev-only: never reaches the shipped adapter.
+bossclawd = { path = "../bossclawd", features = ["test-helpers"] }
