@@ -3674,6 +3674,7 @@ name = "memharness"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bossclaw-core",
  "bossclawd",
  "bossclawd-proto",
  "clap",

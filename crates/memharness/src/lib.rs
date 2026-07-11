@@ -6,6 +6,7 @@ pub mod arms;
 pub mod cases;
 pub mod client;
 pub mod compare;
+pub mod conflict_grade;
 pub mod corpus;
 pub mod daemon;
 pub mod frontmatter;

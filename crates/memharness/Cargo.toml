@@ -27,6 +27,10 @@ path = "src/main.rs"
 # Versions mirror Cargo.lock EXACTLY (verified 2026-07-03) — zero new crate versions.
 bossclawd = { path = "../bossclawd", features = ["test-helpers"] }
 bossclawd-proto = { path = "../bossclawd-proto" }
+# Rung-3 conflict judge core (Verdict/Winner/judge_pair) + its live Ollama Reasoner. In-workspace
+# path dep; `bossclawd` above already pulls bossclaw-core with features=["ollama"] → zero new crate
+# versions / no Cargo.lock churn (memharness's "zero new crate versions" guardrail).
+bossclaw-core = { path = "../bossclaw-core", features = ["ollama"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 serde = { version = "1", features = ["derive"] }
