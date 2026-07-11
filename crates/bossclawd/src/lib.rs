@@ -24,6 +24,12 @@
 
 pub mod lock;
 
+// Session-capture path discipline (SP3). Cross-platform: the session-id allowlist
+// + projects-root resolver compile everywhere; only the confined careful-open's
+// fd-chain body is Unix-gated (a non-unix "unsupported" stub mirrors how `ingest`
+// splits its per-OS open), so the module itself is NOT `#[cfg(unix)]`.
+pub mod capture;
+
 // The engine host + its keychain/onboarding/SSRF support are Unix-only (bossclaw-core is
 // Unix-only: bundled SQLCipher + rustix), exactly like the desktop crate's `#[cfg(unix)] mod engine`.
 #[cfg(unix)]

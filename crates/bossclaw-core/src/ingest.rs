@@ -374,6 +374,89 @@ pub(crate) fn careful_open_file(
     })
 }
 
+// ── Targeted confined open of a KNOWN root-relative path (as opposed to the
+//    readdir-driven `walk_grant`, which enumerates). Shared with `bossclawd`'s
+//    capture module (transcript open, spec I4): both need the SAME kernel-enforced
+//    containment — an `openat` fd chain with `O_NOFOLLOW` on every directory
+//    descent + the `careful_open_file` leaf open — WITHOUT ever canonicalizing
+//    (canonicalize-then-open is the TOCTOU this whole discipline avoids). ──
+/// Open the file at `root`-relative path `relative` with ingest-grade containment:
+/// an fd is anchored at `root` (opened `O_NOFOLLOW`, so even a symlinked `root` is
+/// refused), each directory component is descended with `openat(O_NOFOLLOW)` (so a
+/// symlinked directory component cannot redirect the walk out of `root`), and the
+/// final component is opened via [`careful_open_file`] (`O_NOFOLLOW` / `openat2`
+/// `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` where available, then an fstat regular-file
+/// reject). No canonicalization anywhere → no check-then-open TOCTOU.
+///
+/// `relative` MUST be a normal relative path; this fn re-rejects any `..`/absolute/
+/// prefix component defensively (belt-and-suspenders — the caller is expected to have
+/// derived + validated it already), but higher-level policy (which extension, which
+/// root) lives in the caller. Every rejection is an [`std::io::Error`].
+#[cfg(unix)]
+pub fn open_beneath_confined(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    // Split into directory components + the final (leaf) component. Reject any
+    // non-normal component outright (`..`, absolute root, Windows prefix); `.` is a
+    // no-op and skipped. This is the strictest reading: a single `..` is a rejection,
+    // never a lexical normalization.
+    let mut names: Vec<&std::ffi::OsStr> = Vec::new();
+    for comp in relative.components() {
+        match comp {
+            Component::Normal(n) => names.push(n),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "path component escapes root (`..`/absolute not allowed)",
+                ));
+            }
+        }
+    }
+    // The last normal component is the file to open; everything before it is a
+    // directory to descend. An empty relative path has no file to open.
+    let Some(leaf) = names.pop() else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "empty relative path (no file component under root)",
+        ));
+    };
+
+    // Anchor at `root` (NOFOLLOW: a symlinked root is refused), then descend each
+    // directory component with O_NOFOLLOW. Reassigning `dir_fd` drops (closes) the
+    // parent fd as we go, so no fd is leaked down the chain.
+    let mut dir_fd = rustix::fs::openat(
+        rustix::fs::CWD,
+        root.as_os_str().as_bytes(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| Error::other(format!("open root failed: {e}")))?;
+    for name in &names {
+        dir_fd = rustix::fs::openat(
+            &dir_fd,
+            name.as_bytes(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| {
+            Error::new(ErrorKind::PermissionDenied, format!("containment refused at directory component: {e}"))
+        })?;
+    }
+
+    // Leaf: reuse the ingest careful-open (O_NOFOLLOW/openat2 + fstat regular-file
+    // reject), so a symlinked, FIFO, or otherwise non-regular leaf is refused.
+    let contained = careful_open_file(&dir_fd, leaf)
+        .map_err(|e| Error::new(ErrorKind::PermissionDenied, e.to_string()))?;
+    Ok(contained.file)
+}
+
 // ── Windows: no openat. Canonicalize, assert containment under the grant root,
 //    and reject reparse points (symlinks/junctions). Final-component-strong;
 //    the intermediate-dir swap race is a documented residual (spec §6.1, D3). ──
