@@ -393,10 +393,21 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             capture_notify(engine, session_id, transcript_path).await
         }
 
-        // Remaining SP3 ops — dispatch arms land with their features (tasks A11–A13). Until then
+        // ── SP3 §5: orientation SNAPSHOT (A11). Guest-reachable, NOT capture-gated (a read over
+        // already-captured memory + a live transcript is useful even when ongoing capture is off).
+        // The build is infallible: it always returns a valid, fenced, sanitized, ≤4 KB snapshot —
+        // minimal (just the recall affordance) at worst — so the SessionStart hook can NEVER break
+        // (I1). Every memory-derived field is neutralized + fenced inside the builder. ──
+        Request::Snapshot { project, source, session_id, transcript_path, .. } => {
+            Response::Snapshot(
+                crate::capture::snapshot::build(engine, &project, &source, session_id, transcript_path)
+                    .await,
+            )
+        }
+
+        // Remaining SP3 ops — dispatch arms land with their features (tasks A12–A13). Until then
         // these return a typed error so the enum stays exhaustively matched (no `_` catch-all).
-        Request::Snapshot { .. }
-        | Request::ListSessions { .. }
+        Request::ListSessions { .. }
         | Request::GetSession { .. }
         | Request::DeleteSession { .. }
         | Request::ListNotes { .. }

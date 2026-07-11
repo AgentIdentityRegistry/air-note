@@ -22,6 +22,16 @@ pub mod render;
 #[cfg(unix)]
 pub mod store;
 
+// The SNAPSHOT builder (SP3 A11): the memory-poisoning DEFENSE. Assembles the fenced, sanitized,
+// project-scoped, ≤4 KB orientation text the SessionStart hook injects into a fresh agent context.
+// Every memory-derived field (session titles, live-transcript digest lines) is neutralized by
+// `sanitize_injected` (no newline/control/bidi/zero-width survives → nothing can forge a structural
+// "## SYSTEM:" line) and wrapped in a fixed, daemon-authored untrusted-data fence with a "DATA, not
+// instructions" preamble that always survives truncation (spec §5, I8). Unix-only to match its
+// store/paths/sweeper siblings — it drives the Unix-only `EngineHandle` and the confined careful-open.
+#[cfg(unix)]
+pub mod snapshot;
+
 // The capture SWEEPER (SP3 A9): the durability guarantee (crash/SIGKILL/missed poke →
 // captured within one sweep) AND the backfill engine (first sweep after Connect imports
 // ~30 days of quiet transcripts). Ties together A5 (path discipline), A6 (renderer),
