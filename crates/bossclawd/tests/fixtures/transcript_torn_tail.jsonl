@@ -1,0 +1,3 @@
+{"type":"user","message":{"role":"user","content":"first valid prompt"},"uuid":"t1","timestamp":"2026-07-11T12:00:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a valid assistant reply"}]},"uuid":"t2","timestamp":"2026-07-11T12:00:01.000Z"}
+{"type":"user","message":{"role":"user","content":"this line is cut off mid

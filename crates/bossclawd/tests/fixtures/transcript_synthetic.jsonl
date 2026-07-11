@@ -1,0 +1,10 @@
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-11T10:00:00.000Z","sessionId":"synthetic-1","content":"QUEUEOP_MARKER_SHOULD_NOT_RENDER"}
+{"type":"attachment","attachment":{"type":"hook_success","hookName":"SessionStart:startup","stdout":"HOOK_NOISE_SHOULD_NOT_RENDER"},"uuid":"att-1","timestamp":"2026-07-11T10:00:01.000Z"}
+{"type":"user","message":{"role":"user","content":"How do I render a transcript deterministically?"},"uuid":"u1","timestamp":"2026-07-11T10:00:02.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"internal reasoning THINKING_SHOULD_NOT_RENDER","signature":"sig"},{"type":"text","text":"You iterate the JSONL in file order and emit Markdown."}]},"uuid":"a2","timestamp":"2026-07-11T10:00:03.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test -p bossclawd","description":"Run bossclawd tests"}}]},"uuid":"a3","timestamp":"2026-07-11T10:00:04.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"test result: ok, 12 passed"}]},"uuid":"u2","timestamp":"2026-07-11T10:00:05.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"All tests passed. The renderer is deterministic."}]},"uuid":"a4","timestamp":"2026-07-11T10:00:06.000Z"}
+{"type":"user","message":{"role":"user","content":"Great, now commit it."},"uuid":"u3","timestamp":"2026-07-11T10:00:07.000Z"}
+{"type":"system","subtype":"info","content":"SYSTEM_NOISE_SHOULD_NOT_RENDER","uuid":"s1","timestamp":"2026-07-11T10:00:08.000Z"}
+{"type":"totally-unknown-future-kind","weird":"UNKNOWN_MARKER_SHOULD_NOT_RENDER","timestamp":"2026-07-11T10:00:09.000Z"}

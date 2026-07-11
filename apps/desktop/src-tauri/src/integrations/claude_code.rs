@@ -17,8 +17,14 @@ const MCP_SERVER_KEY: &str = "air-memory";
 /// removed (review Low).
 const HOOK_MARKER: &str = "air-memory-mcp";
 
-/// Read-only status: `NotFound` if Claude Code isn't detected, else `Connected` iff `~/.claude.json`
-/// parses and has `mcpServers["air-memory"]`. Lenient on malformed (→ `NotConnected`).
+/// Read-only status (SP3 R2 — three states): `NotFound` if Claude Code isn't detected; else
+/// `NotConnected` unless `~/.claude.json` parses with `mcpServers["air-memory"]`; else
+/// `Connected { capture }` where `capture` is true iff `settings.json`'s `hooks.SessionEnd[]` also
+/// holds OUR `capture-notify` group. An SP2-era connect (mcpServers present, no capture hook) is thus
+/// `Connected { capture: false }`, which Plan C surfaces as "Re-connect to enable session capture".
+/// Lenient on malformed at every layer (malformed `claude.json` → `NotConnected`; missing/malformed
+/// `settings.json` → `capture: false`) — status is a safe read; `connect()` is where a parse error
+/// fails loud.
 pub fn detect(paths: &ClaudeCodePaths) -> std::io::Result<ClaudeCodeStatus> {
     let present = paths.claude_json.exists() || paths.claude_dir.exists();
     if !present {
@@ -29,11 +35,65 @@ pub fn detect(paths: &ClaudeCodePaths) -> std::io::Result<ClaudeCodeStatus> {
         .flatten()
         .and_then(|v| v.get("mcpServers").and_then(|m| m.get(MCP_SERVER_KEY)).map(|_| ()))
         .is_some();
-    Ok(if connected {
-        ClaudeCodeStatus::Connected
-    } else {
-        ClaudeCodeStatus::NotConnected
-    })
+    if !connected {
+        return Ok(ClaudeCodeStatus::NotConnected);
+    }
+    Ok(ClaudeCodeStatus::Connected { capture: session_end_has_our_capture(&paths.settings_json) })
+}
+
+/// True iff `settings.json`'s `hooks.SessionEnd[]` contains OUR capture group — the B4 marker (a
+/// command with BOTH `air-memory-mcp` AND `capture-notify`, via [`is_our_capture_group`]). Lenient by
+/// design (this backs a read-only status, not a mutation): a missing / malformed / oddly-shaped
+/// `settings.json` → `false`. Reuses the same predicate `connect`/`disconnect` write and remove with,
+/// so detect can never disagree with what was actually installed.
+fn session_end_has_our_capture(settings_json: &Path) -> bool {
+    read_json_object(settings_json)
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            v.get("hooks")
+                .and_then(|h| h.get("SessionEnd"))
+                .and_then(|e| e.as_array())
+                .map(|groups| groups.iter().any(is_our_capture_group))
+        })
+        .unwrap_or(false)
+}
+
+/// Count Claude Code transcripts under `projects_root` for the Connect consent disclosure
+/// (spec §6a: "…including your recent sessions (~30 days, N found)"). Follows the daemon sweeper's
+/// walk SHAPE (A9 `scan_candidates`): ONE level of project dirs, then `.jsonl` leaves directly inside
+/// each; nested-deeper directories and stray root-level files are ignored, exactly as the sweeper
+/// ignores them. A missing / unreadable root is `0`, NEVER an error: this is a best-effort disclosure,
+/// and a not-yet-connected user (no `~/.claude/projects`) legitimately has zero.
+///
+/// N is a best-effort **UPPER BOUND**, not an exact import count: the sweeper additionally rejects any
+/// `.jsonl` whose file-stem fails `valid_session_id` (`[A-Za-z0-9_-]`, ≤128 bytes) before importing,
+/// which this plain `.jsonl` walk does NOT apply — so the real import count is ≤ N (in practice equal,
+/// since Claude Code transcripts are UUID-named). We deliberately do NOT hoist `valid_session_id`
+/// here: it lives in A5's security-reviewed capture module, and the honest upper-bound comment plus
+/// Plan C's non-exact consent copy ("~N found") is the right scope. True parity (sharing
+/// `valid_session_id` via `bossclawd-paths`) is a possible follow-up.
+pub fn backfill_candidate_count(projects_root: &Path) -> u64 {
+    let Ok(projects) = std::fs::read_dir(projects_root) else {
+        return 0; // absent / unreadable root → nothing to import (I10 parity with the sweeper).
+    };
+    let mut count = 0u64;
+    for project in projects.flatten() {
+        if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue; // only project directories hold transcripts (stray root files are ignored).
+        }
+        let Ok(entries) = std::fs::read_dir(project.path()) else {
+            continue; // unreadable project dir — skip it, don't abort the whole count.
+        };
+        for entry in entries.flatten() {
+            let is_transcript = entry.path().extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if is_transcript {
+                count += 1; // a `.jsonl` leaf directly inside a project dir (no recursion).
+            }
+        }
+    }
+    count
 }
 
 /// Build the mcpServers entry pointing Claude Code at our bundled adapter + the daemon socket.
@@ -68,15 +128,41 @@ fn nudge_hook_group(binary: &Path) -> serde_json::Value {
     })
 }
 
+/// The SessionEnd hook group that runs `<binary> capture-notify` — Claude Code's end-of-session poke
+/// that asks the daemon to snapshot the just-finished session (SP3/B2). Same shell-executed command,
+/// so the path is single-quote-escaped exactly like the nudge; the only new token is a static literal.
+fn capture_hook_group(binary: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": format!("{} capture-notify", sh_single_quote(&binary.to_string_lossy())),
+            "timeout": 5,
+        }]
+    })
+}
+
 /// True iff a SessionStart group is ONE OF OURS: an inner command that BOTH references our binary
 /// (`HOOK_MARKER`) AND invokes `nudge`. Requiring both keeps disconnect from deleting a foreign hook
 /// that merely mentions the string (review Low).
 fn is_our_hook_group(group: &serde_json::Value) -> bool {
+    group_has_command_with(group, "nudge")
+}
+
+/// True iff a SessionEnd group is ONE OF OURS: an inner command that BOTH references our binary
+/// (`HOOK_MARKER`) AND invokes `capture-notify`. DISJOINT from `is_our_hook_group`'s nudge marker —
+/// a `capture-notify` command never contains `nudge` and vice versa — so the two never cross-match,
+/// and a foreign hook that merely mentions `air-memory-mcp` (without `capture-notify`) survives.
+fn is_our_capture_group(group: &serde_json::Value) -> bool {
+    group_has_command_with(group, "capture-notify")
+}
+
+/// Shared marker predicate: some inner hook command contains BOTH `HOOK_MARKER` AND `subcommand`.
+fn group_has_command_with(group: &serde_json::Value, subcommand: &str) -> bool {
     group.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
         hooks.iter().any(|h| {
             h.get("command")
                 .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains(HOOK_MARKER) && c.contains("nudge"))
+                .is_some_and(|c| c.contains(HOOK_MARKER) && c.contains(subcommand))
         })
     })
 }
@@ -105,10 +191,26 @@ fn ensure_array<'a>(
         .ok_or_else(|| invalid(path, &format!("\"{key}\" is not an array")))
 }
 
-/// Write the `air-memory` MCP server + SessionStart nudge into the Claude Code config, merging
-/// (never replacing) and idempotently. **Both files are parsed + shape-validated BEFORE either is
-/// written** (I5): a malformed / oddly-shaped `settings.json` fails loud with `claude.json` left
-/// byte-unchanged — no partial write, no lying "nothing changed" (review MAJOR M3).
+/// Drop OUR groups from `hooks[kind]` (matched by `is_ours`), leaving foreign groups in place.
+/// Returns whether anything was removed (so the caller only rewrites a file it actually changed). A
+/// missing / non-array `hooks[kind]` is a no-op — nothing of ours to remove there.
+fn retain_out_group(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    kind: &str,
+    is_ours: fn(&serde_json::Value) -> bool,
+) -> bool {
+    hooks.get_mut(kind).and_then(|v| v.as_array_mut()).is_some_and(|groups| {
+        let before = groups.len();
+        groups.retain(|g| !is_ours(g));
+        groups.len() != before
+    })
+}
+
+/// Write the `air-memory` MCP server + SessionStart nudge + SessionEnd `capture-notify` hook into the
+/// Claude Code config, merging (never replacing) and idempotently. **Both files are parsed +
+/// shape-validated BEFORE either is written** (I5): a malformed / oddly-shaped `settings.json` fails
+/// loud with `claude.json` left byte-unchanged — no partial write, no lying "nothing changed" (review
+/// MAJOR M3).
 pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io::Result<()> {
     // ── Phase 1: parse + validate + mutate IN MEMORY (no writes yet). ──
     let mut claude = read_json_object(&paths.claude_json)?.unwrap_or_else(|| serde_json::json!({}));
@@ -127,6 +229,11 @@ pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io
     let starts = ensure_array(hooks, "SessionStart", &paths.settings_json)?;
     starts.retain(|g| !is_our_hook_group(g)); // idempotent: drop a prior nudge, then re-add.
     starts.push(nudge_hook_group(binary));
+    // The SessionEnd capture hook joins the SAME in-memory transaction (heals an SP2-era config that
+    // has the nudge but no SessionEnd): retain-out any prior capture, then re-add exactly one.
+    let ends = ensure_array(hooks, "SessionEnd", &paths.settings_json)?;
+    ends.retain(|g| !is_our_capture_group(g));
+    ends.push(capture_hook_group(binary));
 
     // ── Phase 2: both parsed cleanly → create dir + write both (0600, atomic). ──
     make_private_dir(&paths.claude_dir)?;
@@ -135,9 +242,10 @@ pub fn connect(paths: &ClaudeCodePaths, binary: &Path, socket: &Path) -> std::io
     Ok(())
 }
 
-/// Remove ONLY our `air-memory` MCP server + our SessionStart nudge group(s), preserving everything
-/// else. **Both files are parsed BEFORE either is written** (I5) — a malformed file fails loud with
-/// nothing clobbered. Absent files → nothing to do; only files we actually change are rewritten.
+/// Remove ONLY our `air-memory` MCP server + our SessionStart nudge group(s) + our SessionEnd
+/// `capture-notify` group(s), preserving everything else. **Both files are parsed BEFORE either is
+/// written** (I5) — a malformed file fails loud with nothing clobbered. Absent files → nothing to do;
+/// only files we actually change are rewritten.
 pub fn disconnect(paths: &ClaudeCodePaths) -> std::io::Result<()> {
     // Parse both up front — a malformed file errors here, before any write.
     let claude = read_json_object(&paths.claude_json)?;
@@ -151,15 +259,13 @@ pub fn disconnect(paths: &ClaudeCodePaths) -> std::io::Result<()> {
         removed.then_some(root)
     });
     let settings_out = settings.and_then(|mut root| {
-        let changed = root
-            .get_mut("hooks")
-            .and_then(|h| h.get_mut("SessionStart"))
-            .and_then(|s| s.as_array_mut())
-            .is_some_and(|starts| {
-                let before = starts.len();
-                starts.retain(|g| !is_our_hook_group(g));
-                starts.len() != before
-            });
+        // Retain-out BOTH our hook kinds; a foreign group in EITHER array survives. `|` (not `||`) so
+        // both removals always run — a changed SessionEnd must still be written even if SessionStart
+        // was untouched (short-circuit would skip it).
+        let changed = root.get_mut("hooks").and_then(|h| h.as_object_mut()).is_some_and(|hooks| {
+            retain_out_group(hooks, "SessionStart", is_our_hook_group)
+                | retain_out_group(hooks, "SessionEnd", is_our_capture_group)
+        });
         changed.then_some(root)
     });
 
@@ -230,7 +336,11 @@ mod tests {
             br#"{"mcpServers":{"air-memory":{"type":"stdio"}}}"#,
         )
         .unwrap();
-        assert_eq!(detect(&paths(dir.path())).unwrap(), ClaudeCodeStatus::Connected);
+        // mcpServers present but NO settings.json capture hook (SP2-era shape) → capture:false.
+        assert_eq!(
+            detect(&paths(dir.path())).unwrap(),
+            ClaudeCodeStatus::Connected { capture: false }
+        );
     }
 
     #[test]
@@ -263,7 +373,8 @@ mod tests {
         let cmd = groups[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains(HOOK_MARKER) && cmd.contains("nudge"), "hook runs our nudge: {cmd}");
         assert_eq!(mode(&p.settings_json), 0o600);
-        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected);
+        // connect writes the SessionEnd capture hook too → the third state reports capture:true.
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: true });
     }
 
     #[test]
@@ -474,7 +585,7 @@ mod tests {
         .unwrap();
 
         connect(&p, bin(), sock()).unwrap();
-        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected);
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: true });
         assert_eq!(mode(&p.claude_json), 0o600);
         assert_eq!(mode(&p.settings_json), 0o600);
 
@@ -487,5 +598,218 @@ mod tests {
         let groups = sj["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 1, "only the foreign hook remains");
         assert_eq!(groups[0]["hooks"][0]["command"], "node keep.mjs");
+    }
+
+    // ── B4 (SP3): the SessionEnd `capture-notify` hook, disjoint from the nudge marker. ──
+
+    /// Count OUR groups in a hook array: an inner command with BOTH the marker AND the subcommand.
+    fn count_ours(sj: &serde_json::Value, kind: &str, sub: &str) -> usize {
+        sj["hooks"][kind]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter(|g| {
+                        g["hooks"][0]["command"]
+                            .as_str()
+                            .is_some_and(|c| c.contains(HOOK_MARKER) && c.contains(sub))
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn connect_writes_the_session_end_capture_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        connect(&p, bin(), sock()).unwrap();
+
+        let sj = read(&p.settings_json);
+        let ends = sj["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1, "exactly our capture group");
+        assert_eq!(
+            ends[0]["hooks"][0]["command"],
+            format!("{} capture-notify", sh_single_quote(&bin().to_string_lossy())),
+            "SessionEnd runs our capture-notify"
+        );
+        assert_eq!(ends[0]["hooks"][0]["timeout"], 5);
+
+        // The SessionStart nudge group is STILL present (both hook kinds coexist).
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 1, "nudge group untouched");
+        assert_eq!(mode(&p.settings_json), 0o600);
+    }
+
+    #[test]
+    fn disconnect_removes_our_capture_hook_but_keeps_foreign_session_end_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        // A FOREIGN SessionEnd group (someone else's hook) is present before we connect.
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"node cleanup.mjs"}]}]}}"#,
+        )
+        .unwrap();
+
+        connect(&p, bin(), sock()).unwrap(); // adds our capture (+ nudge)
+        disconnect(&p).unwrap();
+
+        let sj = read(&p.settings_json);
+        let ends = sj["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1, "foreign SessionEnd group survives; ours is gone");
+        assert_eq!(ends[0]["hooks"][0]["command"], "node cleanup.mjs");
+        assert_eq!(count_ours(&sj, "SessionEnd", "capture-notify"), 0, "our capture removed");
+        // disconnect removes BOTH our hook kinds — the SessionStart nudge is gone too.
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 0, "our nudge removed too");
+    }
+
+    #[test]
+    fn connect_is_idempotent_and_heals_a_sp2_era_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        // SP2-era state: the SessionStart nudge group exists, but NO SessionEnd at all.
+        let nudge_cmd = format!("{} nudge", sh_single_quote(&bin().to_string_lossy()));
+        std::fs::write(
+            &p.settings_json,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": { "SessionStart": [
+                    { "hooks": [{ "type": "command", "command": nudge_cmd, "timeout": 5 }] }
+                ]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        connect(&p, bin(), sock()).unwrap();
+        let sj = read(&p.settings_json);
+        assert_eq!(count_ours(&sj, "SessionEnd", "capture-notify"), 1, "capture added exactly once");
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 1, "nudge healed, not duped");
+
+        connect(&p, bin(), sock()).unwrap(); // idempotent second run
+        let sj = read(&p.settings_json);
+        assert_eq!(count_ours(&sj, "SessionEnd", "capture-notify"), 1, "still one capture group");
+        assert_eq!(count_ours(&sj, "SessionStart", "nudge"), 1, "still one nudge group");
+    }
+
+    #[test]
+    fn capture_hook_command_is_single_quoted_against_a_hostile_binary_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let evil = Path::new("/t/a'b $(id) `x` air-memory-mcp");
+        connect(&p, evil, sock()).unwrap();
+
+        let sj = read(&p.settings_json);
+        let cmd = sj["hooks"]["SessionEnd"][0]["hooks"][0]["command"].as_str().unwrap();
+        // Exactly the single-quote-escaped path + the static subcommand — no injection surface.
+        assert_eq!(cmd, format!("{} capture-notify", sh_single_quote(&evil.to_string_lossy())));
+        assert!(cmd.starts_with('\''), "path is single-quoted: {cmd}");
+        assert!(cmd.ends_with("' capture-notify"), "only ` capture-notify` is outside quotes: {cmd}");
+        assert!(cmd.contains("'\\''"), "embedded single quote escaped as '\\'': {cmd}");
+    }
+
+    #[test]
+    fn disconnect_marker_does_not_remove_a_foreign_hook_that_merely_mentions_air_memory_mcp() {
+        // A foreign SessionEnd hook whose command has "air-memory-mcp" but NOT "capture-notify"
+        // (e.g. someone's own "air-memory-mcp status") must SURVIVE — our capture marker needs BOTH.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"air-memory-mcp status"}]}]}}"#,
+        )
+        .unwrap();
+
+        disconnect(&p).unwrap();
+
+        let sj = read(&p.settings_json);
+        let ends = sj["hooks"]["SessionEnd"].as_array().unwrap();
+        assert_eq!(ends.len(), 1, "foreign air-memory-mcp hook without capture-notify survives");
+        assert_eq!(ends[0]["hooks"][0]["command"], "air-memory-mcp status");
+    }
+
+    // ── B5 (SP3 R2): the capture-aware THIRD detect state + the app-side backfill count. ──
+
+    #[test]
+    fn detect_reports_capture_presence_as_the_third_state() {
+        // (a) mcpServers entry + SessionEnd capture hook (a full SP3 connect) → capture:true.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        connect(&p, bin(), sock()).unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: true });
+
+        // (b) mcpServers present, NO capture hook (SP2-era) → capture:false — this is the state Plan C
+        // turns into "Re-connect to enable session capture". Build it by hand: our server + only a
+        // SessionStart nudge (no SessionEnd), the exact shape an SP2 install left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"air-memory":{"type":"stdio"}}}"#).unwrap();
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        let nudge_cmd = format!("{} nudge", sh_single_quote(&bin().to_string_lossy()));
+        std::fs::write(
+            &p.settings_json,
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": { "SessionStart": [
+                    { "hooks": [{ "type": "command", "command": nudge_cmd, "timeout": 5 }] }
+                ]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: false });
+
+        // (c) neither our server nor a hook → NotConnected.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"chrome":{}}}"#).unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::NotConnected);
+
+        // (d) no ~/.claude at all → NotFound.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect(&paths(dir.path())).unwrap(), ClaudeCodeStatus::NotFound);
+    }
+
+    #[test]
+    fn detect_capture_ignores_a_foreign_session_end_hook() {
+        // Connected via mcpServers, with a FOREIGN SessionEnd hook (mentions neither our marker nor
+        // capture-notify) → capture stays false: the third state keys on OUR capture group only.
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::write(&p.claude_json, br#"{"mcpServers":{"air-memory":{"type":"stdio"}}}"#).unwrap();
+        std::fs::create_dir(&p.claude_dir).unwrap();
+        std::fs::write(
+            &p.settings_json,
+            br#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"node cleanup.mjs"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect(&p).unwrap(), ClaudeCodeStatus::Connected { capture: false });
+    }
+
+    #[test]
+    fn backfill_candidate_count_counts_jsonl_under_projects_root_only() {
+        // Fake `~/.claude/projects`: three project dirs holding five `.jsonl` transcripts total, plus a
+        // `.txt` (ignored), a nested-deeper dir (NOT recursed — sweeper parity), and a stray root-level
+        // `.jsonl` (NOT inside a project dir → ignored). Expect exactly 5.
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir(r.join("proj-a")).unwrap();
+        std::fs::write(r.join("proj-a/s1.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("proj-a/s2.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("proj-a/notes.txt"), b"ignore me").unwrap(); // wrong extension → ignored
+        std::fs::create_dir(r.join("proj-a/deeper")).unwrap();
+        std::fs::write(r.join("proj-a/deeper/x.jsonl"), b"{}\n").unwrap(); // nested → NOT counted
+        std::fs::create_dir(r.join("proj-b")).unwrap();
+        std::fs::write(r.join("proj-b/s3.jsonl"), b"{}\n").unwrap();
+        std::fs::create_dir(r.join("proj-c")).unwrap();
+        std::fs::write(r.join("proj-c/s4.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("proj-c/s5.jsonl"), b"{}\n").unwrap();
+        std::fs::write(r.join("loose.jsonl"), b"{}\n").unwrap(); // stray root file → NOT counted
+
+        assert_eq!(backfill_candidate_count(r), 5, "all project-dir .jsonl leaves, nothing else");
+
+        // A missing root is 0, never an error (a not-yet-connected user has no projects dir).
+        assert_eq!(backfill_candidate_count(&r.join("does-not-exist")), 0);
     }
 }

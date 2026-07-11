@@ -1,18 +1,28 @@
 /** The set of top-level panels the shell can show. Single source of truth (App, Sidebar, search). */
-export type View = "identity" | "inbox" | "memory" | "review" | "mandates" | "settings";
+export type View = "identity" | "inbox" | "library" | "memory" | "review" | "mandates" | "settings";
 
 export type NavItemDef = { view: View; label: string };
 
-/** Primary nav, in display order. `settings` is rendered separately (pinned to the footer). */
+/**
+ * Primary nav, in display order. `settings` is rendered separately (pinned to the footer).
+ * The Brain item opens the hub at its Library sub-tab (the landing), not raw memory search.
+ */
 export const MAIN_NAV: readonly NavItemDef[] = [
   { view: "identity", label: "AIR" },
   { view: "inbox", label: "AIR Note" },
-  { view: "memory", label: "Brain" },
+  { view: "library", label: "Brain" },
 ] as const;
 
-/** Views hosted inside the Brain hub (Brain search/evolve + Review + Mandates). */
-export const BRAIN_VIEWS = ["memory", "review", "mandates"] as const;
+/** Views hosted inside the Brain hub (Library + Brain search/evolve + Review + Mandates). */
+export const BRAIN_VIEWS = ["library", "memory", "review", "mandates"] as const;
 export const isBrainView = (v: View): boolean => (BRAIN_VIEWS as readonly View[]).includes(v);
+
+/**
+ * Where the shell lands once identity state is known. An onboarded user opens on the
+ * Library (their remembered sessions/notes); a not-onboarded user stays on `identity` so
+ * the onboarding gate is never bypassed — the Brain hub's ops would return NotOnboarded.
+ */
+export const landingView = (onboarded: boolean): View => (onboarded ? "library" : "identity");
 
 /** Display text for a nav count badge, or null when there is nothing to show. */
 export function navBadge(count: number | undefined): string | null {

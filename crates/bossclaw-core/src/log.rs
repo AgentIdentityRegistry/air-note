@@ -246,10 +246,29 @@ const CLOUD_REASONER_CONSENT_KEY: &str = "cloud_reasoner_consent";
 /// only by [`EventLog::set_language_pack_record`]; absence means the English default (I7).
 const LANGUAGE_PACK_KEY: &str = "language_pack";
 
-/// A typed identifier for the three autonomy config flags, mapping to the private `*_KEY`
-/// consts. Used by `EventLog::explicitly_set` so callers (e.g. the desktop `prime_switches`)
-/// reference a compile-checked variant instead of a stringly-typed key that could drift on a
-/// rename (M2). `#[cfg(unix)]` is unnecessary — config flags exist on all platforms.
+/// The `content` key carrying the SP3 ongoing-capture on/off switch in a control `config` event
+/// (spec §6a). Single-sourced so the ONE writer ([`EventLog::set_capture_enabled`]) and the reader
+/// ([`EventLog::capture_enabled`]) can never drift the key apart, exactly like
+/// [`MANDATES_ENABLED_KEY`]. UNLIKE mandates the DEFAULT is CLOSED (`false` when never set) —
+/// capture must never run for a user who never consented (critic Critical C1 / I10).
+const CAPTURE_ENABLED_KEY: &str = "capture_enabled";
+
+/// The `content` key carrying the SP3 one-time backfill (historical-sweep) consent in a control
+/// `config` event (spec §6a). Default CLOSED: a user who declined history at Connect — or never
+/// connected — never has their pre-[`CAPTURE_ENABLED_AT_KEY`] backlog imported (critic Major M4).
+const BACKFILL_CONSENTED_KEY: &str = "backfill_consented";
+
+/// The `content` key carrying the wall-clock instant (supplied by the daemon — core stays
+/// clock-free) at which capture most recently flipped ON (spec §6a). A VALUED (i64) key read via
+/// [`EventLog::latest_config_value`], NOT a bool flag, so it has no [`ConfigFlag`] variant. The
+/// sweeper's forward-only window is `mtime >= capture_enabled_at`; the disable path leaves it
+/// sticky (capture is off, so it is not consulted).
+const CAPTURE_ENABLED_AT_KEY: &str = "capture_enabled_at";
+
+/// A typed identifier for a control-`config` key, mapping to the private `*_KEY` consts. Used by
+/// `EventLog::explicitly_set` (and the capture getters) so callers (e.g. the desktop
+/// `prime_switches`) reference a compile-checked variant instead of a stringly-typed key that could
+/// drift on a rename (M2). `#[cfg(unix)]` is unnecessary — config flags exist on all platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFlag {
     /// The evolve on/off switch ([`EVOLVE_ENABLED_KEY`]).
@@ -264,6 +283,10 @@ pub enum ConfigFlag {
     CloudReasonerConsent,
     /// The signed opt-in multilingual language-pack record ([`LANGUAGE_PACK_KEY`]).
     LanguagePack,
+    /// The SP3 ongoing-capture on/off switch ([`CAPTURE_ENABLED_KEY`]). Default CLOSED.
+    CaptureEnabled,
+    /// The SP3 one-time backfill consent ([`BACKFILL_CONSENTED_KEY`]). Default CLOSED.
+    BackfillConsented,
 }
 
 impl ConfigFlag {
@@ -276,6 +299,8 @@ impl ConfigFlag {
             ConfigFlag::ReasonerConfig => REASONER_CONFIG_KEY,
             ConfigFlag::CloudReasonerConsent => CLOUD_REASONER_CONSENT_KEY,
             ConfigFlag::LanguagePack => LANGUAGE_PACK_KEY,
+            ConfigFlag::CaptureEnabled => CAPTURE_ENABLED_KEY,
+            ConfigFlag::BackfillConsented => BACKFILL_CONSENTED_KEY,
         }
     }
 }
@@ -321,7 +346,84 @@ const EMBEDDABLE_EVENT_TYPES: &[&str] = &[
     crate::graph::MEMORY_EVENT_TYPE,
     crate::graph::PAGE_EVENT_TYPE,
     crate::graph::FILE_INGESTED_EVENT_TYPE,
+    // A captured session's title text must be recallable (SP3). The DELETED
+    // tombstone is deliberately NOT here — tombstones are never embedded.
+    crate::graph::SESSION_CAPTURED_EVENT_TYPE,
 ];
+
+/// Metadata for one captured coding-agent session — the input to
+/// [`EventLog::capture_session`]. All string fields are owned; timestamps are
+/// caller-supplied (the engine reads no clock inside this pure logic). `path` is
+/// the on-disk location of the session body (`<data_dir>/sessions/…`), recorded
+/// as metadata ONLY: `capture_session` records the event; the `.md` file store
+/// is a later task (A7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMeta {
+    /// Stable per-session identity key (the fold's grouping key).
+    pub session_id: String,
+    /// Human-readable session title (embedded so it is recallable).
+    pub title: String,
+    /// The project/repo the session ran against.
+    pub project: String,
+    /// The coding agent that produced the session (e.g. `claude-code`).
+    pub tool: String,
+    /// Caller-supplied start timestamp (Unix seconds; never a clock read here).
+    pub started_at: i64,
+    /// Caller-supplied end timestamp (Unix seconds; never a clock read here).
+    pub ended_at: i64,
+    /// On-disk path of the session body (metadata only; file store is A7).
+    pub path: String,
+    /// SHA-256 of the session body — the dedup/supersede decision key.
+    pub sha256: String,
+    /// Approximate body size in bytes (metadata only).
+    pub approx_bytes: u64,
+}
+
+/// One CURRENT captured session, folded from the log: the latest
+/// (`seq`-max) `session_captured` for a `session_id` not retired by a
+/// `supersede` and not tombstoned by a `session_deleted`. Mirrors
+/// [`crate::graph::Page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentSession {
+    /// The current `session_captured` event's id.
+    pub event_id: String,
+    /// The session's stable identity key.
+    pub session_id: String,
+    /// Human-readable session title.
+    pub title: String,
+    /// The project/repo the session ran against.
+    pub project: String,
+    /// The coding agent that produced the session.
+    pub tool: String,
+    /// Start timestamp (Unix seconds).
+    pub started_at: i64,
+    /// End timestamp (Unix seconds).
+    pub ended_at: i64,
+    /// On-disk path of the session body.
+    pub path: String,
+    /// SHA-256 of the session body.
+    pub sha256: String,
+    /// Approximate body size in bytes.
+    pub approx_bytes: u64,
+}
+
+/// One CURRENT remembered note, folded from the log: a `memory`-kind event
+/// ([`EventLog::remember`] / the corrected note of [`EventLog::supersede_note`])
+/// that is NOT itself retired by a `supersede`. The projection behind
+/// [`EventLog::current_notes`] and the Memory-browser notes list (SP3 §7/§9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentNote {
+    /// The note event's id.
+    pub event_id: String,
+    /// The note text (`content["text"]`; empty if the payload lacks it).
+    pub text: String,
+    /// Creation time (the event `ts` parsed to Unix seconds; 0 if absent/unparseable).
+    pub created_at: i64,
+    /// Always `None` in the current-only fold (a superseded note is EXCLUDED, so any
+    /// note returned is a live head). Carried to mirror `NoteWire`'s shape for a
+    /// possible future edit-history view; this projection never populates it.
+    pub superseded_by: Option<String>,
+}
 
 /// The serialized, signed event log.
 pub struct EventLog {
@@ -1521,6 +1623,27 @@ impl EventLog {
             } else {
                 std::collections::HashSet::new()
             };
+        // Session/note exclusion sets (A3). Both come from ONE fold over the
+        // session/supersede event stream: `fold_sessions` already scans every
+        // `supersede` event (they are shared across the page/file/session/note
+        // folds), so its `superseded` set is the COMPLETE retired-id universe —
+        // deriving both here costs a single scan, versus a separate
+        // `superseded_event_ids()` query plus a `current_sessions` fold. Gated
+        // like the page/file sets above: a recall with no session- or memory-kind
+        // candidate (e.g. pages only) pays nothing. `current_session_event_ids`
+        // is the INCLUSION set (only the current fold head survives);
+        // `superseded_ids` is an EXCLUSION set (see the memory arm below).
+        let (current_session_event_ids, superseded_ids): (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ) = if kinds.values().any(|k| {
+            k == crate::graph::SESSION_CAPTURED_EVENT_TYPE || k == crate::graph::MEMORY_EVENT_TYPE
+        }) {
+            let fold = fold_sessions(&self.session_events_ordered()?);
+            (fold.current.into_iter().map(|cs| cs.event_id).collect(), fold.superseded)
+        } else {
+            (std::collections::HashSet::new(), std::collections::HashSet::new())
+        };
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
 
@@ -1644,6 +1767,29 @@ impl EventLog {
                 // still active (never-forget storage ≠ must-surface).
                 return current_file_ids.contains(&h.event_id);
             }
+            if h.kind == crate::graph::SESSION_CAPTURED_EVENT_TYPE {
+                // Deleted/superseded sessions are gone for EVERY caller — this arm
+                // is UNCONDITIONAL (no RecallOptions gate), so the evolve and
+                // snapshot recall paths are covered with no options change. Keep
+                // only the current fold head; a deleted session (tombstoned) or a
+                // superseded capture is not in `current`, so it is dropped even
+                // after a reopen re-adds its persisted vector (rebuild-proof).
+                // Do NOT "symmetrize" this to the memory arm's exclusion shape:
+                // `!superseded_ids.contains(&h.event_id)` would MISS owner-deleted
+                // sessions — the `session_deleted` tombstone keys on session_id,
+                // not event id, so a deleted session's capture event is absent
+                // from the supersede set. Inclusion-by-fold-head is the only
+                // shape that covers both retirement paths here.
+                return current_session_event_ids.contains(&h.event_id);
+            }
+            if h.kind == crate::graph::MEMORY_EVENT_TYPE {
+                // EXCLUSION, not inclusion: `memory` is the shared kind of EVERY
+                // ground-truth note, so an inclusion set would drop every
+                // non-superseded memory. `superseded_ids` over-covers (it also
+                // holds session/file supersede targets), but this arm consults it
+                // only for memory-kind ids, so the over-breadth is inert.
+                return !superseded_ids.contains(&h.event_id);
+            }
             true // every other kind always survives
         });
         hits.truncate(k);
@@ -1658,6 +1804,14 @@ impl EventLog {
     /// there is a single authoritative list — the Rust const and the SQL clause
     /// cannot drift independently.
     fn collect_pending(&self, model_id: &str) -> Result<Vec<Event>, BossclawError> {
+        // SP3 embed gate: never re-vectorize a retired note/session or an
+        // owner-deleted session. Computed BEFORE the store lock below because it
+        // scans the log (via `session_events_ordered`) under the same lock, and
+        // re-entering it here would deadlock. A deleted session keeps its OLD-model
+        // vector in the `vectors` table, so without this gate a language migration
+        // (which re-embeds every "pending" event under the new model) would mint it
+        // a fresh vector and resurrect it in the rebuilt index.
+        let excluded = self.embed_excluded_event_ids()?;
         // Build `?2,?3,...` placeholders (one per embeddable type; ?1 = model_id).
         let placeholders: String = EMBEDDABLE_EVENT_TYPES
             .iter()
@@ -1688,7 +1842,12 @@ impl EventLog {
         let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(serde_json::from_str(&row?)?);
+            let ev: Event = serde_json::from_str(&row?)?;
+            // Skip a gone event (superseded note/session or deleted session).
+            if excluded.contains(&ev.id) {
+                continue;
+            }
+            out.push(ev);
         }
         Ok(out)
     }
@@ -1958,7 +2117,17 @@ impl EventLog {
     ) -> Result<(), BossclawError> {
         // Total embeddable-with-text events (the completeness denominator — events lacking text are
         // legitimately vector-less and must NOT count against completeness).
-        let embeddable = self.collect_embeddable_events_ordered()?;
+        //
+        // SP3: drop retired/deleted events from BOTH the denominator and the completeness scan so
+        // they agree with `collect_pending`'s embed gate. Otherwise a deleted session (skipped by
+        // `collect_pending`, so never re-embedded under the new model) would still be counted as
+        // "missing a vector" below and block the migration from EVER completing.
+        let excluded = self.embed_excluded_event_ids()?;
+        let embeddable: Vec<(String, String)> = self
+            .collect_embeddable_events_ordered()?
+            .into_iter()
+            .filter(|(id, _)| !excluded.contains(id))
+            .collect();
         let total = embeddable.len() as u64;
         on_progress(0, total);
 
@@ -4491,10 +4660,31 @@ impl EventLog {
     /// though `Err` is returned. A caller retry could thus double-write; dedup is
     /// intentionally deferred to a later SP1 task.
     pub fn remember(&self, embedder: &dyn Embedder, text: &str) -> Result<String, BossclawError> {
+        Self::reject_blank_note_text(text)?;
+        let id = self.append(self.external_note_event(text))?;
+        self.derive_vector_for(embedder, &id)?;
+        Ok(id)
+    }
+
+    /// Reject empty/blank note text with [`BossclawError::InvalidInput`] — the
+    /// single source of the "no empty note" rule shared by [`EventLog::remember`]
+    /// and [`EventLog::supersede_note`] so the two checks can never drift.
+    fn reject_blank_note_text(text: &str) -> Result<(), BossclawError> {
         if text.trim().is_empty() {
             return Err(BossclawError::InvalidInput("cannot remember empty or blank text".into()));
         }
-        let event = Event {
+        Ok(())
+    }
+
+    /// Build the signed, external-tainted `memory` Event carrying `text` — the
+    /// exact content shape shared by [`EventLog::remember`] and the corrected note
+    /// of [`EventLog::supersede_note`]. Stamped `origin = external` (the taint
+    /// model, single-sourced via [`crate::graph::EXTERNAL_ORIGIN`]) so the note is
+    /// recallable (`memory` ∈ `EMBEDDABLE_EVENT_TYPES`) yet never auto-trusted.
+    /// Tier-A (`model_meta: None`), engine-signed. Does NOT validate `text`:
+    /// callers reject blank text via [`EventLog::reject_blank_note_text`] first.
+    fn external_note_event(&self, text: &str) -> Event {
+        Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
@@ -4508,10 +4698,103 @@ impl EventLog {
             hash: None,
             signed_by_did: self.signer_did(),
             signature: None,
-        };
-        let id = self.append(event)?;
-        self.derive_vector_for(embedder, &id)?;
-        Ok(id)
+        }
+    }
+
+    /// Supersede a [`EventLog::remember`] note: validates `target_event_id` is a
+    /// CURRENT note — an existing [`crate::graph::MEMORY_EVENT_TYPE`] event that is
+    /// not itself already retired by a `supersede` (supersede chains have a single
+    /// head) — then appends an atomic ground-truth pair: a
+    /// [`crate::graph::SUPERSEDE_EVENT_TYPE`] link retiring the old note plus a
+    /// fresh corrected note (same external-tainted, Tier-A shape as `remember`,
+    /// via [`EventLog::external_note_event`]). Returns the NEW note's event id.
+    ///
+    /// Rejects (all [`BossclawError::InvalidInput`]): blank `text` (same check as
+    /// `remember`), a target that does not exist, a non-`memory` target (e.g. a
+    /// `session_captured` event), and an already-superseded target.
+    ///
+    /// Recall does not yet exclude superseded notes — that projection lands in a
+    /// later SP3 task; this is the write primitive only. Not atomic across the
+    /// vector: `append_pair` commits before `derive_vector_for` runs, matching
+    /// `remember` and `capture_session`.
+    pub fn supersede_note(
+        &self,
+        embedder: &dyn Embedder,
+        target_event_id: &str,
+        text: &str,
+    ) -> Result<String, BossclawError> {
+        Self::reject_blank_note_text(text)?;
+
+        // Target must be a CURRENT note: it exists, is memory-kind, and is not
+        // already the head-below of a supersede.
+        let target = self.event_by_id(target_event_id)?.ok_or_else(|| {
+            BossclawError::InvalidInput(format!(
+                "cannot supersede {target_event_id}: no such event"
+            ))
+        })?;
+        if target.event_type != crate::graph::MEMORY_EVENT_TYPE {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot supersede {target_event_id}: not a remembered note (event_type = {})",
+                target.event_type
+            )));
+        }
+        if self.superseded_event_ids()?.contains(target_event_id) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot supersede {target_event_id}: already superseded (supersede chain heads only)"
+            )));
+        }
+
+        // Atomic ground-truth pair (mirrors capture_session's changed-sha arm):
+        // retire the old note, then append the corrected note.
+        let supersede = ground_truth_supersede_event(target_event_id, self.signer_did());
+        let corrected = self.external_note_event(text);
+        let (_supersede_id, new_id) = self.append_pair(supersede, corrected)?;
+        self.derive_vector_for(embedder, &new_id)?;
+        Ok(new_id)
+    }
+
+    /// The set of event ids retired by a `supersede` event, across ALL folds:
+    /// page/file/session/note supersedes share [`crate::graph::SUPERSEDE_EVENT_TYPE`]
+    /// and each targets exactly one (disjoint) id. Reads only supersede events
+    /// (`events_of_types` filters on `event_type` — never a whole-log scan). Used
+    /// by [`EventLog::supersede_note`] to reject superseding an already-retired note.
+    fn superseded_event_ids(&self) -> Result<HashSet<String>, BossclawError> {
+        let events = self.events_of_types(&[crate::graph::SUPERSEDE_EVENT_TYPE])?;
+        Ok(events
+            .iter()
+            .filter_map(|e| {
+                e.content.get("supersedes").and_then(|v| v.as_str()).map(String::from)
+            })
+            .collect())
+    }
+
+    /// Event ids that the model-facing BATCH paths must treat as GONE — the union
+    /// of (1) every id retired by a `supersede`: superseded notes, session heads,
+    /// and page/file versions (`session_events_ordered` pulls ALL supersede
+    /// events, which are shared across the folds — and gating retired page/file
+    /// versions out of re-embedding is beneficial, not inert: only the CURRENT
+    /// version of anything should ever re-vectorize) and (2) every
+    /// `session_captured` event whose `session_id` carries a `session_deleted`
+    /// tombstone (the tombstone keys on `session_id`, so the capture event id is
+    /// NOT in the supersede set). One [`EventLog::session_events_ordered`] scan
+    /// feeds both. Used to gate re-embedding ([`EventLog::collect_pending`]) AND
+    /// the migration completeness denominator ([`EventLog::reembed_prepare`]) so
+    /// a deleted session neither re-vectorizes on rebuild/migration nor (by being
+    /// counted "missing") blocks a migration from ever completing.
+    fn embed_excluded_event_ids(&self) -> Result<HashSet<String>, BossclawError> {
+        let events = self.session_events_ordered()?;
+        let fold = fold_sessions(&events);
+        let (deleted, mut excluded) = (fold.deleted, fold.superseded);
+        for ev in &events {
+            if ev.event_type == crate::graph::SESSION_CAPTURED_EVENT_TYPE {
+                if let Some(sid) = ev.content.get("session_id").and_then(|v| v.as_str()) {
+                    if deleted.contains(sid) {
+                        excluded.insert(ev.id.clone());
+                    }
+                }
+            }
+        }
+        Ok(excluded)
     }
 
     /// Derive + persist the vector for a just-appended event id (M5a ingest convenience).
@@ -4529,6 +4812,141 @@ impl EventLog {
             self.derive_vector(embedder, &ev)?;
         }
         Ok(())
+    }
+
+    /// All `session_captured` + `session_deleted` + `supersede` events, in chain
+    /// (`seq ASC`) order — the input to [`fold_sessions`]. The `supersede` rows
+    /// are shared with the page/file folds; cross-fold safety holds because a
+    /// supersede targets a disjoint event id (a session supersede references a
+    /// session event, never a page/file event, and vice-versa).
+    fn session_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
+        self.events_of_types(&[
+            crate::graph::SESSION_CAPTURED_EVENT_TYPE,
+            crate::graph::SESSION_DELETED_EVENT_TYPE,
+            crate::graph::SUPERSEDE_EVENT_TYPE,
+        ])
+    }
+
+    /// Record a captured coding-agent session as a signed, external-tainted,
+    /// embeddable `session_captured` event (SP3, spec §4b/§7a). Mirrors the M5a
+    /// file-ingest dedup/supersede decision, keyed on `session_id`:
+    ///
+    /// - **tombstoned** (`session_deleted` seen for this id) → [`BossclawError::InvalidInput`]
+    ///   (I9: an owner-deleted session can never be recaptured);
+    /// - **same id + same `sha256`** → no-op, returns the EXISTING current event id;
+    /// - **same id + different `sha256`** → an atomic ground-truth `supersede`+`session_captured`
+    ///   pair (the body changed), returning the NEW event id;
+    /// - **new id** → a plain append.
+    ///
+    /// The event's `content["text"]` (title-derived) is embedded like [`EventLog::remember`]
+    /// so the title is recallable; `content["origin"]` is [`crate::graph::EXTERNAL_ORIGIN`]
+    /// so the session body is never auto-trusted. Tier-A (`model_meta: None`), signed by the
+    /// engine DID. The `.md` body file itself is NOT written here (that is task A7): only the
+    /// event is recorded; `meta.path` is metadata.
+    ///
+    /// Not atomic across the vector: `append`/`append_pair` commits before
+    /// `derive_vector_for` runs, matching [`EventLog::remember`] and the M5a ingest path.
+    pub fn capture_session(&self, embedder: &dyn Embedder, meta: &SessionMeta) -> Result<String, BossclawError> {
+        let events = self.session_events_ordered()?;
+        let fold = fold_sessions(&events);
+
+        // I9: a tombstoned session is gone forever — never recapturable.
+        if fold.deleted.contains(&meta.session_id) {
+            return Err(BossclawError::InvalidInput(format!(
+                "session {} was deleted and cannot be recaptured (I9)",
+                meta.session_id
+            )));
+        }
+
+        match fold.current.iter().find(|cs| cs.session_id == meta.session_id) {
+            // Same id + same bytes → no-op (return the existing current event id).
+            // The sweeper's steady-state hot path: no event is even constructed.
+            Some(prev) if prev.sha256 == meta.sha256 => Ok(prev.event_id.clone()),
+            // Same id + changed bytes → atomic supersede + new capture.
+            Some(prev) => {
+                let supersede = ground_truth_supersede_event(&prev.event_id, self.signer_did());
+                let event = session_captured_event(meta, self.signer_did());
+                let (_s, new_id) = self.append_pair(supersede, event)?;
+                self.derive_vector_for(embedder, &new_id)?;
+                Ok(new_id)
+            }
+            // New session → plain append.
+            None => {
+                let event = session_captured_event(meta, self.signer_did());
+                let new_id = self.append(event)?;
+                self.derive_vector_for(embedder, &new_id)?;
+                Ok(new_id)
+            }
+        }
+    }
+
+    /// Owner-commanded deletion of a captured session (SP3, I7): appends a signed,
+    /// non-embeddable `session_deleted` tombstone so [`EventLog::current_sessions`]
+    /// (and, later, recall) treat the session as gone. Append-only — the original
+    /// `session_captured` event stays in the log forever; the tombstone shadows it.
+    /// Returns [`BossclawError::InvalidInput`] if no CURRENT session has that id
+    /// (nothing to delete: already gone, superseded away, or never captured).
+    pub fn delete_session(&self, session_id: &str) -> Result<String, BossclawError> {
+        let events = self.session_events_ordered()?;
+        let fold = fold_sessions(&events);
+        if !fold.current.iter().any(|cs| cs.session_id == session_id) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot delete session {session_id}: no current captured session with that id"
+            )));
+        }
+        // A tombstone carries no embeddable text and is never given a vector.
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::SESSION_DELETED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": session_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// The CURRENT captured sessions: the latest non-superseded, non-tombstoned
+    /// `session_captured` per `session_id` (SP3 §4b). A deterministic fold over
+    /// the log via [`fold_sessions`] — the data source a later recall task filters
+    /// against so deleted/superseded sessions never surface.
+    pub fn current_sessions(&self) -> Result<Vec<CurrentSession>, BossclawError> {
+        let events = self.session_events_ordered()?;
+        Ok(fold_sessions(&events).current)
+    }
+
+    /// The CURRENT remembered notes (SP3 §7/§9): every `memory`-kind event
+    /// ([`EventLog::remember`] / the corrected note of [`EventLog::supersede_note`])
+    /// NOT retired by a `supersede`, newest-first. A deterministic read (no vector,
+    /// no embedder) backing the Memory-browser notes list — mirrors
+    /// [`EventLog::current_sessions`]. "Note" is defined by event-kind EXACTLY as
+    /// [`EventLog::supersede_note`] validates its target (memory-kind), so the list
+    /// and the edit primitive can never disagree on what counts as a note. Reads
+    /// only `memory` + `supersede` events (never a whole-log scan).
+    pub fn current_notes(&self) -> Result<Vec<CurrentNote>, BossclawError> {
+        let events = self.events_of_types(&[
+            crate::graph::MEMORY_EVENT_TYPE,
+            crate::graph::SUPERSEDE_EVENT_TYPE,
+        ])?;
+        Ok(fold_notes(&events))
+    }
+
+    /// The tombstoned (owner-deleted) `session_id`s — the same set
+    /// [`EventLog::capture_session`] consults to enforce I9. A deterministic,
+    /// sorted read over the session fold (no vector, no embedder). The sweeper
+    /// (SP3 A9) uses this to EXCLUDE a deleted session's still-present transcript
+    /// from re-capture at decision time, so it never re-renders — and never
+    /// transiently rewrites the `.md` of — a session the owner deleted (I9). The
+    /// engine's `capture_session` reject remains the durable backstop; this is
+    /// the cheap pre-filter that keeps the per-sweep cap for live sessions.
+    pub fn deleted_session_ids(&self) -> Result<Vec<String>, BossclawError> {
+        let events = self.session_events_ordered()?;
+        let mut ids: Vec<String> = fold_sessions(&events).deleted.into_iter().collect();
+        ids.sort();
+        Ok(ids)
     }
 
     /// Rebuild the persisted `edges`/`nodes` tables as a deterministic fold over
@@ -5565,6 +5983,96 @@ impl EventLog {
             }
         }
         Ok(true) // flag never set → default open
+    }
+
+    /// Whether ongoing session capture is enabled (spec §6a — critic Critical C1's default-CLOSED
+    /// flag). STICKY / fail-closed, reusing [`EventLog::latest_config_value`]'s newest-first scan:
+    /// the newest `config` event carrying an explicit `capture_enabled` bool wins. UNLIKE
+    /// [`EventLog::mandates_enabled`] (default-OPEN), the default here is CLOSED — a never-set flag
+    /// returns `false`, so capture never runs for a user who never consented (I10) even if the boot
+    /// force-off cascade never ran. Because [`EventLog::set_capture_enabled`] is the only writer of
+    /// the key and always writes a bool, the value is never absent-but-present.
+    pub fn capture_enabled(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(ConfigFlag::CaptureEnabled.key())?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// Whether the one-time historical-backfill consent was granted (spec §6a — critic Major M4).
+    /// Default CLOSED, mirroring [`EventLog::capture_enabled`]: a user who declined history at
+    /// Connect — or never connected — reads `false` here, so the sweeper never imports the backlog
+    /// that predates [`EventLog::capture_enabled_at`]. Disabling capture clears this back to `false`
+    /// (the consent is one-time and spent — see [`EventLog::set_capture_enabled`]), so a later
+    /// forward-only re-enable cannot silently resurrect the backlog.
+    pub fn backfill_consented(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(ConfigFlag::BackfillConsented.key())?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// The wall-clock instant capture most recently flipped ON, or `None` if capture was never
+    /// enabled (spec §6a). Written by [`EventLog::set_capture_enabled`] on every ON transition; the
+    /// disable path leaves it sticky (capture is off, so it is not consulted). Backs the sweeper's
+    /// forward-only window (`mtime >= capture_enabled_at`).
+    pub fn capture_enabled_at(&self) -> Result<Option<i64>, BossclawError> {
+        Ok(self
+            .latest_config_value(CAPTURE_ENABLED_AT_KEY)?
+            .and_then(|v| v.as_i64()))
+    }
+
+    /// Flip the SP3 capture flags by appending ONE signed + hash-chained control `config` event
+    /// (spec §6a). ATOMIC by construction — `capture_enabled` and its `capture_enabled_at` timestamp
+    /// can never be persisted apart. `at` is supplied by the daemon so core stays clock-free
+    /// (mirrors how the sweeper passes time in).
+    ///
+    /// Semantics (the C1 + M4 resolution):
+    /// - `enabled` is written explicitly every call → [`EventLog::explicitly_set`]
+    ///   `(ConfigFlag::CaptureEnabled)` becomes true (what the boot cascade keys off).
+    /// - On enable (`enabled == true`) the `capture_enabled_at` timestamp is (re)recorded.
+    /// - `backfill_consented` is written **true** ONLY when enabling WITH `backfill` (the Connect
+    ///   checkbox). Enabling WITHOUT backfill (the Integrations toggle) does NOT touch the key, so a
+    ///   just-granted Connect consent survives and a never-granted one stays `false` (forward-only,
+    ///   M4).
+    /// - DISABLING (`enabled == false`) clears `backfill_consented` to **false**: the historical
+    ///   consent is one-time and spent, so a later forward-only re-enable must NOT silently re-import
+    ///   the declined backlog (M4). `at` is inert on disable (no ON transition to timestamp).
+    ///
+    /// The single writer of all three keys, so the readers above can never drift the shape apart.
+    pub fn set_capture_enabled(
+        &self,
+        enabled: bool,
+        backfill: bool,
+        at: i64,
+    ) -> Result<(), BossclawError> {
+        // Explicit map so keys are the named consts (json!{} cannot take a const identifier as an
+        // object key). One event ⇒ the enabled bit and its timestamp land atomically.
+        let mut content = serde_json::Map::new();
+        content.insert(CAPTURE_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+        if enabled {
+            content.insert(CAPTURE_ENABLED_AT_KEY.to_string(), serde_json::Value::from(at));
+            if backfill {
+                content.insert(BACKFILL_CONSENTED_KEY.to_string(), serde_json::Value::Bool(true));
+            }
+        } else {
+            // Spend the one-time historical consent so a later forward-only enable cannot
+            // resurrect the declined backlog (critic M4).
+            content.insert(BACKFILL_CONSENTED_KEY.to_string(), serde_json::Value::Bool(false));
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            content: serde_json::Value::Object(content),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
     }
 
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
@@ -7145,10 +7653,9 @@ impl EventLog {
 /// The text fed to the embedder for an event, or `None` if the event is not
 /// embeddable.
 ///
-/// Only `memory` and `page` events carry embeddable prose; both expose it at
-/// `content["text"]`. `config`, `grant`, and other control events return
-/// `None`. (`page` is reserved for M4 and produces nothing today, since no such
-/// events exist yet — listing it here keeps the derive seam forward-compatible.)
+/// The kinds listed in [`EMBEDDABLE_EVENT_TYPES`] carry embeddable prose at
+/// `content["text"]` (single-sourced there so this comment cannot go stale).
+/// `config`, `grant`, and other control events return `None`.
 fn embeddable_text(event: &Event) -> Option<String> {
     if !EMBEDDABLE_EVENT_TYPES.contains(&event.event_type.as_str()) {
         return None;
@@ -7235,6 +7742,201 @@ pub fn resolve_arms(
             )))
         }
     }
+}
+
+/// Format a session's `ended_at` (Unix seconds) as a `YYYY-MM-DD` label for the
+/// embeddable text. Deterministic and clock-free: it renders the caller-supplied
+/// timestamp, never `now`. Out-of-range timestamps fall back to the raw integer.
+fn session_date_label(ended_at: i64) -> String {
+    chrono::DateTime::from_timestamp(ended_at, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| ended_at.to_string())
+}
+
+/// Build the signed content of a `session_captured` event (SP3). `text` is
+/// top-level (so `embeddable_text` finds it) and title-derived; `origin` is the
+/// external taint stamp; the metadata fields let [`fold_sessions`] reconstruct a
+/// [`CurrentSession`]. Mirrors `ingest::file_ingested_content`.
+fn session_captured_content(meta: &SessionMeta) -> serde_json::Value {
+    serde_json::json!({
+        "text": format!("{} — {} ({})", meta.title, meta.project, session_date_label(meta.ended_at)),
+        "origin": crate::graph::EXTERNAL_ORIGIN,
+        "session_id": meta.session_id,
+        "title": meta.title,
+        "project": meta.project,
+        "tool": meta.tool,
+        "started_at": meta.started_at,
+        "ended_at": meta.ended_at,
+        "path": meta.path,
+        "sha256": meta.sha256,
+        "approx_bytes": meta.approx_bytes,
+    })
+}
+
+/// A ground-truth `session_captured` Event (`model_meta: None` → plain
+/// append/append_pair), signed by the engine DID.
+fn session_captured_event(meta: &SessionMeta, signer_did: String) -> Event {
+    Event {
+        id: String::new(),
+        ts: String::new(),
+        valid_time: None,
+        event_type: crate::graph::SESSION_CAPTURED_EVENT_TYPE.to_string(),
+        content: session_captured_content(meta),
+        model_meta: None,
+        prev_hash: String::new(),
+        hash: None,
+        signed_by_did: signer_did,
+        signature: None,
+    }
+}
+
+/// A ground-truth `supersede` Event retiring `prior_id` (reuses
+/// `SUPERSEDE_EVENT_TYPE` with `model_meta: None`; cross-fold safety holds via
+/// disjoint event ids). Shared by [`EventLog::capture_session`] (session
+/// supersedes) and [`EventLog::supersede_note`] (note supersedes). Mirrors
+/// `ingest::ground_truth_supersede`, kept local because that helper is
+/// `#[cfg(unix)]`-private to the ingest module.
+fn ground_truth_supersede_event(prior_id: &str, signer_did: String) -> Event {
+    Event {
+        id: String::new(),
+        ts: String::new(),
+        valid_time: None,
+        event_type: crate::graph::SUPERSEDE_EVENT_TYPE.to_string(),
+        content: serde_json::json!({ "supersedes": prior_id }),
+        model_meta: None,
+        prev_hash: String::new(),
+        hash: None,
+        signed_by_did: signer_did,
+        signature: None,
+    }
+}
+
+/// Parse a `session_captured` event into a [`CurrentSession`], or `None` if any
+/// field is missing/mistyped (malformed → skipped by the fold, not fatal —
+/// mirrors `graph::parse_page_content`).
+fn parse_session_content(ev: &Event) -> Option<CurrentSession> {
+    let c = &ev.content;
+    Some(CurrentSession {
+        event_id: ev.id.clone(),
+        session_id: c.get("session_id")?.as_str()?.to_string(),
+        title: c.get("title")?.as_str()?.to_string(),
+        project: c.get("project")?.as_str()?.to_string(),
+        tool: c.get("tool")?.as_str()?.to_string(),
+        started_at: c.get("started_at")?.as_i64()?,
+        ended_at: c.get("ended_at")?.as_i64()?,
+        path: c.get("path")?.as_str()?.to_string(),
+        sha256: c.get("sha256")?.as_str()?.to_string(),
+        approx_bytes: c.get("approx_bytes")?.as_u64()?,
+    })
+}
+
+/// The projection produced by [`fold_sessions`]. A named struct (not a tuple)
+/// because `deleted` and `superseded` share a type but NOT a meaning —
+/// `deleted` holds `session_id`s, `superseded` holds EVENT ids — so a
+/// positional swap would compile silently. House-consistent with the other
+/// folds returning named projections.
+struct SessionFold {
+    /// The CURRENT sessions: the latest `session_captured` per `session_id`
+    /// NOT retired by a `supersede` and whose `session_id` has NO
+    /// `session_deleted` tombstone. Sorted by `session_id` (deterministic).
+    current: Vec<CurrentSession>,
+    /// Tombstoned `session_id`s (NOT event ids) — so `capture_session` can
+    /// enforce I9 (a deleted session is never recapturable).
+    deleted: std::collections::HashSet<String>,
+    /// EVENT ids retired by a `supersede`. Because the fold's input carries
+    /// EVERY `supersede` event (they are shared across the page/file/session/
+    /// note folds), this is the complete retired-id universe — the recall
+    /// exclusion (A3) reuses it instead of a second scan.
+    superseded: std::collections::HashSet<String>,
+}
+
+/// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
+/// `session_captured` + `session_deleted` + `supersede` events in `seq ASC`
+/// order, projects them into a [`SessionFold`] (see its field docs).
+///
+/// Deterministic → byte-identical rebuild. Cross-fold-safe: a page/file
+/// `supersede` targets a disjoint event id, so it never retires a session event.
+fn fold_sessions(events: &[Event]) -> SessionFold {
+    use std::collections::{BTreeMap, HashSet};
+    let mut superseded: HashSet<String> = HashSet::new();
+    let mut deleted: HashSet<String> = HashSet::new();
+    for ev in events {
+        match ev.event_type.as_str() {
+            crate::graph::SUPERSEDE_EVENT_TYPE => {
+                if let Some(p) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
+                    superseded.insert(p.to_string());
+                }
+            }
+            crate::graph::SESSION_DELETED_EVENT_TYPE => {
+                if let Some(s) = ev.content.get("session_id").and_then(|v| v.as_str()) {
+                    deleted.insert(s.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    // Latest non-superseded, non-tombstoned session per id (last write wins).
+    // Built as a BTreeMap keyed on session_id so the last capture per id wins
+    // and the returned Vec is deterministically sorted by session_id.
+    let mut current: BTreeMap<String, CurrentSession> = BTreeMap::new();
+    for ev in events {
+        if ev.event_type != crate::graph::SESSION_CAPTURED_EVENT_TYPE || superseded.contains(&ev.id) {
+            continue;
+        }
+        if let Some(cs) = parse_session_content(ev) {
+            if deleted.contains(&cs.session_id) {
+                continue;
+            }
+            current.insert(cs.session_id.clone(), cs);
+        }
+    }
+    SessionFold { current: current.into_values().collect(), deleted, superseded }
+}
+
+/// Pure note fold (SP3 §7/§9): given `memory` + `supersede` events in `seq ASC`
+/// order, returns the CURRENT notes — every `memory`-kind event NOT retired by a
+/// `supersede` — sorted NEWEST-FIRST (`created_at` desc, then `event_id` desc as a
+/// deterministic tie-break; ULIDs are monotonic + lexicographically sortable, so
+/// `event_id` desc IS newest-first within a same-second group).
+///
+/// A returned note's `superseded_by` is ALWAYS `None`: a superseded note is
+/// EXCLUDED from the fold (only live heads survive), mirroring [`fold_sessions`]'s
+/// current-only projection — so the Library shows an edited note in place (old text
+/// gone, new text present) and recall/list stay consistent. `created_at` is the
+/// event `ts` (RFC 3339) parsed to Unix seconds, or 0 if absent/unparseable
+/// (deterministic fallback — no clock read).
+fn fold_notes(events: &[Event]) -> Vec<CurrentNote> {
+    use std::collections::HashSet;
+    let mut superseded: HashSet<&str> = HashSet::new();
+    for ev in events {
+        if ev.event_type == crate::graph::SUPERSEDE_EVENT_TYPE {
+            if let Some(p) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
+                superseded.insert(p);
+            }
+        }
+    }
+    let mut notes: Vec<CurrentNote> = events
+        .iter()
+        .filter(|ev| {
+            ev.event_type == crate::graph::MEMORY_EVENT_TYPE
+                && !superseded.contains(ev.id.as_str())
+        })
+        .map(|ev| CurrentNote {
+            event_id: ev.id.clone(),
+            text: ev
+                .content
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            created_at: DateTime::parse_from_rfc3339(&ev.ts).map(|dt| dt.timestamp()).unwrap_or(0),
+            superseded_by: None,
+        })
+        .collect();
+    notes.sort_by(|a, b| {
+        b.created_at.cmp(&a.created_at).then_with(|| b.event_id.cmp(&a.event_id))
+    });
+    notes
 }
 
 /// TEST-ONLY seams for the N-deep undo store (M6a, T5). Compiled out of every
@@ -7325,6 +8027,298 @@ mod tests {
         ));
     }
 
+    /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields
+    /// fixed so a test varies only the two axes the fold decisions turn on.
+    fn session_meta(session_id: &str, sha: &str) -> SessionMeta {
+        SessionMeta {
+            session_id: session_id.into(),
+            title: "fix the parser".into(),
+            project: "/repo".into(),
+            tool: "claude-code".into(),
+            started_at: 1,
+            ended_at: 2,
+            path: format!("/data/sessions/{session_id}.md"),
+            sha256: sha.into(),
+            approx_bytes: 10,
+        }
+    }
+
+    /// Like [`session_meta`] but with a caller-chosen `title`, so a recall test
+    /// can key on a distinctive title keyword (the title is what becomes the
+    /// event's embeddable + FTS-indexed text).
+    fn session_meta_titled(session_id: &str, sha: &str, title: &str) -> SessionMeta {
+        SessionMeta { title: title.into(), ..session_meta(session_id, sha) }
+    }
+
+    #[test]
+    fn capture_session_appends_embeddable_external_event_and_fold_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let id = log
+            .capture_session(
+                &embedder,
+                &SessionMeta {
+                    session_id: "abc-123".into(),
+                    title: "fix the parser".into(),
+                    project: "/repo".into(),
+                    tool: "claude-code".into(),
+                    started_at: 1,
+                    ended_at: 2,
+                    path: "/data/sessions/abc-123.md".into(),
+                    sha256: "aa".repeat(32),
+                    approx_bytes: 10,
+                },
+            )
+            .unwrap();
+        let cur = log.current_sessions().unwrap();
+        assert_eq!(cur.len(), 1);
+        assert_eq!(cur[0].session_id, "abc-123");
+        assert_eq!(cur[0].event_id, id);
+    }
+
+    #[test]
+    fn delete_session_tombstones_in_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        assert_eq!(log.current_sessions().unwrap().len(), 1);
+
+        log.delete_session("abc").unwrap();
+        assert!(log.current_sessions().unwrap().is_empty(), "deleted session is gone from the fold");
+
+        // Deleting an id with no current session is rejected.
+        assert!(matches!(
+            log.delete_session("never-existed"),
+            Err(BossclawError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn recapture_same_sha_dedups_and_new_sha_supersedes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        let id1 = log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        assert_eq!(log.current_sessions().unwrap().len(), 1);
+
+        // Same id + same sha → dedup no-op, still one current, same event id.
+        let id_again = log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        let cur = log.current_sessions().unwrap();
+        assert_eq!(cur.len(), 1);
+        assert_eq!(id_again, id1, "same-sha recapture returns the existing event id (no-op)");
+        assert_eq!(cur[0].event_id, id1);
+
+        // Same id + different sha → supersede: one current, but the event id changed.
+        let id2 = log.capture_session(&embedder, &session_meta("abc", "bb")).unwrap();
+        let cur = log.current_sessions().unwrap();
+        assert_eq!(cur.len(), 1);
+        assert_ne!(id2, id1, "changed-sha recapture appends a supersede pair (new event id)");
+        assert_eq!(cur[0].event_id, id2);
+        assert_eq!(cur[0].sha256, "bb");
+    }
+
+    #[test]
+    fn deleted_session_is_not_recapturable() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        log.delete_session("abc").unwrap();
+
+        // I9: a tombstoned session can never be recaptured, whatever the sha.
+        assert!(matches!(
+            log.capture_session(&embedder, &session_meta("abc", "cc")),
+            Err(BossclawError::InvalidInput(_))
+        ));
+        assert!(log.current_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn capture_session_content_is_external_tainted_and_embeddable() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        let id = log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        let ev = log.event_by_id(&id).unwrap().expect("event present");
+
+        // External-tainted: the taint model keys on content["origin"] exactly.
+        assert_eq!(
+            ev.content.get("origin").and_then(|v| v.as_str()),
+            Some("external"),
+            "captured sessions are external-tainted (recallable, never auto-trusted)"
+        );
+        let text = ev.content.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+        assert!(!text.is_empty(), "embeddable text is non-empty");
+        assert!(text.contains("fix the parser"), "embeddable text carries the session title");
+
+        // Embeddable: a vector was derived under the embedder's model.
+        let vecs = log.vectors_for_model(embedder.model_id()).unwrap();
+        assert!(vecs.iter().any(|(vid, _)| vid == &id), "a vector exists for the captured session");
+    }
+
+    #[test]
+    fn supersede_note_rejects_non_note_targets_and_blank_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        let note = log.remember(&embedder, "original").unwrap();
+
+        // Blank replacement text is rejected (same check as `remember`).
+        assert!(matches!(
+            log.supersede_note(&embedder, &note, "  "),
+            Err(BossclawError::InvalidInput(_))
+        ));
+
+        // Only memory-kind events can be superseded: a captured session is rejected.
+        log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        let sess = log.current_sessions().unwrap()[0].event_id.clone();
+        assert!(matches!(
+            log.supersede_note(&embedder, &sess, "nope"),
+            Err(BossclawError::InvalidInput(_))
+        ));
+
+        // Unknown target id is rejected.
+        assert!(matches!(
+            log.supersede_note(&embedder, "no-such-id", "x"),
+            Err(BossclawError::InvalidInput(_))
+        ));
+
+        // Superseding a current note succeeds and yields a NEW event id.
+        let newer = log.supersede_note(&embedder, &note, "corrected").unwrap();
+        assert_ne!(newer, note);
+
+        // Superseding an ALREADY-superseded note is rejected (chain heads only).
+        assert!(matches!(
+            log.supersede_note(&embedder, &note, "again"),
+            Err(BossclawError::InvalidInput(_))
+        ));
+    }
+
+    // ── SP3 A3: durable recall exclusion for deleted sessions + superseded notes ──
+
+    #[test]
+    fn deleted_session_absent_from_recall_even_by_keyword() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        // A distinctive title so the FTS/keyword arm is what surfaces the session.
+        log.capture_session(&embedder, &session_meta_titled("abc", "aa", "quixotic zanzibar refactor"))
+            .unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+
+        let hits = log
+            .recall(&embedder, "quixotic zanzibar", 10, &RecallOptions::default())
+            .unwrap();
+        assert!(!hits.is_empty(), "sanity: title recallable before delete");
+
+        log.delete_session("abc").unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+
+        let hits = log
+            .recall(&embedder, "quixotic zanzibar", 10, &RecallOptions::default())
+            .unwrap();
+        assert!(hits.is_empty(), "keyword arm must also exclude a deleted session (critic M1)");
+    }
+
+    #[test]
+    fn superseded_note_excluded_but_replacement_recallable() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        let old = log.remember(&embedder, "the API key lives in vault slot seven").unwrap();
+        log.supersede_note(&embedder, &old, "the API key lives in vault slot nine").unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+
+        let hits = log
+            .recall(&embedder, "vault slot", 10, &RecallOptions::default())
+            .unwrap();
+        assert!(hits.iter().all(|h| h.event_id != old), "old (superseded) head excluded");
+        assert!(!hits.is_empty(), "the replacement note surfaces");
+    }
+
+    #[test]
+    fn deleted_session_stays_deleted_after_reopen() {
+        // The resurrection test (architect Critical #1): rebuild_indexes runs on
+        // reopen and re-adds the deleted session's PERSISTED vector from the
+        // `vectors` table (VectorIndex::remove is in-memory only), so the ONLY
+        // durable exclusion is the fold-derived filter recomputed inside recall.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let log = open_log(dir.path());
+            let embedder = MockEmbedder::new(8);
+            log.capture_session(
+                &embedder,
+                &session_meta_titled("abc", "aa", "quixotic zanzibar refactor"),
+            )
+            .unwrap();
+            log.rebuild_indexes(&embedder).unwrap();
+            let hits = log
+                .recall(&embedder, "quixotic zanzibar", 10, &RecallOptions::default())
+                .unwrap();
+            assert!(!hits.is_empty(), "sanity: recallable before delete");
+            log.delete_session("abc").unwrap();
+        } // drop the log — nothing in-memory survives
+
+        // Reopen from the same path and rebuild indexes (as a normal open does).
+        let log2 = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        log2.rebuild_indexes(&embedder).unwrap();
+
+        let hits = log2
+            .recall(&embedder, "quixotic zanzibar", 10, &RecallOptions::default())
+            .unwrap();
+        assert!(hits.is_empty(), "deleted session stays deleted after reopen (rebuild-proof)");
+        assert!(log2.current_sessions().unwrap().is_empty(), "and is gone from the session fold");
+    }
+
+    #[test]
+    fn session_events_never_enter_extraction_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        let sess_id = log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        let note_id = log.remember(&embedder, "a genuinely extractable note").unwrap();
+
+        // The evolve loop's extraction batch: only user notes + ingested files.
+        let batch = log.unprocessed_extractable_since(0, 100).unwrap();
+        assert!(
+            batch.iter().any(|(_, id, _)| id == &note_id),
+            "notes ARE extraction subjects"
+        );
+        assert!(
+            !batch.iter().any(|(_, id, _)| id == &sess_id),
+            "a captured session must never enter the extraction queue"
+        );
+    }
+
+    #[test]
+    fn deleted_session_not_re_embedded_by_collect_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        let sess_id = log.capture_session(&embedder, &session_meta("abc", "aa")).unwrap();
+        log.delete_session("abc").unwrap();
+
+        // Force the pending path exactly as a language migration does: a NEW model
+        // id has no vectors, so every embeddable event is "pending" to re-embed.
+        let pending = log.collect_pending("other-model-v1").unwrap();
+        assert!(
+            pending.iter().all(|e| e.id != sess_id),
+            "a deleted session must never re-vectorize (rebuild/migration embed gate)"
+        );
+    }
+
     #[test]
     fn set_active_model_writes_discoverable_config() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7374,6 +8368,81 @@ mod tests {
         assert_eq!(log.cloud_reasoner_consent_json().unwrap().unwrap(), consent);
 
         // Newest write wins (sticky) and the whole chain still verifies (signed).
+        log.verify_chain().unwrap();
+    }
+
+    /// SP3 §6a (critic Critical C1): both capture flags are default-CLOSED at the engine — a fresh
+    /// log has capture OFF, backfill un-consented, and `CaptureEnabled` never explicitly set, so a
+    /// user who never connected has capture no-op with zero files (I10).
+    #[test]
+    fn capture_flags_default_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        assert!(!log.capture_enabled().unwrap(), "capture default OFF");
+        assert!(!log.backfill_consented().unwrap(), "backfill default OFF");
+        assert!(
+            !log.explicitly_set(ConfigFlag::CaptureEnabled).unwrap(),
+            "never-set means explicitly_set is false (the boot cascade keys off this)"
+        );
+        assert_eq!(log.capture_enabled_at().unwrap(), None, "no ON transition yet ⇒ no timestamp");
+    }
+
+    /// SP3 §6a: the Integrations-toggle path — enable ongoing capture WITHOUT backfill. Records the
+    /// `capture_enabled_at` timestamp, marks the flag explicitly set, and leaves backfill un-granted
+    /// (a later plain toggle is NOT history consent — critic M4).
+    #[test]
+    fn set_capture_enabled_records_timestamp_and_is_forward_only_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        log.set_capture_enabled(true, /*backfill=*/ false, /*at=*/ 1_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert_eq!(log.capture_enabled_at().unwrap(), Some(1_000));
+        assert!(!log.backfill_consented().unwrap(), "a later toggle is NOT history consent (M4)");
+        assert!(log.explicitly_set(ConfigFlag::CaptureEnabled).unwrap());
+        log.verify_chain().unwrap(); // the flag event is signed + hash-chained
+    }
+
+    /// SP3 §6a: the Connect-checkbox path — enable + backfill in one atomic call sets BOTH flags and
+    /// the timestamp.
+    #[test]
+    fn connect_path_sets_both_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        log.set_capture_enabled(true, /*backfill=*/ true, /*at=*/ 2_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert!(log.backfill_consented().unwrap());
+        assert_eq!(log.capture_enabled_at().unwrap(), Some(2_000));
+    }
+
+    /// SP3 §6a (critic M4 — the disable/re-enable invariant). CHOSEN semantics: disabling clears
+    /// the one-time backfill consent (it is spent), so a later forward-only re-enable gets a FRESH
+    /// timestamp and does NOT silently re-import the declined backlog. Proven purely at the flag
+    /// layer (no dependence on the sweeper's window logic).
+    #[test]
+    fn disabling_capture_clears_enabled_but_records_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+
+        // Connect grants ongoing capture + historical backfill.
+        log.set_capture_enabled(true, /*backfill=*/ true, /*at=*/ 1_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert!(log.backfill_consented().unwrap());
+
+        // Disable: capture off, and the spent backfill consent is cleared.
+        log.set_capture_enabled(false, /*backfill=*/ false, /*at=*/ 2_000).unwrap();
+        assert!(!log.capture_enabled().unwrap(), "disable turns capture off");
+        assert!(!log.backfill_consented().unwrap(), "disable spends/clears the one-time backfill");
+        // The flag stays explicitly set (disable is a real choice, not a return to never-set).
+        assert!(log.explicitly_set(ConfigFlag::CaptureEnabled).unwrap());
+
+        // Re-enable forward-only: fresh timestamp, backfill STAYS cleared → no silent re-import (M4).
+        log.set_capture_enabled(true, /*backfill=*/ false, /*at=*/ 3_000).unwrap();
+        assert!(log.capture_enabled().unwrap());
+        assert_eq!(log.capture_enabled_at().unwrap(), Some(3_000), "forward-only window moves to re-enable");
+        assert!(
+            !log.backfill_consented().unwrap(),
+            "a forward-only re-enable must NOT resurrect the spent backfill consent (M4)"
+        );
         log.verify_chain().unwrap();
     }
 

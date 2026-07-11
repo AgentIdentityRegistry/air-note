@@ -1,24 +1,54 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { integrationsStatus, connectClaudeCode, disconnectClaudeCode } from "./integrations";
+import {
+  integrationsStatus, connectClaudeCode, disconnectClaudeCode,
+  backfillCount, setCaptureEnabled, captureEnabled, isConnected,
+} from "./integrations";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 describe("api/integrations", () => {
   beforeEach(() => vi.resetAllMocks());
 
-  it("integrationsStatus invokes the status command", async () => {
-    vi.mocked(invoke).mockResolvedValue({ claude_code: "not_connected" });
-    expect(await integrationsStatus()).toEqual({ claude_code: "not_connected" });
+  it("integrationsStatus invokes the status command and returns the object-form connected status", async () => {
+    vi.mocked(invoke).mockResolvedValue({ claude_code: { connected: { capture: true } } });
+    expect(await integrationsStatus()).toEqual({ claude_code: { connected: { capture: true } } });
     expect(invoke).toHaveBeenCalledWith("integrations_status");
   });
 
-  it("connect/disconnect invoke their commands", async () => {
-    vi.mocked(invoke).mockResolvedValue({ claude_code: "connected" });
-    await connectClaudeCode();
-    expect(invoke).toHaveBeenCalledWith("integrations_connect_claude_code");
+  it("connectClaudeCode forwards the consent as a camelCase arg (Tauri renames to snake_case)", async () => {
+    vi.mocked(invoke).mockResolvedValue({ claude_code: { connected: { capture: true } } });
+    await connectClaudeCode(true);
+    expect(invoke).toHaveBeenCalledWith("integrations_connect_claude_code", { captureConsent: true });
+  });
+
+  it("disconnectClaudeCode invokes its command", async () => {
     vi.mocked(invoke).mockResolvedValue({ claude_code: "not_connected" });
     await disconnectClaudeCode();
     expect(invoke).toHaveBeenCalledWith("integrations_disconnect_claude_code");
+  });
+
+  it("backfillCount invokes its command and returns the number", async () => {
+    vi.mocked(invoke).mockResolvedValue(42);
+    expect(await backfillCount()).toBe(42);
+    expect(invoke).toHaveBeenCalledWith("integrations_backfill_count");
+  });
+
+  it("setCaptureEnabled forwards the enabled flag as a camelCase arg", async () => {
+    vi.mocked(invoke).mockResolvedValue({ claude_code: { connected: { capture: true } } });
+    await setCaptureEnabled(false);
+    expect(invoke).toHaveBeenCalledWith("integrations_set_capture_enabled", { enabled: false });
+  });
+
+  it("captureEnabled invokes its command and returns the bool", async () => {
+    vi.mocked(invoke).mockResolvedValue(true);
+    expect(await captureEnabled()).toBe(true);
+    expect(invoke).toHaveBeenCalledWith("integrations_capture_enabled");
+  });
+
+  it("isConnected narrows only the object-form Connected variant, never the bare strings", () => {
+    expect(isConnected({ connected: { capture: false } })).toBe(true);
+    expect(isConnected("not_found")).toBe(false);
+    expect(isConnected("not_connected")).toBe(false);
   });
 });

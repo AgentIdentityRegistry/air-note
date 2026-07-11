@@ -45,7 +45,8 @@ use std::sync::Arc;
 
 use bossclawd_proto::types::{
     EngineStateWire, EngineStatusWire, MandateSummaryWire, MandateWriteSummaryWire, ModelStateWire,
-    ModelStatusWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire, ReasonerModeWire,
+    ModelStatusWire, NoteWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire,
+    ReasonerModeWire, RecallMissWire, RecallStatsWire, SessionDetailWire, SessionSummaryWire,
 };
 use bossclawd_proto::{HitWire, OpErrorKindWire, Request, Response};
 
@@ -53,7 +54,8 @@ use super::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use super::transport::Transport;
 use super::{
     ApplyResult, EngineError, EngineOpError, EngineState, EngineStatus, EvolveTelemetry, HitWithText,
-    MandateSummary, MandateWriteSummary, ModelState, PreviewData, ProposalSummary,
+    MandateSummary, MandateWriteSummary, ModelState, Note, PreviewData, ProposalSummary, RecallMiss,
+    RecallStats, SessionDetail, SessionSummary,
 };
 
 /// A daemon-backed drop-in for today's in-process `EngineHandle`. Generic over the [`Transport`] so
@@ -420,6 +422,104 @@ impl<T: Transport + ?Sized> EngineClient<T> {
         }
     }
 
+    // ── Session capture (SP3 B5). App-only ops. Like every sibling, `onboarded` is THREADED from the
+    //    caller (the command layer's real `is_onboarded()`), NOT hardcoded true: the daemon's App role
+    //    trusts the wire flag, so a hardcoded true would `get_or_open(true)` and mint a brain.db even
+    //    pre-onboarding. Threading the real flag makes a pre-onboarding call cleanly `NotOnboarded`
+    //    with zero side effects. ──
+
+    /// Mirrors `EngineHandle::set_capture_enabled`: enable/disable ongoing session capture, with
+    /// `backfill` additionally consenting (or not) to the one-time import of pre-existing sessions.
+    /// The CALLER owns the M4 guarantee by choosing `backfill`: Connect passes `backfill == consent`
+    /// (both flags in one call); the Integrations toggle + Disconnect pass `backfill: false`
+    /// (forward-only). The daemon supplies the `at` timestamp, so the wire carries only the flags.
+    pub async fn set_capture_enabled(
+        &self,
+        onboarded: bool,
+        enabled: bool,
+        backfill: bool,
+    ) -> Result<(), EngineOpError> {
+        self.unit(Request::SetCaptureEnabled { onboarded, enabled, backfill }).await
+    }
+
+    /// Mirrors `EngineHandle::capture_enabled`: read the sticky ongoing-capture flag (default CLOSED).
+    /// Mirrors the `mandates_enabled` read shape.
+    pub async fn capture_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        match self.request(Request::CaptureEnabled { onboarded }).await? {
+            Response::CaptureEnabled(b) => Ok(b),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    // ── Memory-browser Library (SP3 C1). App-only ops: the daemon's role gate denies `MemoryClient`
+    //    for each, and it resolves onboarding from its OWN identity — but the wire still carries an
+    //    `onboarded` flag, so like every sibling (B5) it is THREADED from the caller's real
+    //    `is_onboarded()`, never hardcoded true. The wire summary/detail/note/stats structs have no
+    //    core equivalent and no proto `From` (Family-2; see module docs), so the field-by-field
+    //    conversions live HERE next to their only consumer. ──
+
+    /// Mirrors the daemon's `ListSessions`: the captured-session summaries for the Library
+    /// (`SessionSummaryWire` → desktop [`SessionSummary`]).
+    pub async fn list_sessions(&self, onboarded: bool) -> Result<Vec<SessionSummary>, EngineOpError> {
+        match self.request(Request::ListSessions { onboarded }).await? {
+            Response::ListSessions(ss) => Ok(ss.into_iter().map(session_summary_from_wire).collect()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Mirrors `GetSession`: one captured session's summary + rendered Markdown. A `session_id` that
+    /// is not a CURRENT session (deleted / superseded / never captured) maps to the typed
+    /// [`EngineOpError::Rejected`] ("session not found or deleted"), so the UI can tell "already
+    /// deleted" from a real fault (spec §3) — the daemon returns that clean reject for the case.
+    pub async fn get_session(
+        &self,
+        onboarded: bool,
+        session_id: String,
+    ) -> Result<SessionDetail, EngineOpError> {
+        match self.request(Request::GetSession { onboarded, session_id }).await? {
+            Response::Session(d) => Ok(session_detail_from_wire(d)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Mirrors `DeleteSession`: tombstone a captured session (honest, durable forget). Idempotent by
+    /// construction daemon-side — deleting an unknown-but-valid id is a clean `Ok`.
+    pub async fn delete_session(&self, onboarded: bool, session_id: String) -> Result<(), EngineOpError> {
+        self.unit(Request::DeleteSession { onboarded, session_id }).await
+    }
+
+    /// Mirrors `ListNotes`: the current (non-superseded) `remember` notes (`NoteWire` → [`Note`]).
+    pub async fn list_notes(&self, onboarded: bool) -> Result<Vec<Note>, EngineOpError> {
+        match self.request(Request::ListNotes { onboarded }).await? {
+            Response::ListNotes(ns) => Ok(ns.into_iter().map(note_from_wire).collect()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Mirrors `SupersedeNote`: replace a note's text, yielding the new (superseding) event id. An
+    /// unknown / non-note / already-superseded `event_id` maps to the typed [`EngineOpError::Rejected`]
+    /// (the daemon lets the core primitive's message flow through with the App-supplied id).
+    pub async fn supersede_note(
+        &self,
+        onboarded: bool,
+        event_id: String,
+        text: String,
+    ) -> Result<String, EngineOpError> {
+        match self.request(Request::SupersedeNote { onboarded, event_id, text }).await? {
+            Response::Superseded(id) => Ok(id),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Mirrors `RecallStats`: recall hit/miss telemetry for the retrieval-floor tuning UI
+    /// (`RecallStatsWire` → [`RecallStats`]).
+    pub async fn recall_stats(&self, onboarded: bool) -> Result<RecallStats, EngineOpError> {
+        match self.request(Request::RecallStats { onboarded }).await? {
+            Response::RecallStats(s) => Ok(recall_stats_from_wire(s)),
+            other => Err(unexpected(other)),
+        }
+    }
+
     // ── Internal request helpers ─────────────────────────────────────────────
 
     /// Send `req` and unwrap the daemon's non-success signals to a typed error. Success and
@@ -633,6 +733,45 @@ fn mandate_write_summary_from_wire(w: MandateWriteSummaryWire) -> MandateWriteSu
     }
 }
 
+// ── SP3 C1 Library wire → desktop conversions (Family-2; no proto `From`). ──
+
+fn session_summary_from_wire(w: SessionSummaryWire) -> SessionSummary {
+    SessionSummary {
+        session_id: w.session_id,
+        title: w.title,
+        project: w.project,
+        tool: w.tool,
+        started_at: w.started_at,
+        ended_at: w.ended_at,
+        approx_bytes: w.approx_bytes,
+    }
+}
+
+fn session_detail_from_wire(w: SessionDetailWire) -> SessionDetail {
+    SessionDetail { summary: session_summary_from_wire(w.summary), markdown: w.markdown }
+}
+
+fn note_from_wire(w: NoteWire) -> Note {
+    Note {
+        event_id: w.event_id,
+        text: w.text,
+        created_at: w.created_at,
+        superseded_by: w.superseded_by,
+    }
+}
+
+fn recall_miss_from_wire(w: RecallMissWire) -> RecallMiss {
+    RecallMiss { query: w.query, at: w.at }
+}
+
+fn recall_stats_from_wire(w: RecallStatsWire) -> RecallStats {
+    RecallStats {
+        total: w.total,
+        misses: w.misses,
+        recent_misses: w.recent_misses.into_iter().map(recall_miss_from_wire).collect(),
+    }
+}
+
 fn preview_data_from_wire(w: PreviewDataWire) -> PreviewData {
     PreviewData {
         path: w.path,
@@ -727,6 +866,23 @@ mod tests {
         /// thread and blocks until it is bound (a `SyncSender` handshake) before returning, so the
         /// caller can connect immediately without a bind race.
         fn start_runtime(sock: &std::path::Path, home: std::path::PathBuf) -> DaemonRuntime {
+            // Stage an onboarded-identity marker (`identity.json`, the daemon's `METADATA_FILE`) in the
+            // daemon home so the SP3 C1 App-only ops (ListSessions / GetSession / DeleteSession /
+            // ListNotes / SupersedeNote) see an onboarded brain: unlike the pre-SP3 ops (which trust
+            // the client-passed `onboarded` flag), those resolve onboarding from the daemon's OWN
+            // `is_onboarded_local()` verdict (A13), which reads this file. Mirrors the daemon's own
+            // `tests/forget.rs` fixture; harmless to every pre-SP3 op (they never read it).
+            std::fs::create_dir_all(&home).expect("daemon home dir");
+            std::fs::write(
+                home.join("identity.json"),
+                serde_json::json!({
+                    "did": "did:wba:example.com:tester",
+                    "name": "Tester",
+                    "created_at": "2026-07-11T00:00:00+00:00"
+                })
+                .to_string(),
+            )
+            .expect("stage onboarded identity marker");
             let shutdown = Arc::new(tokio::sync::Notify::new());
             let shutdown_for_thread = shutdown.clone();
             let sock = sock.to_path_buf();
@@ -808,11 +964,12 @@ mod tests {
     async fn status_shape_parity_over_socket() {
         let daemon = TestDaemon::spawn().await;
         let client = daemon.client();
-        // Onboarded → fresh brain opens Ready with exactly the 3 primed config events + intact chain,
+        // Onboarded → fresh brain opens Ready with exactly the 4 primed config events + intact chain,
         // IDENTICAL to `EngineHandle::status` (see `mod.rs::onboarded_opens_fresh_brain_and_memoizes`).
+        // (SP3 A8 added the capture-enabled boot force-off, so prime_switches now writes 4, not 3.)
         let st = bounded(client.status(true)).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
-        assert_eq!(st.event_count, 3, "prime_switches wrote 3 sticky config events");
+        assert_eq!(st.event_count, 4, "prime_switches wrote the 4 sticky config events");
         assert!(st.chain_ok, "fresh brain chain verifies");
         // Not-onboarded → the NotOnboarded state (never-erroring), same as the in-process Engine.
         let st = bounded(client.status(false)).await;
@@ -1111,6 +1268,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_and_get_capture_enabled_over_the_socket() {
+        // SP3 B5: the capture flag round-trips through the real hermetic daemon. A fresh brain has
+        // capture CLOSED (A8 default-off + boot force-off); enabling it (the Connect call shape,
+        // backfill=true) flips the read to true.
+        let daemon = TestDaemon::spawn().await;
+        let client = daemon.client();
+        assert!(!bounded(client.capture_enabled(true)).await.expect("capture_enabled"), "default closed");
+        bounded(client.set_capture_enabled(true, true, true)).await.expect("set_capture_enabled");
+        assert!(bounded(client.capture_enabled(true)).await.expect("capture_enabled"), "enabled reads back");
+    }
+
+    #[tokio::test]
     async fn proposals_family_roundtrip_empty() {
         let daemon = TestDaemon::spawn().await;
         let client = daemon.client();
@@ -1215,5 +1384,176 @@ mod tests {
             .await
             .expect_err("daemon dies mid-request → Err");
         assert!(matches!(err, EngineOpError::Unavailable(_)), "got {err:?}");
+    }
+
+    // ── SP3 C1: the Memory-browser Library ops round-trip through the real hermetic daemon. These
+    //    assert fresh-brain SHAPE PARITY (empty lists / zeroed stats) + the typed rejects the UI
+    //    distinguishes; the populated happy-path FIELD MAPPING is asserted by the `CannedTransport`
+    //    tests below (and the daemon's own roundtrip suite). Mirrors `proposals_family_roundtrip_empty`
+    //    + `mandate_family_rejected_maps_typed`. Every await is `bounded` so a hang fails, never wedges. ──
+
+    #[tokio::test]
+    async fn library_read_ops_roundtrip_empty() {
+        let daemon = TestDaemon::spawn().await;
+        let client = daemon.client();
+        // Fresh brain: no captured sessions, no notes, zeroed recall stats (shape parity).
+        assert!(bounded(client.list_sessions(true)).await.expect("list_sessions").is_empty());
+        assert!(bounded(client.list_notes(true)).await.expect("list_notes").is_empty());
+        let stats = bounded(client.recall_stats(true)).await.expect("recall_stats");
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.misses, 0);
+        assert!(stats.recent_misses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_session_unknown_maps_rejected() {
+        // A session id that is not a CURRENT capture (deleted / superseded / never captured) → the
+        // typed `Rejected` with the specced "session not found or deleted" message, so the UI can tell
+        // "already deleted" from a real fault (spec §3). Proves the op reaches the engine over the
+        // socket and the daemon's clean reject maps to `EngineOpError::Rejected` intact.
+        let daemon = TestDaemon::spawn().await;
+        let client = daemon.client();
+        let err = bounded(client.get_session(true, "deadbeef-1111-2222-3333-444455556666".to_string()))
+            .await
+            .expect_err("unknown session → Rejected");
+        match err {
+            EngineOpError::Rejected(m) => assert_eq!(m, "session not found or deleted"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_session_unknown_is_idempotent_ok() {
+        // Deleting an unknown-but-valid-format id removes nothing and tombstones nothing current →
+        // still a clean `Ok` (idempotent by construction, A7). Proves the unit op round-trips.
+        let daemon = TestDaemon::spawn().await;
+        let client = daemon.client();
+        bounded(client.delete_session(true, "deadbeef-1111-2222-3333-444455556666".to_string()))
+            .await
+            .expect("delete_session on an unknown id is a clean Ok");
+    }
+
+    #[tokio::test]
+    async fn supersede_note_unknown_event_maps_rejected() {
+        // Superseding an unknown / non-note / already-superseded event id is the core primitive's
+        // typed `Rejected` (InvalidInput → Rejected in the daemon engine), carried across the wire
+        // intact so the notes UI can style it as a validation error, not an engine fault.
+        let daemon = TestDaemon::spawn().await;
+        let client = daemon.client();
+        let err = bounded(client.supersede_note(true, "no-such-event".to_string(), "new text".to_string()))
+            .await
+            .expect_err("unknown note event → Rejected");
+        assert!(matches!(err, EngineOpError::Rejected(_)), "got {err:?}");
+    }
+
+    // ── Populated wire → desktop FIELD MAPPING, driven by a canned transport so the mapping is exact
+    //    and deterministic (the hermetic daemon tests above prove reachability on empty/reject paths).
+    //    This is the equivalent of the `BusyTransport`/`ErrTransport` fakes already in this module. ──
+
+    /// A transport that returns one canned response regardless of the request — for asserting the
+    /// client's `*_from_wire` field mapping precisely.
+    struct CannedTransport(Response);
+    #[async_trait::async_trait]
+    impl Transport for CannedTransport {
+        async fn request(&self, _req: Request) -> Result<Response, EngineOpError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_maps_wire_fields() {
+        use bossclawd_proto::types::SessionSummaryWire;
+        let wire = SessionSummaryWire {
+            session_id: "s1".into(),
+            title: "Refactor".into(),
+            project: "air-note".into(),
+            tool: "claude-code".into(),
+            started_at: 100,
+            ended_at: 200,
+            approx_bytes: 4096,
+        };
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::ListSessions(vec![wire]))));
+        let got = bounded(client.list_sessions(true)).await.expect("list_sessions");
+        assert_eq!(got.len(), 1);
+        let s = &got[0];
+        assert_eq!(s.session_id, "s1");
+        assert_eq!(s.title, "Refactor");
+        assert_eq!(s.project, "air-note");
+        assert_eq!(s.tool, "claude-code");
+        assert_eq!(s.started_at, 100);
+        assert_eq!(s.ended_at, 200);
+        assert_eq!(s.approx_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn get_session_maps_detail_and_summary_fields() {
+        use bossclawd_proto::types::{SessionDetailWire, SessionSummaryWire};
+        let wire = SessionDetailWire {
+            summary: SessionSummaryWire {
+                session_id: "s2".into(),
+                title: "T".into(),
+                project: "p".into(),
+                tool: "claude-code".into(),
+                started_at: 1,
+                ended_at: 2,
+                approx_bytes: 8,
+            },
+            markdown: "# hello\n".into(),
+        };
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::Session(wire))));
+        let d = bounded(client.get_session(true, "s2".into())).await.expect("get_session");
+        assert_eq!(d.summary.session_id, "s2");
+        assert_eq!(d.summary.approx_bytes, 8);
+        assert_eq!(d.markdown, "# hello\n");
+    }
+
+    #[tokio::test]
+    async fn list_notes_maps_wire_fields() {
+        use bossclawd_proto::types::NoteWire;
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::ListNotes(vec![
+            NoteWire { event_id: "n1".into(), text: "remember me".into(), created_at: 42, superseded_by: None },
+            NoteWire {
+                event_id: "n2".into(),
+                text: "edited".into(),
+                created_at: 43,
+                superseded_by: Some("n3".into()),
+            },
+        ]))));
+        let got = bounded(client.list_notes(true)).await.expect("list_notes");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].event_id, "n1");
+        assert_eq!(got[0].text, "remember me");
+        assert_eq!(got[0].created_at, 42);
+        assert_eq!(got[0].superseded_by, None);
+        assert_eq!(got[1].superseded_by.as_deref(), Some("n3"));
+    }
+
+    #[tokio::test]
+    async fn recall_stats_maps_wire_fields_including_recent_misses() {
+        use bossclawd_proto::types::{RecallMissWire, RecallStatsWire};
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::RecallStats(RecallStatsWire {
+            total: 10,
+            misses: 3,
+            recent_misses: vec![
+                RecallMissWire { query: "who is Aria?".into(), at: 1000 },
+                RecallMissWire { query: "the port".into(), at: 2000 },
+            ],
+        }))));
+        let s = bounded(client.recall_stats(true)).await.expect("recall_stats");
+        assert_eq!(s.total, 10);
+        assert_eq!(s.misses, 3);
+        assert_eq!(s.recent_misses.len(), 2);
+        assert_eq!(s.recent_misses[0].query, "who is Aria?");
+        assert_eq!(s.recent_misses[0].at, 1000);
+        assert_eq!(s.recent_misses[1].query, "the port");
+    }
+
+    #[tokio::test]
+    async fn supersede_note_returns_new_event_id() {
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::Superseded("new-id".into()))));
+        let id = bounded(client.supersede_note(true, "old-id".into(), "text".into()))
+            .await
+            .expect("supersede_note");
+        assert_eq!(id, "new-id");
     }
 }

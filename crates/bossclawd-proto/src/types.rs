@@ -674,6 +674,61 @@ pub struct ReasonerConfigWire {
     pub base_url: Option<String>,
 }
 
+// ---- SP3 (Memory Hub "never forgets"): session archive + notes + recall telemetry ----
+// Serde-only wire structs (Family 2): the daemon produces them from its capture store / event log
+// (SP3 daemon tasks); the desktop Library renders them. NO From/Into here — no core mirror exists,
+// they are produced daemon-side directly. Round-trip proven by serde tests only.
+
+/// Wire summary of one captured Claude Code session — a Memory-browser Library row. `started_at`/
+/// `ended_at` are unix-epoch seconds; `approx_bytes` is the rendered `.md`'s size (a cheap Library
+/// "how big" hint, not a security boundary).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct SessionSummaryWire {
+    pub session_id: String,
+    pub title: String,
+    pub project: String,
+    pub tool: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub approx_bytes: u64,
+}
+
+/// Wire detail of one captured session: its [`SessionSummaryWire`] plus the deterministically
+/// rendered Markdown body (the shoebox artifact). The `GetSession` op's payload.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct SessionDetailWire {
+    pub summary: SessionSummaryWire,
+    pub markdown: String,
+}
+
+/// Wire form of one `remember` note projected for the Memory-browser notes list. `superseded_by` is
+/// `Some(new_event_id)` once the note has been edited (superseded), else `None`. `created_at` is
+/// unix-epoch seconds.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct NoteWire {
+    pub event_id: String,
+    pub text: String,
+    pub created_at: i64,
+    pub superseded_by: Option<String>,
+}
+
+/// Wire form of one recorded recall miss — a recall that found nothing — for the retrieval-floor
+/// tuning UI. `at` is unix-epoch seconds.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct RecallMissWire {
+    pub query: String,
+    pub at: i64,
+}
+
+/// Wire form of the recall-miss telemetry the `RecallStats` op returns: lifetime `total` recalls,
+/// how many were `misses`, and the most `recent_misses` (bounded daemon-side) for the tuning UI.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct RecallStatsWire {
+    pub total: u64,
+    pub misses: u64,
+    pub recent_misses: Vec<RecallMissWire>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,5 +1099,74 @@ mod tests {
     fn reasoner_mode_wire_strings_are_snake_case() {
         assert_eq!(serde_json::to_string(&ReasonerModeWire::Local).unwrap(), "\"local\"");
         assert_eq!(serde_json::to_string(&ReasonerModeWire::Cloud).unwrap(), "\"cloud\"");
+    }
+
+    // ---- SP3 session archive + notes + recall telemetry (serde-only round-trips) ----
+
+    #[test]
+    fn session_summary_wire_serde_roundtrip() {
+        let s = SessionSummaryWire {
+            session_id: "01J-SESSION".to_string(),
+            title: "Fix the login bug".to_string(),
+            project: "/home/me/repo".to_string(),
+            tool: "claude-code".to_string(),
+            started_at: 1_752_000_000,
+            ended_at: 1_752_003_600,
+            approx_bytes: 4096,
+        };
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let back: SessionSummaryWire = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn session_detail_wire_serde_roundtrip() {
+        let s = SessionDetailWire {
+            summary: SessionSummaryWire {
+                session_id: "01J-SESSION".to_string(),
+                title: "Fix the login bug".to_string(),
+                project: "/home/me/repo".to_string(),
+                tool: "claude-code".to_string(),
+                started_at: 1_752_000_000,
+                ended_at: 1_752_003_600,
+                approx_bytes: 4096,
+            },
+            markdown: "# Fix the login bug\n\n> user: it 500s\n".to_string(),
+        };
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let back: SessionDetailWire = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn note_wire_serde_roundtrip() {
+        // Both `superseded_by` states (current note vs. edited/superseded note) round-trip.
+        for superseded_by in [None, Some("01J-NEWER".to_string())] {
+            let s = NoteWire {
+                event_id: "01J-NOTE".to_string(),
+                text: "prefer tabs over spaces".to_string(),
+                created_at: 1_752_000_000,
+                superseded_by,
+            };
+            let bytes = serde_json::to_vec(&s).unwrap();
+            let back: NoteWire = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(s, back);
+        }
+    }
+
+    #[test]
+    fn recall_stats_wire_serde_roundtrip() {
+        // Populated `recent_misses` also exercises the nested `RecallMissWire`.
+        let s = RecallStatsWire {
+            total: 128,
+            misses: 12,
+            recent_misses: vec![
+                RecallMissWire { query: "who is Aria?".to_string(), at: 1_752_000_000 },
+                RecallMissWire { query: "the port number".to_string(), at: 1_752_000_600 },
+            ],
+        };
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let back: RecallStatsWire = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(s, back);
     }
 }

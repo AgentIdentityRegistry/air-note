@@ -2128,6 +2128,91 @@ fn reembed_prepare_then_finalize_migrates_vectors_and_entity_vectors() {
     assert_eq!(stats.gc_removed, 2, "2 old vector rows removed");
 }
 
+// ── SP3 A3: migration completes over deletions/supersedes; exclusion survives the swap ──
+use bossclaw_core::log::SessionMeta;
+
+/// Guards the `reembed_prepare` denominator filter (SP3 A3): `collect_pending`'s
+/// embed gate skips deleted-session and superseded events, so the migration
+/// completeness denominator must skip them too — otherwise they count as
+/// "missing a vector" and `reembed_prepare` returns Err on EVERY retry (the
+/// migration can never complete). The `Ok` below is the assertion that fails if
+/// the denominator filter is ever dropped. The recall assertions then prove the
+/// exclusion carries across the model swap end-to-end: the FTS rebuild still
+/// indexes the deleted/superseded events (by design — the retain closure is the
+/// durable mechanism), so post-swap recall genuinely exercises the exclusion arms.
+#[test]
+fn migration_with_deletions_and_supersedes_completes_and_exclusion_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&KEY_BYTES);
+    let log = EventLog::open(&dir.path().join("m.db"), &DEK, key).unwrap();
+    let v1 = MockEmbedder::new(MID_DIM);
+
+    // A plain live note (stays recallable throughout).
+    let live = log.remember(&v1, "ocean waves crashing").unwrap();
+
+    // A captured session that gets DELETED (its v1 vector stays in `vectors`).
+    let sess = log
+        .capture_session(
+            &v1,
+            &SessionMeta {
+                session_id: "abc".into(),
+                title: "quixotic zanzibar refactor".into(),
+                project: "/repo".into(),
+                tool: "claude-code".into(),
+                started_at: 1,
+                ended_at: 2,
+                path: "/data/sessions/abc.md".into(),
+                sha256: "aa".repeat(32),
+                approx_bytes: 10,
+            },
+        )
+        .unwrap();
+    log.delete_session("abc").unwrap();
+
+    // A note that gets SUPERSEDED by a replacement.
+    let old = log.remember(&v1, "the API key lives in vault slot seven").unwrap();
+    let replacement =
+        log.supersede_note(&v1, &old, "the API key lives in vault slot nine").unwrap();
+
+    // Migrate v1 → v2. THE guarding assertion: without the denominator filter,
+    // the deleted session + superseded note (skipped by collect_pending) would
+    // be counted "missing" and this would Err forever.
+    let v2 = MockEmbedderV2::new(MID_DIM);
+    log.reembed_prepare(&v2, &mut |_done, _total| {}).expect(
+        "migration must complete over deletions/supersedes: the completeness \
+         denominator must exclude the same events collect_pending's embed gate skips",
+    );
+    log.reembed_finalize_gc(&v2).unwrap();
+
+    // Gone events got NO new-model vector (embed gate); live ones did.
+    let v2_ids: Vec<String> =
+        log.vectors_for_model(MOCK_V2_MODEL_ID).unwrap().into_iter().map(|(id, _)| id).collect();
+    assert!(!v2_ids.contains(&sess), "deleted session never re-vectorized under the new model");
+    assert!(!v2_ids.contains(&old), "superseded note never re-vectorized under the new model");
+    assert!(v2_ids.contains(&live) && v2_ids.contains(&replacement), "live events migrated");
+
+    // Post-swap recall under the new model: the exclusion survived the migration.
+    let hits = log.recall(&v2, "quixotic zanzibar", 10, &RecallOptions::default()).unwrap();
+    assert!(
+        hits.iter().all(|h| h.event_id != sess),
+        "deleted session unrecallable after the model swap; hits={hits:?}"
+    );
+    let hits = log.recall(&v2, "vault slot", 10, &RecallOptions::default()).unwrap();
+    assert!(
+        hits.iter().all(|h| h.event_id != old),
+        "old superseded note unrecallable after the model swap; hits={hits:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.event_id == replacement),
+        "the replacement note surfaces under the new model; hits={hits:?}"
+    );
+    let hits = log.recall(&v2, "ocean waves", 10, &RecallOptions::default()).unwrap();
+    assert!(
+        hits.iter().any(|h| h.event_id == live),
+        "the live note surfaces under the new model; hits={hits:?}"
+    );
+}
+
 // ── Rung 2: I7 invariance guard — the default (no language pack) path is unchanged ──
 
 /// I7 output identity: with NO signed `language_pack` record, the store behaves exactly as it did

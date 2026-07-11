@@ -20,13 +20,14 @@ describe("memoryResults", () => {
 });
 
 describe("flattenResults", () => {
-  it("concatenates memory, then conversations, then files in order", () => {
+  it("concatenates memory, then sessions, then conversations, then files in order", () => {
     const g: GroupedResults = {
       memory: [{ id: "mem:1", kind: "memory", title: "M", snippet: "", target: { view: "memory" } }],
+      sessions: [{ id: "session:1", kind: "session", title: "S", snippet: "", target: { view: "library" } }],
       conversations: [{ id: "conv:1", kind: "conversation", title: "C", snippet: "", target: { view: "inbox", convKey: "c" } }],
       files: [{ id: "file:1", kind: "file", title: "F", snippet: "", target: { view: "settings" } }],
-      errors: { memory: false, conversations: false, files: false },
+      errors: { memory: false, sessions: false, conversations: false, files: false },
     };
-    expect(flattenResults(g).map((r) => r.id)).toEqual(["mem:1", "conv:1", "file:1"]);
+    expect(flattenResults(g).map((r) => r.id)).toEqual(["mem:1", "session:1", "conv:1", "file:1"]);
   });
 });

@@ -33,8 +33,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::types::{
     ApplyResultWire, EngineStatusWire, EvolveReportMirror, EvolveStatusMirror, EvolveTelemetryWire,
     FileRecordMirror, GrantMirror, HitMirror, IngestReportMirror, MandateSummaryWire,
-    MandateWriteSummaryWire, ModelStatusWire, PreviewDataWire, ProposalSummaryWire,
-    ReasonerConfigWire,
+    MandateWriteSummaryWire, ModelStatusWire, NoteWire, PreviewDataWire, ProposalSummaryWire,
+    ReasonerConfigWire, RecallStatsWire, SessionDetailWire, SessionSummaryWire,
 };
 
 /// The wire-protocol version. Bumped on any breaking change to [`Request`],
@@ -56,21 +56,28 @@ pub enum Role {
     /// Full access to every wire op (the default; the desktop app).
     #[default]
     App,
-    /// A scoped coding-agent client: may invoke ONLY `Recall` + `Remember`.
+    /// A scoped coding-agent client: may invoke ONLY `Recall` + `Remember` + the SP3 session-capture
+    /// pokes (`CaptureNotify` + `Snapshot`) — never the destructive/listing/telemetry ops.
     MemoryClient,
 }
 
 impl Role {
     /// Fail-closed per-op allowlist. `App` may invoke every op. `MemoryClient` may invoke ONLY
-    /// [`Request::Recall`] + [`Request::Remember`]; **every other variant — present or future — is
-    /// refused by default** (the `matches!` denies anything not explicitly listed). A new `Request`
-    /// variant is therefore refused for `MemoryClient` until someone deliberately adds it here.
+    /// [`Request::Recall`], [`Request::Remember`], [`Request::CaptureNotify`], and
+    /// [`Request::Snapshot`] (the read+write loop plus the SP3 session-capture pokes); **every other
+    /// variant — present or future — is refused by default** (the `matches!` denies anything not
+    /// explicitly listed). A new `Request` variant is therefore refused for `MemoryClient` until
+    /// someone deliberately adds it here.
     pub fn allows(&self, req: &Request) -> bool {
         match self {
             Role::App => true,
-            Role::MemoryClient => {
-                matches!(req, Request::Recall { .. } | Request::Remember { .. })
-            }
+            Role::MemoryClient => matches!(
+                req,
+                Request::Recall { .. }
+                    | Request::Remember { .. }
+                    | Request::CaptureNotify { .. }
+                    | Request::Snapshot { .. }
+            ),
         }
     }
 }
@@ -191,6 +198,42 @@ pub enum Request {
     /// Tauri command maps to it (it is reached only via the `air-memory-mcp` adapter as a
     /// `MemoryClient`); `onboarded` mirrors every other op.
     Remember { onboarded: bool, text: String },
+    /// SP3 session-capture poke: render the just-ended Claude Code session to signed Markdown now.
+    /// Reached by the app AND the `air-memory-mcp` guest (a `MemoryClient` op — the SessionEnd hook
+    /// fires it); the daemon validates `session_id` and confines `transcript_path` before any read.
+    CaptureNotify { onboarded: bool, session_id: String, transcript_path: String },
+    /// SP3 orientation snapshot: return a lean, project-aware brief for a starting/compacted session.
+    /// Reached by the app AND the `air-memory-mcp` guest (a `MemoryClient` op — the SessionStart hook
+    /// fires it); `session_id`/`transcript_path` are present only for the `source=compact` flavor
+    /// (absent for a fresh start, which needs no live-transcript digest).
+    Snapshot {
+        onboarded: bool,
+        project: String,
+        source: String,
+        session_id: Option<String>,
+        transcript_path: Option<String>,
+    },
+    /// SP3 Memory-browser listing: the captured-session summaries for the Library. App-only.
+    ListSessions { onboarded: bool },
+    /// SP3 Memory-browser read: one captured session's summary + rendered Markdown body. App-only.
+    GetSession { onboarded: bool, session_id: String },
+    /// SP3 Memory-browser delete: tombstone a captured session (honest forget). App-only (destructive).
+    DeleteSession { onboarded: bool, session_id: String },
+    /// SP3 Memory-browser listing: the current (non-superseded) `remember` notes. App-only.
+    ListNotes { onboarded: bool },
+    /// SP3 Memory-browser edit: supersede a note with new text, yielding the new event id. App-only.
+    SupersedeNote { onboarded: bool, event_id: String, text: String },
+    /// SP3 recall-miss telemetry: the recall hit/miss counters + recent misses for the tuning UI.
+    /// App-only.
+    RecallStats { onboarded: bool },
+    /// SP3 capture toggle: enable/disable ongoing session capture; `backfill` additionally consents to
+    /// the one-time import of existing sessions (the Connect checkbox sets both flags in one call; the
+    /// later Integrations toggle passes `backfill: false`). App-only. Follows the `SetMandatesEnabled`
+    /// wire shape.
+    SetCaptureEnabled { onboarded: bool, enabled: bool, backfill: bool },
+    /// SP3 capture-toggle query: whether ongoing session capture is enabled. App-only. Mirrors
+    /// `MandatesEnabled`.
+    CaptureEnabled { onboarded: bool },
 }
 
 /// One response from the daemon to the client. Each success variant carries the
@@ -259,6 +302,20 @@ pub enum Response {
     ModelStatus(ModelStatusWire),
     /// `Remember` result — the id of the newly appended `memory` event.
     Remember(String),
+    /// `Snapshot` result — the fenced orientation text (empty when there is nothing to orient with).
+    Snapshot(String),
+    /// `ListSessions` result — the captured-session summaries for the Library.
+    ListSessions(Vec<SessionSummaryWire>),
+    /// `GetSession` result — one captured session's summary + rendered Markdown body.
+    Session(SessionDetailWire),
+    /// `ListNotes` result — the current (non-superseded) notes.
+    ListNotes(Vec<NoteWire>),
+    /// `SupersedeNote` result — the id of the new (superseding) note event.
+    Superseded(String),
+    /// `RecallStats` result — recall hit/miss telemetry for the tuning UI.
+    RecallStats(RecallStatsWire),
+    /// `CaptureEnabled` result — the sticky capture-enabled flag.
+    CaptureEnabled(bool),
     /// The engine is not onboarded (mirrors `EngineError::NotOnboarded`). A signal,
     /// not a fault — the UI shows onboarding.
     NotOnboarded,
@@ -719,12 +776,13 @@ mod protocol_tests {
         assert!(serde_json::from_slice::<Request>(&hello_bytes).is_err());
     }
 
-    /// Spot-checks that a representative set of destructive/egress/read ops are refused for
-    /// `MemoryClient` and that Recall+Remember are allowed. The true fail-closed guarantee is
-    /// structural: `Role::allows`'s positive `matches!` allowlist denies every non-listed variant,
-    /// present or future; this test guards against a regression that admits one of these specific ops.
+    /// Spot-checks that a representative set of pre-SP3 destructive/egress/read ops stay refused for
+    /// `MemoryClient` (SP3's `memory_client_allows_exactly_four_ops` covers the new SP3 ops). The true
+    /// fail-closed guarantee is structural: `Role::allows`'s positive `matches!` allowlist denies every
+    /// non-listed variant, present or future; this test guards against a regression that admits one of
+    /// these specific ops.
     #[test]
-    fn memory_client_allowlist_is_exactly_recall_and_remember() {
+    fn memory_client_refuses_pre_sp3_privileged_ops() {
         let allowed = [
             Request::Recall { onboarded: true, query: "q".into(), k: 1 },
             Request::Remember { onboarded: true, text: "t".into() },
@@ -754,6 +812,49 @@ mod protocol_tests {
             assert!(Role::App.allows(req), "App must allow {req:?}");
         }
     }
+
+    /// `MemoryClient` allows EXACTLY the four guest ops — recall/remember plus the SP3 capture and
+    /// snapshot pokes — and REFUSES every other new SP3 op (listing, get, delete, notes, supersede,
+    /// stats, capture toggle/query). Enumerates all new variants so a future variant wrongly admitted
+    /// to the guest role fails here (the fail-closed allowlist's positive guarantee, pinned per-op).
+    #[test]
+    fn memory_client_allows_exactly_four_ops() {
+        use Request::*;
+        let yes = [
+            Recall { onboarded: true, query: "q".into(), k: 1 },
+            Remember { onboarded: true, text: "t".into() },
+            CaptureNotify { onboarded: true, session_id: "s".into(), transcript_path: "/p.jsonl".into() },
+            Snapshot { onboarded: true, project: "/repo".into(), source: "startup".into(), session_id: None, transcript_path: None },
+        ];
+        for r in yes { assert!(Role::MemoryClient.allows(&r), "{r:?}"); }
+        let no = [
+            ListSessions { onboarded: true },
+            GetSession { onboarded: true, session_id: "s".into() },
+            DeleteSession { onboarded: true, session_id: "s".into() },
+            ListNotes { onboarded: true },
+            SupersedeNote { onboarded: true, event_id: "e".into(), text: "t".into() },
+            RecallStats { onboarded: true },
+            SetCaptureEnabled { onboarded: true, enabled: true, backfill: false },
+            CaptureEnabled { onboarded: true },
+        ];
+        for r in no { assert!(!Role::MemoryClient.allows(&r), "{r:?}"); }
+    }
+
+    /// The SP3 `Snapshot` request round-trips through JSON with its `Option` fields populated — the
+    /// externally-tagged variant survives serde unchanged (the backward-safe "add variants" contract).
+    #[test]
+    fn new_variants_round_trip_serde() {
+        let req = Request::Snapshot { onboarded: true, project: "/r".into(), source: "compact".into(),
+            session_id: Some("abc".into()), transcript_path: Some("/t.jsonl".into()) };
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let back: Request = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(back, Request::Snapshot { .. }));
+    }
+
+    /// SP3 adds only new externally-tagged variants (backward-safe); the wire version must NOT bump — a
+    /// bump would wedge already-connected users across an app upgrade (architect Critical).
+    #[test]
+    fn proto_version_still_one() { assert_eq!(PROTO_VERSION, 1); }
 
     /// A `Hello` frame that omits `role` (a peer predating the field) deserializes as `App` — the
     /// wire back-compat that keeps the app unchanged (I3).

@@ -14,9 +14,10 @@ export function Sidebar({
   reviewCount: number;
 }) {
   const { theme, toggleTheme } = useTheme();
-  // The review count surfaces on the Brain (memory) tab now that Review lives inside the Brain hub.
+  // The review count surfaces on the Brain tab (whose nav item routes at a Brain view — the
+  // Library landing) now that Review lives inside the Brain hub.
   const countFor = (v: View): number | undefined =>
-    v === "inbox" ? inboxUnread : v === "memory" ? reviewCount : undefined;
+    v === "inbox" ? inboxUnread : isBrainView(v) ? reviewCount : undefined;
 
   return (
     <aside className="sidebar">
@@ -31,7 +32,7 @@ export function Sidebar({
             view={item.view}
             label={item.label}
             count={countFor(item.view)}
-            active={item.view === "memory" ? isBrainView(view) : view === item.view}
+            active={isBrainView(item.view) ? isBrainView(view) : view === item.view}
             onNavigate={onNavigate}
           />
         ))}

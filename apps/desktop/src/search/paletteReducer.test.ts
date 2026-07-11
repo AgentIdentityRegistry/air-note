@@ -4,9 +4,10 @@ import { EMPTY_RESULTS, type GroupedResults } from "./types";
 
 const results: GroupedResults = {
   memory: [{ id: "mem:1", kind: "memory", title: "M", snippet: "", target: { view: "memory" } }],
+  sessions: [],
   conversations: [{ id: "conv:1", kind: "conversation", title: "C", snippet: "", target: { view: "inbox", convKey: "c" } }],
   files: [{ id: "file:1", kind: "file", title: "F", snippet: "", target: { view: "settings" } }],
-  errors: { memory: false, conversations: false, files: false },
+  errors: { memory: false, sessions: false, conversations: false, files: false },
 };
 const ready = (): PaletteState => paletteReducer(initialPaletteState, { type: "setResults", results });
 
@@ -58,6 +59,7 @@ describe("EMPTY_RESULTS", () => {
   it("is deeply frozen so the shared singleton can't be mutated", () => {
     expect(Object.isFrozen(EMPTY_RESULTS)).toBe(true);
     expect(Object.isFrozen(EMPTY_RESULTS.memory)).toBe(true);
+    expect(Object.isFrozen(EMPTY_RESULTS.sessions)).toBe(true);
     expect(Object.isFrozen(EMPTY_RESULTS.errors)).toBe(true);
   });
 });

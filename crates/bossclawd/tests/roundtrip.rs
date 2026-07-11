@@ -166,9 +166,10 @@ async fn status_roundtrip_over_socket() {
     let resp = client.call(Request::Status { onboarded: true }).await;
     match resp {
         Response::Status(s) => {
-            // A fresh brain primes 3 autonomy switches off → exactly 3 config events, chain intact.
+            // A fresh brain primes the autonomy switches off → the 3 original flags
+            // (evolve/proposals/mandates) plus the SP3 capture force-off = 4 config events, chain intact.
             assert!(s.chain_ok, "fresh brain chain verifies");
-            assert_eq!(s.event_count, 3, "prime_switches wrote the 3 sticky config events");
+            assert_eq!(s.event_count, 4, "prime_switches wrote the 4 sticky config events");
         }
         other => panic!("expected Status, got {other:?}"),
     }

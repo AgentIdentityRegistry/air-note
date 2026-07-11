@@ -224,11 +224,29 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_model_status,
             #[cfg(unix)]
+            commands::engine::engine_list_sessions,
+            #[cfg(unix)]
+            commands::engine::engine_get_session,
+            #[cfg(unix)]
+            commands::engine::engine_delete_session,
+            #[cfg(unix)]
+            commands::engine::engine_list_notes,
+            #[cfg(unix)]
+            commands::engine::engine_supersede_note,
+            #[cfg(unix)]
+            commands::engine::engine_recall_stats,
+            #[cfg(unix)]
             commands::integrations::integrations_status,
             #[cfg(unix)]
             commands::integrations::integrations_connect_claude_code,
             #[cfg(unix)]
             commands::integrations::integrations_disconnect_claude_code,
+            #[cfg(unix)]
+            commands::integrations::integrations_backfill_count,
+            #[cfg(unix)]
+            commands::integrations::integrations_set_capture_enabled,
+            #[cfg(unix)]
+            commands::integrations::integrations_capture_enabled,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

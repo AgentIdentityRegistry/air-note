@@ -11,7 +11,7 @@ import { ReasonerConfigPanel } from "./ReasonerConfigPanel";
 import { CloudEgressBanner } from "./CloudEgressBanner";
 import { LanguagePackCard } from "./LanguagePackCard";
 import { searchBlurb, modeBlurb } from "./reasonerView";
-import { toRow } from "./recallView";
+import { HitList } from "./HitList";
 import { formatEvolve } from "./evolveStatus";
 
 /** How many recall hits to request per search. */
@@ -145,27 +145,7 @@ export function MemoryPanel() {
         <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>Nothing found yet — try a different search.</p>
       ) : null}
 
-      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-        {hits.map((h) => {
-          const row = toRow(h);
-          return (
-            <li key={row.id} style={{ padding: "10px 0", borderBottom: "1px solid var(--border-soft)" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                <span style={{
-                  fontSize: 11, fontWeight: 600, color: "var(--text-secondary)",
-                  background: "var(--surface-soft)", borderRadius: 4, padding: "2px 6px",
-                }}>
-                  {row.kindLabel}
-                </span>
-                <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
-                  {row.sourcesLabel}{row.sourcesLabel ? " · " : ""}score {row.score}
-                </span>
-              </div>
-              <div style={{ fontSize: 14, lineHeight: 1.4 }}>{row.text}</div>
-            </li>
-          );
-        })}
-      </ul>
+      <HitList hits={hits} />
 
       <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid var(--border-soft)" }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Evolve</div>

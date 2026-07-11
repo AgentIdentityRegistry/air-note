@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { IdentityProvider, useIdentity } from "./state/identity";
 import { OnboardingProvider, useOnboarding } from "./state/onboarding";
 import { InboxProvider, useInbox } from "./state/inbox";
@@ -15,7 +15,7 @@ import { AirSettings } from "./settings/AirSettings";
 import { Sidebar } from "./shell/Sidebar";
 import { MainSearch } from "./shell/MainSearch";
 import { useReviewCount } from "./shell/useReviewCount";
-import type { View } from "./shell/nav";
+import { landingView, type View } from "./shell/nav";
 import { CommandPalette } from "./search/CommandPalette";
 import { useCommandPaletteHotkey } from "./shell/useCommandPaletteHotkey";
 import type { NavTarget } from "./search/types";
@@ -40,11 +40,26 @@ function Shell() {
   const { identity, loading } = useIdentity();
   const { totalUnread, select } = useInbox();
   const reviewCount = useReviewCount(!!identity);
-  const [view, setView] = useState<View>("identity");
   const [onboardingDone, setOnboardingDone] = useState(false);
+  // Identity loads asynchronously, so at mount we can't yet know if the user is onboarded.
+  // Start on the landing for the not-yet-onboarded state (identity) and, once onboarding
+  // resolves true, flip to the Library exactly once (see the effect below). A fresh user
+  // never has the flip fire, so the onboarding gate is never bypassed.
+  const onboarded = !!identity || onboardingDone;
+  const [view, setView] = useState<View>(() => landingView(onboarded));
+  const landedRef = useRef(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const openSearch = useCallback(() => setSearchOpen(true), []);
   useCommandPaletteHotkey(openSearch);
+
+  useEffect(() => {
+    // One-shot: land an onboarded user on their Library the first time onboarding resolves
+    // true, without clobbering any later navigation the user makes.
+    if (onboarded && !landedRef.current) {
+      landedRef.current = true;
+      setView(landingView(true));
+    }
+  }, [onboarded]);
 
   const navigateTo = useCallback((target: NavTarget) => {
     setView(target.view);

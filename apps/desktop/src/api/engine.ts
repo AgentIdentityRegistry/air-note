@@ -179,3 +179,43 @@ export const revokeMandate = (mandateGrantId: string): Promise<void> =>
 export const listMandates = (): Promise<MandateDto[]> => invoke<MandateDto[]>("engine_list_mandates");
 export const mandateWrites = (): Promise<MandateWriteDto[]> =>
   invoke<MandateWriteDto[]>("engine_mandate_writes");
+
+// ---- Library (SP3, Plan C — sessions / notes / forget / recall stats) ----
+// snake_case field names mirror C1's serde DTOs (the wire contract). i64/u64 timestamps + byte
+// counts arrive as `number`; every `Option<_>` arrives as `null` when absent (serde emits all fields).
+
+/** One captured-session Library row. */
+export type SessionSummaryDto = {
+  session_id: string;
+  title: string;
+  project: string;
+  tool: string;
+  started_at: number;
+  ended_at: number;
+  approx_bytes: number;
+};
+/** One captured session's detail: its summary + the daemon-rendered Markdown body. */
+export type SessionDetailDto = { summary: SessionSummaryDto; markdown: string };
+/** One `remember` note. `superseded_by` is the superseding event id once the note has been edited. */
+export type NoteDto = { event_id: string; text: string; created_at: number; superseded_by: string | null };
+/** One recorded recall miss (a recall that found nothing) for the tuning UI. */
+export type RecallMissDto = { query: string; at: number };
+/** Recall telemetry: lifetime `total` recalls, how many were `misses`, and the recent misses. */
+export type RecallStatsDto = { total: number; misses: number; recent_misses: RecallMissDto[] };
+
+export const listSessions = (): Promise<SessionSummaryDto[]> =>
+  invoke<SessionSummaryDto[]>("engine_list_sessions");
+/**
+ * Read one session's summary + Markdown. An unknown/deleted id rejects with the daemon's bare
+ * "session not found or deleted" string — deliberately propagated so the UI can show "already deleted".
+ */
+export const getSession = (sessionId: string): Promise<SessionDetailDto> =>
+  invoke<SessionDetailDto>("engine_get_session", { sessionId });
+/** Tombstone a captured session (durable forget). Idempotent — deleting an unknown id resolves Ok. */
+export const deleteSession = (sessionId: string): Promise<void> =>
+  invoke<void>("engine_delete_session", { sessionId });
+export const listNotes = (): Promise<NoteDto[]> => invoke<NoteDto[]>("engine_list_notes");
+/** Supersede a note with new text; resolves to the new (superseding) event id. */
+export const supersedeNote = (eventId: string, text: string): Promise<string> =>
+  invoke<string>("engine_supersede_note", { eventId, text });
+export const recallStats = (): Promise<RecallStatsDto> => invoke<RecallStatsDto>("engine_recall_stats");

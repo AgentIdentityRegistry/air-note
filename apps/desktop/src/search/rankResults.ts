@@ -13,7 +13,12 @@ export function memoryResults(hits: HitDto[], cap = RESULTS_PER_GROUP): SearchRe
   }));
 }
 
-/** Flatten grouped results into the keyboard-navigation order: memory → conversations → files. */
+/**
+ * Flatten grouped results into the keyboard-navigation order:
+ * memory → sessions (Library) → conversations → files.
+ * MUST stay in lockstep with the palette's `groups` array order, or arrow-key
+ * selection (which indexes into this flat list) points at the wrong row.
+ */
 export function flattenResults(g: GroupedResults): SearchResult[] {
-  return [...g.memory, ...g.conversations, ...g.files];
+  return [...g.memory, ...g.sessions, ...g.conversations, ...g.files];
 }

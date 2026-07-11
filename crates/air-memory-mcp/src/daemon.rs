@@ -17,6 +17,18 @@ use tokio::net::UnixStream;
 /// hang a tool call.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The SHORT bound for the fire-and-forget capture poke ([`tool_capture_notify`]). Deliberately a
+/// couple of seconds — NOT [`CALL_TIMEOUT`] — so a wedged daemon can never hang the millisecond
+/// SessionEnd hook. On timeout the poke simply fails (discarded → exit 0 at the caller); the sweeper
+/// backfills the missed session, so the immediacy is an optimization, never the durability path.
+const CAPTURE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Per-call bound for the snapshot fetch ([`tool_snapshot`]). MUST be well under Claude Code's 5s
+/// SessionStart hook timeout so the static-nudge fallback still prints before the hook is killed (a
+/// cold daemon can take ~1s just to open the encrypted DB). NOT the 30s tool [`CALL_TIMEOUT`] —
+/// reusing that would defeat the fallback in exactly the cold-daemon case it exists for.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A daemon-call failure, rendered by the MCP layer as a clean tool error (never a panic).
 #[derive(Debug)]
 pub enum DaemonError {
@@ -66,6 +78,19 @@ pub fn resolve_socket_path() -> PathBuf {
 /// Open a fresh connection, handshake as [`Role::MemoryClient`], send `req`, read the `Response`.
 /// Bounded by [`CALL_TIMEOUT`]; any failure is a [`DaemonError`] (never a panic).
 pub async fn call_daemon(sock: &Path, req: Request) -> Result<Response, DaemonError> {
+    call_daemon_bounded(sock, req, CALL_TIMEOUT).await
+}
+
+/// The shared connect + handshake + one round-trip, bounded by an explicit `timeout`. Factored out
+/// so the 30s tool calls ([`call_daemon`]) and the SHORT-timeout capture poke
+/// ([`tool_capture_notify`]) run the exact same exchange with different bounds — the poke must never
+/// inherit the 30s bound and hang the SessionEnd hook. Any failure is a [`DaemonError`] (never a
+/// panic).
+async fn call_daemon_bounded(
+    sock: &Path,
+    req: Request,
+    timeout: Duration,
+) -> Result<Response, DaemonError> {
     let exchange = async {
         let mut stream = UnixStream::connect(sock)
             .await
@@ -101,7 +126,7 @@ pub async fn call_daemon(sock: &Path, req: Request) -> Result<Response, DaemonEr
         serde_json::from_slice::<Response>(&frame)
             .map_err(|e| DaemonError::Protocol(format!("decode response: {e}")))
     };
-    tokio::time::timeout(CALL_TIMEOUT, exchange)
+    tokio::time::timeout(timeout, exchange)
         .await
         .map_err(|_| DaemonError::Unavailable("daemon call timed out".to_string()))?
 }
@@ -137,6 +162,59 @@ pub async fn tool_remember(sock: &Path, text: &str) -> Result<String, DaemonErro
     }
     match call_daemon(sock, Request::Remember { onboarded: true, text: text.to_string() }).await? {
         Response::Remember(id) => Ok(format!("Remembered. (event {id})")),
+        other => Err(map_error_response(other)),
+    }
+}
+
+/// Fire-and-forget capture poke (B2): a SHORT-timeout single round-trip asking the daemon to render
+/// the just-ended Claude Code session now. All failures map to Ok(()) at the CALLER (the
+/// `capture-notify` subcommand exits 0 regardless — the sweeper is the durability guarantee, I1/§6).
+/// Uses [`CAPTURE_NOTIFY_TIMEOUT`], NOT the 30s [`CALL_TIMEOUT`], so a wedged daemon can never hang
+/// the SessionEnd hook. The daemon validates `session_id` + confines `transcript_path` and may
+/// cleanly reject (capture disabled, rate-limited, bad id/path); any non-`Ok` becomes an error the
+/// caller discards.
+pub async fn tool_capture_notify(
+    sock: &Path,
+    session_id: &str,
+    transcript_path: &str,
+) -> Result<(), DaemonError> {
+    let req = Request::CaptureNotify {
+        onboarded: true,
+        session_id: session_id.to_string(),
+        transcript_path: transcript_path.to_string(),
+    };
+    match call_daemon_bounded(sock, req, CAPTURE_NOTIFY_TIMEOUT).await? {
+        Response::Ok => Ok(()),
+        other => Err(map_error_response(other)),
+    }
+}
+
+/// Fetch a live orientation snapshot for the SessionStart nudge (B3). MemoryClient handshake;
+/// `Request::Snapshot`; on `Response::Snapshot(s)` → `Ok(s)`; any other response or error → `Err`
+/// (the caller falls back to the static [`crate::NUDGE_TEXT`]). Bounded by [`SNAPSHOT_TIMEOUT`] via
+/// [`call_daemon_bounded`] (B2's shared helper), NOT the 30s [`CALL_TIMEOUT`], so a cold/wedged daemon
+/// can never hold the SessionStart hook past its short budget — the fallback still prints inside 5s.
+///
+/// `project` MUST be the transcript's parent-dir slug ([`crate::hook::snapshot_project`]) so it matches
+/// what capture stored (`server::transcript_project_slug` / the sweeper); `session_id`/`transcript_path`
+/// are passed through only for the `source=compact` flavor's live-transcript digest (absent for a
+/// fresh start).
+pub async fn tool_snapshot(
+    sock: &Path,
+    project: &str,
+    source: &str,
+    session_id: Option<String>,
+    transcript_path: Option<String>,
+) -> Result<String, DaemonError> {
+    let req = Request::Snapshot {
+        onboarded: true,
+        project: project.to_string(),
+        source: source.to_string(),
+        session_id,
+        transcript_path,
+    };
+    match call_daemon_bounded(sock, req, SNAPSHOT_TIMEOUT).await? {
+        Response::Snapshot(text) => Ok(text),
         other => Err(map_error_response(other)),
     }
 }
