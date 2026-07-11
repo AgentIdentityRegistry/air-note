@@ -3,6 +3,7 @@
 //! tests can drive `daemon`/`mcp` directly.
 
 pub mod daemon;
+pub mod hook;
 pub mod mcp;
 
 /// The static reminder the SP2 SessionStart hook injects into every Claude Code session so the
