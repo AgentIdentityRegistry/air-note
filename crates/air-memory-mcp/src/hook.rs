@@ -93,6 +93,25 @@ pub fn capture_target(h: &HookInput) -> Option<(String, String)> {
     Some((session_id.to_string(), transcript_path.to_string()))
 }
 
+/// The snapshot's project key = the transcript's PARENT-DIRECTORY name — the Claude Code cwd-slug
+/// (e.g. `-Users-x-repo`) that the daemon stored as `project` for every session of this repo. It is
+/// the load-bearing match key: the daemon's `Snapshot` filters sessions by exact `project` string, so
+/// this MUST be byte-identical to what capture stored. It is — this reproduces the daemon's own
+/// derivation verbatim (`server::transcript_project_slug` and the sweeper's `project.file_name()`:
+/// `parent().file_name()` → lossy String), differing only in returning `None` (not `""`) for the
+/// degenerate no-parent case, since an empty key can match nothing → the caller uses the static nudge.
+///
+/// `None` when `transcript_path` is absent or empty (the B1 contract surfaces a present-but-empty
+/// field as `Some("")`, treated as absent): with no path we cannot compute a matchable key, so the
+/// caller falls back to the static nudge rather than query a key that returns this repo nothing.
+pub fn snapshot_project(h: &HookInput) -> Option<String> {
+    let path = h.transcript_path.as_deref().filter(|s| !s.is_empty())?;
+    std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
 /// Drop every Unicode control character (C0 incl. `\n`/`\r`/`\t`, `DEL`, and the C1 range) from a
 /// string field so it is safe to place in a log line or a wire frame. This is a *strip* (the char is
 /// removed), not a map-to-space: `"a b\nc"` → `"a bc"` — ordinary spaces are preserved, controls

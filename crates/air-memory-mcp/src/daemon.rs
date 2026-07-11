@@ -23,6 +23,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// backfills the missed session, so the immediacy is an optimization, never the durability path.
 const CAPTURE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Per-call bound for the snapshot fetch ([`tool_snapshot`]). MUST be well under Claude Code's 5s
+/// SessionStart hook timeout so the static-nudge fallback still prints before the hook is killed (a
+/// cold daemon can take ~1s just to open the encrypted DB). NOT the 30s tool [`CALL_TIMEOUT`] —
+/// reusing that would defeat the fallback in exactly the cold-daemon case it exists for.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A daemon-call failure, rendered by the MCP layer as a clean tool error (never a panic).
 #[derive(Debug)]
 pub enum DaemonError {
@@ -179,6 +185,36 @@ pub async fn tool_capture_notify(
     };
     match call_daemon_bounded(sock, req, CAPTURE_NOTIFY_TIMEOUT).await? {
         Response::Ok => Ok(()),
+        other => Err(map_error_response(other)),
+    }
+}
+
+/// Fetch a live orientation snapshot for the SessionStart nudge (B3). MemoryClient handshake;
+/// `Request::Snapshot`; on `Response::Snapshot(s)` → `Ok(s)`; any other response or error → `Err`
+/// (the caller falls back to the static [`crate::NUDGE_TEXT`]). Bounded by [`SNAPSHOT_TIMEOUT`] via
+/// [`call_daemon_bounded`] (B2's shared helper), NOT the 30s [`CALL_TIMEOUT`], so a cold/wedged daemon
+/// can never hold the SessionStart hook past its short budget — the fallback still prints inside 5s.
+///
+/// `project` MUST be the transcript's parent-dir slug ([`crate::hook::snapshot_project`]) so it matches
+/// what capture stored (`server::transcript_project_slug` / the sweeper); `session_id`/`transcript_path`
+/// are passed through only for the `source=compact` flavor's live-transcript digest (absent for a
+/// fresh start).
+pub async fn tool_snapshot(
+    sock: &Path,
+    project: &str,
+    source: &str,
+    session_id: Option<String>,
+    transcript_path: Option<String>,
+) -> Result<String, DaemonError> {
+    let req = Request::Snapshot {
+        onboarded: true,
+        project: project.to_string(),
+        source: source.to_string(),
+        session_id,
+        transcript_path,
+    };
+    match call_daemon_bounded(sock, req, SNAPSHOT_TIMEOUT).await? {
+        Response::Snapshot(text) => Ok(text),
         other => Err(map_error_response(other)),
     }
 }

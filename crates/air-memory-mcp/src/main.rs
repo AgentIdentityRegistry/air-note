@@ -8,10 +8,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
-    // SP2: the `nudge` subcommand prints the static SessionStart reminder and exits — no socket,
-    // no server. Claude Code's SessionStart hook runs `air-memory-mcp nudge`.
+    // SP3/B3: the `nudge` subcommand is Claude Code's SessionStart hook. It tries a LIVE, project-aware
+    // orientation snapshot from the daemon and falls back to the static reminder on ANY failure. It is
+    // fail-quiet by contract (spec §5 / I1): the hook must never break or block session start, so the
+    // snapshot fetch is bounded (SNAPSHOT_TIMEOUT ≪ Claude Code's 5s hook kill), stdin is byte-bounded,
+    // and it ALWAYS exits 0. An SP2-era hook that pipes no stdin still prints the static text (default
+    // HookInput → no transcript_path → no matchable project key → static nudge, socket untouched).
     if std::env::args().nth(1).as_deref() == Some("nudge") {
-        print!("{}", air_memory_mcp::NUDGE_TEXT);
+        let h = hook::HookInput::read_from_stdin();
+        print!("{}", air_memory_mcp::run_nudge(&daemon::resolve_socket_path(), h).await);
         return Ok(());
     }
 
