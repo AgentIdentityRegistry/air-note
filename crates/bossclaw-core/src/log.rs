@@ -1431,6 +1431,19 @@ impl EventLog {
         }
     }
 
+    /// The number of vectors in the recall index, or `0` if it has not been built
+    /// yet (no [`EventLog::rebuild_indexes`] call since open).
+    ///
+    /// Task 6 asserts recall stays byte-untouched by comparing this count before
+    /// and after building the separate conflict index — the recall index must
+    /// never change.
+    // consumed by Task 6 (recall-untouched assertion); no non-test reader yet.
+    #[allow(dead_code)]
+    pub(crate) fn vector_index_len(&self) -> usize {
+        let guard = self.vector_index.lock().expect(POISON);
+        guard.as_ref().map_or(0, |ix| ix.len())
+    }
+
     /// Index an event in the FTS5 keyword index.
     ///
     /// The `event_id` / `text` pair is inserted into the `fts` virtual table
@@ -8228,6 +8241,24 @@ mod tests {
             log.remember(&embedder, "   "),
             Err(BossclawError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn vector_index_len_is_zero_until_rebuilt_then_reflects_the_recall_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        // `open` does not build the ANN index (it is None), so the count is 0.
+        assert_eq!(log.vector_index_len(), 0, "no index built yet ⇒ 0");
+
+        // A remembered note plus a rebuild populates the recall index.
+        log.remember(&embedder, "ferris the crab loves rust").unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+        assert!(
+            log.vector_index_len() > 0,
+            "after remember + rebuild the recall index holds ≥1 vector"
+        );
     }
 
     /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields

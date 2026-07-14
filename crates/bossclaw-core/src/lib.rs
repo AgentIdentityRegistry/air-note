@@ -17,6 +17,7 @@
 #![deny(missing_docs)]
 
 pub mod actuator;
+mod chunk;
 pub mod conflict;
 pub mod embed;
 pub mod error;
@@ -51,6 +52,7 @@ pub use actuator::{
     classify_op_existence, diff_guard, DiffFlags, FileId, GatedProposal, OpExistence, Provenance,
     Taint, WriteOp, WriteProposal, WriteVerdict,
 };
+pub use chunk::chunk_text;
 pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};

@@ -37,11 +37,42 @@ const EF_CONSTRUCTION: usize = 200;
 /// scale their beam with `k`. `ef` must be ≥ `k` for hnsw_rs.
 const EF_SEARCH_MIN: usize = 64;
 
+/// Unit-separator that joins an event id and a chunk index into one `VectorIndex`
+/// key. `0x1f` (US) cannot appear in a Crockford-base32 ULID, so `event_id_of`
+/// below can always recover the bare id — the property the fold-back relies on.
+pub const CHUNK_KEY_SEP: char = '\u{1f}';
+
+/// Encode `(event_id, chunk_ix)` as the composite `VectorIndex` key.
+pub fn encode_chunk_key(event_id: &str, chunk_ix: usize) -> String {
+    format!("{event_id}{CHUNK_KEY_SEP}{chunk_ix}")
+}
+
+/// Decode a composite key back to `(event_id, chunk_ix)`, or `None` if it is not
+/// a well-formed chunk key (no separator, or a non-numeric index). Uses the FIRST
+/// separator (`split_once`) so it agrees byte-for-byte with `event_id_of` on the
+/// event-id field — a stray extra separator makes the index non-numeric ⇒ None
+/// (never a silently-wrong parse). Event ULIDs never contain 0x1f, so real keys
+/// always have exactly one separator.
+pub fn decode_chunk_key(key: &str) -> Option<(&str, usize)> {
+    let (id, ix) = key.split_once(CHUNK_KEY_SEP)?;
+    Some((id, ix.parse().ok()?))
+}
+
+/// The bare event id for a composite (or already-bare) key — the fold-back reduce
+/// key. A key without the separator is returned unchanged (defensive). Uses the
+/// FIRST separator, matching `decode_chunk_key`.
+pub fn event_id_of(key: &str) -> &str {
+    key.split_once(CHUNK_KEY_SEP).map_or(key, |(id, _)| id)
+}
+
 /// An in-memory ANN index over the vectors of a single (active) embedding model.
 ///
 /// NOT persisted in v1 — rebuilt from the encrypted log on open (zero plaintext
 /// index on disk). Implementations operate purely on `(event_id, vector)` pairs
 /// and never touch storage.
+// `len` here is a row-count accessor for the recall-untouched assertion, not a
+// collection-emptiness API; an `is_empty` companion would be dead surface.
+#[allow(clippy::len_without_is_empty)]
 pub trait VectorIndex: Send + Sync {
     /// Add a vector under `event_id`. Re-adding an existing `event_id` is a
     /// documented no-op (the first vector wins); the authoritative vector for an
@@ -73,6 +104,12 @@ pub trait VectorIndex: Send + Sync {
     /// `None` if nothing has been added. A duplicate `add` (same `event_id`, a
     /// documented no-op) does NOT advance `last_indexed`.
     fn last_indexed(&self) -> Option<String>;
+
+    /// The number of distinct vectors currently held (each [`add`](VectorIndex::add)
+    /// of a new `event_id` grows it by one; a duplicate `add` does not). Tombstoned
+    /// ids still count until the next rebuild physically drops them — `len` is the
+    /// element count, not the live-hit count.
+    fn len(&self) -> usize;
 }
 
 /// HNSW-backed [`VectorIndex`].
@@ -199,6 +236,13 @@ impl VectorIndex for HnswIndex {
     fn last_indexed(&self) -> Option<String> {
         self.last_indexed.clone()
     }
+
+    fn len(&self) -> usize {
+        // `id_to_slot` is the de-dup guard `add` grows once per distinct id, so its
+        // size is the authoritative physical element count (`remove` only tombstones
+        // — it never shrinks this map; a rebuild is what drops dropped ids).
+        self.id_to_slot.len()
+    }
 }
 
 /// Zero-dep compile-time guard: if a future field breaks `Send + Sync` on
@@ -208,3 +252,54 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<HnswIndex>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_key_round_trips_and_separator_is_ulid_safe() {
+        let key = encode_chunk_key("01J8Z3ABCDXYZ", 7);
+        assert_eq!(key, "01J8Z3ABCDXYZ\u{1f}7");
+        let (id, ix) = decode_chunk_key(&key).unwrap();
+        assert_eq!(id, "01J8Z3ABCDXYZ");
+        assert_eq!(ix, 7);
+        // 0x1f never appears in a Crockford-base32 ULID, so decoding is unambiguous.
+        assert_eq!(decode_chunk_key("no-separator-here"), None);
+        // Malformed index is rejected (not silently 0).
+        assert_eq!(decode_chunk_key("id\u{1f}notanumber"), None);
+    }
+
+    #[test]
+    fn event_id_of_and_decode_agree_on_split_direction() {
+        // Both use the FIRST separator (split_once) — so a key with a stray extra
+        // separator decodes/reduces identically. (event ULIDs never contain 0x1f,
+        // so this only guards defensive/mixed-data robustness, not a real ULID.)
+        let weird = "01J8Z3ABCDXYZ\u{1f}2\u{1f}5"; // two separators
+        assert_eq!(event_id_of(weird), "01J8Z3ABCDXYZ", "reduce key = first field");
+        // decode_chunk_key rejects it: the index field "2\u{1f}5" isn't a number.
+        assert_eq!(decode_chunk_key(weird), None, "ambiguous multi-sep key is not a valid chunk key");
+    }
+
+    #[test]
+    fn event_id_of_extracts_the_bare_id_for_foldback() {
+        assert_eq!(event_id_of("01J8Z3ABCDXYZ\u{1f}3"), "01J8Z3ABCDXYZ");
+        // A bare (non-chunk) key is returned unchanged — defensive for mixed data.
+        assert_eq!(event_id_of("01J8Z3ABCDXYZ"), "01J8Z3ABCDXYZ");
+    }
+
+    #[test]
+    fn len_counts_distinct_added_vectors() {
+        // A fresh index holds nothing; each distinct `add` grows the count by one;
+        // a duplicate `add` (documented no-op) does NOT — `len` == the number of
+        // physical vectors the index would search, the invariant Task 6's
+        // "recall index untouched" assertion depends on.
+        let mut ix = HnswIndex::with_capacity(4);
+        assert_eq!(ix.len(), 0, "a fresh index is empty");
+        ix.add("a", &[1.0, 0.0, 0.0]);
+        ix.add("b", &[0.0, 1.0, 0.0]);
+        assert_eq!(ix.len(), 2, "two distinct vectors ⇒ len 2");
+        ix.add("a", &[0.0, 0.0, 1.0]); // duplicate id: dedup no-op
+        assert_eq!(ix.len(), 2, "re-adding an existing id does not grow len");
+    }
+}
