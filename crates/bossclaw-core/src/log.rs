@@ -5901,6 +5901,15 @@ impl EventLog {
     /// position, independent of the active model). [`EventLog::retire_passage`]
     /// uses this to range-check a `passage_id` BEFORE any recall rebuild, so it
     /// deliberately does NOT scope by `model_id`.
+    ///
+    /// Safety of the un-scoped count: with multiple models embedding the same
+    /// capture, `COUNT(*)` can only OVER-count (it sums a passage across model_ids);
+    /// it can never under-count. An over-permissive range check merely admits an
+    /// INERT `passage_retired` marker for a `passage_id` that matches nothing at
+    /// model-scoped [`EventLog::rebuild_conflict_index`] time — harmless. Tightening
+    /// this to model-scoped would instead wrongly REJECT valid passages (a capture
+    /// whose passages were embedded only under a since-swapped model), so it MUST
+    /// stay model-agnostic.
     pub fn session_passage_count(&self, event_id: &str) -> Result<usize, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let n: i64 = store.conn().query_row(
@@ -8623,22 +8632,52 @@ mod tests {
     /// keeps the marker), and `unretire_passage` reverses it.
     #[test]
     fn passage_retire_hides_one_survives_sweep_and_reverses() {
-        let dir = tempfile::tempdir().unwrap(); let log = open_log(dir.path()); let emb = MockEmbedder::new(8);
-        let ev = log.capture_session(&emb, &session_meta("s1","aa")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
         let chunks = vec!["Vercel".to_string(), "Postgres".to_string()];
         log.store_session_passages(&emb, &ev, &chunks).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
         log.retire_passage("s1", 0).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
-        let hit = |q:&str| log.conflict_search(&emb.embed(&[q.into()]).unwrap()[0], 8).iter().any(|(s,p,_)| s=="s1" && *p==0);
+        let hit = |q: &str| {
+            log.conflict_search(&emb.embed(&[q.into()]).unwrap()[0], 8)
+                .iter()
+                .any(|(s, p, _)| s == "s1" && *p == 0)
+        };
         assert!(!hit("Vercel"), "retired passage 0 hidden");
-        assert!(log.conflict_search(&emb.embed(&["Postgres".into()]).unwrap()[0],8).iter().any(|(s,p,_)| s=="s1" && *p==1), "sibling kept");
+        assert!(
+            log.conflict_search(&emb.embed(&["Postgres".into()]).unwrap()[0], 8)
+                .iter()
+                .any(|(s, p, _)| s == "s1" && *p == 1),
+            "sibling kept"
+        );
+        // Reject branches, asserted WHILE passage 0 is still retired (all three are
+        // read-only rejects that append nothing, so they never disturb the flow below).
+        assert!(
+            matches!(log.retire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
+            "double-retire of a still-retired passage is rejected (I6)"
+        );
+        assert!(
+            matches!(log.retire_passage("s1", 9), Err(BossclawError::InvalidInput(_))),
+            "out-of-range passage_id (≥ N=2) is rejected"
+        );
+        assert!(
+            matches!(log.retire_passage("ghost", 0), Err(BossclawError::InvalidInput(_))),
+            "retire against a non-current session is rejected"
+        );
         // SWEEP durability: same-sha re-capture is a no-op (returns the same id); marker persists across rebuild.
-        log.capture_session(&emb, &session_meta("s1","aa")).unwrap();
+        log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
         assert!(!hit("Vercel"), "retire survives a sweeper cycle");
-        log.unretire_passage("s1", 0).unwrap(); log.rebuild_conflict_index(&emb).unwrap();
+        log.unretire_passage("s1", 0).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
         assert!(hit("Vercel"), "unretire restores the passage");
+        assert!(
+            matches!(log.unretire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
+            "unretiring a no-longer-retired passage is rejected (I6)"
+        );
     }
 
     /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields
