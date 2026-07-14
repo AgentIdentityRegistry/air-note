@@ -734,6 +734,44 @@ impl EngineHandle {
         Ok(id)
     }
 
+    /// Rung 3 §7.3: retire a `remember` note (the App-only `RetireMemory` note variant) by appending a
+    /// distinct `note_retired` marker, returning the marker's event id. Recall/list exclusion is
+    /// fold-time, so — UNLIKE [`Self::supersede_note`] — NO embedder is resolved and the recall index
+    /// is NOT invalidated (nothing to re-embed; the next fold simply drops the retired target). A
+    /// missing / non-memory, superseded, or already-retired target folds to the typed `Rejected` (core
+    /// reports these as `InvalidInput`); any other core failure folds to `Core`. Onboarding is the
+    /// daemon's OWN verdict (App-only, mirrors [`Self::current_notes`]).
+    pub async fn retire_memory(&self, event_id: String) -> Result<String, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.retire_memory(&event_id).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung 3 §7.3: reverse a prior note retire (the App-only `Unretire` op) by appending an `unretire`
+    /// marker, returning its event id. Like [`Self::retire_memory`] this is a pure marker append: NO
+    /// embedder, NO index invalidation (fold-time exclusion). An id that is not CURRENTLY retired folds
+    /// to the typed `Rejected` (core reports `InvalidInput`); any other core failure folds to `Core`.
+    /// Onboarding is the daemon's OWN verdict (App-only).
+    pub async fn unretire(&self, retired_event_id: String) -> Result<String, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.unretire(&retired_event_id).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// SP3 A9/I9: the tombstoned (owner-deleted) `session_id`s. The sweeper reads this so a
     /// deleted session's still-present transcript is never re-captured (never resurrected) — the
     /// engine's `capture_session` reject is the backstop, this is the cheap decision-time filter.
