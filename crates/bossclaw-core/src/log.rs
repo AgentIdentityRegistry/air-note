@@ -5853,9 +5853,18 @@ impl EventLog {
             let Some(&session_id) = sid_of.get(event_id.as_str()) else {
                 continue; // orphaned / superseded / tombstoned capture — skip
             };
-            if fold.retired_passages.contains(&(session_id.to_string(), ix)) {
+            // `.to_string()` allocates a throwaway key, so gate it behind the common
+            // no-retirements case — only pay the alloc when retirements actually exist.
+            if !fold.retired_passages.is_empty()
+                && fold.retired_passages.contains(&(session_id.to_string(), ix))
+            {
                 continue; // retired passage — excluded at rebuild time
             }
+            // `encode_chunk_key`'s param is named `event_id`, but here we key by
+            // session_id BY DESIGN: an A5-validated session_id is `[A-Za-z0-9_-]`
+            // (see bossclawd `valid_session_id`), so it can never contain
+            // CHUNK_KEY_SEP (`\u{1f}`) — the key round-trips losslessly through
+            // `decode_chunk_key` in `conflict_search`.
             index.add(&crate::index::encode_chunk_key(session_id, ix), &vec);
         }
         let boxed: Box<dyn VectorIndex> = Box::new(index);
@@ -5866,12 +5875,21 @@ impl EventLog {
     /// Search the SEPARATE conflict index (Rung-3 §7.1) for the `k` nearest
     /// `(session_id, passage_ix, distance)` triples to the query vector `qv`.
     /// Mirrors [`EventLog::entity_search`] but takes a pre-computed query vector and
-    /// returns a plain `Vec` — an unbuilt index yields an EMPTY result (the conflict
-    /// retrieval front-end treats "no index" as "no hits", where entity resolution
-    /// errors). Keys that fail to decode are dropped (never happens — we encoded
-    /// them via `encode_chunk_key`).
+    /// returns a plain `Vec`.
+    ///
+    /// Callers MUST call [`EventLog::rebuild_conflict_index`] first. An unbuilt
+    /// index yields an EMPTY result BY DESIGN — "no index → no hits" is a deliberate
+    /// non-fatal policy for this detector (in release, "no index built yet" simply
+    /// flags no conflicts), whereas entity resolution errors on an unbuilt index. A
+    /// `debug_assert` guards the "called before rebuild" bug in dev/test, where it
+    /// is always a mistake. Keys that fail to decode are dropped (never happens — we
+    /// encoded them via `encode_chunk_key`).
     pub fn conflict_search(&self, qv: &[f32], k: usize) -> Vec<(String, usize, f32)> {
         let guard = self.conflict_index.lock().expect(POISON);
+        debug_assert!(
+            guard.is_some(),
+            "conflict_search called before rebuild_conflict_index"
+        );
         let Some(index) = guard.as_ref() else {
             return Vec::new();
         };
@@ -8470,10 +8488,27 @@ mod tests {
         log.store_session_passages(&emb, &ev, &chunks).unwrap();
         log.rebuild_indexes(&emb).unwrap();
         let recall_len = log.vector_index_len();
+        assert_eq!(recall_len, 1, "one capture event is in the recall index");
         log.rebuild_conflict_index(&emb).unwrap();
         let hits = log.conflict_search(&emb.embed(&["Vercel".into()]).unwrap()[0], 8); // k ≥ #chunks → membership stable
         assert!(hits.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0)); // session id resolved via fold head
         assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
+    }
+
+    /// Rung-3 Phase-1 (§7.1): a BUILT-but-EMPTY conflict index yields no hits. This
+    /// pins the empty-result contract via the legitimate "rebuild first" path (a
+    /// fresh log has no passages, so the rebuild produces an empty index) — so it
+    /// respects `conflict_search`'s dev/test `debug_assert` that the index was built,
+    /// rather than probing the unbuilt-`None` path (which is a caller bug the assert
+    /// deliberately trips).
+    #[test]
+    fn conflict_search_on_empty_built_index_yields_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        log.rebuild_conflict_index(&emb).unwrap(); // no passages ⇒ empty index (but built)
+        let hits = log.conflict_search(&emb.embed(&["x".into()]).unwrap()[0], 8);
+        assert!(hits.is_empty(), "an empty (built) conflict index yields no hits");
     }
 
     /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields
