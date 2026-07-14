@@ -263,9 +263,21 @@ mod tests {
         );
         assert!(title.recall < 0.30, "title-only genuinely misses body conflicts: {}", title.recall);
         assert!(passage.recall >= 0.70, "passage index catches them: {}", passage.recall);
+        // The REAL over-surfacing guard: an ABSOLUTE precision floor. A `>= title.precision`
+        // comparison is vacuous here — the title arm flags nothing, so `title.precision` is
+        // structurally `ratio(0, 0) = 0.0`, and `passage.precision >= 0.0` can never fail (a
+        // regression dropping passage precision to 0.5 would still pass). The absolute floor turns
+        // "does not over-surface the coexist hard negatives" into a gate with teeth (measured
+        // passage.precision is 1.000, so 0.99 has full margin).
+        assert!(
+            passage.precision >= 0.99,
+            "passage index does not over-surface the coexist hard negatives: {}",
+            passage.precision,
+        );
+        // Secondary narrative: the passage arm is at least as precise as the (blind) title arm.
         assert!(
             passage.precision >= title.precision,
-            "passage index does not over-surface (hard negatives): passage={} title={}",
+            "passage precision is at least the title arm's: passage={} title={}",
             passage.precision,
             title.precision,
         );
