@@ -158,24 +158,42 @@ pub async fn store_capture(
         .await
         .map_err(|e| CaptureStoreError::Engine(e.to_string()))?;
 
-    // (5) Rung-3 Phase-1 (§7.1): persist the session's body passages into the conflict index's
-    // restart-safe source table. Skip re-embedding on a same-`sha` recapture (A2 dedup returns the
-    // existing event id, which already has rows) — `session_passages_absent` gates that. `r.body`
-    // is exactly the text composed into the `.md`, so heal (which recovers it via `capture_body`)
-    // chunks the identical text. Accepted limitation: a CHANGED-`sha` recapture supersedes to a
-    // NEW event id and persists under it, so the old capture's rows linger un-GC'd — passage-level
+    // (5) Rung-3 Phase-1 (§7.1): persist the session's body passages (BEST-EFFORT — the `.md` +
+    // signed event above are already durable; see [`persist_passages_if_absent`]). `r.body` is
+    // exactly the text composed into the `.md`, so heal (which recovers it via `capture_body`)
+    // chunks the identical text. Accepted limitation: a CHANGED-`sha` recapture supersedes to a NEW
+    // event id and persists under it, so the old capture's rows linger un-GC'd — passage-level
     // retire is Task 7's job, not Task 5's (no orphan GC here).
-    if engine
-        .session_passages_absent(ev.clone())
-        .await
-        .map_err(|e| CaptureStoreError::Engine(e.to_string()))?
-    {
-        engine
-            .store_session_passages(ev, bossclaw_core::chunk_text(&r.body))
-            .await
-            .map_err(|e| CaptureStoreError::Engine(e.to_string()))?;
-    }
+    persist_passages_if_absent(engine, ev, &r.body).await;
     Ok(())
+}
+
+/// Persist a captured session's body passages into the conflict index's restart-safe source table
+/// (§7.1), gated on absence, chunking `body` (`store_capture`'s `Rendered::body` or heal's
+/// [`capture_body`]-recovered text) only when it will actually be stored.
+///
+/// BEST-EFFORT, mirroring core `derive_vector` (log.rs `derive_vector`: vector derivation "is
+/// best-effort … never blocks the append"): by the time this runs the caller's PRIMARY flow — the
+/// `.md` file and the signed capture event — is ALREADY durable, so a passage embed/insert failure
+/// is LOGGED and swallowed. It must never turn a durable capture into a client-visible error, nor
+/// abort a [`heal_orphans`] pass over the remaining orphans. There is NO backfill hook in Phase 1,
+/// so a transient failure drops that session's passages until it is re-captured — an accepted
+/// Phase-1 limitation (a re-embed hook is out of scope). The absent gate skips re-embedding on a
+/// same-`sha` recapture (which returns the existing event id that already has rows).
+async fn persist_passages_if_absent(engine: &EngineHandle, ev: String, body: &str) {
+    match engine.session_passages_absent(ev.clone()).await {
+        Ok(true) => {
+            if let Err(e) =
+                engine.store_session_passages(ev, bossclaw_core::chunk_text(body)).await
+            {
+                eprintln!("capture: session-passage persist failed (best-effort, dropped): {e}");
+            }
+        }
+        Ok(false) => {} // already has rows (same-`sha` recapture) — nothing to do
+        Err(e) => {
+            eprintln!("capture: session-passage absence check failed (best-effort, skipped): {e}");
+        }
+    }
 }
 
 /// Delete a capture (I7, app-only — the caller enforces that at dispatch, not here): append the
@@ -288,27 +306,18 @@ pub async fn heal_orphans(
             match engine.capture_session(meta).await {
                 Ok(ev) => {
                     report.orphan_files_captured += 1;
-                    // Rung-3 Phase-1 (§7.1): persist this orphan's body passages too, so a capture
-                    // recovered by heal has the SAME conflict-index source rows a normal
+                    // Rung-3 Phase-1 (§7.1): persist this orphan's body passages too (best-effort),
+                    // so a heal-recovered capture has the SAME conflict-index rows a normal
                     // `store_capture` would. Window (a) above read only the bounded front-matter
-                    // PREFIX, so re-read the FULL `.md` and `capture_body`-strip the front-matter —
-                    // chunking exactly `store_capture`'s `Rendered::body`. Best-effort on the body
-                    // read (the event is already durable, so an unreadable body just skips passages
-                    // for this file, consistent with window (a)'s "unreadable — leave it").
+                    // PREFIX, so re-read the FULL `.md` and `capture_body`-strip the front-matter to
+                    // chunk exactly `store_capture`'s `Rendered::body`.
+                    // Edge: `read_capture_markdown` caps at `MAX_CAPTURE_MD_BYTES` (16 MiB), so a
+                    // body >16 MiB is truncated on re-read and its chunks would diverge from the
+                    // original capture's — narrow (needs a >16 MiB body AND a crash between the file
+                    // write and the event append), accepted. An unreadable body just skips passages
+                    // for this file, consistent with window (a)'s "unreadable — leave it".
                     if let Ok(full) = read_capture_markdown(&path) {
-                        if engine
-                            .session_passages_absent(ev.clone())
-                            .await
-                            .map_err(|e| CaptureStoreError::Engine(e.to_string()))?
-                        {
-                            engine
-                                .store_session_passages(
-                                    ev,
-                                    bossclaw_core::chunk_text(capture_body(&full)),
-                                )
-                                .await
-                                .map_err(|e| CaptureStoreError::Engine(e.to_string()))?;
-                        }
+                        persist_passages_if_absent(engine, ev, capture_body(&full)).await;
                     }
                 }
                 // Owner-deleted (tombstoned, I9): the leftover .md is stale → remove it.

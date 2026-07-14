@@ -840,7 +840,11 @@ impl EventLog {
         // captured session's body chunks here at capture time. Separate from
         // both `vectors` (recall) and `entity_vectors` (resolution) so the
         // conflict index NEVER mixes with either.
-        // model_id-scoped; a language-pack swap empties this until re-capture (Phase-1 accepted limitation)
+        // model_id-scoped, but the capture-time skip-gate (`session_passages_absent`) is
+        // model-AGNOSTIC: after a model/language-pack swap, existing sessions' passages are NOT
+        // auto-repopulated (a same-`sha` re-capture finds the OLD model's rows and skips), so they
+        // stay under the old model_id until a future re-embed/backfill hook — a deferred Phase-1
+        // limitation (that hook is out of scope here).
         store.exec(
             "CREATE TABLE IF NOT EXISTS session_passage_vectors (
                 session_captured_event_id TEXT NOT NULL,
@@ -5728,14 +5732,20 @@ impl EventLog {
         }
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
+        // ALL-OR-NOTHING: one transaction over the whole passage set, not N implicit
+        // ones. A mid-loop failure must never leave a PARTIAL set — `session_passages_absent`'s
+        // "any row ⇒ done" gate would then treat that partial as complete forever. Also collapses
+        // N fsyncs into one.
+        let tx = conn.unchecked_transaction()?;
         for (ix, blob) in &rows {
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO session_passage_vectors \
                  (session_captured_event_id, passage_ix, model_id, dim, embedding) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![event_id, *ix as i64, embedder.model_id(), embedder.dim() as i64, blob],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
