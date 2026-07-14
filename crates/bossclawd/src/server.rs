@@ -451,10 +451,11 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             RetireTarget::Note { event_id } => {
                 op_result(engine.retire_memory(event_id).await, Response::Retired)
             }
-            // Passage-granularity retire is Task 7; until then answer with a clean typed reject
-            // (NOT an invented engine fn) so the wire shape is stable and the arm is exhaustive.
+            // Passage-granularity retire lands in Task 7; until then answer with a clean typed reject
+            // (NOT an invented engine fn) so the wire shape is stable and the arm is exhaustive. The
+            // runtime message stays user-neutral (it can surface in the App UI) — no task number.
             RetireTarget::Passage { .. } => op_result(
-                Err(EngineOpError::Rejected("passage retire lands in Task 7".into())),
+                Err(EngineOpError::Rejected("passage retire is not yet supported".into())),
                 Response::Retired,
             ),
         },

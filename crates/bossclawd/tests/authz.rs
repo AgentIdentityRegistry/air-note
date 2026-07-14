@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use bossclawd::server;
 use bossclawd_proto::{
-    read_frame, write_frame, Hello, HelloOk, OpErrorKindWire, Request, Response, Role, PROTO_VERSION,
+    read_frame, write_frame, Hello, HelloOk, OpErrorKindWire, Request, Response, RetireTarget, Role,
+    PROTO_VERSION,
 };
 use tokio::net::UnixStream;
 
@@ -103,6 +104,24 @@ async fn memory_client_is_refused_destructive_ops() {
     assert!(
         is_not_permitted(&c.call(Request::Status { onboarded: true }).await),
         "Status is not on the MemoryClient allowlist → refused (fail-closed default)"
+    );
+    // Rung 3 retire ops (§7.3) are App-only — a guest is refused over the real socket, not just at
+    // the two unit-level gates.
+    assert!(
+        is_not_permitted(
+            &c.call(Request::RetireMemory {
+                onboarded: true,
+                target: RetireTarget::Note { event_id: "x".into() },
+            })
+            .await
+        ),
+        "RetireMemory must be refused"
+    );
+    assert!(
+        is_not_permitted(
+            &c.call(Request::Unretire { onboarded: true, retired_event_id: "x".into() }).await
+        ),
+        "Unretire must be refused"
     );
 }
 
