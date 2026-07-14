@@ -1,0 +1,113 @@
+{"a":"CI runs on Travis CI.","b":"We moved CI over to GitHub Actions.","label":"contradicts","winner":"newer"}
+{"a":"The max upload size is capped at 5 MB.","b":"We raised the max upload size to 25 MB.","label":"contradicts","winner":"newer"}
+{"a":"Webhooks POST to /api/hooks.","b":"Webhooks now POST to /api/events.","label":"contradicts","winner":"newer"}
+{"a":"The project targets Node 18.","b":"We bumped the project to Node 20.","label":"contradicts","winner":"newer"}
+{"a":"Peter keeps his editor in dark mode.","b":"Peter switched his editor to light mode.","label":"contradicts","winner":"newer"}
+{"a":"Pull requests merge with one approval.","b":"Pull requests now require two approvals.","label":"contradicts","winner":"newer"}
+{"a":"The billing service is called billing-svc.","b":"We renamed billing-svc to payments-svc.","label":"contradicts","winner":"newer"}
+{"a":"Telemetry ships on by default.","b":"Telemetry is now off by default.","label":"contradicts","winner":"newer"}
+{"a":"The cache TTL is 60 seconds.","b":"We set the cache TTL to 300 seconds.","label":"contradicts","winner":"newer"}
+{"a":"HTTP calls use axios.","b":"We replaced axios with the native fetch API.","label":"contradicts","winner":"newer"}
+{"a":"We decided to keep everything in a single monolith.","b":"We split the monolith into microservices.","label":"contradicts","winner":"newer"}
+{"a":"App logs are written to /var/log/app.","b":"App logs now go to /opt/app/logs.","label":"contradicts","winner":"newer"}
+{"a":"Daily standup is at 9 AM.","b":"Standup moved to 10 AM.","label":"contradicts","winner":"newer"}
+{"a":"The service config is stored as JSON.","b":"We converted the service config to YAML.","label":"contradicts","winner":"newer"}
+{"a":"Alice owns the onboarding flow.","b":"Ben took over ownership of the onboarding flow.","label":"contradicts","winner":"newer"}
+{"a":"Internal services talk to each other over REST.","b":"Internal services now communicate over gRPC.","label":"contradicts","winner":"newer"}
+{"a":"The new_editor feature flag is enabled in production.","b":"We disabled the new_editor flag in production.","label":"contradicts","winner":"newer"}
+{"a":"Releases are cut from the develop branch.","b":"Releases are now cut from the main branch.","label":"contradicts","winner":"newer"}
+{"a":"The frontend builds with webpack.","b":"We switched the frontend build to Vite.","label":"contradicts","winner":"newer"}
+{"a":"Sessions are stored in Redis.","b":"We moved session storage to DynamoDB.","label":"contradicts","winner":"newer"}
+{"a":"Transactional email goes through SendGrid.","b":"We switched transactional email to Postmark.","label":"contradicts","winner":"newer"}
+{"a":"The API rate limit is 100 requests per minute.","b":"We lowered the API rate limit to 60 requests per minute.","label":"contradicts","winner":"newer"}
+{"a":"The backend runs on Python 3.10.","b":"We upgraded the backend to Python 3.12.","label":"contradicts","winner":"newer"}
+{"a":"The auth secret is read from the API_KEY env var.","b":"We renamed the auth secret env var to API_TOKEN.","label":"contradicts","winner":"newer"}
+{"a":"Sign-ups are open to everyone.","b":"We made sign-ups invite-only.","label":"contradicts","winner":"newer"}
+{"a":"Passwords must be at least 8 characters.","b":"Passwords now must be at least 12 characters.","label":"contradicts","winner":"newer"}
+{"a":"Date handling uses moment.js.","b":"We replaced moment.js with date-fns.","label":"contradicts","winner":"newer"}
+{"a":"The site is server-side rendered.","b":"We moved the site to client-side rendering.","label":"contradicts","winner":"newer"}
+{"a":"User uploads are saved to local disk.","b":"User uploads now go to an S3 bucket.","label":"contradicts","winner":"newer"}
+{"a":"Database backups run nightly.","b":"Database backups now run hourly.","label":"contradicts","winner":"newer"}
+{"a":"Timestamps are stored as Unix epoch integers.","b":"We switched stored timestamps to ISO 8601 strings.","label":"contradicts","winner":"newer"}
+{"a":"The platform team handles on-call rotation.","b":"The SRE team now handles on-call rotation.","label":"contradicts","winner":"newer"}
+{"a":"Auth uses server-side session cookies.","b":"Auth now uses stateless JWTs.","label":"contradicts","winner":"newer"}
+{"a":"DNS is managed in Cloudflare.","b":"We moved DNS to Route 53.","label":"contradicts","winner":"newer"}
+{"a":"The scheduler uses UTC for cron times.","b":"We changed the scheduler to use America/New_York for cron times.","label":"contradicts","winner":"newer"}
+{"a":"The app is on React 17.","b":"We upgraded the app to React 18.","label":"contradicts","winner":"newer"}
+{"a":"We squash-merge every pull request.","b":"We switched to using merge commits for pull requests.","label":"contradicts","winner":"newer"}
+{"a":"Force-pushing to shared branches is allowed.","b":"We banned force-pushing to shared branches.","label":"contradicts","winner":"newer"}
+{"a":"User records live in the users table.","b":"We renamed the users table to accounts.","label":"contradicts","winner":"newer"}
+{"a":"Response compression is disabled by default.","b":"We enabled response compression by default.","label":"contradicts","winner":"newer"}
+{"a":"The HTTP client timeout is 30 seconds.","b":"We reduced the HTTP client timeout to 10 seconds.","label":"contradicts","winner":"newer"}
+{"a":"Unit tests run on Jest.","b":"We migrated the unit tests to Vitest.","label":"contradicts","winner":"newer"}
+{"a":"Full-text search is powered by Elasticsearch.","b":"We replaced Elasticsearch with Meilisearch.","label":"contradicts","winner":"newer"}
+{"a":"Payments are processed through Stripe.","b":"We switched payment processing to Braintree.","label":"contradicts","winner":"newer"}
+{"a":"The dev server listens on port 8080.","b":"The dev server now listens on port 3000.","label":"contradicts","winner":"newer"}
+{"a":"The production log level is set to info.","b":"We changed the production log level to warn.","label":"contradicts","winner":"newer"}
+{"a":"All services share one database.","b":"Each service now owns its own database.","label":"contradicts","winner":"newer"}
+{"a":"The deploy scripts are written in Bash.","b":"We rewrote the deploy scripts in Python.","label":"contradicts","winner":"newer"}
+{"a":"The team retro happens every two weeks.","b":"The team retro is now weekly.","label":"contradicts","winner":"newer"}
+{"a":"The public API returns XML.","b":"The public API now returns JSON.","label":"contradicts","winner":"newer"}
+{"a":"The product is named Notely.","b":"We rebranded the product to AirNote.","label":"contradicts","winner":"newer"}
+{"a":"Background jobs use RabbitMQ.","b":"We moved the job queue to Kafka.","label":"contradicts","winner":"newer"}
+{"a":"The free tier allows 3 projects.","b":"The free tier now allows only 1 project.","label":"contradicts","winner":"newer"}
+{"a":"Two-factor auth is optional for users.","b":"Two-factor auth is now mandatory for all users.","label":"contradicts","winner":"newer"}
+{"a":"We use npm to manage packages.","b":"We switched the repo to pnpm.","label":"contradicts","winner":"newer"}
+{"a":"Config is read from ~/.apprc.","b":"Config now lives at ~/.config/app/config.toml.","label":"contradicts","winner":"newer"}
+{"a":"The crate uses Rust edition 2018.","b":"We bumped the crate to Rust edition 2021.","label":"contradicts","winner":"newer"}
+{"a":"Metrics are shipped to Datadog.","b":"We moved metrics to Grafana Cloud.","label":"contradicts","winner":"newer"}
+{"a":"The analytics service uses ClickHouse.","b":"The auth service uses Postgres.","label":"coexist"}
+{"a":"Local dev uses SQLite.","b":"CI runs against an in-memory database.","label":"coexist"}
+{"a":"The database query timeout is 5 seconds.","b":"The HTTP request timeout is 30 seconds.","label":"coexist"}
+{"a":"Indent JavaScript with 2 spaces.","b":"Indent Makefiles with tabs.","label":"coexist"}
+{"a":"The web server listens on port 443.","b":"The metrics endpoint listens on port 9090.","label":"coexist"}
+{"a":"Frontend dependencies are managed with pnpm.","b":"Python dependencies are managed with Poetry.","label":"coexist"}
+{"a":"Rust tests run with cargo test.","b":"JavaScript tests run with Vitest.","label":"coexist"}
+{"a":"Batch jobs run on GCP.","b":"The web tier runs on AWS.","label":"coexist"}
+{"a":"Session data is cached in Redis.","b":"Static assets are cached at the CDN edge.","label":"coexist"}
+{"a":"The public API authenticates with API keys.","b":"The dashboard authenticates with OAuth.","label":"coexist"}
+{"a":"Development logs at debug level.","b":"Production logs at warn level.","label":"coexist"}
+{"a":"Feature work happens on topic branches.","b":"Releases are tagged on main.","label":"coexist"}
+{"a":"Email jobs run on the low-priority queue.","b":"Image processing runs on the high-priority queue.","label":"coexist"}
+{"a":"User avatars are stored in S3.","b":"Structured user data is stored in Postgres.","label":"coexist"}
+{"a":"Free-tier users get 60 requests per minute.","b":"Pro-tier users get 600 requests per minute.","label":"coexist"}
+{"a":"The marketing site is built with Next.js.","b":"The admin panel is built with SvelteKit.","label":"coexist"}
+{"a":"Go code is formatted with gofmt.","b":"TypeScript is formatted with Prettier.","label":"coexist"}
+{"a":"Raw events land in Kafka.","b":"Aggregates are stored in Postgres.","label":"coexist"}
+{"a":"EU traffic is served from the Frankfurt region.","b":"US traffic is served from the Virginia region.","label":"coexist"}
+{"a":"CI secrets live in GitHub Actions secrets.","b":"Runtime secrets live in AWS Secrets Manager.","label":"coexist"}
+{"a":"The API repo targets Node 20.","b":"The legacy tools repo still targets Node 16.","label":"coexist"}
+{"a":"Rust code is linted with clippy.","b":"Shell scripts are linted with shellcheck.","label":"coexist"}
+{"a":"Access tokens expire after 15 minutes.","b":"Refresh tokens expire after 30 days.","label":"coexist"}
+{"a":"The frontend deploys on every merge.","b":"Database migrations are deployed manually.","label":"coexist"}
+{"a":"Uptime is monitored with Pingdom.","b":"Errors are tracked with Sentry.","label":"coexist"}
+{"a":"YAML files use 2-space indentation.","b":"Go files use tab indentation.","label":"coexist"}
+{"a":"Access logs are retained for 30 days.","b":"Audit logs are retained for 7 years.","label":"coexist"}
+{"a":"The API serves HTTP/2.","b":"The realtime channel uses WebSockets.","label":"coexist"}
+{"a":"The docs site deploys to Netlify.","b":"The app deploys to Fly.io.","label":"coexist"}
+{"a":"The US store prices in USD.","b":"The EU store prices in EUR.","label":"coexist"}
+{"a":"The user-profile cache has a 5-minute TTL.","b":"The config cache has a 24-hour TTL.","label":"coexist"}
+{"a":"Unit tests run on every commit.","b":"End-to-end tests run nightly.","label":"coexist"}
+{"a":"The beta banner is enabled in staging.","b":"The beta banner is disabled in production.","label":"coexist"}
+{"a":"Read replicas serve analytics queries.","b":"The primary database handles all writes.","label":"coexist"}
+{"a":"The gateway service is written in Go.","b":"The recommendation service is written in Python.","label":"coexist"}
+{"a":"The CEO's dog is named Biscuit.","b":"The Redis connection pool size is 20.","label":"unrelated"}
+{"a":"Lunch is catered on Wednesdays.","b":"The primary key on the orders table is a UUID.","label":"unrelated"}
+{"a":"The all-hands slides are due Thursday.","b":"The Docker base image is Alpine Linux.","label":"unrelated"}
+{"a":"Peter takes his coffee with oat milk.","b":"The CI cache is keyed on the lockfile hash.","label":"unrelated"}
+{"a":"The quarterly all-hands is in the main auditorium.","b":"The linter enforces a 100-character line limit.","label":"unrelated"}
+{"a":"The staging server is nicknamed Gandalf.","b":"Invoices are numbered sequentially per year.","label":"unrelated"}
+{"a":"The team uses Slack for chat.","b":"The homepage hero image is 1200 pixels wide.","label":"unrelated"}
+{"a":"Fire drills happen every spring.","b":"The build artifact is a single static binary.","label":"unrelated"}
+{"a":"The design team prefers Figma.","b":"Database migrations are timestamped in their filenames.","label":"unrelated"}
+{"a":"The kitchen restocks snacks on Mondays.","b":"The API returns paginated results 50 at a time.","label":"unrelated"}
+{"a":"New hires get a welcome mug.","b":"The service mesh injects sidecar proxies.","label":"unrelated"}
+{"a":"The parking garage closes at 10 PM.","b":"Feature branches are prefixed with the ticket number.","label":"unrelated"}
+{"a":"The company retreat is in October.","b":"The logo uses a hexagon motif.","label":"unrelated"}
+{"a":"Peter's standing desk is set to 42 inches.","b":"The webhook payload is signed with HMAC.","label":"unrelated"}
+{"a":"The break room has a foosball table.","b":"Env vars are loaded from a .env file.","label":"unrelated"}
+{"a":"The whiteboard markers are running low.","b":"Login attempts are rate-limited to five per minute.","label":"unrelated"}
+{"a":"The onboarding buddy program pairs new hires with mentors.","b":"The thumbnail service resizes images to 256 pixels.","label":"unrelated"}
+{"a":"The team celebrates ship-days with pizza.","b":"The database uses connection pooling.","label":"unrelated"}
+{"a":"The receptionist's name is Dana.","b":"GraphQL queries are depth-limited to 10.","label":"unrelated"}
+{"a":"The office thermostat is set to 71 degrees.","b":"The changelog follows the Keep a Changelog format.","label":"unrelated"}

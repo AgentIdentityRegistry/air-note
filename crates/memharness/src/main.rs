@@ -93,6 +93,15 @@ struct ConflictGradeArgs {
     /// Bootstrap seed (deterministic CI).
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// Report the §9 statistical BINDING gate (precision CI-lower ≥ 0.90 at recall ≥ 0.30) as the
+    /// PASS/FAIL verdict, instead of the tiny-seed plumbing SMOKE. Use ONLY on the 50+-pair binding
+    /// set — the precision CI is degenerate on the ~10-row seed.
+    #[arg(long)]
+    binding: bool,
+    /// Print every MISCLASSIFIED pair (false positive / false negative) with the model's
+    /// self-reported confidence + rationale — the evidence for tuning `CONFLICT_CONF_MIN`.
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(clap::Args)]
@@ -121,7 +130,7 @@ fn main() -> anyhow::Result<()> {
 /// judge (Ollama over the daemon's `Reasoner` seam) and prints TP/FP/FN + the Phase-0 SMOKE
 /// verdict. The precision CI is DEFERRED (tiny-N seed); `smoke_ok` is the honest Phase-0 gate.
 fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
-    use memharness::conflict_grade::{parse_pairs, run_grade, smoke_ok};
+    use memharness::conflict_grade::{parse_pairs, run_grade_detailed, verdict_line};
     let body = std::fs::read_to_string(&args.cases)
         .with_context(|| format!("reading conflict cases {}", args.cases.display()))?;
     let pairs = parse_pairs(&body)?;
@@ -129,11 +138,32 @@ fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
     // `OllamaReasoner::new` POSTs /api/chat with `format = schema` + a system channel, so the
     // verdict schema is actually enforced (unlike memharness::ollama::generate → /api/generate).
     let judge = bossclaw_core::ollama::OllamaReasoner::new(&args.model);
-    let g = run_grade(&pairs, &judge, args.seed)?;
-    let smoke = smoke_ok(&g.metrics);
+    let (g, graded) = run_grade_detailed(&pairs, &judge, args.seed)?;
+    if args.verbose {
+        // Show only the errors — a false positive (flagged a non-conflict) or a false negative
+        // (missed a real one). The FP confidences tell us whether raising CONFLICT_CONF_MIN helps.
+        for gp in graded.iter().filter(|gp| gp.is_error()) {
+            let kind = if gp.flagged() { "FP" } else { "FN" };
+            let (conf, why) = gp
+                .verdict
+                .as_ref()
+                .map(|v| (v.confidence, v.why.as_str()))
+                .unwrap_or((0, "(dropped: below floor or not a contradiction)"));
+            println!(
+                "  [{kind}] truth={:?} conf={conf} a={:?} b={:?} why={:?}",
+                gp.label, gp.a, gp.b, why,
+            );
+        }
+    }
+    if args.binding && pairs.len() < 50 {
+        eprintln!(
+            "warning: --binding wants a 50+-pair set for a non-degenerate precision CI; got {} pairs",
+            pairs.len(),
+        );
+    }
     println!(
-        "conflict-grade: n={} TP={} FP={} FN={} recall={:.3} precision={:.3} \
-         (ci_lower={:.3} — DEFERRED gate, tiny-N) cry_wolf={:.3} → SMOKE {}",
+        "conflict-grade: n={} TP={} FP={} FN={} recall={:.3} precision={:.3} ci_lower={:.3} \
+         cry_wolf={:.3} → {}",
         pairs.len(),
         g.metrics.true_positives,
         g.metrics.false_positives,
@@ -142,7 +172,7 @@ fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
         g.metrics.precision,
         g.precision_ci_lower,
         g.metrics.cry_wolf_rate,
-        if smoke { "PASS (0 FP, ≥2 caught)" } else { "FAIL" },
+        verdict_line(&g, args.binding),
     );
     Ok(())
 }

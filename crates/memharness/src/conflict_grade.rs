@@ -139,22 +139,85 @@ pub fn smoke_ok(m: &Metrics) -> bool {
     m.false_positives == 0 && m.true_positives >= 2
 }
 
-use bossclaw_core::conflict::judge_pair;
+/// The headline PASS/FAIL line for a graded run. `binding=true` reports the §9 statistical
+/// binding gate (precision CI-lower ≥ [`GATE_PRECISION_CI_LOWER`] AND recall ≥ [`GATE_RECALL_MIN`],
+/// = `GradeResult::passes`) — meaningful ONLY on the 50+-pair set, where the precision CI is not
+/// degenerate. `binding=false` reports the tiny-seed plumbing SMOKE ([`smoke_ok`]). Binding mode
+/// echoes the CI-lower + recall numbers so the verdict is auditable, not a bare boolean.
+pub fn verdict_line(g: &GradeResult, binding: bool) -> String {
+    if binding {
+        format!(
+            "BINDING GATE {} (precision CI-lower {:.3} ≥ {:.2} AND recall {:.3} ≥ {:.2})",
+            if g.passes { "PASS" } else { "FAIL" },
+            g.precision_ci_lower,
+            GATE_PRECISION_CI_LOWER,
+            g.metrics.recall,
+            GATE_RECALL_MIN,
+        )
+    } else {
+        format!(
+            "SMOKE {}",
+            if smoke_ok(&g.metrics) { "PASS (0 FP, ≥2 caught)" } else { "FAIL" },
+        )
+    }
+}
+
+use bossclaw_core::conflict::{judge_pair, Verdict};
 use bossclaw_core::reason::Reasoner;
 
-/// Run the judge over every labelled pair and grade it. A judge transport error on
-/// any pair fails the whole run loudly (a partial grade is a misleading grade).
+/// Per-pair detail for verbose grading / threshold tuning: the ground-truth label plus the
+/// flagged verdict (`Some` iff [`judge_pair`] returned actionable). Lets the CLI show exactly
+/// which pairs the judge got wrong and at what self-reported confidence — the direct input to
+/// tuning `CONFLICT_CONF_MIN`.
+#[derive(Debug, Clone)]
+pub struct GradedPair {
+    pub a: String,
+    pub b: String,
+    pub label: PairLabel,
+    pub verdict: Option<Verdict>,
+}
+
+impl GradedPair {
+    pub fn flagged(&self) -> bool {
+        self.verdict.is_some()
+    }
+    pub fn truly_contradicts(&self) -> bool {
+        self.label == PairLabel::Contradicts
+    }
+    /// A misclassification: flagged a non-conflict (FP) or missed a real one (FN).
+    pub fn is_error(&self) -> bool {
+        self.flagged() != self.truly_contradicts()
+    }
+}
+
+/// Run the judge over every pair, returning the aggregate grade AND per-pair detail (for
+/// `--verbose` error inspection / threshold tuning). A transport error on any pair fails the
+/// whole run loudly (a partial grade is a misleading grade).
+pub fn run_grade_detailed(
+    pairs: &[LabelledPair],
+    judge: &dyn Reasoner,
+    seed: u64,
+) -> anyhow::Result<(GradeResult, Vec<GradedPair>)> {
+    let mut graded = Vec::with_capacity(pairs.len());
+    for p in pairs {
+        let verdict = judge_pair(judge, &p.a, &p.b)?;
+        graded.push(GradedPair { a: p.a.clone(), b: p.b.clone(), label: p.label, verdict });
+    }
+    let outcomes: Vec<Outcome> = graded
+        .iter()
+        .map(|g| Outcome { flagged: g.flagged(), truly_contradicts: g.truly_contradicts() })
+        .collect();
+    Ok((grade(&outcomes, seed), graded))
+}
+
+/// Run the judge over every labelled pair and grade it (aggregate only). A judge transport error
+/// on any pair fails the whole run loudly (a partial grade is a misleading grade).
 pub fn run_grade(
     pairs: &[LabelledPair],
     judge: &dyn Reasoner,
     seed: u64,
 ) -> anyhow::Result<GradeResult> {
-    let mut outcomes = Vec::with_capacity(pairs.len());
-    for p in pairs {
-        let flagged = judge_pair(judge, &p.a, &p.b)?.is_some();
-        outcomes.push(Outcome { flagged, truly_contradicts: p.label == PairLabel::Contradicts });
-    }
-    Ok(grade(&outcomes, seed))
+    run_grade_detailed(pairs, judge, seed).map(|(g, _)| g)
 }
 
 #[cfg(test)]
@@ -294,5 +357,61 @@ mod tests {
         let g = run_grade(&pairs, &r, 42).expect("grade ok");
         assert_eq!(g.metrics.false_positives, 2, "both coexist pairs falsely flagged");
         assert!(!smoke_ok(&g.metrics), "a cry-wolf judge FAILS the smoke");
+    }
+
+    #[test]
+    fn verdict_line_reports_smoke_vs_binding_gate() {
+        // A clean run: 20 correct flags + 5 clean abstentions → clears BOTH gates.
+        let good: Vec<Outcome> = (0..20)
+            .map(|_| Outcome { flagged: true, truly_contradicts: true })
+            .chain((0..5).map(|_| Outcome { flagged: false, truly_contradicts: false }))
+            .collect();
+        let g = grade(&good, 42);
+        assert!(verdict_line(&g, false).starts_with("SMOKE PASS"));
+        assert!(verdict_line(&g, true).starts_with("BINDING GATE PASS"));
+        // Binding mode echoes the auditable numbers, not a bare boolean.
+        let bl = verdict_line(&g, true);
+        assert!(bl.contains("precision CI-lower") && bl.contains("recall"));
+
+        // A cry-wolf run (half the flags wrong) fails the binding gate.
+        let noisy: Vec<Outcome> = (0..10)
+            .map(|_| Outcome { flagged: true, truly_contradicts: true })
+            .chain((0..10).map(|_| Outcome { flagged: true, truly_contradicts: false }))
+            .collect();
+        assert!(verdict_line(&grade(&noisy, 42), true).starts_with("BINDING GATE FAIL"));
+    }
+
+    #[test]
+    fn detailed_run_marks_fp_and_fn_pairs_with_confidence() {
+        use bossclaw_core::conflict::Winner;
+        // A coexist pair the judge WRONGLY flags (FP) + a real contradiction it MISSES (FN, dropped
+        // below the confidence floor). Verbose mode must expose both, incl. the FP's confidence.
+        let pairs = vec![
+            LabelledPair { a: "x1".into(), b: "y1".into(), label: PairLabel::Coexist, winner: None },
+            LabelledPair {
+                a: "x2".into(),
+                b: "y2".into(),
+                label: PairLabel::Contradicts,
+                winner: Some(Winner::Newer),
+            },
+        ];
+        let r = ScriptedReasoner::new("mixed")
+            .with_response(
+                CONFLICT_SYSTEM,
+                &build_conflict_prompt("x1", "y1"),
+                serde_json::json!({"contradicts": true, "winner": "newer", "confidence": 80, "why": "looks conflicty"}),
+            )
+            .with_response(
+                CONFLICT_SYSTEM,
+                &build_conflict_prompt("x2", "y2"),
+                serde_json::json!({"contradicts": true, "winner": "newer", "confidence": 5, "why": "unsure"}),
+            );
+        let (_g, graded) = run_grade_detailed(&pairs, &r, 42).expect("ok");
+        let fp = &graded[0];
+        assert!(fp.flagged() && fp.is_error(), "coexist flagged = FP error");
+        assert_eq!(fp.verdict.as_ref().expect("flagged verdict").confidence, 80);
+        let miss = &graded[1];
+        assert!(!miss.flagged() && miss.is_error(), "missed contradiction = FN error");
+        assert!(miss.verdict.is_none(), "a dropped pair carries no flagged verdict");
     }
 }
