@@ -153,10 +153,28 @@ pub async fn store_capture(
         sha256: r.sha256.clone(),
         approx_bytes: r.approx_bytes,
     };
-    engine
+    let ev = engine
         .capture_session(meta)
         .await
         .map_err(|e| CaptureStoreError::Engine(e.to_string()))?;
+
+    // (5) Rung-3 Phase-1 (§7.1): persist the session's body passages into the conflict index's
+    // restart-safe source table. Skip re-embedding on a same-`sha` recapture (A2 dedup returns the
+    // existing event id, which already has rows) — `session_passages_absent` gates that. `r.body`
+    // is exactly the text composed into the `.md`, so heal (which recovers it via `capture_body`)
+    // chunks the identical text. Accepted limitation: a CHANGED-`sha` recapture supersedes to a
+    // NEW event id and persists under it, so the old capture's rows linger un-GC'd — passage-level
+    // retire is Task 7's job, not Task 5's (no orphan GC here).
+    if engine
+        .session_passages_absent(ev.clone())
+        .await
+        .map_err(|e| CaptureStoreError::Engine(e.to_string()))?
+    {
+        engine
+            .store_session_passages(ev, bossclaw_core::chunk_text(&r.body))
+            .await
+            .map_err(|e| CaptureStoreError::Engine(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -268,7 +286,31 @@ pub async fn heal_orphans(
                 continue; // already consistent (has an event)
             }
             match engine.capture_session(meta).await {
-                Ok(_) => report.orphan_files_captured += 1,
+                Ok(ev) => {
+                    report.orphan_files_captured += 1;
+                    // Rung-3 Phase-1 (§7.1): persist this orphan's body passages too, so a capture
+                    // recovered by heal has the SAME conflict-index source rows a normal
+                    // `store_capture` would. Window (a) above read only the bounded front-matter
+                    // PREFIX, so re-read the FULL `.md` and `capture_body`-strip the front-matter —
+                    // chunking exactly `store_capture`'s `Rendered::body`. Best-effort on the body
+                    // read (the event is already durable, so an unreadable body just skips passages
+                    // for this file, consistent with window (a)'s "unreadable — leave it").
+                    if let Ok(full) = read_capture_markdown(&path) {
+                        if engine
+                            .session_passages_absent(ev.clone())
+                            .await
+                            .map_err(|e| CaptureStoreError::Engine(e.to_string()))?
+                        {
+                            engine
+                                .store_session_passages(
+                                    ev,
+                                    bossclaw_core::chunk_text(capture_body(&full)),
+                                )
+                                .await
+                                .map_err(|e| CaptureStoreError::Engine(e.to_string()))?;
+                        }
+                    }
+                }
                 // Owner-deleted (tombstoned, I9): the leftover .md is stale → remove it.
                 Err(EngineOpError::Rejected(_)) => {
                     let _ = std::fs::remove_file(&path);
@@ -470,4 +512,61 @@ fn front_matter_block(md: &str) -> Option<&str> {
     let rest = md.strip_prefix("---\n")?;
     let end = rest.find("\n---\n")?;
     Some(&rest[..end])
+}
+
+/// Recover the body text a capture chunked, from its stored `.md` — the inverse of
+/// [`compose_document`]'s front-matter framing. Returns everything after the closing `---\n\n`
+/// fence, dropping exactly the ONE blank separator line `compose_document` inserts between the
+/// block and the body. If the document is not front-matter-framed the whole input is the body
+/// (defensive: an unframed file is all body). This pins [`heal_orphans`]'s chunk input to the SAME
+/// text [`store_capture`] chunked (`Rendered::body`), so both persist byte-identical passages —
+/// even when the body itself contains a bare `---` line (the FIRST `\n---\n` is always the closing
+/// fence, since our front-matter keys are never a bare `---` line, the guarantee
+/// [`front_matter_block`] already relies on).
+fn capture_body(md: &str) -> &str {
+    let Some(rest) = md.strip_prefix("---\n") else {
+        return md; // not framed — the whole document is body
+    };
+    let Some(end) = rest.find("\n---\n") else {
+        return md; // opened but never closed — treat the whole document as body
+    };
+    let after_fence = &rest[end + "\n---\n".len()..];
+    // `compose_document` puts a blank line between the block and the body ("---\n\n"); drop
+    // exactly one leading '\n' so the body round-trips to exactly what was composed.
+    after_fence.strip_prefix('\n').unwrap_or(after_fence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `capture_body` is the exact inverse of `compose_document`'s front-matter framing: the body
+    /// it recovers from a stored `.md` is byte-identical to the body that was composed — even for a
+    /// body that contains a bare `---` line and multiple paragraphs (so the strip cannot over-reach
+    /// into the body). This pins [`heal_orphans`] to chunk EXACTLY the text [`store_capture`]
+    /// chunked (`Rendered::body`), so both persist identical session passages.
+    #[test]
+    fn capture_body_round_trips_compose_document_body() {
+        let body = "First paragraph, before a divider.\n\n---\n\nSecond paragraph, after a bare `---` line.\n";
+        let md = compose_document(
+            "sess-1",
+            "A Title\nwith a newline", // flattened by `one_line` — must not break fence detection
+            "proj",
+            "claude-code",
+            "abc123",
+            10,
+            20,
+            4096,
+            0,
+            0,
+            false,
+            /*recovered_stub=*/ false,
+            body,
+        );
+        assert_eq!(
+            capture_body(&md),
+            body,
+            "recovered body must equal the composed body, even with an embedded `---` line"
+        );
+    }
 }

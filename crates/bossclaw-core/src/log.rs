@@ -835,6 +835,22 @@ impl EventLog {
                 PRIMARY KEY(entity_id, model_id)
             )",
         )?;
+        // Session-passage vectors (Rung-3 Phase-1 §7.1; Tier-A derived). The
+        // restart-safe SOURCE for the conflict index — the daemon embeds each
+        // captured session's body chunks here at capture time. Separate from
+        // both `vectors` (recall) and `entity_vectors` (resolution) so the
+        // conflict index NEVER mixes with either.
+        // model_id-scoped; a language-pack swap empties this until re-capture (Phase-1 accepted limitation)
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS session_passage_vectors (
+                session_captured_event_id TEXT NOT NULL,
+                passage_ix                INTEGER NOT NULL,
+                model_id                  TEXT NOT NULL,
+                dim                       INTEGER NOT NULL,
+                embedding                 BLOB NOT NULL,
+                PRIMARY KEY(session_captured_event_id, passage_ix, model_id)
+            )",
+        )?;
         // Evolve-loop progress (re-derivable progress state — NOT a Tier-A fold,
         // spec §4). Single row (id pinned to 0), advanced after each committed
         // batch. Losing it only re-processes events (idempotent: an active
@@ -5691,6 +5707,87 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Rung-3 Phase-1 (§7.1): embed + persist a captured session's body passages
+    /// under `event_id`, ONE row per chunk `ix`, into the dedicated
+    /// `session_passage_vectors` table (the conflict index's restart-safe source).
+    /// Mirrors [`EventLog::derive_entity_vector`] — same blob encoding, `model_id`
+    /// and `dim` taken from `embedder`. A SEPARATE table from `vectors` (recall)
+    /// and `entity_vectors` (resolution), so persisting here never perturbs the
+    /// recall index. Idempotent upsert per `(event_id, ix, model_id)`.
+    pub fn store_session_passages(
+        &self,
+        embedder: &dyn Embedder,
+        event_id: &str,
+        chunks: &[String],
+    ) -> Result<(), BossclawError> {
+        // Embed first (no store lock needed), then upsert each — the same
+        // "embed, then lock, then insert" ordering as `derive_entity_vector`.
+        let mut rows: Vec<(usize, Vec<u8>)> = Vec::with_capacity(chunks.len());
+        for (ix, chunk) in chunks.iter().enumerate() {
+            rows.push((ix, vec_to_blob(&embed_one(embedder, chunk)?)));
+        }
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        for (ix, blob) in &rows {
+            conn.execute(
+                "INSERT OR REPLACE INTO session_passage_vectors \
+                 (session_captured_event_id, passage_ix, model_id, dim, embedding) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![event_id, *ix as i64, embedder.model_id(), embedder.dim() as i64, blob],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// All session-passage vectors for `model_id` as `(event_id, passage_ix,
+    /// vector)` triples, ordered `session_captured_event_id, passage_ix ASC`.
+    /// Mirrors [`EventLog::entity_vectors_for_model`] but over
+    /// `session_passage_vectors` and carrying the passage index (the tuple shape
+    /// the Task-6/7 conflict index consumes).
+    pub fn session_passages_for_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Vec<(String, usize, Vec<f32>)>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT session_captured_event_id, passage_ix, embedding \
+             FROM session_passage_vectors WHERE model_id = ?1 \
+             ORDER BY session_captured_event_id, passage_ix ASC",
+        )?;
+        let rows = stmt.query_map([model_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (event_id, ix, blob) = row?;
+            out.push((event_id, ix as usize, blob_to_vec(&blob)?));
+        }
+        Ok(out)
+    }
+
+    /// True when NO passage rows exist for `event_id` (existence probe over any
+    /// model). The capture path uses this to persist passages on the FIRST
+    /// capture and SKIP re-embedding on a same-`sha` recapture that already has
+    /// rows.
+    pub fn session_passages_absent(&self, event_id: &str) -> Result<bool, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let present: Option<i64> = store
+            .conn()
+            .query_row(
+                "SELECT 1 FROM session_passage_vectors \
+                 WHERE session_captured_event_id = ?1 LIMIT 1",
+                rusqlite::params![event_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(present.is_none())
+    }
+
     /// Search the entity-resolution index for the `k` nearest `(entity_id,
     /// distance)` pairs to `mention`'s embedding. ONLY entity nodes are searched
     /// (the index holds only `entity_vectors`). Returns [`BossclawError::InvalidInput`]
@@ -8258,6 +8355,27 @@ mod tests {
         assert!(
             log.vector_index_len() > 0,
             "after remember + rebuild the recall index holds ≥1 vector"
+        );
+    }
+
+    /// Rung-3 Phase-1 (§7.1): a capture's body passages embed + persist into the
+    /// dedicated `session_passage_vectors` table (the conflict index's restart-safe
+    /// source) and survive a reopen, keyed by the capture's event id + passage ix.
+    #[test]
+    fn store_session_passages_persists_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let chunks = vec!["we deploy on Vercel".to_string(), "db is Postgres".to_string()];
+        {
+            let log = open_log(dir.path());
+            log.store_session_passages(&emb, "cap1", &chunks).unwrap();
+        }
+        let log = open_log(dir.path()); // reopen — the table is restart-durable
+        let rows = log.session_passages_for_model(emb.model_id()).unwrap();
+        assert_eq!(
+            rows.iter().filter(|(e, _, _)| e == "cap1").count(),
+            2,
+            "both passages persisted under cap1 and survive a reopen"
         );
     }
 

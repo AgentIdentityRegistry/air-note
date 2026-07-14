@@ -660,6 +660,47 @@ impl EngineHandle {
         Ok(id)
     }
 
+    /// Rung-3 Phase-1 (§7.1): embed + persist a capture's body passages into the
+    /// `session_passage_vectors` table (the conflict index's restart-safe source). The
+    /// embedder is resolved INTERNALLY (like [`Self::capture_session`]) so the daemon capture
+    /// path never handles one — it passes only the capture's `event_id` + its body `chunks`.
+    /// A blank/empty embed folds to `Rejected`; any other core failure folds to `Core`, mirroring
+    /// `capture_session`'s mapping.
+    ///
+    /// This writes a SEPARATE table, NOT the recall index — so (unlike `capture_session`) it must
+    /// NOT invalidate `self.indexed`.
+    pub async fn store_session_passages(
+        &self,
+        event_id: String,
+        chunks: Vec<String>,
+    ) -> Result<(), EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        let embedder = self.embedder_provider.embedder_for(&log)?;
+        spawn_blocking(move || -> Result<(), EngineOpError> {
+            log.store_session_passages(&*embedder, &event_id, &chunks).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-3 Phase-1 (§7.1): true when NO passage rows exist yet for `event_id`. The capture
+    /// path gates on this so it persists passages on the FIRST capture and SKIPS re-embedding on a
+    /// same-`sha` recapture that already has rows. A pure read; gated + `spawn_blocking` like
+    /// [`Self::current_sessions`].
+    pub async fn session_passages_absent(&self, event_id: String) -> Result<bool, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.session_passages_absent(&event_id).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// SP3 A7/I7: append the owner-commanded `session_deleted` tombstone so the session leaves
     /// the fold + recall (the `.md` file itself is removed by the capture store). A delete of a
     /// session that is NOT current (already gone / superseded away / never captured) is the
