@@ -451,13 +451,13 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             RetireTarget::Note { event_id } => {
                 op_result(engine.retire_memory(event_id).await, Response::Retired)
             }
-            // Passage-granularity retire lands in Task 7; until then answer with a clean typed reject
-            // (NOT an invented engine fn) so the wire shape is stable and the arm is exhaustive. The
-            // runtime message stays user-neutral (it can surface in the App UI) — no task number.
-            RetireTarget::Passage { .. } => op_result(
-                Err(EngineOpError::Rejected("passage retire is not yet supported".into())),
-                Response::Retired,
-            ),
+            // Rung 3 §7.2 passage-granularity retire: append a `passage_retired` marker for the
+            // (session_id, passage_id). The engine wrapper resolves onboarding and folds an unknown
+            // session / out-of-range / already-retired passage to a typed `Rejected`. (Passage UNretire
+            // is core-only in Phase 1 — the wire `Unretire` op is note-only — so there is no arm for it.)
+            RetireTarget::Passage { session_id, passage_id } => {
+                op_result(engine.retire_passage(session_id, passage_id).await, Response::Retired)
+            }
         },
         Request::Unretire { retired_event_id, .. } => {
             op_result(engine.unretire(retired_event_id).await, Response::Retired)

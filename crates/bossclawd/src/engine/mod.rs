@@ -813,6 +813,30 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Rung 3 §7.2: retire a SINGLE session passage (the App-only `RetireMemory{Passage}` op) by
+    /// appending a `passage_retired` marker, returning its event id. Like [`Self::retire_memory`] this
+    /// is a pure marker append: NO embedder, NO index invalidation (the next conflict-index rebuild
+    /// simply drops the retired passage). An unknown session, an out-of-range `passage_id`, or an
+    /// already-retired passage folds to the typed `Rejected` (core reports `InvalidInput`); any other
+    /// core failure folds to `Core`. Onboarding is the daemon's OWN verdict (App-only). Passage
+    /// UNretire is core-only in Phase 1 (no wire op), so there is no matching wrapper here.
+    pub async fn retire_passage(
+        &self,
+        session_id: String,
+        passage_id: usize,
+    ) -> Result<String, EngineOpError> {
+        let onboarded = self.is_onboarded_local();
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.retire_passage(&session_id, passage_id).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// SP3 A9/I9: the tombstoned (owner-deleted) `session_id`s. The sweeper reads this so a
     /// deleted session's still-present transcript is never re-captured (never resurrected) — the
     /// engine's `capture_session` reject is the backstop, this is the cheap decision-time filter.

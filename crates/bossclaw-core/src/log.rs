@@ -4860,6 +4860,96 @@ impl EventLog {
         })
     }
 
+    /// Rung-3 §7.2: retire a SINGLE session passage (by `session_id` +
+    /// `passage_id`) via a DISTINCT [`crate::graph::PASSAGE_RETIRED_EVENT_TYPE`]
+    /// marker — the next [`EventLog::rebuild_conflict_index`] excludes exactly
+    /// that passage from [`EventLog::conflict_search`], leaving its siblings and
+    /// the recall / resolution indexes byte-untouched. Reversible via
+    /// [`EventLog::unretire_passage`]; the append-only marker also survives a
+    /// same-sha re-capture (an A2 dedup no-op), so a sweeper cycle never resurrects
+    /// the passage.
+    ///
+    /// Validation is model-AGNOSTIC (so it holds before ANY recall rebuild and
+    /// regardless of the active model): resolve the session's CURRENT fold-head
+    /// capture event id via `fold.current`, then reject a `passage_id` at/above the
+    /// [`EventLog::session_passage_count`] for that capture. Also rejects an unknown
+    /// session and (I6) an already-retired passage. Returns the marker event's id.
+    pub fn retire_passage(
+        &self,
+        session_id: &str,
+        passage_id: usize,
+    ) -> Result<String, BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let cs = fold
+            .current
+            .iter()
+            .find(|cs| cs.session_id == session_id)
+            .ok_or_else(|| {
+                BossclawError::InvalidInput(format!(
+                    "cannot retire passage: no current session {session_id}"
+                ))
+            })?;
+        let n = self.session_passage_count(&cs.event_id)?;
+        if passage_id >= n {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire passage {passage_id} of {session_id}: out of range ({n})"
+            )));
+        }
+        if fold.retired_passages.contains(&(session_id.to_string(), passage_id)) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire passage {passage_id} of {session_id}: already retired"
+            )));
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::PASSAGE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": session_id, "passage_id": passage_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Reverse a prior [`EventLog::retire_passage`] (Rung-3 §7.3): appends an
+    /// [`crate::graph::UNRETIRE_EVENT_TYPE`] marker carrying `{session_id,
+    /// passage_id}`, which the fold removes from `retired_passages` — restoring the
+    /// passage to [`EventLog::conflict_search`] and NOTHING else (it never touches
+    /// `superseded`/`retired_notes`, so it can never resurrect edited-away content).
+    /// Rejects (I6) a passage that is not currently retired. Returns the marker id.
+    ///
+    /// Phase-1 note: passage-unretire is CORE-ONLY — there is deliberately no
+    /// proto/server unretire-passage op (the wire `Request::Unretire` is note-only).
+    /// The Phase-3 conflict-resolution UI wires this; it exists now so the retire
+    /// action is provably reversible.
+    pub fn unretire_passage(
+        &self,
+        session_id: &str,
+        passage_id: usize,
+    ) -> Result<String, BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        if !fold.retired_passages.contains(&(session_id.to_string(), passage_id)) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot unretire passage {passage_id} of {session_id}: not retired"
+            )));
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": session_id, "passage_id": passage_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
     /// Validate `target_event_id` is a retirable CURRENT note — the same
     /// exists/memory-kind/not-already-superseded checks
     /// [`EventLog::supersede_note`] applies (blank-text excepted: retire has no
@@ -5804,6 +5894,22 @@ impl EventLog {
             )
             .optional()?;
         Ok(present.is_none())
+    }
+
+    /// Count of `session_passage_vectors` rows for `event_id`, over ANY model
+    /// (model-AGNOSTIC — a retire targets a logical `(session_id, passage_id)`
+    /// position, independent of the active model). [`EventLog::retire_passage`]
+    /// uses this to range-check a `passage_id` BEFORE any recall rebuild, so it
+    /// deliberately does NOT scope by `model_id`.
+    pub fn session_passage_count(&self, event_id: &str) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM session_passage_vectors \
+             WHERE session_captured_event_id = ?1",
+            rusqlite::params![event_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
     }
 
     /// Search the entity-resolution index for the `k` nearest `(entity_id,
@@ -8509,6 +8615,30 @@ mod tests {
         log.rebuild_conflict_index(&emb).unwrap(); // no passages ⇒ empty index (but built)
         let hits = log.conflict_search(&emb.embed(&["x".into()]).unwrap()[0], 8);
         assert!(hits.is_empty(), "an empty (built) conflict index yields no hits");
+    }
+
+    /// Rung-3 §7.2/§7.3: the passage-retire ACTION — retiring one passage hides
+    /// exactly that passage from `conflict_search`, siblings stay, the retire
+    /// survives a sweeper cycle (same-sha re-capture is an A2 dedup no-op that
+    /// keeps the marker), and `unretire_passage` reverses it.
+    #[test]
+    fn passage_retire_hides_one_survives_sweep_and_reverses() {
+        let dir = tempfile::tempdir().unwrap(); let log = open_log(dir.path()); let emb = MockEmbedder::new(8);
+        let ev = log.capture_session(&emb, &session_meta("s1","aa")).unwrap();
+        let chunks = vec!["Vercel".to_string(), "Postgres".to_string()];
+        log.store_session_passages(&emb, &ev, &chunks).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        log.retire_passage("s1", 0).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        let hit = |q:&str| log.conflict_search(&emb.embed(&[q.into()]).unwrap()[0], 8).iter().any(|(s,p,_)| s=="s1" && *p==0);
+        assert!(!hit("Vercel"), "retired passage 0 hidden");
+        assert!(log.conflict_search(&emb.embed(&["Postgres".into()]).unwrap()[0],8).iter().any(|(s,p,_)| s=="s1" && *p==1), "sibling kept");
+        // SWEEP durability: same-sha re-capture is a no-op (returns the same id); marker persists across rebuild.
+        log.capture_session(&emb, &session_meta("s1","aa")).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        assert!(!hit("Vercel"), "retire survives a sweeper cycle");
+        log.unretire_passage("s1", 0).unwrap(); log.rebuild_conflict_index(&emb).unwrap();
+        assert!(hit("Vercel"), "unretire restores the passage");
     }
 
     /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields
