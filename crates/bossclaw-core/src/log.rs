@@ -1633,16 +1633,25 @@ impl EventLog {
         // candidate (e.g. pages only) pays nothing. `current_session_event_ids`
         // is the INCLUSION set (only the current fold head survives);
         // `superseded_ids` is an EXCLUSION set (see the memory arm below).
-        let (current_session_event_ids, superseded_ids): (
+        let (current_session_event_ids, superseded_ids, retired_note_ids): (
+            std::collections::HashSet<String>,
             std::collections::HashSet<String>,
             std::collections::HashSet<String>,
         ) = if kinds.values().any(|k| {
             k == crate::graph::SESSION_CAPTURED_EVENT_TYPE || k == crate::graph::MEMORY_EVENT_TYPE
         }) {
             let fold = fold_sessions(&self.session_events_ordered()?);
-            (fold.current.into_iter().map(|cs| cs.event_id).collect(), fold.superseded)
+            (
+                fold.current.into_iter().map(|cs| cs.event_id).collect(),
+                fold.superseded,
+                fold.retired_notes,
+            )
         } else {
-            (std::collections::HashSet::new(), std::collections::HashSet::new())
+            (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
         };
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
@@ -1787,8 +1796,12 @@ impl EventLog {
                 // ground-truth note, so an inclusion set would drop every
                 // non-superseded memory. `superseded_ids` over-covers (it also
                 // holds session/file supersede targets), but this arm consults it
-                // only for memory-kind ids, so the over-breadth is inert.
-                return !superseded_ids.contains(&h.event_id);
+                // only for memory-kind ids, so the over-breadth is inert. A rung-3
+                // retired note (distinct `note_retired` marker, reversible) is also
+                // dropped here — fold-time, no index rebuild — so retire/unretire
+                // take effect immediately (the vector stays in the HNSW index).
+                return !superseded_ids.contains(&h.event_id)
+                    && !retired_note_ids.contains(&h.event_id);
             }
             true // every other kind always survives
         });
@@ -4753,6 +4766,107 @@ impl EventLog {
         Ok(new_id)
     }
 
+    /// Retire a [`EventLog::remember`] note (rung-3 "Retire older") via a DISTINCT
+    /// [`crate::graph::NOTE_RETIRED_EVENT_TYPE`] marker — reversible, no replacement.
+    /// A distinct marker (not a `supersede`) is what lets [`EventLog::unretire`]
+    /// reverse a retire WITHOUT ever reversing an edit: a bare supersede is
+    /// byte-identical to an edit, so retiring through the supersede machinery would
+    /// let an unretire resurrect edited-away content. Validation mirrors
+    /// [`EventLog::supersede_note`] (exists, memory-kind, not already superseded)
+    /// EXCEPT the blank-text check (there is no replacement text), plus a
+    /// not-already-retired check. Returns the `note_retired` event's id.
+    ///
+    /// I5 completeness caveat (documented): retire excludes the note from recall,
+    /// the Library list, and the embed-rebuild gate, but does NOT yet remove
+    /// already-minted entities/edges or dequeue it from extraction — that
+    /// edge-invalidation is resolution-time (Phase 3 / Task 9), not a Phase-1 blocker.
+    pub fn retire_memory(&self, target_event_id: &str) -> Result<String, BossclawError> {
+        self.assert_retirable_note(target_event_id)?;
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "retires": target_event_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Reverse a prior [`EventLog::retire_memory`] (rung-3): appends a
+    /// [`crate::graph::UNRETIRE_EVENT_TYPE`] marker that removes the note from
+    /// `fold_sessions().retired_notes`, restoring it to recall and the Library list.
+    /// Only reverses a RETIRE — an `unretire` removes solely from `retired_notes`,
+    /// never from `superseded`, so it can never resurrect an edited-away note.
+    /// Returns [`BossclawError::InvalidInput`] if `retired_event_id` is not currently
+    /// retired (validated before appending). Returns the `unretire` event's id.
+    pub fn unretire(&self, retired_event_id: &str) -> Result<String, BossclawError> {
+        self.assert_note_retired(retired_event_id)?;
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "unretires": retired_event_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Validate `target_event_id` is a retirable CURRENT note — the same
+    /// exists/memory-kind/not-already-superseded checks
+    /// [`EventLog::supersede_note`] applies (blank-text excepted: retire has no
+    /// replacement), PLUS not already retired by a live `note_retired` marker.
+    /// All failures are [`BossclawError::InvalidInput`].
+    fn assert_retirable_note(&self, target_event_id: &str) -> Result<(), BossclawError> {
+        let target = self.event_by_id(target_event_id)?.ok_or_else(|| {
+            BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: no such event"
+            ))
+        })?;
+        if target.event_type != crate::graph::MEMORY_EVENT_TYPE {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: not a remembered note (event_type = {})",
+                target.event_type
+            )));
+        }
+        if self.superseded_event_ids()?.contains(target_event_id) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: already superseded"
+            )));
+        }
+        if fold_sessions(&self.session_events_ordered()?)
+            .retired_notes
+            .contains(target_event_id)
+        {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: already retired"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate `retired_event_id` is currently retired (present in
+    /// `fold_sessions().retired_notes`), the precondition for [`EventLog::unretire`].
+    /// Returns [`BossclawError::InvalidInput`] otherwise.
+    fn assert_note_retired(&self, retired_event_id: &str) -> Result<(), BossclawError> {
+        if !fold_sessions(&self.session_events_ordered()?)
+            .retired_notes
+            .contains(retired_event_id)
+        {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot unretire {retired_event_id}: not retired"
+            )));
+        }
+        Ok(())
+    }
+
     /// The set of event ids retired by a `supersede` event, across ALL folds:
     /// page/file/session/note supersedes share [`crate::graph::SUPERSEDE_EVENT_TYPE`]
     /// and each targets exactly one (disjoint) id. Reads only supersede events
@@ -4776,15 +4890,19 @@ impl EventLog {
     /// version of anything should ever re-vectorize) and (2) every
     /// `session_captured` event whose `session_id` carries a `session_deleted`
     /// tombstone (the tombstone keys on `session_id`, so the capture event id is
-    /// NOT in the supersede set). One [`EventLog::session_events_ordered`] scan
-    /// feeds both. Used to gate re-embedding ([`EventLog::collect_pending`]) AND
-    /// the migration completeness denominator ([`EventLog::reembed_prepare`]) so
-    /// a deleted session neither re-vectorizes on rebuild/migration nor (by being
-    /// counted "missing") blocks a migration from ever completing.
+    /// NOT in the supersede set), and (3) every rung-3 retired note (a live
+    /// `note_retired` marker, reversible via `unretire`) — so a retired note never
+    /// re-vectorizes on rebuild/migration either. One
+    /// [`EventLog::session_events_ordered`] scan feeds all three. Used to gate
+    /// re-embedding ([`EventLog::collect_pending`]) AND the migration completeness
+    /// denominator ([`EventLog::reembed_prepare`]) so a deleted/retired item
+    /// neither re-vectorizes on rebuild/migration nor (by being counted "missing")
+    /// blocks a migration from ever completing.
     fn embed_excluded_event_ids(&self) -> Result<HashSet<String>, BossclawError> {
         let events = self.session_events_ordered()?;
         let fold = fold_sessions(&events);
         let (deleted, mut excluded) = (fold.deleted, fold.superseded);
+        excluded.extend(fold.retired_notes);
         for ev in &events {
             if ev.event_type == crate::graph::SESSION_CAPTURED_EVENT_TYPE {
                 if let Some(sid) = ev.content.get("session_id").and_then(|v| v.as_str()) {
@@ -4925,16 +5043,20 @@ impl EventLog {
 
     /// The CURRENT remembered notes (SP3 §7/§9): every `memory`-kind event
     /// ([`EventLog::remember`] / the corrected note of [`EventLog::supersede_note`])
-    /// NOT retired by a `supersede`, newest-first. A deterministic read (no vector,
-    /// no embedder) backing the Memory-browser notes list — mirrors
+    /// NOT retired by a `supersede` AND NOT retired by a live rung-3 `note_retired`
+    /// marker (an `unretire` restores it), newest-first. A deterministic read (no
+    /// vector, no embedder) backing the Memory-browser notes list — mirrors
     /// [`EventLog::current_sessions`]. "Note" is defined by event-kind EXACTLY as
     /// [`EventLog::supersede_note`] validates its target (memory-kind), so the list
     /// and the edit primitive can never disagree on what counts as a note. Reads
-    /// only `memory` + `supersede` events (never a whole-log scan).
+    /// only `memory` + `supersede` + `note_retired` + `unretire` events (never a
+    /// whole-log scan).
     pub fn current_notes(&self) -> Result<Vec<CurrentNote>, BossclawError> {
         let events = self.events_of_types(&[
             crate::graph::MEMORY_EVENT_TYPE,
             crate::graph::SUPERSEDE_EVENT_TYPE,
+            crate::graph::NOTE_RETIRED_EVENT_TYPE,
+            crate::graph::UNRETIRE_EVENT_TYPE,
         ])?;
         Ok(fold_notes(&events))
     }
@@ -7857,9 +7979,9 @@ struct SessionFold {
     /// reversed by an `unretire` (Rung-3). Kept strictly separate from
     /// `superseded` so an `unretire` reverses a retire and NEVER an edit — a
     /// bare supersede is byte-identical to an edit, so folding retires into
-    /// `superseded` would let `unretire` resurrect edited-away content. Consumed
-    /// by the recall-exclusion + `unretire` tasks (Task 2+).
-    #[allow(dead_code)] // read by the recall-exclusion task (Task 2); Task 1 only builds the state.
+    /// `superseded` would let `unretire` resurrect edited-away content. Read by
+    /// recall's memory-arm exclusion, the embed-rebuild gate, and the
+    /// retire/unretire validation (Task 2).
     retired_notes: std::collections::HashSet<String>,
     /// `(session_id, passage_id)` pairs retired by a `passage_retired` marker and
     /// NOT yet reversed by an `unretire` (Rung-3) — the passage-granularity twin
@@ -7955,25 +8077,39 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
     }
 }
 
-/// Pure note fold (SP3 §7/§9): given `memory` + `supersede` events in `seq ASC`
-/// order, returns the CURRENT notes — every `memory`-kind event NOT retired by a
-/// `supersede` — sorted NEWEST-FIRST (`created_at` desc, then `event_id` desc as a
-/// deterministic tie-break; ULIDs are monotonic + lexicographically sortable, so
-/// `event_id` desc IS newest-first within a same-second group).
+/// Pure note fold (SP3 §7/§9): given `memory` + `supersede` events (plus the
+/// rung-3 `note_retired` / `unretire` markers) in `seq ASC` order, returns the
+/// CURRENT notes — every `memory`-kind event NOT retired by a `supersede` AND NOT
+/// retired by a live `note_retired` marker — sorted NEWEST-FIRST (`created_at`
+/// desc, then `event_id` desc as a deterministic tie-break; ULIDs are monotonic +
+/// lexicographically sortable, so `event_id` desc IS newest-first within a
+/// same-second group).
 ///
 /// A returned note's `superseded_by` is ALWAYS `None`: a superseded note is
 /// EXCLUDED from the fold (only live heads survive), mirroring [`fold_sessions`]'s
 /// current-only projection — so the Library shows an edited note in place (old text
-/// gone, new text present) and recall/list stay consistent. `created_at` is the
-/// event `ts` (RFC 3339) parsed to Unix seconds, or 0 if absent/unparseable
-/// (deterministic fallback — no clock read).
+/// gone, new text present) and recall/list stay consistent. Rung-3 retire is
+/// reversible: a `note_retired` marker removes a note, a later `unretire` restores
+/// it (walked in `seq` order, so the last marker wins) — kept SEPARATE from the
+/// `superseded` set so an `unretire` can never resurrect an edited-away note.
+/// `created_at` is the event `ts` (RFC 3339) parsed to Unix seconds, or 0 if
+/// absent/unparseable (deterministic fallback — no clock read).
 fn fold_notes(events: &[Event]) -> Vec<CurrentNote> {
     use std::collections::HashSet;
     let mut superseded: HashSet<&str> = HashSet::new();
+    let mut retired: HashSet<&str> = HashSet::new();
     for ev in events {
         if ev.event_type == crate::graph::SUPERSEDE_EVENT_TYPE {
             if let Some(p) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
                 superseded.insert(p);
+            }
+        } else if ev.event_type == crate::graph::NOTE_RETIRED_EVENT_TYPE {
+            if let Some(p) = ev.content.get("retires").and_then(|v| v.as_str()) {
+                retired.insert(p);
+            }
+        } else if ev.event_type == crate::graph::UNRETIRE_EVENT_TYPE {
+            if let Some(p) = ev.content.get("unretires").and_then(|v| v.as_str()) {
+                retired.remove(p);
             }
         }
     }
@@ -7982,6 +8118,7 @@ fn fold_notes(events: &[Event]) -> Vec<CurrentNote> {
         .filter(|ev| {
             ev.event_type == crate::graph::MEMORY_EVENT_TYPE
                 && !superseded.contains(ev.id.as_str())
+                && !retired.contains(ev.id.as_str())
         })
         .map(|ev| CurrentNote {
             event_id: ev.id.clone(),
@@ -8413,6 +8550,23 @@ mod tests {
             .unwrap();
         assert!(hits.iter().all(|h| h.event_id != old), "old (superseded) head excluded");
         assert!(!hits.is_empty(), "the replacement note surfaces");
+    }
+
+    #[test]
+    fn retire_memory_note_excludes_from_recall_and_list_and_unretire_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let ev = log.remember(&emb, "we deploy on Vercel").unwrap();
+        log.rebuild_indexes(&emb).unwrap();
+        assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev));
+        log.retire_memory(&ev).unwrap();
+        assert!(!log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "retired note excluded from recall");
+        assert!(!log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "retired note excluded from the Library list");
+        assert!(matches!(log.unretire("not-a-retired-id"), Err(BossclawError::InvalidInput(_))), "unretire refuses a non-retired id");
+        log.unretire(&ev).unwrap();
+        assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "unretire restores recall");
+        assert!(matches!(log.retire_memory("nope"), Err(BossclawError::InvalidInput(_))));
     }
 
     #[test]
