@@ -1,269 +1,282 @@
-# Rung 3 — Phase 1: Engine Prerequisites — Implementation Plan (Rev 2, review-folded)
+# Rung 3 — Phase 1: Engine Prerequisites — Implementation Plan (Rev 3, two review rounds folded)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax. **Run every `cargo` command SYNCHRONOUSLY in the foreground** (the standing P0 lesson).
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use `- [ ]`. **Run every `cargo` command SYNCHRONOUSLY in the foreground.** Tests here MIRROR named existing tests (real public methods + inline `Event{}` appends) — do NOT invent private helpers; when a snippet names a fn, it is either an existing fn (line cited) or created by an explicit step in the same task.
 
-**Goal:** Build the engine prerequisites Phase 2 detection needs — (7.1) a *separate* session-passage conflict index fed by persisted passage vectors, and (7.3) a reversible `retire_memory` primitive at **note + passage** granularity (App-only) — such that recall (rungs 1/2) does not regress, a passage-retire survives a sweeper cycle, `retire_memory` is guest-refused, and `unretire` round-trips **without ever reversing an ordinary edit**.
+**Goal:** Engine prerequisites for Phase-2 detection — (7.1) a *separate* session-passage conflict index fed by passage vectors persisted at capture; (7.3) a reversible `retire_memory` primitive at **note + passage** granularity (App-only) — with recall (rungs 1/2) not regressing, a passage-retire surviving a sweeper cycle, `retire_memory` guest-refused, and `unretire` round-tripping **without ever reversing an ordinary edit**.
 
-**Architecture:** State logic lives in `crates/bossclaw-core/src/log.rs` (`EventLog`, append-only + signed + fold-derived). Retire uses **distinct `note_retired`/`passage_retired` marker events** (NOT a bare `supersede` — a supersede is byte-identical to an edit, so reusing it makes `unretire` unable to tell a retire from an edit → silent resurrection; review BLOCKER-1/M1). A distinct marker tracked in its own `retired` set makes `unretire` refusable and safe. Session passages are **chunked + embedded once at capture time by the daemon and persisted** to a new encrypted `session_passage_vectors` table (mirroring the existing `entity_vectors`), so the separate `conflict_index` has a real, restart-surviving data source and core stays filesystem-free (review BLOCKER-2/C1). The recall `vector_index` is **byte-untouched**, making "no recall regression" true by construction.
+**Architecture:** State lives in `crates/bossclaw-core/src/log.rs` (`EventLog`, append-only + signed via `append_event_in_tx`). Retire uses **distinct `note_retired`/`passage_retired` marker events** (NOT a `supersede`, which is byte-identical to an edit — reusing it makes `unretire` unable to distinguish a retire from an edit). The distinct markers are folded into **`SessionFold`'s own new `retired_notes`/`retired_passages` sets** — the same fold the recall arm already consumes at `log.rs:1642` — so recall exclusion actually reaches the arm (fixing round-2 BLOCKER-1). Session passages are chunked + embedded once **at capture time by the daemon** (`store_capture`, which already holds `r.body`) and persisted to a new `session_passage_vectors` table (mirroring `entity_vectors`); `rebuild_conflict_index` reads that table, so the conflict index has a real, restart-surviving source and core stays filesystem-free (fixing round-2 MAJOR: wrong seam). The recall `vector_index` is byte-untouched → "no recall regression" by construction.
 
-**Tech Stack:** Rust, `serde`/`serde_json`, encrypted SQLite (`store.rs`), `hnsw_rs` via `VectorIndex`/`HnswIndex` (`index.rs`), `model2vec_rs` embedder, `clap` (memharness), ULID ids, Ed25519 signing (automatic in `append_event_in_tx:955`).
+**Tech Stack:** Rust, `serde_json`, encrypted SQLite (`store.rs`), `hnsw_rs` via `VectorIndex`/`HnswIndex` (`index.rs`), `model2vec_rs` embedder, `clap` (memharness), ULID ids, Ed25519 signing (automatic in `append_event_in_tx:955`).
 
-**Spec:** `docs/superpowers/specs/2026-07-12-rung3-conflict-resolution-design.md` (§3, §7, §9, §13, I1/I5/I6/I8). **Branch:** `feat-rung3-conflict-resolution`. **Rev 2** folds the architect+critic plan review (see "Review resolutions" at the end).
+**Spec:** `docs/superpowers/specs/2026-07-12-rung3-conflict-resolution-design.md` (§3, §7, §9, §13, I1/I5/I6/I8). **Branch:** `feat-rung3-conflict-resolution`.
 
-**Design decisions folded (owner-ratified 2026-07-14):**
-- **D1 — Session retire is PASSAGE-granularity only.** No whole-session retire (no §6 action invokes it; sessions conflict at the passage level per §4c). Notes retire via their own distinct marker. → removes the sweeper `include_candidate` change and the session-level retired-set/`retired_session_ids` entirely.
-- **D2 — Passage vectors persist at capture time** in a new `session_passage_vectors` table (mirror `entity_vectors`), written by the daemon capture path; `rebuild_conflict_index` reads that table. Core never reads `.md` bodies.
+**Owner decisions (ratified 2026-07-14):** **D1** session retire is PASSAGE-granularity only (no whole-session retire — nothing invokes it; §4c conflicts at passage level); notes retire via their own marker. **D2** passage vectors persist at capture in `session_passage_vectors`.
 
-**Exit gate (spec §3 / §13):** passage index built + queried; **recall-neutrality** (rungs 1/2 unchanged) proven; a passage-retire survives a simulated sweeper cycle; `retire_memory` guest-refused; `unretire` round-trips (and never un-does an edit); passage-vs-title catch rate measured on an honest fixture.
+**Accepted Phase-1 limitations (documented, deferred):**
+- **Model-version survival:** `session_passage_vectors` is keyed by `model_id` (mirroring `entity_vectors`). A rung-2 language-pack swap changes the active `model_id`, so `rebuild_conflict_index` returns empty until sessions are re-captured under the new model. Acceptable because the *consumer* (Phase-2 detection) does not exist yet. A future re-embed hook (mirroring `reembed_prepare`) is out of Phase-1 scope. **Must be stated in a code comment on the table.**
+- **Orphan passage rows:** a changed-sha re-capture mints a new capture event id; the old id's passage rows are skipped by `rebuild_conflict_index` (it reads only current fold heads) but remain on disk. Bounded cleanup is a one-line delete in Task 5 Step 3 (delete rows for a superseded capture id); if deferred, document it.
+- **Passage-id ordinal fragility:** `passage_id` = chunk ordinal; a changed-sha body re-chunk shifts ordinals, so a marker could mis-target after an edit. Harmless for the Phase-1 primitive (no Retire *action* yet); when the action ships (Phase 3), key the marker on a chunk content-hash.
 
----
-
-## File Structure
-
-**Modified — core (`crates/bossclaw-core/src/`):**
-- `graph.rs:37` — consts `NOTE_RETIRED_EVENT_TYPE`, `PASSAGE_RETIRED_EVENT_TYPE`, `UNRETIRE_EVENT_TYPE` (all non-embeddable; do NOT add to `EMBEDDABLE_EVENT_TYPES:345`).
-- `log.rs` — note-fold `retired` set + reversal (`fold_notes:7908`, recall memory arm `:1785`, `embed_excluded_event_ids:4784`, `current_notes` query `:4930`, `superseded_event_ids:4761`); `SessionFold:7838` gains `retired_passages`; `fold_sessions:7859` + `session_events_ordered:4822` learn the new types; new `retire_memory`/`unretire`/`retire_passage`/`unretire_passage` primitives; new `session_passage_vectors` table + `store_session_passages`/`session_passages_for_model` (mirror `entity_vectors`/`entity_vectors_for_model:5528`); new `conflict_index` field + `rebuild_conflict_index:mirror(5515)` + `conflict_search:mirror(1420)`; `VectorIndex::len` accessor (`index.rs:45`).
-- `index.rs` — port `CHUNK_KEY_SEP`/`encode_chunk_key`/`decode_chunk_key`/`event_id_of` from `origin/feat-retrieval-rung3-chunking`; add `len()` to the `VectorIndex` trait + `HnswIndex`.
-
-**Created — core:** `crates/bossclaw-core/src/chunk.rs` (port; `chunk_text`, `CHUNK_BUDGET_CHARS=600`).
-
-**Modified — proto (`crates/bossclawd-proto/src/lib.rs`):** `Request::RetireMemory{onboarded, target: RetireTarget}` + `Request::Unretire{...}` (`:125`); `enum RetireTarget{ Note{event_id}, Passage{session_id, passage_id} }` (derives `Serialize,Deserialize,Clone,PartialEq,Debug`); `Response::Retired(String)` (`:257`); allowlist tests (`:820`,`:846`). `Role::allows` + `PROTO_VERSION` untouched.
-
-**Modified — daemon (`crates/bossclawd/src/`):** `server.rs:258` dispatch arms; `engine/mod.rs:717` async wrappers (mirror `supersede_note`); `capture/store.rs` capture path chunks+embeds+persists passages; `capture/store.rs` retire path must **NOT** call `delete_capture:182` (it deletes the `.md`).
-
-**Modified — harness (`crates/memharness/src/`):** `main.rs` `conflict-grade --retrieval {title|passage}` mode; `compare.rs` `recall_regressed` helper; new fixture `fixtures/session-conflict-pairs.jsonl`.
+**Exit gate (§3/§13):** passage index built + queried; recall-neutrality (rungs 1/2 unchanged); passage-retire survives a simulated sweeper cycle; `retire_memory` guest-refused; `unretire` round-trips and never un-does an edit; passage-vs-title catch rate on an honest fixture.
 
 ---
 
-## Task 1 — Distinct reversible retire markers + fold state (§7.2/§7.3 foundation)
+## File Structure (verified line refs)
+**Core (`crates/bossclaw-core/src/`):**
+- `graph.rs:37` (beside `SESSION_DELETED_EVENT_TYPE`) — `NOTE_RETIRED_EVENT_TYPE`, `PASSAGE_RETIRED_EVENT_TYPE`, `UNRETIRE_EVENT_TYPE`. Keep them OUT of `EMBEDDABLE_EVENT_TYPES` (`log.rs:345`).
+- `log.rs` — `SessionFold` (`:7838`) gains `retired_notes: HashSet<String>` + `retired_passages: HashSet<(String,usize)>`; `fold_sessions` (`:7859`) learns the 3 types (insert on retire, remove on unretire, seq order); `session_events_ordered` (`:4822`) adds the 3 types; recall memory arm (`:1785`) also excludes `retired_notes` (extracted at `:1642`); `embed_excluded_event_ids` (`:4784`) unions `retired_notes`; `current_notes` (`:4929`)/`fold_notes` (`:7908`) exclude retired notes from the Library list; new `retire_memory`/`unretire`/`retire_passage`/`unretire_passage` + `assert_retirable_note`/`assert_note_retired` (mirror `supersede_note:4720` validation + `delete_session:4898` append shape); new `session_passage_vectors` table + `store_session_passages`/`session_passages_for_model` (mirror `derive_entity_vector:5494`/`entity_vectors_for_model:5529`); new `conflict_index` field + `rebuild_conflict_index` (mirror `rebuild_entity_index:5515`) + `conflict_search` (mirror `entity_search:5554`) + `pub(crate) fn vector_index_len(&self)->usize`.
+- `index.rs:45` — port `chunk_text` deps + `encode_chunk_key`/`decode_chunk_key`/`event_id_of` from `origin/feat-retrieval-rung3-chunking`; add `fn len(&self)->usize` to `VectorIndex` + `HnswIndex`.
+**Created:** `crates/bossclaw-core/src/chunk.rs` (port).
+**Proto (`crates/bossclawd-proto/src/lib.rs`):** `Request::RetireMemory{onboarded, target: RetireTarget}` + `Unretire{onboarded, retired_event_id}` (`:125`); `enum RetireTarget{ Note{event_id}, Passage{session_id, passage_id} }` deriving `Serialize,Deserialize,Clone,PartialEq,Debug`; `Response::Retired(String)` (`:257`). `Role::allows` (`:71`) + `PROTO_VERSION` untouched (auto-refused; every `Response` consumer has an `other=>` catch-all — verified).
+**Daemon (`crates/bossclawd/src/`):** `server.rs:243` dispatch arms; `engine/mod.rs:717` async wrappers (mirror `supersede_note`); `capture/store.rs:109` `store_capture` binds the `capture_session` id + chunks `r.body` + persists passages; `heal_orphans` (window a, `store.rs:270`) does the same via `read_capture_markdown`. Retire path must NOT call `delete_capture:163` (it removes the `.md`).
+**Harness (`crates/memharness/src/`):** `main.rs` `conflict-grade --retrieval {title|passage}`; `compare.rs` `recall_regressed`; new `fixtures/session-conflict-pairs.jsonl`.
 
-Adds `note_retired`/`passage_retired`/`unretire` events and folds them into a **separate** `retired` set (never the `superseded` set), so `unretire` can only ever reverse a retire — never an edit.
+---
 
-**Files:** `graph.rs:37`; `log.rs:7838`(`SessionFold`), `:7859`(`fold_sessions`), `:7908`(`fold_notes`), `:4822`(`session_events_ordered`), `:4930`(`current_notes`). Test: mirror `superseded_note_excluded_but_replacement_recallable:8232`.
+## Task 1 — Distinct retire markers + reversible `SessionFold` state (BLOCKER-1 fix)
+
+Adds the 3 event consts and folds them into `SessionFold`'s OWN new sets (the fold recall consumes), so `unretire` reverses a retire and NEVER an edit-supersede. Standalone: the test appends raw `Event{}`s via the in-module `append` (as `delete_session` does), so it compiles without Task 2.
+
+**Files:** `graph.rs:37`; `log.rs:7838`(struct), `:7859`(`fold_sessions`), `:4822`(`session_events_ordered`). Test: mirror `deleted_session_tombstones_in_fold` (session-fold test in `log.rs`'s `#[cfg(test)] mod tests`; setup `let dir = tempfile::tempdir().unwrap(); let log = open_log(dir.path());`).
 
 - [ ] **Step 1: consts** (`graph.rs:37`):
 ```rust
-/// Rung-3 retire markers — DISTINCT from `supersede` (which is byte-identical to an edit).
-/// A distinct type is what lets `unretire` reverse a retire without ever reversing an edit.
+/// Rung-3 retire markers — DISTINCT from `supersede` (a supersede is byte-identical to an edit;
+/// a distinct type is what lets `unretire` reverse a retire without ever reversing an edit).
 pub const NOTE_RETIRED_EVENT_TYPE: &str = "note_retired";       // content: {"retires": <note_event_id>}
 pub const PASSAGE_RETIRED_EVENT_TYPE: &str = "passage_retired"; // content: {"session_id","passage_id"}
-pub const UNRETIRE_EVENT_TYPE: &str = "unretire";              // content: {"unretires": <event_id>} OR {"session_id","passage_id"}
+pub const UNRETIRE_EVENT_TYPE: &str = "unretire";              // content: {"unretires": id}  OR  {"session_id","passage_id"}
 ```
-- [ ] **Step 2: failing fold test** (helpers `open_log:7990`, `MockEmbedder::new(8)`):
+- [ ] **Step 2: failing test** (append raw markers inline; assert fold reversal + edit-disjointness):
 ```rust
 #[test]
-fn note_retired_is_reversible_and_never_reverses_an_edit() {
-    let log = open_log(); let emb = MockEmbedder::new(8);
-    let note = log.external_note_event_committed("uses Vercel");   // existing note-write path; see Step 4 helper note
-    let edited = log.supersede_note(&emb, &note, "left Vercel").unwrap();  // an ORDINARY edit
-    // retire the (already-edited) note via a DISTINCT note_retired event, then unretire it:
-    log.append_note_retired(&edited).unwrap();
-    assert!(log.note_fold_retired_for_test().contains(&edited));
-    log.append_unretire(&edited).unwrap();
-    assert!(!log.note_fold_retired_for_test().contains(&edited));
-    // The ORIGINAL edit-supersede is still in `superseded` — unretire never touched it:
-    assert!(log.superseded_event_ids().unwrap().contains(&note), "edit-supersede is untouched by unretire");
+fn note_retire_folds_reversibly_and_leaves_edit_supersedes_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let emb = MockEmbedder::new(8);
+    // a real note + a real edit-supersede of it (existing public path):
+    let n = log.remember(&emb, "uses Vercel").unwrap();
+    let edited = log.supersede_note(&emb, &n, "left Vercel").unwrap(); // n now in fold.superseded
+    // retire the (edited) head via a DISTINCT note_retired marker, appended inline like delete_session:
+    log.append(Event { id: String::new(), ts: String::new(), valid_time: None,
+        event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
+        content: serde_json::json!({ "retires": edited }),
+        model_meta: None, prev_hash: String::new(), hash: None,
+        signed_by_did: log.signer_did(), signature: None }).unwrap();
+    let fold = fold_sessions(&log.session_events_ordered().unwrap());
+    assert!(fold.retired_notes.contains(&edited));
+    assert!(fold.superseded.contains(&n), "the ORIGINAL edit-supersede is untouched");
+    // unretire removes ONLY from retired_notes:
+    log.append(Event { /* ..UNRETIRE.. */ content: serde_json::json!({ "unretires": edited }), ../*same shape*/ }).unwrap();
+    let fold = fold_sessions(&log.session_events_ordered().unwrap());
+    assert!(!fold.retired_notes.contains(&edited));
+    assert!(fold.superseded.contains(&n), "unretire did NOT reverse the edit");
 }
 ```
-- [ ] **Step 3: run → FAIL.**
-- [ ] **Step 4: implement fold.**
-  - `SessionFold` (`:7838`) — add `retired_passages: HashSet<(String, usize)>`.
-  - Add a note-level `retired: HashSet<String>` to `fold_notes`'s return (extend its struct/tuple).
-  - `session_events_ordered` (`:4822`) and `current_notes` query (`:4930`) — add `NOTE_RETIRED`, `PASSAGE_RETIRED`, `UNRETIRE` to `events_of_types([...])`.
-  - `fold_notes` (`:7908`) + `fold_sessions` (`:7859`) — process events in `seq ASC`: `NOTE_RETIRED` → `retired.insert(retires)`; `PASSAGE_RETIRED` → `retired_passages.insert((sid,pid))`; `UNRETIRE` → remove the matching id/pair. **Do not touch the `superseded` set** — retire and supersede are now disjoint universes.
-- [ ] **Step 5: run → PASS.** **Step 6: commit** `feat(rung3-p1): distinct reversible retire markers (note/passage), disjoint from supersede`.
+- [ ] **Step 3: run → FAIL** (`retired_notes` field absent). `cargo test -p bossclaw-core --lib note_retire_folds_reversibly`.
+- [ ] **Step 4: implement.** `SessionFold` (`:7838`) — add `retired_notes: HashSet<String>` + `retired_passages: HashSet<(String, usize)>`. `session_events_ordered` (`:4822`) — add `NOTE_RETIRED_EVENT_TYPE, PASSAGE_RETIRED_EVENT_TYPE, UNRETIRE_EVENT_TYPE` to the `events_of_types([...])`. `fold_sessions` (`:7859`) first loop — add arms (events are already `seq ASC`):
+```rust
+crate::graph::NOTE_RETIRED_EVENT_TYPE => { if let Some(id)=ev.content.get("retires").and_then(|v|v.as_str()) { retired_notes.insert(id.into()); } }
+crate::graph::PASSAGE_RETIRED_EVENT_TYPE => { if let (Some(s),Some(p))=(sid(ev),pid(ev)) { retired_passages.insert((s,p)); } }
+crate::graph::UNRETIRE_EVENT_TYPE => {
+    if let Some(id)=ev.content.get("unretires").and_then(|v|v.as_str()) { retired_notes.remove(id); }
+    else if let (Some(s),Some(p))=(sid(ev),pid(ev)) { retired_passages.remove(&(s,p)); }
+}
+```
+(`sid`/`pid` = tiny inline closures reading `content["session_id"]`/`content["passage_id"]`.) Return them in the `SessionFold{..}`.
+- [ ] **Step 5: run → PASS. Step 6: commit** `feat(rung3-p1): distinct reversible retire markers folded into SessionFold (disjoint from supersede)`.
 
 ---
 
-## Task 2 — `retire_memory`(note) + `unretire` core primitives (§7.3)
+## Task 2 — `retire_memory`(note) + `unretire` primitives + recall/list exclusion (BLOCKER-1 wiring)
 
-**Files:** `log.rs` new `retire_memory`/`unretire` (mirror `delete_session:4889` for the append shape, `supersede_note:4720` for validation) + `assert_retirable_note`/`assert_note_retired` helpers; recall memory arm `:1785`; `embed_excluded_event_ids:4784`; `superseded_event_ids:4761` unchanged (retire is not a supersede). Test: mirror `deleted_session_absent_from_recall_even_by_keyword:8206`.
+**Files:** `log.rs` new `retire_memory`/`unretire`/`assert_retirable_note`/`assert_note_retired` (append shape from `delete_session:4898`; validation from `supersede_note:4726-4745`); recall arm `:1642`+`:1785`; `embed_excluded_event_ids:4784`; `current_notes:4929`/`fold_notes:7908`. Test: mirror `superseded_note_excluded_but_replacement_recallable` (`log.rs:8232`) — swap the supersede for a retire.
 
-- [ ] **Step 1: failing test — note retire drops from recall; unretire restores; refuses non-retired.**
+- [ ] **Step 1: failing test** (mirror `:8232` setup; note retired → gone from recall AND `current_notes`; unretire restores; unretire refuses a non-retired id):
 ```rust
 #[test]
-fn retire_memory_note_excludes_from_recall_and_unretire_round_trips() {
-    let log = open_log(); let emb = MockEmbedder::new(8);
-    let ev = log.external_note_event_committed("we deploy on Vercel");
+fn retire_memory_note_excludes_from_recall_and_list_and_unretire_round_trips() {
+    let dir = tempfile::tempdir().unwrap(); let log = open_log(dir.path()); let emb = MockEmbedder::new(8);
+    let ev = log.remember(&emb, "we deploy on Vercel").unwrap();
     log.rebuild_indexes(&emb).unwrap();
-    assert!(recall_contains(&log, &emb, "Vercel", &ev));
+    assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev));
     log.retire_memory(&ev).unwrap();
-    assert!(!recall_contains(&log, &emb, "Vercel", &ev), "retired note excluded");
-    assert!(matches!(log.unretire("not-retired-id"), Err(BossclawError::InvalidInput(_))), "unretire refuses a non-retired id");
+    assert!(!log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "retired note excluded from recall");
+    assert!(!log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "retired note excluded from the Library list");
+    assert!(matches!(log.unretire("not-a-retired-id"), Err(BossclawError::InvalidInput(_))), "unretire refuses a non-retired id");
     log.unretire(&ev).unwrap();
-    assert!(recall_contains(&log, &emb, "Vercel", &ev), "unretire restores");
+    assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "unretire restores recall");
     assert!(matches!(log.retire_memory("nope"), Err(BossclawError::InvalidInput(_))));
 }
 ```
-(Add the thin test helpers `external_note_event_committed` = append `external_note_event:4686` via `append`; `recall_contains` = `recall(...).any(event_id==)`. These are test-module helpers — add them explicitly, do not assume they exist.)
 - [ ] **Step 2: run → FAIL.**
-- [ ] **Step 3: implement** (distinct marker, NOT supersede; free-fn calls are free-fn, not `self.`):
+- [ ] **Step 3: implement.**
 ```rust
-/// Retire a memory-kind note (rung-3 "Retire older"): append a DISTINCT `note_retired` marker.
-/// Reversible via `unretire`; App-only (guest-refused at proto). No replacement, no vector.
+/// Retire a memory-kind note (rung-3 "Retire older") via a DISTINCT `note_retired` marker
+/// (reversible, no replacement). App-only (guest-refused at proto). Validation mirrors
+/// `supersede_note` (exists, memory-kind, not already superseded), plus not-already-retired.
 pub fn retire_memory(&self, target_event_id: &str) -> Result<String, BossclawError> {
-    self.assert_retirable_note(target_event_id)?;   // exists, memory-kind, not already superseded/retired
-    let ev = event_of(NOTE_RETIRED_EVENT_TYPE, serde_json::json!({ "retires": target_event_id }));
-    self.append(ev)                                 // auto hash+sign (append_event_in_tx:955)
+    self.assert_retirable_note(target_event_id)?;
+    self.append(Event { id: String::new(), ts: String::new(), valid_time: None,
+        event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
+        content: serde_json::json!({ "retires": target_event_id }),
+        model_meta: None, prev_hash: String::new(), hash: None,
+        signed_by_did: self.signer_did(), signature: None })
 }
 pub fn unretire(&self, retired_event_id: &str) -> Result<String, BossclawError> {
-    self.assert_note_retired(retired_event_id)?;    // must be in fold_notes().retired — refuses anything else
-    let ev = event_of(UNRETIRE_EVENT_TYPE, serde_json::json!({ "unretires": retired_event_id }));
-    self.append(ev)
+    self.assert_note_retired(retired_event_id)?;  // must be in fold_sessions().retired_notes — else InvalidInput
+    self.append(Event { /* UNRETIRE, content: {"unretires": retired_event_id}, same 10 fields */ })
 }
 ```
-  - Recall memory arm (`:1785`) — change to `return !superseded_ids.contains(&h.event_id) && !retired_ids.contains(&h.event_id);` (both sets from the single `fold` at `:1642`; add `retired_ids`).
-  - `embed_excluded_event_ids` (`:4784`) — union in the note-retired ids so a retired note isn't re-vectorized on migration.
-- [ ] **Step 4: run → PASS**, then `cargo test -p bossclaw-core` (confirms no supersede/delete regression). **Step 5: commit** `feat(rung3-p1): retire_memory + unretire note primitives (distinct marker, recall-excluded, guarded reversal)`.
+  - `assert_retirable_note`: copy `supersede_note`'s three checks (`:4730-4745`) EXCEPT blank-text, and add `if fold_sessions(&self.session_events_ordered()?).retired_notes.contains(id) { return Err(InvalidInput("already retired")) }`.
+  - `assert_note_retired`: `if !fold_sessions(...).retired_notes.contains(id) { return Err(InvalidInput("not retired")) }`.
+  - Recall wiring: at `:1642` also bind `retired_notes` from the fold → change the tuple to `(current_session_event_ids, superseded_ids, retired_note_ids)`; memory arm (`:1785`) → `return !superseded_ids.contains(&h.event_id) && !retired_note_ids.contains(&h.event_id);`.
+  - `embed_excluded_event_ids` (`:4784`) — after building `excluded`, `excluded.extend(fold.retired_notes)`.
+  - Library list: `current_notes` (`:4929`) add `NOTE_RETIRED_EVENT_TYPE, UNRETIRE_EVENT_TYPE` to its `events_of_types`; `fold_notes` (`:7908`) build a `retired: HashSet<&str>` (insert on `NOTE_RETIRED.retires`, remove on `UNRETIRE.unretires`) and add `&& !retired.contains(ev.id.as_str())` to the filter (`:7921`).
+- [ ] **Step 4: run → PASS**, then `cargo test -p bossclaw-core` (no supersede/delete regression). **Step 5: commit** `feat(rung3-p1): retire_memory + unretire note primitives (distinct marker; recall+list excluded; guarded reversal)`.
 
 ---
 
 ## Task 3 — Proto op + allowlist + server + engine wrapper (§7.3, guest-refused)
-
-**Files:** `proto/lib.rs:125`(Request), `:257`(Response), `:820`/`:846`(tests); `server.rs:258`(dispatch), `:1055`(override test); `engine/mod.rs:717`(wrappers).
-
-- [ ] **Step 1: failing allowlist/serde tests.** Extend `memory_client_allows_exactly_four_ops:820` — add `RetireMemory`/`Unretire` to the `no=[...]` asserting `!MemoryClient.allows`; add both to `new_variants_round_trip_serde:846`; add a `server.rs` assertion that `override_onboarding_for_guest(RetireMemory{..})` is `None` (`:1055`).
-- [ ] **Step 2: run → FAIL** (variants missing → won't compile).
-- [ ] **Step 3: add variants + Response::Retired + RetireTarget** (derives as listed). `Role::allows` untouched (auto-refused); `PROTO_VERSION` stays 1.
-- [ ] **Step 4: dispatch + wrappers.** In `dispatch` (`:258`, exhaustive):
+**Files:** `proto/lib.rs:125`/`:257`/`:820`/`:846`; `server.rs:243`(dispatch)/`:1055`(override test); `engine/mod.rs:717`.
+- [ ] **Step 1: failing tests** — extend `memory_client_allows_exactly_four_ops:820` (add `RetireMemory`/`Unretire` to the refused list), `new_variants_round_trip_serde:846` (both variants), and a `server.rs` assert that `override_onboarding_for_guest(RetireMemory{..})` is `None` (`:1055`).
+- [ ] **Step 2: run → FAIL** (variants missing → non-exhaustive `dispatch` won't compile — the intended RED).
+- [ ] **Step 3: add** `Request::{RetireMemory,Unretire}` + `RetireTarget` + `Response::Retired`. `Role::allows` untouched; `PROTO_VERSION` = 1.
+- [ ] **Step 4: dispatch + wrappers** (`server.rs:243`; helpers here are `op_result`/`not_permitted_response()`/`unit_result` — the Passage placeholder returns a Rejected via the engine, NOT an invented fn):
 ```rust
 Request::RetireMemory { target, .. } => match target {
     RetireTarget::Note { event_id } => op_result(engine.retire_memory(event_id).await, Response::Retired),
-    RetireTarget::Passage { .. } => not_permitted_or_rejected("passage retire lands in Task 7"), // Rejected, keeps wire shape
+    RetireTarget::Passage { .. } => op_result(Err(EngineOpError::Rejected("passage retire lands in Task 7".into())), Response::Retired),
 },
 Request::Unretire { retired_event_id, .. } => op_result(engine.unretire(retired_event_id).await, Response::Retired),
 ```
-Add `EngineHandle::retire_memory`/`unretire` (mirror `supersede_note:717`: `is_onboarded_local`, `spawn_blocking`, `InvalidInput→Rejected`; note retire needs no index rebuild, so **do not** force `indexed=false`).
-- [ ] **Step 5: run `cargo test -p bossclawd-proto -p bossclawd` → PASS. Step 6: commit** `feat(rung3-p1): retire_memory/unretire proto op — App-only, guest-refused, server-wired`.
+`EngineHandle::retire_memory`/`unretire` mirror `supersede_note:717` (`is_onboarded_local`, `spawn_blocking`, `InvalidInput→Rejected`) but do NOT force `indexed=false` — recall exclusion is fold-time (`:1642`), so no rebuild is needed (contrast `supersede_note`'s wrapper, which does set it).
+- [ ] **Step 5: `cargo test -p bossclawd-proto -p bossclawd` → PASS. Step 6: commit** `feat(rung3-p1): retire_memory/unretire proto op — App-only, guest-refused, server-wired`.
 
 ---
 
-## Task 4 — Port `chunk.rs` + composite key helpers + `VectorIndex::len`
-
-- [ ] **Step 1: port.** `git show origin/feat-retrieval-rung3-chunking:crates/bossclaw-core/src/chunk.rs > crates/bossclaw-core/src/chunk.rs`; add `mod chunk; pub use chunk::chunk_text;` to `lib.rs`; copy `CHUNK_KEY_SEP`/`encode_chunk_key`/`decode_chunk_key`/`event_id_of` (+ tests) into `index.rs`.
-- [ ] **Step 2: add `len()`** to the `VectorIndex` trait (`index.rs:45`) + `HnswIndex` (return element count) — needed for the recall-untouched assertion in Task 6.
-- [ ] **Step 3: run `cargo test -p bossclaw-core --lib chunk index` → PASS** (ported tests unchanged). **Step 4: commit** `feat(rung3-p1): port chunk_text + composite key helpers + VectorIndex::len`.
+## Task 4 — Port `chunk.rs` + key helpers + `VectorIndex::len` + `vector_index_len`
+- [ ] **Step 1: port** `git show origin/feat-retrieval-rung3-chunking:crates/bossclaw-core/src/chunk.rs > crates/bossclaw-core/src/chunk.rs`; `mod chunk; pub use chunk::chunk_text;` in `lib.rs`; copy `CHUNK_KEY_SEP`/`encode_chunk_key`/`decode_chunk_key`/`event_id_of` (+ their tests) into `index.rs`.
+- [ ] **Step 2:** add `fn len(&self)->usize` to the `VectorIndex` trait (`index.rs:45`) + `HnswIndex`; add `pub(crate) fn vector_index_len(&self)->usize` on `EventLog` returning the recall index's `len()` (0 if unbuilt) — used by Task 6's recall-untouched assertion.
+- [ ] **Step 3: `cargo test -p bossclaw-core --lib chunk index` → PASS. Step 4: commit** `feat(rung3-p1): port chunk_text + composite key helpers + index len accessors`.
 
 ---
 
-## Task 5 — Persist session passages at capture (§7.1 data source, D2)
+## Task 5 — Persist session passages at capture (§7.1 data source, MAJOR fix)
+Core gets the table + store/read (mirror `derive_entity_vector:5494`/`entity_vectors_for_model:5529`); the daemon `store_capture` (the REAL capture path) binds the returned event id, chunks `r.body`, and persists.
 
-Core gets a `session_passage_vectors` table + store/read (mirror `entity_vectors`/`entity_vectors_for_model:5528`); the **daemon** capture path chunks the body, embeds, and persists — so bodies never enter core.
-
-**Files:** `log.rs` (table DDL beside the `entity_vectors` migration, `store_session_passages`, `session_passages_for_model`); `crates/bossclawd/src/capture/store.rs` (in the capture path, after `read_capture_markdown:99`, `chunk_text` → `embed` → `engine.store_session_passages(session_captured_event_id, &chunks, &vecs)`); `engine/mod.rs` wrapper.
-
-- [ ] **Step 1: failing test — capturing a 2-passage body persists 2 rows, readable after reopen.**
+**Files:** `log.rs` (table DDL beside the `entity_vectors` migration; `store_session_passages`; `session_passages_for_model`); `engine/mod.rs` wrapper; `capture/store.rs:109` `store_capture` + `:270` `heal_orphans`.
+- [ ] **Step 1: failing core test** — persist 2 passages under a capture id, survive reopen:
 ```rust
 #[test]
-fn capture_persists_session_passage_vectors_surviving_reopen() {
-    let dir = tempdir(); let emb = MockEmbedder::new(8);
-    { let log = open_log_at(&dir);
-      log.store_session_passages("cap1", &["we deploy on Vercel".into(), "db is Postgres".into()],
-                                  &emb.embed(&["we deploy on Vercel".into(),"db is Postgres".into()]).unwrap()).unwrap(); }
-    let log = open_log_at(&dir);   // reopen → rows must survive
-    let rows = log.session_passages_for_model(emb.model_id()).unwrap();
-    assert_eq!(rows.iter().filter(|r| r.event_id == "cap1").count(), 2);
+fn store_session_passages_persists_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap(); let emb = MockEmbedder::new(8);
+    let chunks = vec!["we deploy on Vercel".to_string(), "db is Postgres".to_string()];
+    { let log = open_log(dir.path());
+      log.store_session_passages("cap1", &chunks, &emb.embed(&chunks).unwrap()).unwrap(); }
+    let log = open_log(dir.path());  // reopen
+    let rows = log.session_passages_for_model(emb.model_id()).unwrap(); // Vec<(event_id, passage_ix, Vec<f32>)>
+    assert_eq!(rows.iter().filter(|(e,_,_)| e == "cap1").count(), 2);
 }
 ```
-- [ ] **Step 2: run → FAIL. Step 3: implement** the table (`session_passage_vectors(session_captured_event_id TEXT, passage_ix INTEGER, model_id TEXT, embedding BLOB, PRIMARY KEY(session_captured_event_id, passage_ix, model_id))`) + store/read (LE-f32 BLOB like `vectors`), and the daemon capture wiring. **Step 4: run → PASS. Step 5: commit** `feat(rung3-p1): persist session-passage vectors at capture (separate table, restart-safe)`.
+- [ ] **Step 2: run → FAIL. Step 3: implement.**
+  - Table: `session_passage_vectors(session_captured_event_id TEXT, passage_ix INTEGER, model_id TEXT, dim INTEGER, embedding BLOB, PRIMARY KEY(session_captured_event_id, passage_ix, model_id))` with a `-- model_id-scoped; a language-pack swap empties this until re-capture (Phase-1 accepted limitation)` comment. `store_session_passages(event_id, chunks, vecs)` = per-index `INSERT OR REPLACE` (LE-f32 blob via `vec_to_blob`, model from the embedder). `session_passages_for_model` mirrors `entity_vectors_for_model:5529` but selects `passage_ix` too, ordered `session_captured_event_id, passage_ix ASC`.
+  - Daemon `store_capture` (`store.rs:156`): change `engine.capture_session(meta).await.map_err(..)?` to bind `let ev = ...?;`, then (only if this is a fresh/changed capture — skip when the returned id already has rows: `if engine.session_passages_absent(&ev).await?`) `chunk_text(&r.body)` → `embed` → `engine.store_session_passages(&ev, &chunks, &vecs).await`. Add the same persist in `heal_orphans` (`:270`) reading the body via `read_capture_markdown`. Optional orphan GC: on a changed-sha supersede, delete rows for the old capture id.
+- [ ] **Step 4: run → PASS. Step 5: commit** `feat(rung3-p1): persist session-passage vectors at capture (store_capture seam, restart-safe)`.
 
 ---
 
-## Task 6 — Separate `conflict_index` + passage retrieval (§7.1)
-
-**Files:** `log.rs:429-457`(field, init `None` like `entity_index:445`), `rebuild_conflict_index`(mirror `rebuild_entity_index:5515`), `conflict_search`(mirror `vector_search:1420`).
-
+## Task 6 — Separate `conflict_index` + passage retrieval (§7.1, BLOCKER-2 test fix)
+**Files:** `log.rs:445`(field, init `None` like `entity_index`), `rebuild_conflict_index`(mirror `:5515`), `conflict_search`(mirror `:5554`). Test **captures first** so the event id maps to a real `session_id`.
 - [ ] **Step 1: failing test.**
 ```rust
 #[test]
-fn conflict_index_retrieves_passages_and_leaves_recall_len_unchanged() {
-    let log = open_log(); let emb = MockEmbedder::new(8);
-    log.store_session_passages("cap1", &["we deploy on Vercel".into(),"db is Postgres".into()], &two_vecs(&emb)).unwrap();
+fn conflict_index_retrieves_by_session_and_leaves_recall_len_unchanged() {
+    let dir = tempfile::tempdir().unwrap(); let log = open_log(dir.path()); let emb = MockEmbedder::new(8);
+    let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();  // real capture → fold head "s1"
+    let chunks = vec!["we deploy on Vercel".to_string(), "db is Postgres".to_string()];
+    log.store_session_passages(&ev, &chunks, &emb.embed(&chunks).unwrap()).unwrap();
     log.rebuild_indexes(&emb).unwrap();
-    let recall_len = log.vector_index_len();                  // Task 4 accessor
+    let recall_len = log.vector_index_len();
     log.rebuild_conflict_index(&emb).unwrap();
-    let hits = log.conflict_search(&emb.embed(&["Vercel".into()]).unwrap()[0], 8); // k ≥ total chunks → membership stable (HNSW)
-    assert!(hits.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0));            // session id resolved from cap1's fold head
+    let hits = log.conflict_search(&emb.embed(&["Vercel".into()]).unwrap()[0], 8); // k ≥ #chunks → membership stable
+    assert!(hits.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0));            // session id resolved via fold head
     assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
 }
 ```
-- [ ] **Step 2: run → FAIL. Step 3: implement.** `rebuild_conflict_index`: for each **current, non-retired-passage** session (map `fold_sessions().current` event_id→session_id), read its rows via `session_passages_for_model`, skip `(session_id, ix) ∈ retired_passages`, `add(encode_chunk_key(session_id, ix), vec)` into a fresh `HnswIndex`. `conflict_search` decodes keys back to `(session_id, passage_id, score)`. **Do not touch `rebuild_indexes`/`vector_search`/`EMBEDDABLE_EVENT_TYPES`** (recall-neutrality by construction). **HNSW hermeticity (spec §13):** assert set-membership, keep `k ≥ index size`, never assert rank order.
-- [ ] **Step 4: run → PASS. Step 5: commit** `feat(rung3-p1): separate session-passage conflict index + passage retrieval (recall untouched)`.
+- [ ] **Step 2: run → FAIL. Step 3: implement.** `rebuild_conflict_index`: build `event_id→session_id` from `fold_sessions().current`; for each current session's rows from `session_passages_for_model`, skip `(session_id, ix) ∈ fold.retired_passages`, `index.add(&encode_chunk_key(&session_id, ix), &vec)`; box into `conflict_index`. `conflict_search(qv,k) -> Vec<(String,usize,f32)>` decodes each hit key via `decode_chunk_key`. **Do NOT touch `rebuild_indexes`/`vector_search`/`EMBEDDABLE_EVENT_TYPES`.** Assert set-membership only; keep `k ≥ index size` (HNSW rank is non-deterministic across rebuilds, spec §13).
+- [ ] **Step 4: run → PASS. Step 5: commit** `feat(rung3-p1): separate session-passage conflict index + retrieval (recall untouched)`.
 
 ---
 
 ## Task 7 — Passage-level retire + sweeper-cycle durability (§7.2/§7.3)
-
-`retire_memory` on a `RetireTarget::Passage` hides one `(session_id, passage_id)` from the conflict index without dropping the session; it survives a re-capture + rebuild; `unretire` restores it.
-
-**Files:** `log.rs` `retire_passage`/`unretire_passage` (emit `PASSAGE_RETIRED`/`UNRETIRE`); `rebuild_conflict_index` exclusion (Task 6 already reads `retired_passages`); `server.rs` real Passage dispatch arm + `engine/mod.rs` wrapper.
-
-- [ ] **Step 1: failing test — hide one passage, keep siblings, survive a sweep, reverse.**
+**Files:** `log.rs` `retire_passage`/`unretire_passage` (emit `PASSAGE_RETIRED`/`UNRETIRE`, validate the passage exists in the current session body); `server.rs` real Passage dispatch arm; `engine/mod.rs` wrapper. Test captures first, retires after.
+- [ ] **Step 1: failing test.**
 ```rust
 #[test]
 fn passage_retire_hides_one_survives_sweep_and_reverses() {
-    let log = open_log(); let emb = MockEmbedder::new(8);
-    log.store_session_passages("cap1", &["Vercel".into(),"Postgres".into()], &two_vecs(&emb)).unwrap();
+    let dir = tempfile::tempdir().unwrap(); let log = open_log(dir.path()); let emb = MockEmbedder::new(8);
+    let ev = log.capture_session(&emb, &session_meta("s1","aa")).unwrap();
+    let chunks = vec!["Vercel".to_string(), "Postgres".to_string()];
+    log.store_session_passages(&ev, &chunks, &emb.embed(&chunks).unwrap()).unwrap();
     log.rebuild_conflict_index(&emb).unwrap();
     log.retire_passage("s1", 0).unwrap();
     log.rebuild_conflict_index(&emb).unwrap();
-    assert!(!has_hit(&log,&emb,"Vercel","s1",0) && has_hit(&log,&emb,"Postgres","s1",1), "one hidden, sibling kept");
-    // SWEEP durability: a same-sha re-capture is a no-op; the passage marker persists across a rebuild.
-    log.capture_session(&emb, &session_meta("s1","aa")).unwrap();  // same sha → dedup no-op
+    let hit = |q:&str| log.conflict_search(&emb.embed(&[q.into()]).unwrap()[0], 8).iter().any(|(s,p,_)| s=="s1" && *p==0);
+    assert!(!hit("Vercel"), "retired passage 0 hidden");
+    assert!(log.conflict_search(&emb.embed(&["Postgres".into()]).unwrap()[0],8).iter().any(|(s,p,_)| s=="s1" && *p==1), "sibling kept");
+    // SWEEP durability: same-sha re-capture is a no-op (returns the same id); marker persists across rebuild.
+    log.capture_session(&emb, &session_meta("s1","aa")).unwrap();
     log.rebuild_conflict_index(&emb).unwrap();
-    assert!(!has_hit(&log,&emb,"Vercel","s1",0), "retire survives a sweeper cycle");
+    assert!(!hit("Vercel"), "retire survives a sweeper cycle");
     log.unretire_passage("s1", 0).unwrap(); log.rebuild_conflict_index(&emb).unwrap();
-    assert!(has_hit(&log,&emb,"Vercel","s1",0), "unretire restores the passage");
+    assert!(hit("Vercel"), "unretire restores the passage");
 }
 ```
-- [ ] **Step 2: run → FAIL. Step 3: implement** `retire_passage`/`unretire_passage` (validate the passage exists in the current body; emit the markers) + the real `server.rs` Passage dispatch arm + `engine/mod.rs` wrapper. **Note the known limitation** (do NOT fix in Phase 1): `passage_id` is the chunk ordinal; a *changed-sha* re-capture re-chunks and shifts ordinals, so a marker could mis-target after a body edit. Harmless for the Phase-1 primitive (no Retire *action* yet); when the action ships (Phase 3), key the marker on a chunk content-hash. **Step 4: run → PASS. Step 5: commit** `feat(rung3-p1): passage-granular retire — one passage hidden, siblings intact, survives sweep, reversible`.
+- [ ] **Step 2: run → FAIL. Step 3: implement** `retire_passage`/`unretire_passage` (append `PASSAGE_RETIRED`/`UNRETIRE` with `{session_id,passage_id}`; validate `(session_id,passage_id)` exists among the current session's persisted rows) + the real `server.rs` Passage arm + `engine/mod.rs` wrapper. (Ordinal-shift limitation documented in the header.) **Step 4: run → PASS. Step 5: commit** `feat(rung3-p1): passage-granular retire — one hidden, siblings intact, survives sweep, reversible`.
 
 ---
 
-## Task 8 — Harness: recall-neutrality + honest passage-vs-title (§9/§13 exit gate)
-
-**Files:** `compare.rs` `recall_regressed`; `main.rs` `conflict-grade --retrieval {title|passage}`; new fixture.
-
-- [ ] **Step 1: recall-neutrality — enforce by construction, not just runbook.** Add a `bossclaw-core` test asserting the recall paths are literally untouched: e.g. a golden test that a note-recall over a corpus is byte-identical before/after a session passage is indexed/retired (proves the conflict index can't perturb recall). Plus `recall_regressed(&[SegmentComparison]) -> Option<&SegmentComparison>` in `compare.rs` (first gating segment with a significant negative s@k delta) + its unit test. **Runbook (owner-gated, needs the frozen corpus):** freeze once → run pre/post-Phase-1 binaries → `memharness compare` → assert `recall_regressed == None`.
-- [ ] **Step 2: honest passage-vs-title fixture + non-tautological assertion.** `fixtures/session-conflict-pairs.jsonl` schema: `{"session_id","title","body","conflicting_query","label":"contradicts|coexist"}` where the conflict genuinely lives in `body` (title is generic) — **include coexist hard negatives** so passage retrieval must also NOT over-surface. Assert an ABSOLUTE bar, not a bare `>`:
+## Task 8 — Harness: recall-neutrality + honest passage-vs-title (§9/§13)
+**Files:** `compare.rs` `recall_regressed`; `main.rs` `--retrieval {title|passage}`; new fixture.
+- [ ] **Step 1: recall-neutrality — by construction + measured.** (a) A `bossclaw-core` golden test: capture a session, `store_session_passages` + `rebuild_conflict_index` + `retire_passage`, and assert a note-recall over a fixed corpus is byte-identical before/after (the conflict index provably cannot perturb `vector_index`). (b) `recall_regressed(&[SegmentComparison]) -> Option<&SegmentComparison>` in `compare.rs` (first gating segment with a significant negative s@k delta) + unit test. Runbook (owner-gated, frozen corpus): pre/post-Phase-1 `memharness run` → `compare` → assert `recall_regressed == None`.
+- [ ] **Step 2: honest passage-vs-title.** Fixture `session-conflict-pairs.jsonl` schema `{"session_id","title","body","conflicting_query","label":"contradicts|coexist"}` where the conflict lives in `body` (title generic), WITH coexist hard-negatives. `flagged = did the retrieval front-end surface the conflicting passage as a candidate` (judge-free). Assert ABSOLUTE bars, not a bare `>`:
 ```rust
 #[test]
 fn passage_index_meaningfully_beats_title_only() {
     let f = load_session_pairs(include_str!("../fixtures/session-conflict-pairs.jsonl"));
-    let title = grade_retrieval(&f, Retrieval::TitleOnly);
-    let passage = grade_retrieval(&f, Retrieval::PassageIndex);
+    let (title, passage) = (grade_retrieval(&f, Retrieval::TitleOnly), grade_retrieval(&f, Retrieval::PassageIndex));
     assert!(title.recall < 0.30, "title-only genuinely misses body conflicts: {}", title.recall);
-    assert!(passage.recall >= 0.70, "passage index actually catches them: {}", passage.recall);
+    assert!(passage.recall >= 0.70, "passage index catches them: {}", passage.recall);
     assert!(passage.precision >= title.precision, "passage index does not over-surface (hard negatives)");
 }
 ```
-`flagged = did the retrieval front-end surface the conflicting passage as a candidate` (judge-free — the Phase-2 judge is deliberately out of this measurement). Define `load_session_pairs`/`grade_retrieval`/`Retrieval` in the harness.
-- [ ] **Step 3: run → FAIL, implement, run → PASS. Step 4: live gate (owner-gated, not CI)** — record numbers in this plan's RESULTS section. **Step 5: commit** `feat(rung3-p1): harness recall-neutrality guard + honest passage-vs-title catch-rate`.
+Define `load_session_pairs`/`grade_retrieval`/`Retrieval` in the harness (memharness already depends on `bossclaw-core` in-process, so `grade_retrieval` calls the real index directly — no wire op).
+- [ ] **Step 3: run → FAIL, implement, run → PASS. Step 4: live gate (owner-gated)** — record numbers in a RESULTS section. **Step 5: commit** `feat(rung3-p1): harness recall-neutrality (golden + guard) + honest passage-vs-title`.
 
 ---
 
 ## Task 9 (OPTIONAL — defer to Phase 3) — §7.4 edge-invalidation
-Stamp `Edge.invalidated_at`/`invalidated_by` (already present, `graph.rs:147/149`) inside a confirmed retire when a retired note maps to a derived edge. The Retire *action* is Phase 3, so this naturally lands there; the Phase-1 primitive works without it. Leave a one-line TODO reference in `retire_memory`.
+Stamp `Edge.invalidated_at`/`invalidated_by` (`graph.rs:147/149`) inside a confirmed retire when a retired note maps to a derived edge. The Retire *action* is Phase 3; leave a one-line TODO in `retire_memory`.
 
 ---
 
-## Downstream / product-direction note (owner, 2026-07-14)
-Per [[air/vision-background-first-claude-code-native-2026-07-14]]: AIR Agent should be **background-first, reachable from Claude Code**, not a destination app. Phase 1 here is pure background engine (interface-agnostic) — fully aligned. **Implication for Phase 3 (Resolution + UI):** surface the conflict + draft the retire *through the Claude Code session*, NOT only as a desktop card. Keep the confirm on a trusted surface (resolution stays App-only/guest-refused, I1/I8 — the MCP channel must not be able to delete memories), but the *notification and drafting* should reach the user where they work. Do not over-invest in desktop UI polish.
+## Downstream / product-direction (owner, 2026-07-14)
+Per [[air/vision-background-first-claude-code-native-2026-07-14]]: background-first, reachable from Claude Code — not a destination app. Phase 1 is interface-agnostic engine work (aligned). **Phase 3 implication:** surface the conflict + draft the retire THROUGH the Claude Code session, with the confirm on a trusted surface (resolution stays App-only/guest-refused, I1/I8). Don't over-invest in desktop UI.
 
-## Global gates (before every commit)
-```bash
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p bossclaw-core -p bossclawd-proto -p bossclawd -p memharness
-```
-Invariants: I1 (no auto-retire — every retire is an explicit op), I5 (append-only+signed automatically via `append_event_in_tx:955`; retire markers distinct from supersede so honesty is preserved), I6 (double-retire refused, fold-rebuild self-heals), I8 (allowlist gains nothing). Never reuse `delete_capture:182` (deletes the `.md`).
+## Global gates + invariants
+`cargo clippy --workspace --all-targets -- -D warnings` and `cargo test -p bossclaw-core -p bossclawd-proto -p bossclawd -p memharness`. I1 (retire is always an explicit op), I5 (append+sign automatic; retire markers distinct from supersede so honesty holds), I6 (double-retire/unretire-non-retired refused; fold-rebuild self-heals), I8 (allowlist gains nothing). Never call `delete_capture:163` in retire.
 
-## Review resolutions (architect + critic, 2026-07-14)
-- **BLOCKER retire-incoherence / M1 unretire-reverses-edit** → distinct `note_retired`/`passage_retired` markers in a separate `retired` set (Tasks 1-2); `unretire` refuses non-retired ids; `superseded_event_ids` untouched. Whole-session retire dropped (dead scaffolding) → **sweeper task removed** (D1).
-- **BLOCKER Task-6 body seam / C1** → passages persisted at capture in `session_passage_vectors` (Task 5, D2); core stays filesystem-free; index survives restart.
-- **MAJOR compile-order** → Task 3 Passage arm returns Rejected; real arm + wrapper in Task 7.
-- **M2 invented helpers** → each test helper is now an explicit "add this helper" step; free-fn calls corrected (`event_of`/`external_note_event` are free fns); `VectorIndex::len` added in Task 4.
-- **M3 rigged benchmark** → honest fixture (real body-conflicts + coexist hard-negatives) + absolute-floor assertion + defined schema (Task 8).
-- **Minors** → HNSW membership-not-rank + `k ≥ size` (Tasks 6-8); passage-id ordinal fragility documented (Task 7); recall-neutrality enforced by a byte-unchanged golden test, not only a runbook (Task 8); `RetireTarget` derives + `Response::Retired` pinned (Task 3).
+## Second-review resolutions (round 2, architect + critic)
+- **BLOCKER note-retire wired to wrong fold** → `retired_notes` added to `SessionFold`, populated in `fold_sessions`, read at recall `:1642`/`:1785` + `embed_excluded` + `current_notes`/`fold_notes` (Tasks 1-2).
+- **BLOCKER Tasks 6/7 test identity** → tests `capture_session` FIRST to get the real event id, then `store_session_passages(&ev,...)`, then assert by `session_id` (Tasks 6-7).
+- **MAJOR wrong capture seam** → Task 5 targets `store_capture:109` (holds `r.body`), binds the discarded `capture_session` id, covers `heal_orphans`.
+- **MAJOR model-version survival** → documented accepted limitation (Phase-2 consumer doesn't exist yet); table comment required.
+- **`event_of` nonexistent / free-fn claim wrong** → real `self.append(Event{..})` literal (as `delete_session:4898`); `assert_*` helpers are explicit new methods.
+- **Invented/miscalled helpers** → tests mirror named existing tests (`deleted_session_tombstones_in_fold`, `superseded_note_excluded_but_replacement_recallable:8232`) using REAL public methods (`remember`, `recall`, `current_notes`, `capture_session`, `rebuild_indexes`) + inline `Event{}`; `vector_index_len` added as an explicit step (Task 4); `open_log(dir.path())` arity correct.
+- **`current_notes` still listed retired (M7)** → `fold_notes` now excludes retired notes (Task 2).
+- **Orphan rows / ordinal fragility / boot-rebuild** → documented limitations; orphan GC is an optional one-liner (Task 5).
+- **Line refs** → corrected (`current_notes:4929`, `entity_vectors_for_model:5529`, `EMBEDDABLE_EVENT_TYPES` is `log.rs:345`).
 
-## Self-review (spec coverage)
-§7.1 → Tasks 4,5,6. §7.2 (sweeper-safe, passage granularity) → Tasks 1,7. §7.3 (retire_memory + proto + allowlist + unretire) → Tasks 2,3,7. §7.4 → Task 9 (Phase 3). §9/§13 (passage-vs-title, recall-neutrality, guest-refused, unretire round-trip, survives sweep) → Tasks 8,3,2,7. I8 → Task 3. Exit gate fully covered; every helper the tests use is created by a step; no forward references compile-break.
+## Self-review honesty
+This revision was written against the ACTUAL source (SessionFold/fold_sessions `:7838-7893`, recall arms `:1636-1795`, `delete_session:4898`, `external_note_event:4686`, `entity_vectors` `:5494-5548`, `store_capture:109`, `capture_session` wrapper `engine/mod.rs:644`). It has NOT yet been independently re-reviewed — that pass is required before execution (do not self-certify). Every fn a test calls is either cited as existing or created by a step; grep-verify before sign-off.
