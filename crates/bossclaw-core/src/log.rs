@@ -443,6 +443,13 @@ pub struct EventLog {
     /// `None` until [`EventLog::rebuild_entity_index`]; rebuilt from the encrypted
     /// log on open (zero plaintext index on disk, like the recall index).
     entity_index: Mutex<Option<Box<dyn VectorIndex>>>,
+    /// In-memory ANN index over captured-session BODY-PASSAGE vectors ONLY, for
+    /// cross-session conflict retrieval (Rung-3 §7.1). Physically separate from
+    /// both `vector_index` (recall) and `entity_index` (resolution) so building it
+    /// never perturbs recall. Keyed by `(session_id, passage_ix)`. `None` until
+    /// [`EventLog::rebuild_conflict_index`]; rebuilt from the `session_passage_vectors`
+    /// table (zero plaintext index on disk, like the other two).
+    conflict_index: Mutex<Option<Box<dyn VectorIndex>>>,
     /// The actuator rename mutex (spec §9). DISTINCT from `inner` (the SQLite
     /// append serializer): the M6a `execute_write` (T4) will hold THIS across its
     /// entire re-canonicalize → re-check → base-guard → temp-write → finalize-rename
@@ -890,6 +897,7 @@ impl EventLog {
             highwater: None,
             vector_index: Mutex::new(None),
             entity_index: Mutex::new(None),
+            conflict_index: Mutex::new(None),
             rename_lock: Mutex::new(()),
         })
     }
@@ -5818,6 +5826,64 @@ impl EventLog {
         }
     }
 
+    /// Rebuild the SEPARATE conflict index (Rung-3 §7.1) from the
+    /// `session_passage_vectors` table: one vector per CURRENT session's live
+    /// passage, keyed by `(session_id, passage_ix)`. Mirrors
+    /// [`EventLog::rebuild_entity_index`] but writes ONLY `conflict_index` — the
+    /// recall `vector_index` and the resolution `entity_index` are byte-untouched.
+    ///
+    /// A passage row is keyed on its capture `event_id`; the index is keyed on the
+    /// session's stable `session_id`, so rows are mapped through the fold head
+    /// (`fold.current`). Rows whose `event_id` is NOT a current head (superseded /
+    /// tombstoned / orphaned captures) are SKIPPED, and any `(session_id,
+    /// passage_ix)` in `fold.retired_passages` is EXCLUDED at build time (a retired
+    /// passage is simply never added).
+    pub fn rebuild_conflict_index(&self, embedder: &dyn Embedder) -> Result<(), BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        // event_id → session_id for the CURRENT (non-superseded, non-tombstoned)
+        // sessions; rows outside this map are not part of any current session.
+        let sid_of: std::collections::HashMap<&str, &str> = fold
+            .current
+            .iter()
+            .map(|cs| (cs.event_id.as_str(), cs.session_id.as_str()))
+            .collect();
+        let rows = self.session_passages_for_model(embedder.model_id())?;
+        let mut index = HnswIndex::with_capacity(rows.len());
+        for (event_id, ix, vec) in rows {
+            let Some(&session_id) = sid_of.get(event_id.as_str()) else {
+                continue; // orphaned / superseded / tombstoned capture — skip
+            };
+            if fold.retired_passages.contains(&(session_id.to_string(), ix)) {
+                continue; // retired passage — excluded at rebuild time
+            }
+            index.add(&crate::index::encode_chunk_key(session_id, ix), &vec);
+        }
+        let boxed: Box<dyn VectorIndex> = Box::new(index);
+        *self.conflict_index.lock().expect(POISON) = Some(boxed);
+        Ok(())
+    }
+
+    /// Search the SEPARATE conflict index (Rung-3 §7.1) for the `k` nearest
+    /// `(session_id, passage_ix, distance)` triples to the query vector `qv`.
+    /// Mirrors [`EventLog::entity_search`] but takes a pre-computed query vector and
+    /// returns a plain `Vec` — an unbuilt index yields an EMPTY result (the conflict
+    /// retrieval front-end treats "no index" as "no hits", where entity resolution
+    /// errors). Keys that fail to decode are dropped (never happens — we encoded
+    /// them via `encode_chunk_key`).
+    pub fn conflict_search(&self, qv: &[f32], k: usize) -> Vec<(String, usize, f32)> {
+        let guard = self.conflict_index.lock().expect(POISON);
+        let Some(index) = guard.as_ref() else {
+            return Vec::new();
+        };
+        index
+            .search(qv, k)
+            .into_iter()
+            .filter_map(|(key, score)| {
+                crate::index::decode_chunk_key(&key).map(|(sid, ix)| (sid.to_string(), ix, score))
+            })
+            .collect()
+    }
+
     /// Resolve one entity `mention` against the existing entity nodes (spec §6):
     /// embed → search the entity index → convert distance to cosine similarity →
     /// [`crate::extract::resolve_decision`]; for the mid-band, ask `reasoner` to
@@ -8109,8 +8175,8 @@ struct SessionFold {
     retired_notes: std::collections::HashSet<String>,
     /// `(session_id, passage_id)` pairs retired by a `passage_retired` marker and
     /// NOT yet reversed by an `unretire` (Rung-3) — the passage-granularity twin
-    /// of `retired_notes`. Consumed by the recall-exclusion task (Task 2+).
-    #[allow(dead_code)] // read by the recall-exclusion task (Task 2); Task 1 only builds the state.
+    /// of `retired_notes`. Read by `rebuild_conflict_index` to exclude retired
+    /// passages from the conflict index at build time.
     retired_passages: std::collections::HashSet<(String, usize)>,
 }
 
@@ -8387,6 +8453,27 @@ mod tests {
             2,
             "both passages persisted under cap1 and survive a reopen"
         );
+    }
+
+    /// Rung-3 Phase-1 (§7.1): the SEPARATE conflict index retrieves a captured
+    /// session's passages keyed by the fold-resolved `session_id` (not the raw
+    /// capture event id), and building it leaves the recall `vector_index`
+    /// byte-untouched (its `len` is the guard). `k ≥ #passages` ⇒ set-membership is
+    /// stable across HNSW rank non-determinism (spec §13).
+    #[test]
+    fn conflict_index_retrieves_by_session_and_leaves_recall_len_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap(); // real capture → fold head "s1"
+        let chunks = vec!["we deploy on Vercel".to_string(), "db is Postgres".to_string()];
+        log.store_session_passages(&emb, &ev, &chunks).unwrap();
+        log.rebuild_indexes(&emb).unwrap();
+        let recall_len = log.vector_index_len();
+        log.rebuild_conflict_index(&emb).unwrap();
+        let hits = log.conflict_search(&emb.embed(&["Vercel".into()]).unwrap()[0], 8); // k ≥ #chunks → membership stable
+        assert!(hits.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0)); // session id resolved via fold head
+        assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
     }
 
     /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields
