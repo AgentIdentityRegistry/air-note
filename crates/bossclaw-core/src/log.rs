@@ -4824,6 +4824,12 @@ impl EventLog {
     /// [`EventLog::supersede_note`] applies (blank-text excepted: retire has no
     /// replacement), PLUS not already retired by a live `note_retired` marker.
     /// All failures are [`BossclawError::InvalidInput`].
+    ///
+    /// The superseded + retired checks read BOTH sets off a single
+    /// [`fold_sessions`] pass: `fold.superseded` IS the complete superseded-id
+    /// universe (identical to [`EventLog::superseded_event_ids`] — the recall arm
+    /// documents the same equivalence), and `fold.retired_notes` the retired one,
+    /// so one scan over the session/supersede stream answers both.
     fn assert_retirable_note(&self, target_event_id: &str) -> Result<(), BossclawError> {
         let target = self.event_by_id(target_event_id)?.ok_or_else(|| {
             BossclawError::InvalidInput(format!(
@@ -4836,15 +4842,13 @@ impl EventLog {
                 target.event_type
             )));
         }
-        if self.superseded_event_ids()?.contains(target_event_id) {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        if fold.superseded.contains(target_event_id) {
             return Err(BossclawError::InvalidInput(format!(
                 "cannot retire {target_event_id}: already superseded"
             )));
         }
-        if fold_sessions(&self.session_events_ordered()?)
-            .retired_notes
-            .contains(target_event_id)
-        {
+        if fold.retired_notes.contains(target_event_id) {
             return Err(BossclawError::InvalidInput(format!(
                 "cannot retire {target_event_id}: already retired"
             )));
@@ -8563,9 +8567,15 @@ mod tests {
         log.retire_memory(&ev).unwrap();
         assert!(!log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "retired note excluded from recall");
         assert!(!log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "retired note excluded from the Library list");
+        // (a) retiring an already-retired note rejects (guard path).
+        assert!(matches!(log.retire_memory(&ev), Err(BossclawError::InvalidInput(_))), "cannot retire an already-retired note");
         assert!(matches!(log.unretire("not-a-retired-id"), Err(BossclawError::InvalidInput(_))), "unretire refuses a non-retired id");
         log.unretire(&ev).unwrap();
         assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "unretire restores recall");
+        // (c) the Library list restores too — a SEPARATE path (`fold_notes` builds its own retired set).
+        assert!(log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "unretire restores the Library list");
+        // (b) double unretire rejects: it is no longer in `retired_notes`.
+        assert!(matches!(log.unretire(&ev), Err(BossclawError::InvalidInput(_))), "cannot unretire a note that is not retired");
         assert!(matches!(log.retire_memory("nope"), Err(BossclawError::InvalidInput(_))));
     }
 
