@@ -4814,16 +4814,21 @@ impl EventLog {
         Ok(())
     }
 
-    /// All `session_captured` + `session_deleted` + `supersede` events, in chain
+    /// All `session_captured` + `session_deleted` + `supersede` + Rung-3 retire
+    /// markers (`note_retired` / `passage_retired` / `unretire`), in chain
     /// (`seq ASC`) order — the input to [`fold_sessions`]. The `supersede` rows
     /// are shared with the page/file folds; cross-fold safety holds because a
     /// supersede targets a disjoint event id (a session supersede references a
-    /// session event, never a page/file event, and vice-versa).
+    /// session event, never a page/file event, and vice-versa). The retire
+    /// markers fold into their OWN sets, strictly disjoint from `superseded`.
     fn session_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
         self.events_of_types(&[
             crate::graph::SESSION_CAPTURED_EVENT_TYPE,
             crate::graph::SESSION_DELETED_EVENT_TYPE,
             crate::graph::SUPERSEDE_EVENT_TYPE,
+            crate::graph::NOTE_RETIRED_EVENT_TYPE,
+            crate::graph::PASSAGE_RETIRED_EVENT_TYPE,
+            crate::graph::UNRETIRE_EVENT_TYPE,
         ])
     }
 
@@ -7848,11 +7853,26 @@ struct SessionFold {
     /// note folds), this is the complete retired-id universe — the recall
     /// exclusion (A3) reuses it instead of a second scan.
     superseded: std::collections::HashSet<String>,
+    /// Note EVENT ids retired by a DISTINCT `note_retired` marker and NOT yet
+    /// reversed by an `unretire` (Rung-3). Kept strictly separate from
+    /// `superseded` so an `unretire` reverses a retire and NEVER an edit — a
+    /// bare supersede is byte-identical to an edit, so folding retires into
+    /// `superseded` would let `unretire` resurrect edited-away content. Consumed
+    /// by the recall-exclusion + `unretire` tasks (Task 2+).
+    #[allow(dead_code)] // read by the recall-exclusion task (Task 2); Task 1 only builds the state.
+    retired_notes: std::collections::HashSet<String>,
+    /// `(session_id, passage_id)` pairs retired by a `passage_retired` marker and
+    /// NOT yet reversed by an `unretire` (Rung-3) — the passage-granularity twin
+    /// of `retired_notes`. Consumed by the recall-exclusion task (Task 2+).
+    #[allow(dead_code)] // read by the recall-exclusion task (Task 2); Task 1 only builds the state.
+    retired_passages: std::collections::HashSet<(String, usize)>,
 }
 
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
-/// `session_captured` + `session_deleted` + `supersede` events in `seq ASC`
-/// order, projects them into a [`SessionFold`] (see its field docs).
+/// `session_captured` + `session_deleted` + `supersede` + the Rung-3 retire
+/// markers (`note_retired` / `passage_retired` / `unretire`) in `seq ASC`
+/// order, projects them into a [`SessionFold`] (see its field docs) — the retire
+/// markers fold into their OWN sets, strictly disjoint from `superseded`.
 ///
 /// Deterministic → byte-identical rebuild. Cross-fold-safe: a page/file
 /// `supersede` targets a disjoint event id, so it never retires a session event.
@@ -7860,6 +7880,22 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
     use std::collections::{BTreeMap, HashSet};
     let mut superseded: HashSet<String> = HashSet::new();
     let mut deleted: HashSet<String> = HashSet::new();
+    let mut retired_notes: HashSet<String> = HashSet::new();
+    let mut retired_passages: HashSet<(String, usize)> = HashSet::new();
+    // A retired passage is keyed on (session_id, passage_id); `passage_id` is a
+    // chunk ordinal stored as a JSON number.
+    let sid = |ev: &Event| {
+        ev.content
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let pid = |ev: &Event| {
+        ev.content
+            .get("passage_id")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+    };
     for ev in events {
         match ev.event_type.as_str() {
             crate::graph::SUPERSEDE_EVENT_TYPE => {
@@ -7870,6 +7906,26 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
             crate::graph::SESSION_DELETED_EVENT_TYPE => {
                 if let Some(s) = ev.content.get("session_id").and_then(|v| v.as_str()) {
                     deleted.insert(s.to_string());
+                }
+            }
+            // Rung-3 retire markers fold into their OWN sets (disjoint from
+            // `superseded`). Events arrive `seq ASC`, so a later `unretire`
+            // deterministically reverses an earlier retire.
+            crate::graph::NOTE_RETIRED_EVENT_TYPE => {
+                if let Some(id) = ev.content.get("retires").and_then(|v| v.as_str()) {
+                    retired_notes.insert(id.to_string());
+                }
+            }
+            crate::graph::PASSAGE_RETIRED_EVENT_TYPE => {
+                if let (Some(s), Some(p)) = (sid(ev), pid(ev)) {
+                    retired_passages.insert((s, p));
+                }
+            }
+            crate::graph::UNRETIRE_EVENT_TYPE => {
+                if let Some(id) = ev.content.get("unretires").and_then(|v| v.as_str()) {
+                    retired_notes.remove(id);
+                } else if let (Some(s), Some(p)) = (sid(ev), pid(ev)) {
+                    retired_passages.remove(&(s, p));
                 }
             }
             _ => {}
@@ -7890,7 +7946,13 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
             current.insert(cs.session_id.clone(), cs);
         }
     }
-    SessionFold { current: current.into_values().collect(), deleted, superseded }
+    SessionFold {
+        current: current.into_values().collect(),
+        deleted,
+        superseded,
+        retired_notes,
+        retired_passages,
+    }
 }
 
 /// Pure note fold (SP3 §7/§9): given `memory` + `supersede` events in `seq ASC`
@@ -8094,6 +8156,114 @@ mod tests {
             log.delete_session("never-existed"),
             Err(BossclawError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn note_retire_folds_reversibly_and_leaves_edit_supersedes_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A real note + a real edit-supersede of it (existing public path).
+        let n = log.remember(&emb, "uses Vercel").unwrap();
+        let edited = log.supersede_note(&emb, &n, "left Vercel").unwrap(); // n now in fold.superseded
+
+        // Retire the (edited) head via a DISTINCT note_retired marker, appended
+        // inline exactly like `delete_session` builds its tombstone.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "retires": edited }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(fold.retired_notes.contains(&edited));
+        assert!(fold.superseded.contains(&n), "the ORIGINAL edit-supersede is untouched");
+
+        // Unretire removes ONLY from retired_notes, never from superseded.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "unretires": edited }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(!fold.retired_notes.contains(&edited));
+        assert!(fold.superseded.contains(&n), "unretire did NOT reverse the edit");
+    }
+
+    #[test]
+    fn passage_retire_folds_reversibly_by_session_and_passage_id_leaving_supersede_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A live edit-supersede so `superseded` is non-empty — the passage cycle
+        // below must never disturb it (the disjointness invariant holds for
+        // passages too, not just notes).
+        let n = log.remember(&emb, "uses Vercel").unwrap();
+        log.supersede_note(&emb, &n, "left Vercel").unwrap(); // n now in fold.superseded
+
+        // A passage is keyed on (session_id, passage_id) — passage_id is a chunk
+        // ordinal stored as a JSON number, so the fold must read it back as usize.
+        let sess = "sess-abc";
+        let passage: usize = 3;
+        let key = (sess.to_string(), passage);
+
+        // Retire the passage via a DISTINCT passage_retired marker, appended
+        // inline exactly like `delete_session` builds its tombstone.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::PASSAGE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": sess, "passage_id": passage }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(fold.retired_passages.contains(&key));
+        assert!(fold.superseded.contains(&n), "the edit-supersede is untouched by a passage retire");
+
+        // Unretire (passage form) removes ONLY from retired_passages.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": sess, "passage_id": passage }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(!fold.retired_passages.contains(&key));
+        assert!(fold.superseded.contains(&n), "unretire of a passage did NOT reverse the edit");
     }
 
     #[test]

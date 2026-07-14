@@ -35,6 +35,13 @@ pub const SUPERSEDE_EVENT_TYPE: &str = "supersede";
 pub const SESSION_CAPTURED_EVENT_TYPE: &str = "session_captured";
 /// Owner-commanded deletion tombstone for a captured session (honest stub — I7).
 pub const SESSION_DELETED_EVENT_TYPE: &str = "session_deleted";
+/// Rung-3 retire markers — DISTINCT from `supersede` (a supersede is byte-identical to an edit;
+/// a distinct type is what lets `unretire` reverse a retire without ever reversing an edit).
+pub const NOTE_RETIRED_EVENT_TYPE: &str = "note_retired"; // content: {"retires": <note_event_id>}
+/// Retire marker for a captured-session passage (content: {"session_id","passage_id"}).
+pub const PASSAGE_RETIRED_EVENT_TYPE: &str = "passage_retired";
+/// Reversal of a retire (content: {"unretires": id}  OR  {"session_id","passage_id"}).
+pub const UNRETIRE_EVENT_TYPE: &str = "unretire";
 /// The neutral entity type stamped on an entity the model named ONLY as a bare
 /// relation/retraction endpoint (never listed in `entities[]`, so it carries no
 /// declared type). Single-sourced so the endpoint-mint site has no magic string.
