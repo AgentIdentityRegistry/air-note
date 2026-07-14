@@ -8680,6 +8680,69 @@ mod tests {
         );
     }
 
+    /// Rung-3 §9/§13 recall-NEUTRALITY (by construction + measured): building the SEPARATE
+    /// conflict index and retiring a body passage write ONLY `conflict_index` / append a
+    /// `passage_retired` marker — they NEVER touch the recall `vector_index`. So a note recall
+    /// over a fixed corpus is BYTE-IDENTICAL before and after the whole conflict-side sequence,
+    /// and the recall index's element count is unchanged. This is the core (by-construction) half
+    /// of the harness recall-neutrality proof; the `memharness` `compare`/`recall_regressed` guard
+    /// is the frozen-corpus statistical half. The recall index is built ONCE and never rebuilt
+    /// between the two recalls, so it is the SAME instance — the assertion is a true byte-identity,
+    /// not a re-embedding round-trip (no HNSW rank non-determinism is in play).
+    #[test]
+    fn conflict_index_and_passage_retire_leave_note_recall_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A small fixed note corpus + one built recall index.
+        for text in [
+            "ferris the crab loves rust",
+            "postgres is the datastore",
+            "we deploy on vercel",
+        ] {
+            log.remember(&emb, text).unwrap();
+        }
+        log.rebuild_indexes(&emb).unwrap();
+
+        // Baseline: the ORDERED note-recall hit-id sequence for a fixed query + the recall index's
+        // element count. The query overlaps only the notes, never the session title captured below.
+        let recall_ids = |q: &str| -> Vec<String> {
+            log.recall(&emb, q, 5, &RecallOptions::default())
+                .unwrap()
+                .into_iter()
+                .map(|h| h.event_id)
+                .collect()
+        };
+        let baseline_ids = recall_ids("datastore postgres");
+        let baseline_len = log.vector_index_len();
+        assert!(!baseline_ids.is_empty(), "the query recalls ≥1 note (non-vacuous baseline)");
+
+        // The ENTIRE conflict-side sequence: capture a session, persist its body passages, build
+        // the conflict index, retire a passage, rebuild the conflict index to reflect the retire.
+        // NONE of these calls rebuild the recall index, so the recall `vector_index` box is the
+        // SAME instance the baseline searched.
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        let chunks = vec!["we deploy on vercel".to_string(), "db is postgres".to_string()];
+        log.store_session_passages(&emb, &ev, &chunks).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        log.retire_passage("s1", 0).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+
+        // Byte-identity: same ordered hit ids, same recall-index element count. The conflict index
+        // build + passage retire provably could not perturb note recall.
+        assert_eq!(
+            recall_ids("datastore postgres"),
+            baseline_ids,
+            "note recall hit sequence is byte-identical after the conflict-side sequence"
+        );
+        assert_eq!(
+            log.vector_index_len(),
+            baseline_len,
+            "recall vector_index element count unchanged"
+        );
+    }
+
     /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields
     /// fixed so a test varies only the two axes the fold decisions turn on.
     fn session_meta(session_id: &str, sha: &str) -> SessionMeta {

@@ -15,6 +15,7 @@ pub mod mine;
 pub mod ollama;
 pub mod report;
 pub mod resolve;
+pub mod retrieval_grade;
 pub mod run;
 pub mod stats;
 pub mod synth;

@@ -117,6 +117,28 @@ pub fn compare_runs(baseline: &str, candidate: &str) -> anyhow::Result<Vec<Segme
         .collect())
 }
 
+/// Significance threshold for the recall-regression guard. A drop must be significant at
+/// p < [`REGRESSION_ALPHA`] to count as a regression (a statistical tie is not a regression);
+/// mirrors the `wilcoxon.p_value < 0.05` convention the existing compare tests already assert.
+const REGRESSION_ALPHA: f64 = 0.05;
+
+/// The FIRST segment that significantly REGRESSED: candidate s@k STRICTLY below baseline AND the
+/// paired Wilcoxon rejects "no difference" at p < [`REGRESSION_ALPHA`]. Returns `None` when every
+/// segment improved or merely tied (no significant drop) — the recall-NEUTRALITY verdict.
+///
+/// This is the harness half of the Rung-3 §9/§13 recall-neutrality proof (the core `log.rs` golden
+/// test is the by-construction half): a pre/post-Phase-1 `compare` over a FROZEN corpus asserts
+/// `recall_regressed(&segments).is_none()` — building/using the passage conflict index and retiring
+/// passages must not drop note recall on ANY segment. An IMPROVEMENT is never a regression, and a
+/// non-significant dip is treated as noise, not a regression. Segments are scanned in their stable
+/// (label-sorted, from `compare_runs`' `BTreeMap`) order, so the first gating regression is
+/// deterministic.
+pub fn recall_regressed(segments: &[SegmentComparison]) -> Option<&SegmentComparison> {
+    segments
+        .iter()
+        .find(|s| s.candidate_s_at_k < s.baseline_s_at_k && s.wilcoxon.p_value < REGRESSION_ALPHA)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +245,44 @@ mod tests {
             compare_runs(&dup, &ok2).unwrap_err().to_string().contains("duplicate case_idx"),
             "duplicate baseline case_idx refused"
         );
+    }
+
+    #[test]
+    fn recall_regressed_flags_only_a_significant_drop() {
+        // Build segments directly (mirrors the wilcoxon.p_value idiom of the tests above): a
+        // segment carries a baseline/candidate s@k plus a paired Wilcoxon p.
+        fn seg(label: &str, base: f64, cand: f64, p: f64) -> SegmentComparison {
+            SegmentComparison {
+                label: label.into(),
+                n: 30,
+                baseline_s_at_k: base,
+                candidate_s_at_k: cand,
+                wilcoxon: WilcoxonResult {
+                    n_nonzero: 30,
+                    w_statistic: 0.0,
+                    p_value: p,
+                    small_n_approx: false,
+                },
+            }
+        }
+
+        // A significant regression sits AFTER a clean improvement and a non-significant dip, so it
+        // is selected by the PREDICATE, not by position: candidate down AND p < 0.05.
+        let segs = vec![
+            seg("a·improved", 0.50, 0.80, 0.001), // candidate UP → never a regression
+            seg("b·noise", 0.80, 0.78, 0.40),     // down but NOT significant → a tie, not a regression
+            seg("c·regressed", 0.80, 0.50, 0.001), // down AND significant → THE gating segment
+        ];
+        let hit = recall_regressed(&segs).expect("a significant drop is a regression");
+        assert_eq!(hit.label, "c·regressed");
+
+        // An all-clean set (an improvement + a non-significant dip) is recall-NEUTRAL → None.
+        let clean = vec![seg("x·up", 0.40, 0.60, 0.01), seg("y·tie", 0.70, 0.69, 0.90)];
+        assert!(recall_regressed(&clean).is_none(), "no significant drop ⇒ neutral ⇒ None");
+
+        // Boundary: a drop exactly AT alpha (p == 0.05) is NOT significant (the guard uses strict <),
+        // so it is not flagged — pins the comparison against a silent >= slip.
+        let at_alpha = vec![seg("z·edge", 0.80, 0.60, REGRESSION_ALPHA)];
+        assert!(recall_regressed(&at_alpha).is_none(), "p == alpha is not < alpha ⇒ not flagged");
     }
 }

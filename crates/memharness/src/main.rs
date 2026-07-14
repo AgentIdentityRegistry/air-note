@@ -32,6 +32,18 @@ enum Command {
     ConflictGrade(ConflictGradeArgs),
 }
 
+/// Which INDEX the judge-free retrieval grader searches (Rung-3 §9/§13). `title` = the pre-Rung-3
+/// title-only arm; `passage` = the body-passage conflict index.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RetrievalArm {
+    Title,
+    Passage,
+}
+
+/// Workspace-root-relative path to the retrieval grader's fixture (a DIFFERENT schema from the
+/// judge fixtures, so it lives in its own file). Run `conflict-grade --retrieval …` from repo root.
+const SESSION_PAIRS_FIXTURE: &str = "crates/memharness/fixtures/session-conflict-pairs.jsonl";
+
 /// Which model judges open-query answer quality (known-item scoring is mechanical, no judge).
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum JudgeMode {
@@ -102,6 +114,13 @@ struct ConflictGradeArgs {
     /// self-reported confidence + rationale — the evidence for tuning `CONFLICT_CONF_MIN`.
     #[arg(long)]
     verbose: bool,
+    /// Run the judge-FREE retrieval grader (Rung-3 §9/§13) instead of the judge grade: score the
+    /// body-passage conflict index (`passage`) or the pre-Rung-3 title-only index (`title`) over
+    /// `session-conflict-pairs.jsonl`, printing recall/precision. When set, REPLACES the judge path
+    /// (different fixture + schema); the model/cases/binding args do not apply. The CI gate is the
+    /// `#[test]`; this is the owner's live-run view.
+    #[arg(long, value_enum)]
+    retrieval: Option<RetrievalArm>,
 }
 
 #[derive(clap::Args)]
@@ -130,6 +149,11 @@ fn main() -> anyhow::Result<()> {
 /// judge (Ollama over the daemon's `Reasoner` seam) and prints TP/FP/FN + the Phase-0 SMOKE
 /// verdict. The precision CI is DEFERRED (tiny-N seed); `smoke_ok` is the honest Phase-0 gate.
 fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
+    // Judge-FREE retrieval grader (Rung-3 §9/§13) fully replaces the judge path when requested:
+    // a different fixture + schema, no model call.
+    if let Some(arm) = args.retrieval {
+        return retrieval_grade_cmd(arm);
+    }
     use memharness::conflict_grade::{parse_pairs, run_grade_detailed, verdict_line};
     let body = std::fs::read_to_string(&args.cases)
         .with_context(|| format!("reading conflict cases {}", args.cases.display()))?;
@@ -173,6 +197,31 @@ fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
         g.precision_ci_lower,
         g.metrics.cry_wolf_rate,
         verdict_line(&g, args.binding),
+    );
+    Ok(())
+}
+
+/// The judge-FREE retrieval grader surface (Rung-3 §9/§13): load the session-conflict pairs and
+/// print the chosen arm's recall/precision. The CI gate is the `#[test]`
+/// (`passage_index_meaningfully_beats_title_only`); this owner-facing line is the live-run view of
+/// one arm at a time (run once with `title`, once with `passage` to see the gap).
+fn retrieval_grade_cmd(arm: RetrievalArm) -> anyhow::Result<()> {
+    use memharness::retrieval_grade::{grade_retrieval, load_session_pairs, Retrieval};
+    let body = std::fs::read_to_string(SESSION_PAIRS_FIXTURE).with_context(|| {
+        format!("reading session-conflict pairs {SESSION_PAIRS_FIXTURE} (run from repo root)")
+    })?;
+    let pairs = load_session_pairs(&body)?;
+    let (mode, label) = match arm {
+        RetrievalArm::Title => (Retrieval::TitleOnly, "title"),
+        RetrievalArm::Passage => (Retrieval::PassageIndex, "passage"),
+    };
+    let g = grade_retrieval(&pairs, mode);
+    println!(
+        "retrieval-grade: mode={} n={} recall={:.3} precision={:.3}",
+        label,
+        pairs.len(),
+        g.recall,
+        g.precision,
     );
     Ok(())
 }
