@@ -126,8 +126,9 @@ fn flush(current: &mut Vec<char>, chunks: &mut Vec<Vec<char>>) {
 /// `CHUNK_OVERLAP_CHARS` chars of the previous chunk as leading context. All
 /// slicing is on the block's `char` vector, so no codepoint is ever split.
 fn emit_block_with_overlap(block: &[char], chunks: &mut Vec<Vec<char>>) {
-    // Effective stride per interior window: BUDGET - OVERLAP = 1300 NEW chars,
-    // because each window's leading OVERLAP chars re-cover the prior window's tail.
+    // Effective stride per interior window: CHUNK_BUDGET_CHARS − CHUNK_OVERLAP_CHARS
+    // = 500 NEW chars, because each window's leading OVERLAP chars re-cover the
+    // prior window's tail.
     let mut pos = 0;
     while pos < block.len() {
         // Seed the chunk with overlap carried from the immediately-preceding chunk.
@@ -175,12 +176,12 @@ mod tests {
 
     #[test]
     fn long_text_splits_on_paragraph_boundaries_within_budget() {
-        // Three paragraphs each ~700 chars; budget 1500 ⇒ para1+para2 in chunk 0,
-        // para3 in chunk 1 (a paragraph is never split when it fits whole).
+        // Three ~700-char paragraphs, each larger than CHUNK_BUDGET_CHARS, so the
+        // text splits into several within-budget chunks (each checked below).
         let para = "x".repeat(700);
         let t = format!("{para}\n\n{para}\n\n{para}");
         let chunks = chunk_text(&t);
-        assert!(chunks.len() >= 2, "3×700 chars must exceed one 1500-char chunk: {}", chunks.len());
+        assert!(chunks.len() >= 2, "3×700 chars must exceed one {CHUNK_BUDGET_CHARS}-char chunk: {}", chunks.len());
         for c in &chunks {
             assert!(c.chars().count() <= CHUNK_BUDGET_CHARS, "each chunk within budget");
         }
@@ -191,7 +192,7 @@ mod tests {
         // 4,000 Korean chars in ONE paragraph (no split points) forces a hard split.
         let t: String = "가".repeat(4_000);
         let chunks = chunk_text(&t);
-        assert!(chunks.len() >= 3, "4000 KO chars over a 1500 budget ⇒ ≥3 chunks");
+        assert!(chunks.len() >= 3, "4000 KO chars over a {CHUNK_BUDGET_CHARS} budget ⇒ ≥3 chunks");
         for c in &chunks {
             assert!(c.chars().count() <= CHUNK_BUDGET_CHARS);
             // The load-bearing KO safety property: every chunk is valid UTF-8 with
@@ -207,7 +208,7 @@ mod tests {
     #[test]
     fn adjacent_chunks_overlap_by_the_configured_budget() {
         let para = "y".repeat(1_400);
-        let t = format!("{para}\n\n{para}"); // 2 paras, each near-budget ⇒ 2 chunks
+        let t = format!("{para}\n\n{para}"); // 2 paras, each over CHUNK_BUDGET_CHARS ⇒ several overlapping chunks
         let chunks = chunk_text(&t);
         assert!(chunks.len() >= 2);
         // The tail of chunk[i] and the head of chunk[i+1] must share overlap chars.
@@ -238,7 +239,7 @@ mod tests {
         // One paragraph, no "\n\n" ⇒ this is the hard-split (not the pack) path.
         assert!(!t.contains("\n\n"), "test input must be a single un-split block");
         let chunks = chunk_text(&t);
-        assert!(chunks.len() >= 3, "4000 chars over a 1500 budget ⇒ ≥3 windows: {}", chunks.len());
+        assert!(chunks.len() >= 3, "4000 chars over a {CHUNK_BUDGET_CHARS} budget ⇒ ≥3 windows: {}", chunks.len());
         for c in &chunks {
             assert!(c.chars().count() <= CHUNK_BUDGET_CHARS, "each window within budget");
         }
@@ -259,10 +260,9 @@ mod tests {
     fn crlf_blank_line_is_a_block_boundary() {
         // Guards the load-bearing `flat_map(|part| part.split("\r\n\r\n"))`: a
         // Windows/Markdown CRLF blank line ("\r\n\r\n") has NO "\n\n" substring,
-        // so `split("\n\n")` alone would keep this as one block. Both sides are
-        // near-budget so a correct 2-block split yields ≥2 chunks; a broken
-        // single block (2800 chars) would still exceed budget but is the wrong
-        // shape — the split_into_blocks probe below pins the boundary directly.
+        // so `split("\n\n")` alone would keep this as one block. The
+        // split_into_blocks probe below pins the boundary directly — it checks
+        // block count, not chunk count, so it is independent of CHUNK_BUDGET_CHARS.
         let a = "A".repeat(1_400);
         let b = "B".repeat(1_400);
         let t = format!("{a}\r\n\r\n{b}");
