@@ -153,11 +153,47 @@ pub async fn store_capture(
         sha256: r.sha256.clone(),
         approx_bytes: r.approx_bytes,
     };
-    engine
+    let ev = engine
         .capture_session(meta)
         .await
         .map_err(|e| CaptureStoreError::Engine(e.to_string()))?;
+
+    // (5) Rung-3 Phase-1 (§7.1): persist the session's body passages (BEST-EFFORT — the `.md` +
+    // signed event above are already durable; see [`persist_passages_if_absent`]). `r.body` is
+    // exactly the text composed into the `.md`, so heal (which recovers it via `capture_body`)
+    // chunks the identical text. Accepted limitation: a CHANGED-`sha` recapture supersedes to a NEW
+    // event id and persists under it, so the old capture's rows linger un-GC'd — passage-level
+    // retire is Task 7's job, not Task 5's (no orphan GC here).
+    persist_passages_if_absent(engine, ev, &r.body).await;
     Ok(())
+}
+
+/// Persist a captured session's body passages into the conflict index's restart-safe source table
+/// (§7.1), gated on absence, chunking `body` (`store_capture`'s `Rendered::body` or heal's
+/// [`capture_body`]-recovered text) only when it will actually be stored.
+///
+/// BEST-EFFORT, mirroring core `derive_vector` (log.rs `derive_vector`: vector derivation "is
+/// best-effort … never blocks the append"): by the time this runs the caller's PRIMARY flow — the
+/// `.md` file and the signed capture event — is ALREADY durable, so a passage embed/insert failure
+/// is LOGGED and swallowed. It must never turn a durable capture into a client-visible error, nor
+/// abort a [`heal_orphans`] pass over the remaining orphans. There is NO backfill hook in Phase 1,
+/// so a transient failure drops that session's passages until it is re-captured — an accepted
+/// Phase-1 limitation (a re-embed hook is out of scope). The absent gate skips re-embedding on a
+/// same-`sha` recapture (which returns the existing event id that already has rows).
+async fn persist_passages_if_absent(engine: &EngineHandle, ev: String, body: &str) {
+    match engine.session_passages_absent(ev.clone()).await {
+        Ok(true) => {
+            if let Err(e) =
+                engine.store_session_passages(ev, bossclaw_core::chunk_text(body)).await
+            {
+                eprintln!("capture: session-passage persist failed (best-effort, dropped): {e}");
+            }
+        }
+        Ok(false) => {} // already has rows (same-`sha` recapture) — nothing to do
+        Err(e) => {
+            eprintln!("capture: session-passage absence check failed (best-effort, skipped): {e}");
+        }
+    }
 }
 
 /// Delete a capture (I7, app-only — the caller enforces that at dispatch, not here): append the
@@ -268,7 +304,22 @@ pub async fn heal_orphans(
                 continue; // already consistent (has an event)
             }
             match engine.capture_session(meta).await {
-                Ok(_) => report.orphan_files_captured += 1,
+                Ok(ev) => {
+                    report.orphan_files_captured += 1;
+                    // Rung-3 Phase-1 (§7.1): persist this orphan's body passages too (best-effort),
+                    // so a heal-recovered capture has the SAME conflict-index rows a normal
+                    // `store_capture` would. Window (a) above read only the bounded front-matter
+                    // PREFIX, so re-read the FULL `.md` and `capture_body`-strip the front-matter to
+                    // chunk exactly `store_capture`'s `Rendered::body`.
+                    // Edge: `read_capture_markdown` caps at `MAX_CAPTURE_MD_BYTES` (16 MiB), so a
+                    // body >16 MiB is truncated on re-read and its chunks would diverge from the
+                    // original capture's — narrow (needs a >16 MiB body AND a crash between the file
+                    // write and the event append), accepted. An unreadable body just skips passages
+                    // for this file, consistent with window (a)'s "unreadable — leave it".
+                    if let Ok(full) = read_capture_markdown(&path) {
+                        persist_passages_if_absent(engine, ev, capture_body(&full)).await;
+                    }
+                }
                 // Owner-deleted (tombstoned, I9): the leftover .md is stale → remove it.
                 Err(EngineOpError::Rejected(_)) => {
                     let _ = std::fs::remove_file(&path);
@@ -470,4 +521,61 @@ fn front_matter_block(md: &str) -> Option<&str> {
     let rest = md.strip_prefix("---\n")?;
     let end = rest.find("\n---\n")?;
     Some(&rest[..end])
+}
+
+/// Recover the body text a capture chunked, from its stored `.md` — the inverse of
+/// [`compose_document`]'s front-matter framing. Returns everything after the closing `---\n\n`
+/// fence, dropping exactly the ONE blank separator line `compose_document` inserts between the
+/// block and the body. If the document is not front-matter-framed the whole input is the body
+/// (defensive: an unframed file is all body). This pins [`heal_orphans`]'s chunk input to the SAME
+/// text [`store_capture`] chunked (`Rendered::body`), so both persist byte-identical passages —
+/// even when the body itself contains a bare `---` line (the FIRST `\n---\n` is always the closing
+/// fence, since our front-matter keys are never a bare `---` line, the guarantee
+/// [`front_matter_block`] already relies on).
+fn capture_body(md: &str) -> &str {
+    let Some(rest) = md.strip_prefix("---\n") else {
+        return md; // not framed — the whole document is body
+    };
+    let Some(end) = rest.find("\n---\n") else {
+        return md; // opened but never closed — treat the whole document as body
+    };
+    let after_fence = &rest[end + "\n---\n".len()..];
+    // `compose_document` puts a blank line between the block and the body ("---\n\n"); drop
+    // exactly one leading '\n' so the body round-trips to exactly what was composed.
+    after_fence.strip_prefix('\n').unwrap_or(after_fence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `capture_body` is the exact inverse of `compose_document`'s front-matter framing: the body
+    /// it recovers from a stored `.md` is byte-identical to the body that was composed — even for a
+    /// body that contains a bare `---` line and multiple paragraphs (so the strip cannot over-reach
+    /// into the body). This pins [`heal_orphans`] to chunk EXACTLY the text [`store_capture`]
+    /// chunked (`Rendered::body`), so both persist identical session passages.
+    #[test]
+    fn capture_body_round_trips_compose_document_body() {
+        let body = "First paragraph, before a divider.\n\n---\n\nSecond paragraph, after a bare `---` line.\n";
+        let md = compose_document(
+            "sess-1",
+            "A Title\nwith a newline", // flattened by `one_line` — must not break fence detection
+            "proj",
+            "claude-code",
+            "abc123",
+            10,
+            20,
+            4096,
+            0,
+            0,
+            false,
+            /*recovered_stub=*/ false,
+            body,
+        );
+        assert_eq!(
+            capture_body(&md),
+            body,
+            "recovered body must equal the composed body, even with an embedded `---` line"
+        );
+    }
 }

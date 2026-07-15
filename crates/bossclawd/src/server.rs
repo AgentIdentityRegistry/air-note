@@ -31,8 +31,8 @@ use bossclawd_proto::types::{
     ReasonerModeWire, RecallStatsWire, ReindexProgressWire, SessionDetailWire, SessionSummaryWire,
 };
 use bossclawd_proto::{
-    read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response, Role,
-    PROTO_VERSION,
+    read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response,
+    RetireTarget, Role, PROTO_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -443,6 +443,24 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
             // reject, whereas GetSession/DeleteSession keep static messages for symmetry with the I4
             // capture-path rejects that DO carry hostile bytes.
             op_result(engine.supersede_note(event_id, text).await, Response::Superseded)
+        }
+        // ── Rung 3 §7.3: retire / unretire (App-only — `Role::allows` denies both for a
+        // `MemoryClient`, so the guest never reaches here; onboarding is the daemon's OWN verdict,
+        // resolved inside the engine wrapper). ──
+        Request::RetireMemory { target, .. } => match target {
+            RetireTarget::Note { event_id } => {
+                op_result(engine.retire_memory(event_id).await, Response::Retired)
+            }
+            // Rung 3 §7.2 passage-granularity retire: append a `passage_retired` marker for the
+            // (session_id, passage_id). The engine wrapper resolves onboarding and folds an unknown
+            // session / out-of-range / already-retired passage to a typed `Rejected`. (Passage UNretire
+            // is core-only in Phase 1 — the wire `Unretire` op is note-only — so there is no arm for it.)
+            RetireTarget::Passage { session_id, passage_id } => {
+                op_result(engine.retire_passage(session_id, passage_id).await, Response::Retired)
+            }
+        },
+        Request::Unretire { retired_event_id, .. } => {
+            op_result(engine.unretire(retired_event_id).await, Response::Retired)
         }
         Request::SetCaptureEnabled { onboarded, enabled, backfill } => {
             // `at` is the ONLY clock read on the dispatch core — the daemon boundary supplies it so
@@ -1112,6 +1130,24 @@ mod tests {
         assert!(
             override_onboarding_for_guest(Request::Status { onboarded: false }, true).is_none(),
             "an unhandled op must fail closed (None), not pass through with the client's flag"
+        );
+        // Rung 3 retire ops are App-only (guest-refused): they are NOT handled here, so they fall
+        // through to None just like any other non-guest op — the role gate then refuses them.
+        assert!(
+            override_onboarding_for_guest(
+                Request::RetireMemory { onboarded: false, target: RetireTarget::Note { event_id: "e".into() } },
+                true,
+            )
+            .is_none(),
+            "RetireMemory is App-only and must fail closed (None) for a guest"
+        );
+        assert!(
+            override_onboarding_for_guest(
+                Request::Unretire { onboarded: false, retired_event_id: "r".into() },
+                true,
+            )
+            .is_none(),
+            "Unretire is App-only and must fail closed (None) for a guest"
         );
     }
 }

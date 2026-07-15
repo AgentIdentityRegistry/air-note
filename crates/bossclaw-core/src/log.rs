@@ -443,6 +443,13 @@ pub struct EventLog {
     /// `None` until [`EventLog::rebuild_entity_index`]; rebuilt from the encrypted
     /// log on open (zero plaintext index on disk, like the recall index).
     entity_index: Mutex<Option<Box<dyn VectorIndex>>>,
+    /// In-memory ANN index over captured-session BODY-PASSAGE vectors ONLY, for
+    /// cross-session conflict retrieval (Rung-3 §7.1). Physically separate from
+    /// both `vector_index` (recall) and `entity_index` (resolution) so building it
+    /// never perturbs recall. Keyed by `(session_id, passage_ix)`. `None` until
+    /// [`EventLog::rebuild_conflict_index`]; rebuilt from the `session_passage_vectors`
+    /// table (zero plaintext index on disk, like the other two).
+    conflict_index: Mutex<Option<Box<dyn VectorIndex>>>,
     /// The actuator rename mutex (spec §9). DISTINCT from `inner` (the SQLite
     /// append serializer): the M6a `execute_write` (T4) will hold THIS across its
     /// entire re-canonicalize → re-check → base-guard → temp-write → finalize-rename
@@ -835,6 +842,26 @@ impl EventLog {
                 PRIMARY KEY(entity_id, model_id)
             )",
         )?;
+        // Session-passage vectors (Rung-3 Phase-1 §7.1; Tier-A derived). The
+        // restart-safe SOURCE for the conflict index — the daemon embeds each
+        // captured session's body chunks here at capture time. Separate from
+        // both `vectors` (recall) and `entity_vectors` (resolution) so the
+        // conflict index NEVER mixes with either.
+        // model_id-scoped, but the capture-time skip-gate (`session_passages_absent`) is
+        // model-AGNOSTIC: after a model/language-pack swap, existing sessions' passages are NOT
+        // auto-repopulated (a same-`sha` re-capture finds the OLD model's rows and skips), so they
+        // stay under the old model_id until a future re-embed/backfill hook — a deferred Phase-1
+        // limitation (that hook is out of scope here).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS session_passage_vectors (
+                session_captured_event_id TEXT NOT NULL,
+                passage_ix                INTEGER NOT NULL,
+                model_id                  TEXT NOT NULL,
+                dim                       INTEGER NOT NULL,
+                embedding                 BLOB NOT NULL,
+                PRIMARY KEY(session_captured_event_id, passage_ix, model_id)
+            )",
+        )?;
         // Evolve-loop progress (re-derivable progress state — NOT a Tier-A fold,
         // spec §4). Single row (id pinned to 0), advanced after each committed
         // batch. Losing it only re-processes events (idempotent: an active
@@ -870,6 +897,7 @@ impl EventLog {
             highwater: None,
             vector_index: Mutex::new(None),
             entity_index: Mutex::new(None),
+            conflict_index: Mutex::new(None),
             rename_lock: Mutex::new(()),
         })
     }
@@ -1431,6 +1459,19 @@ impl EventLog {
         }
     }
 
+    /// The number of vectors in the recall index, or `0` if it has not been built
+    /// yet (no [`EventLog::rebuild_indexes`] call since open).
+    ///
+    /// Task 6 asserts recall stays byte-untouched by comparing this count before
+    /// and after building the separate conflict index — the recall index must
+    /// never change.
+    // consumed by Task 6 (recall-untouched assertion); no non-test reader yet.
+    #[allow(dead_code)]
+    pub(crate) fn vector_index_len(&self) -> usize {
+        let guard = self.vector_index.lock().expect(POISON);
+        guard.as_ref().map_or(0, |ix| ix.len())
+    }
+
     /// Index an event in the FTS5 keyword index.
     ///
     /// The `event_id` / `text` pair is inserted into the `fts` virtual table
@@ -1633,16 +1674,25 @@ impl EventLog {
         // candidate (e.g. pages only) pays nothing. `current_session_event_ids`
         // is the INCLUSION set (only the current fold head survives);
         // `superseded_ids` is an EXCLUSION set (see the memory arm below).
-        let (current_session_event_ids, superseded_ids): (
+        let (current_session_event_ids, superseded_ids, retired_note_ids): (
+            std::collections::HashSet<String>,
             std::collections::HashSet<String>,
             std::collections::HashSet<String>,
         ) = if kinds.values().any(|k| {
             k == crate::graph::SESSION_CAPTURED_EVENT_TYPE || k == crate::graph::MEMORY_EVENT_TYPE
         }) {
             let fold = fold_sessions(&self.session_events_ordered()?);
-            (fold.current.into_iter().map(|cs| cs.event_id).collect(), fold.superseded)
+            (
+                fold.current.into_iter().map(|cs| cs.event_id).collect(),
+                fold.superseded,
+                fold.retired_notes,
+            )
         } else {
-            (std::collections::HashSet::new(), std::collections::HashSet::new())
+            (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
         };
         let now = Utc::now();
         let pinned: std::collections::HashSet<&String> = opts.pinned.iter().collect();
@@ -1787,8 +1837,12 @@ impl EventLog {
                 // ground-truth note, so an inclusion set would drop every
                 // non-superseded memory. `superseded_ids` over-covers (it also
                 // holds session/file supersede targets), but this arm consults it
-                // only for memory-kind ids, so the over-breadth is inert.
-                return !superseded_ids.contains(&h.event_id);
+                // only for memory-kind ids, so the over-breadth is inert. A rung-3
+                // retired note (distinct `note_retired` marker, reversible) is also
+                // dropped here — fold-time, no index rebuild — so retire/unretire
+                // take effect immediately (the vector stays in the HNSW index).
+                return !superseded_ids.contains(&h.event_id)
+                    && !retired_note_ids.contains(&h.event_id);
             }
             true // every other kind always survives
         });
@@ -4753,6 +4807,201 @@ impl EventLog {
         Ok(new_id)
     }
 
+    /// Retire a [`EventLog::remember`] note (rung-3 "Retire older") via a DISTINCT
+    /// [`crate::graph::NOTE_RETIRED_EVENT_TYPE`] marker — reversible, no replacement.
+    /// A distinct marker (not a `supersede`) is what lets [`EventLog::unretire`]
+    /// reverse a retire WITHOUT ever reversing an edit: a bare supersede is
+    /// byte-identical to an edit, so retiring through the supersede machinery would
+    /// let an unretire resurrect edited-away content. Validation mirrors
+    /// [`EventLog::supersede_note`] (exists, memory-kind, not already superseded)
+    /// EXCEPT the blank-text check (there is no replacement text), plus a
+    /// not-already-retired check. Returns the `note_retired` event's id.
+    ///
+    /// I5 completeness caveat (documented): retire excludes the note from recall,
+    /// the Library list, and the embed-rebuild gate, but does NOT yet remove
+    /// already-minted entities/edges or dequeue it from extraction — that
+    /// edge-invalidation is resolution-time (Phase 3 / Task 9), not a Phase-1 blocker.
+    pub fn retire_memory(&self, target_event_id: &str) -> Result<String, BossclawError> {
+        self.assert_retirable_note(target_event_id)?;
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "retires": target_event_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Reverse a prior [`EventLog::retire_memory`] (rung-3): appends a
+    /// [`crate::graph::UNRETIRE_EVENT_TYPE`] marker that removes the note from
+    /// `fold_sessions().retired_notes`, restoring it to recall and the Library list.
+    /// Only reverses a RETIRE — an `unretire` removes solely from `retired_notes`,
+    /// never from `superseded`, so it can never resurrect an edited-away note.
+    /// Returns [`BossclawError::InvalidInput`] if `retired_event_id` is not currently
+    /// retired (validated before appending). Returns the `unretire` event's id.
+    pub fn unretire(&self, retired_event_id: &str) -> Result<String, BossclawError> {
+        self.assert_note_retired(retired_event_id)?;
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "unretires": retired_event_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Rung-3 §7.2: retire a SINGLE session passage (by `session_id` +
+    /// `passage_id`) via a DISTINCT [`crate::graph::PASSAGE_RETIRED_EVENT_TYPE`]
+    /// marker — the next [`EventLog::rebuild_conflict_index`] excludes exactly
+    /// that passage from [`EventLog::conflict_search`], leaving its siblings and
+    /// the recall / resolution indexes byte-untouched. Reversible via
+    /// [`EventLog::unretire_passage`]; the append-only marker also survives a
+    /// same-sha re-capture (an A2 dedup no-op), so a sweeper cycle never resurrects
+    /// the passage.
+    ///
+    /// Validation is model-AGNOSTIC (so it holds before ANY recall rebuild and
+    /// regardless of the active model): resolve the session's CURRENT fold-head
+    /// capture event id via `fold.current`, then reject a `passage_id` at/above the
+    /// [`EventLog::session_passage_count`] for that capture. Also rejects an unknown
+    /// session and (I6) an already-retired passage. Returns the marker event's id.
+    pub fn retire_passage(
+        &self,
+        session_id: &str,
+        passage_id: usize,
+    ) -> Result<String, BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let cs = fold
+            .current
+            .iter()
+            .find(|cs| cs.session_id == session_id)
+            .ok_or_else(|| {
+                BossclawError::InvalidInput(format!(
+                    "cannot retire passage: no current session {session_id}"
+                ))
+            })?;
+        let n = self.session_passage_count(&cs.event_id)?;
+        if passage_id >= n {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire passage {passage_id} of {session_id}: out of range ({n})"
+            )));
+        }
+        if fold.retired_passages.contains(&(session_id.to_string(), passage_id)) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire passage {passage_id} of {session_id}: already retired"
+            )));
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::PASSAGE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": session_id, "passage_id": passage_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Reverse a prior [`EventLog::retire_passage`] (Rung-3 §7.3): appends an
+    /// [`crate::graph::UNRETIRE_EVENT_TYPE`] marker carrying `{session_id,
+    /// passage_id}`, which the fold removes from `retired_passages` — restoring the
+    /// passage to [`EventLog::conflict_search`] and NOTHING else (it never touches
+    /// `superseded`/`retired_notes`, so it can never resurrect edited-away content).
+    /// Rejects (I6) a passage that is not currently retired. Returns the marker id.
+    ///
+    /// Phase-1 note: passage-unretire is CORE-ONLY — there is deliberately no
+    /// proto/server unretire-passage op (the wire `Request::Unretire` is note-only).
+    /// The Phase-3 conflict-resolution UI wires this; it exists now so the retire
+    /// action is provably reversible.
+    pub fn unretire_passage(
+        &self,
+        session_id: &str,
+        passage_id: usize,
+    ) -> Result<String, BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        if !fold.retired_passages.contains(&(session_id.to_string(), passage_id)) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot unretire passage {passage_id} of {session_id}: not retired"
+            )));
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": session_id, "passage_id": passage_id }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Validate `target_event_id` is a retirable CURRENT note — the same
+    /// exists/memory-kind/not-already-superseded checks
+    /// [`EventLog::supersede_note`] applies (blank-text excepted: retire has no
+    /// replacement), PLUS not already retired by a live `note_retired` marker.
+    /// All failures are [`BossclawError::InvalidInput`].
+    ///
+    /// The superseded + retired checks read BOTH sets off a single
+    /// [`fold_sessions`] pass: `fold.superseded` IS the complete superseded-id
+    /// universe (identical to [`EventLog::superseded_event_ids`] — the recall arm
+    /// documents the same equivalence), and `fold.retired_notes` the retired one,
+    /// so one scan over the session/supersede stream answers both.
+    fn assert_retirable_note(&self, target_event_id: &str) -> Result<(), BossclawError> {
+        let target = self.event_by_id(target_event_id)?.ok_or_else(|| {
+            BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: no such event"
+            ))
+        })?;
+        if target.event_type != crate::graph::MEMORY_EVENT_TYPE {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: not a remembered note (event_type = {})",
+                target.event_type
+            )));
+        }
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        if fold.superseded.contains(target_event_id) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: already superseded"
+            )));
+        }
+        if fold.retired_notes.contains(target_event_id) {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot retire {target_event_id}: already retired"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate `retired_event_id` is currently retired (present in
+    /// `fold_sessions().retired_notes`), the precondition for [`EventLog::unretire`].
+    /// Returns [`BossclawError::InvalidInput`] otherwise.
+    fn assert_note_retired(&self, retired_event_id: &str) -> Result<(), BossclawError> {
+        if !fold_sessions(&self.session_events_ordered()?)
+            .retired_notes
+            .contains(retired_event_id)
+        {
+            return Err(BossclawError::InvalidInput(format!(
+                "cannot unretire {retired_event_id}: not retired"
+            )));
+        }
+        Ok(())
+    }
+
     /// The set of event ids retired by a `supersede` event, across ALL folds:
     /// page/file/session/note supersedes share [`crate::graph::SUPERSEDE_EVENT_TYPE`]
     /// and each targets exactly one (disjoint) id. Reads only supersede events
@@ -4776,15 +5025,19 @@ impl EventLog {
     /// version of anything should ever re-vectorize) and (2) every
     /// `session_captured` event whose `session_id` carries a `session_deleted`
     /// tombstone (the tombstone keys on `session_id`, so the capture event id is
-    /// NOT in the supersede set). One [`EventLog::session_events_ordered`] scan
-    /// feeds both. Used to gate re-embedding ([`EventLog::collect_pending`]) AND
-    /// the migration completeness denominator ([`EventLog::reembed_prepare`]) so
-    /// a deleted session neither re-vectorizes on rebuild/migration nor (by being
-    /// counted "missing") blocks a migration from ever completing.
+    /// NOT in the supersede set), and (3) every rung-3 retired note (a live
+    /// `note_retired` marker, reversible via `unretire`) — so a retired note never
+    /// re-vectorizes on rebuild/migration either. One
+    /// [`EventLog::session_events_ordered`] scan feeds all three. Used to gate
+    /// re-embedding ([`EventLog::collect_pending`]) AND the migration completeness
+    /// denominator ([`EventLog::reembed_prepare`]) so a deleted/retired item
+    /// neither re-vectorizes on rebuild/migration nor (by being counted "missing")
+    /// blocks a migration from ever completing.
     fn embed_excluded_event_ids(&self) -> Result<HashSet<String>, BossclawError> {
         let events = self.session_events_ordered()?;
         let fold = fold_sessions(&events);
         let (deleted, mut excluded) = (fold.deleted, fold.superseded);
+        excluded.extend(fold.retired_notes);
         for ev in &events {
             if ev.event_type == crate::graph::SESSION_CAPTURED_EVENT_TYPE {
                 if let Some(sid) = ev.content.get("session_id").and_then(|v| v.as_str()) {
@@ -4814,16 +5067,21 @@ impl EventLog {
         Ok(())
     }
 
-    /// All `session_captured` + `session_deleted` + `supersede` events, in chain
+    /// All `session_captured` + `session_deleted` + `supersede` + Rung-3 retire
+    /// markers (`note_retired` / `passage_retired` / `unretire`), in chain
     /// (`seq ASC`) order — the input to [`fold_sessions`]. The `supersede` rows
     /// are shared with the page/file folds; cross-fold safety holds because a
     /// supersede targets a disjoint event id (a session supersede references a
-    /// session event, never a page/file event, and vice-versa).
+    /// session event, never a page/file event, and vice-versa). The retire
+    /// markers fold into their OWN sets, strictly disjoint from `superseded`.
     fn session_events_ordered(&self) -> Result<Vec<Event>, BossclawError> {
         self.events_of_types(&[
             crate::graph::SESSION_CAPTURED_EVENT_TYPE,
             crate::graph::SESSION_DELETED_EVENT_TYPE,
             crate::graph::SUPERSEDE_EVENT_TYPE,
+            crate::graph::NOTE_RETIRED_EVENT_TYPE,
+            crate::graph::PASSAGE_RETIRED_EVENT_TYPE,
+            crate::graph::UNRETIRE_EVENT_TYPE,
         ])
     }
 
@@ -4920,16 +5178,20 @@ impl EventLog {
 
     /// The CURRENT remembered notes (SP3 §7/§9): every `memory`-kind event
     /// ([`EventLog::remember`] / the corrected note of [`EventLog::supersede_note`])
-    /// NOT retired by a `supersede`, newest-first. A deterministic read (no vector,
-    /// no embedder) backing the Memory-browser notes list — mirrors
+    /// NOT retired by a `supersede` AND NOT retired by a live rung-3 `note_retired`
+    /// marker (an `unretire` restores it), newest-first. A deterministic read (no
+    /// vector, no embedder) backing the Memory-browser notes list — mirrors
     /// [`EventLog::current_sessions`]. "Note" is defined by event-kind EXACTLY as
     /// [`EventLog::supersede_note`] validates its target (memory-kind), so the list
     /// and the edit primitive can never disagree on what counts as a note. Reads
-    /// only `memory` + `supersede` events (never a whole-log scan).
+    /// only `memory` + `supersede` + `note_retired` + `unretire` events (never a
+    /// whole-log scan).
     pub fn current_notes(&self) -> Result<Vec<CurrentNote>, BossclawError> {
         let events = self.events_of_types(&[
             crate::graph::MEMORY_EVENT_TYPE,
             crate::graph::SUPERSEDE_EVENT_TYPE,
+            crate::graph::NOTE_RETIRED_EVENT_TYPE,
+            crate::graph::UNRETIRE_EVENT_TYPE,
         ])?;
         Ok(fold_notes(&events))
     }
@@ -5547,6 +5809,118 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Rung-3 Phase-1 (§7.1): embed + persist a captured session's body passages
+    /// under `event_id`, ONE row per chunk `ix`, into the dedicated
+    /// `session_passage_vectors` table (the conflict index's restart-safe source).
+    /// Mirrors [`EventLog::derive_entity_vector`] — same blob encoding, `model_id`
+    /// and `dim` taken from `embedder`. A SEPARATE table from `vectors` (recall)
+    /// and `entity_vectors` (resolution), so persisting here never perturbs the
+    /// recall index. Idempotent upsert per `(event_id, ix, model_id)`.
+    pub fn store_session_passages(
+        &self,
+        embedder: &dyn Embedder,
+        event_id: &str,
+        chunks: &[String],
+    ) -> Result<(), BossclawError> {
+        // Embed first (no store lock needed), then upsert each — the same
+        // "embed, then lock, then insert" ordering as `derive_entity_vector`.
+        let mut rows: Vec<(usize, Vec<u8>)> = Vec::with_capacity(chunks.len());
+        for (ix, chunk) in chunks.iter().enumerate() {
+            rows.push((ix, vec_to_blob(&embed_one(embedder, chunk)?)));
+        }
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        // ALL-OR-NOTHING: one transaction over the whole passage set, not N implicit
+        // ones. A mid-loop failure must never leave a PARTIAL set — `session_passages_absent`'s
+        // "any row ⇒ done" gate would then treat that partial as complete forever. Also collapses
+        // N fsyncs into one.
+        let tx = conn.unchecked_transaction()?;
+        for (ix, blob) in &rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO session_passage_vectors \
+                 (session_captured_event_id, passage_ix, model_id, dim, embedding) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![event_id, *ix as i64, embedder.model_id(), embedder.dim() as i64, blob],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All session-passage vectors for `model_id` as `(event_id, passage_ix,
+    /// vector)` triples, ordered `session_captured_event_id, passage_ix ASC`.
+    /// Mirrors [`EventLog::entity_vectors_for_model`] but over
+    /// `session_passage_vectors` and carrying the passage index (the tuple shape
+    /// the Task-6/7 conflict index consumes).
+    pub fn session_passages_for_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Vec<(String, usize, Vec<f32>)>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT session_captured_event_id, passage_ix, embedding \
+             FROM session_passage_vectors WHERE model_id = ?1 \
+             ORDER BY session_captured_event_id, passage_ix ASC",
+        )?;
+        let rows = stmt.query_map([model_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (event_id, ix, blob) = row?;
+            out.push((event_id, ix as usize, blob_to_vec(&blob)?));
+        }
+        Ok(out)
+    }
+
+    /// True when NO passage rows exist for `event_id` (existence probe over any
+    /// model). The capture path uses this to persist passages on the FIRST
+    /// capture and SKIP re-embedding on a same-`sha` recapture that already has
+    /// rows.
+    pub fn session_passages_absent(&self, event_id: &str) -> Result<bool, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let present: Option<i64> = store
+            .conn()
+            .query_row(
+                "SELECT 1 FROM session_passage_vectors \
+                 WHERE session_captured_event_id = ?1 LIMIT 1",
+                rusqlite::params![event_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(present.is_none())
+    }
+
+    /// Count of `session_passage_vectors` rows for `event_id`, over ANY model
+    /// (model-AGNOSTIC — a retire targets a logical `(session_id, passage_id)`
+    /// position, independent of the active model). [`EventLog::retire_passage`]
+    /// uses this to range-check a `passage_id` BEFORE any recall rebuild, so it
+    /// deliberately does NOT scope by `model_id`.
+    ///
+    /// Safety of the un-scoped count: with multiple models embedding the same
+    /// capture, `COUNT(*)` can only OVER-count (it sums a passage across model_ids);
+    /// it can never under-count. An over-permissive range check merely admits an
+    /// INERT `passage_retired` marker for a `passage_id` that matches nothing at
+    /// model-scoped [`EventLog::rebuild_conflict_index`] time — harmless. Tightening
+    /// this to model-scoped would instead wrongly REJECT valid passages (a capture
+    /// whose passages were embedded only under a since-swapped model), so it MUST
+    /// stay model-agnostic.
+    pub fn session_passage_count(&self, event_id: &str) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM session_passage_vectors \
+             WHERE session_captured_event_id = ?1",
+            rusqlite::params![event_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// Search the entity-resolution index for the `k` nearest `(entity_id,
     /// distance)` pairs to `mention`'s embedding. ONLY entity nodes are searched
     /// (the index holds only `entity_vectors`). Returns [`BossclawError::InvalidInput`]
@@ -5565,6 +5939,82 @@ impl EventLog {
                 "entity index not built — call rebuild_entity_index".into(),
             )),
         }
+    }
+
+    /// Rebuild the SEPARATE conflict index (Rung-3 §7.1) from the
+    /// `session_passage_vectors` table: one vector per CURRENT session's live
+    /// passage, keyed by `(session_id, passage_ix)`. Mirrors
+    /// [`EventLog::rebuild_entity_index`] but writes ONLY `conflict_index` — the
+    /// recall `vector_index` and the resolution `entity_index` are byte-untouched.
+    ///
+    /// A passage row is keyed on its capture `event_id`; the index is keyed on the
+    /// session's stable `session_id`, so rows are mapped through the fold head
+    /// (`fold.current`). Rows whose `event_id` is NOT a current head (superseded /
+    /// tombstoned / orphaned captures) are SKIPPED, and any `(session_id,
+    /// passage_ix)` in `fold.retired_passages` is EXCLUDED at build time (a retired
+    /// passage is simply never added).
+    pub fn rebuild_conflict_index(&self, embedder: &dyn Embedder) -> Result<(), BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        // event_id → session_id for the CURRENT (non-superseded, non-tombstoned)
+        // sessions; rows outside this map are not part of any current session.
+        let sid_of: std::collections::HashMap<&str, &str> = fold
+            .current
+            .iter()
+            .map(|cs| (cs.event_id.as_str(), cs.session_id.as_str()))
+            .collect();
+        let rows = self.session_passages_for_model(embedder.model_id())?;
+        let mut index = HnswIndex::with_capacity(rows.len());
+        for (event_id, ix, vec) in rows {
+            let Some(&session_id) = sid_of.get(event_id.as_str()) else {
+                continue; // orphaned / superseded / tombstoned capture — skip
+            };
+            // `.to_string()` allocates a throwaway key, so gate it behind the common
+            // no-retirements case — only pay the alloc when retirements actually exist.
+            if !fold.retired_passages.is_empty()
+                && fold.retired_passages.contains(&(session_id.to_string(), ix))
+            {
+                continue; // retired passage — excluded at rebuild time
+            }
+            // `encode_chunk_key`'s param is named `event_id`, but here we key by
+            // session_id BY DESIGN: an A5-validated session_id is `[A-Za-z0-9_-]`
+            // (see bossclawd `valid_session_id`), so it can never contain
+            // CHUNK_KEY_SEP (`\u{1f}`) — the key round-trips losslessly through
+            // `decode_chunk_key` in `conflict_search`.
+            index.add(&crate::index::encode_chunk_key(session_id, ix), &vec);
+        }
+        let boxed: Box<dyn VectorIndex> = Box::new(index);
+        *self.conflict_index.lock().expect(POISON) = Some(boxed);
+        Ok(())
+    }
+
+    /// Search the SEPARATE conflict index (Rung-3 §7.1) for the `k` nearest
+    /// `(session_id, passage_ix, distance)` triples to the query vector `qv`.
+    /// Mirrors [`EventLog::entity_search`] but takes a pre-computed query vector and
+    /// returns a plain `Vec`.
+    ///
+    /// Callers MUST call [`EventLog::rebuild_conflict_index`] first. An unbuilt
+    /// index yields an EMPTY result BY DESIGN — "no index → no hits" is a deliberate
+    /// non-fatal policy for this detector (in release, "no index built yet" simply
+    /// flags no conflicts), whereas entity resolution errors on an unbuilt index. A
+    /// `debug_assert` guards the "called before rebuild" bug in dev/test, where it
+    /// is always a mistake. Keys that fail to decode are dropped (never happens — we
+    /// encoded them via `encode_chunk_key`).
+    pub fn conflict_search(&self, qv: &[f32], k: usize) -> Vec<(String, usize, f32)> {
+        let guard = self.conflict_index.lock().expect(POISON);
+        debug_assert!(
+            guard.is_some(),
+            "conflict_search called before rebuild_conflict_index"
+        );
+        let Some(index) = guard.as_ref() else {
+            return Vec::new();
+        };
+        index
+            .search(qv, k)
+            .into_iter()
+            .filter_map(|(key, score)| {
+                crate::index::decode_chunk_key(&key).map(|(sid, ix)| (sid.to_string(), ix, score))
+            })
+            .collect()
     }
 
     /// Resolve one entity `mention` against the existing entity nodes (spec §6):
@@ -7848,11 +8298,26 @@ struct SessionFold {
     /// note folds), this is the complete retired-id universe — the recall
     /// exclusion (A3) reuses it instead of a second scan.
     superseded: std::collections::HashSet<String>,
+    /// Note EVENT ids retired by a DISTINCT `note_retired` marker and NOT yet
+    /// reversed by an `unretire` (Rung-3). Kept strictly separate from
+    /// `superseded` so an `unretire` reverses a retire and NEVER an edit — a
+    /// bare supersede is byte-identical to an edit, so folding retires into
+    /// `superseded` would let `unretire` resurrect edited-away content. Read by
+    /// recall's memory-arm exclusion, the embed-rebuild gate, and the
+    /// retire/unretire validation (Task 2).
+    retired_notes: std::collections::HashSet<String>,
+    /// `(session_id, passage_id)` pairs retired by a `passage_retired` marker and
+    /// NOT yet reversed by an `unretire` (Rung-3) — the passage-granularity twin
+    /// of `retired_notes`. Read by `rebuild_conflict_index` to exclude retired
+    /// passages from the conflict index at build time.
+    retired_passages: std::collections::HashSet<(String, usize)>,
 }
 
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
-/// `session_captured` + `session_deleted` + `supersede` events in `seq ASC`
-/// order, projects them into a [`SessionFold`] (see its field docs).
+/// `session_captured` + `session_deleted` + `supersede` + the Rung-3 retire
+/// markers (`note_retired` / `passage_retired` / `unretire`) in `seq ASC`
+/// order, projects them into a [`SessionFold`] (see its field docs) — the retire
+/// markers fold into their OWN sets, strictly disjoint from `superseded`.
 ///
 /// Deterministic → byte-identical rebuild. Cross-fold-safe: a page/file
 /// `supersede` targets a disjoint event id, so it never retires a session event.
@@ -7860,6 +8325,22 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
     use std::collections::{BTreeMap, HashSet};
     let mut superseded: HashSet<String> = HashSet::new();
     let mut deleted: HashSet<String> = HashSet::new();
+    let mut retired_notes: HashSet<String> = HashSet::new();
+    let mut retired_passages: HashSet<(String, usize)> = HashSet::new();
+    // A retired passage is keyed on (session_id, passage_id); `passage_id` is a
+    // chunk ordinal stored as a JSON number.
+    let sid = |ev: &Event| {
+        ev.content
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let pid = |ev: &Event| {
+        ev.content
+            .get("passage_id")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+    };
     for ev in events {
         match ev.event_type.as_str() {
             crate::graph::SUPERSEDE_EVENT_TYPE => {
@@ -7870,6 +8351,26 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
             crate::graph::SESSION_DELETED_EVENT_TYPE => {
                 if let Some(s) = ev.content.get("session_id").and_then(|v| v.as_str()) {
                     deleted.insert(s.to_string());
+                }
+            }
+            // Rung-3 retire markers fold into their OWN sets (disjoint from
+            // `superseded`). Events arrive `seq ASC`, so a later `unretire`
+            // deterministically reverses an earlier retire.
+            crate::graph::NOTE_RETIRED_EVENT_TYPE => {
+                if let Some(id) = ev.content.get("retires").and_then(|v| v.as_str()) {
+                    retired_notes.insert(id.to_string());
+                }
+            }
+            crate::graph::PASSAGE_RETIRED_EVENT_TYPE => {
+                if let (Some(s), Some(p)) = (sid(ev), pid(ev)) {
+                    retired_passages.insert((s, p));
+                }
+            }
+            crate::graph::UNRETIRE_EVENT_TYPE => {
+                if let Some(id) = ev.content.get("unretires").and_then(|v| v.as_str()) {
+                    retired_notes.remove(id);
+                } else if let (Some(s), Some(p)) = (sid(ev), pid(ev)) {
+                    retired_passages.remove(&(s, p));
                 }
             }
             _ => {}
@@ -7890,28 +8391,48 @@ fn fold_sessions(events: &[Event]) -> SessionFold {
             current.insert(cs.session_id.clone(), cs);
         }
     }
-    SessionFold { current: current.into_values().collect(), deleted, superseded }
+    SessionFold {
+        current: current.into_values().collect(),
+        deleted,
+        superseded,
+        retired_notes,
+        retired_passages,
+    }
 }
 
-/// Pure note fold (SP3 §7/§9): given `memory` + `supersede` events in `seq ASC`
-/// order, returns the CURRENT notes — every `memory`-kind event NOT retired by a
-/// `supersede` — sorted NEWEST-FIRST (`created_at` desc, then `event_id` desc as a
-/// deterministic tie-break; ULIDs are monotonic + lexicographically sortable, so
-/// `event_id` desc IS newest-first within a same-second group).
+/// Pure note fold (SP3 §7/§9): given `memory` + `supersede` events (plus the
+/// rung-3 `note_retired` / `unretire` markers) in `seq ASC` order, returns the
+/// CURRENT notes — every `memory`-kind event NOT retired by a `supersede` AND NOT
+/// retired by a live `note_retired` marker — sorted NEWEST-FIRST (`created_at`
+/// desc, then `event_id` desc as a deterministic tie-break; ULIDs are monotonic +
+/// lexicographically sortable, so `event_id` desc IS newest-first within a
+/// same-second group).
 ///
 /// A returned note's `superseded_by` is ALWAYS `None`: a superseded note is
 /// EXCLUDED from the fold (only live heads survive), mirroring [`fold_sessions`]'s
 /// current-only projection — so the Library shows an edited note in place (old text
-/// gone, new text present) and recall/list stay consistent. `created_at` is the
-/// event `ts` (RFC 3339) parsed to Unix seconds, or 0 if absent/unparseable
-/// (deterministic fallback — no clock read).
+/// gone, new text present) and recall/list stay consistent. Rung-3 retire is
+/// reversible: a `note_retired` marker removes a note, a later `unretire` restores
+/// it (walked in `seq` order, so the last marker wins) — kept SEPARATE from the
+/// `superseded` set so an `unretire` can never resurrect an edited-away note.
+/// `created_at` is the event `ts` (RFC 3339) parsed to Unix seconds, or 0 if
+/// absent/unparseable (deterministic fallback — no clock read).
 fn fold_notes(events: &[Event]) -> Vec<CurrentNote> {
     use std::collections::HashSet;
     let mut superseded: HashSet<&str> = HashSet::new();
+    let mut retired: HashSet<&str> = HashSet::new();
     for ev in events {
         if ev.event_type == crate::graph::SUPERSEDE_EVENT_TYPE {
             if let Some(p) = ev.content.get("supersedes").and_then(|v| v.as_str()) {
                 superseded.insert(p);
+            }
+        } else if ev.event_type == crate::graph::NOTE_RETIRED_EVENT_TYPE {
+            if let Some(p) = ev.content.get("retires").and_then(|v| v.as_str()) {
+                retired.insert(p);
+            }
+        } else if ev.event_type == crate::graph::UNRETIRE_EVENT_TYPE {
+            if let Some(p) = ev.content.get("unretires").and_then(|v| v.as_str()) {
+                retired.remove(p);
             }
         }
     }
@@ -7920,6 +8441,7 @@ fn fold_notes(events: &[Event]) -> Vec<CurrentNote> {
         .filter(|ev| {
             ev.event_type == crate::graph::MEMORY_EVENT_TYPE
                 && !superseded.contains(ev.id.as_str())
+                && !retired.contains(ev.id.as_str())
         })
         .map(|ev| CurrentNote {
             event_id: ev.id.clone(),
@@ -8027,6 +8549,200 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn vector_index_len_is_zero_until_rebuilt_then_reflects_the_recall_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        // `open` does not build the ANN index (it is None), so the count is 0.
+        assert_eq!(log.vector_index_len(), 0, "no index built yet ⇒ 0");
+
+        // A remembered note plus a rebuild populates the recall index.
+        log.remember(&embedder, "ferris the crab loves rust").unwrap();
+        log.rebuild_indexes(&embedder).unwrap();
+        assert!(
+            log.vector_index_len() > 0,
+            "after remember + rebuild the recall index holds ≥1 vector"
+        );
+    }
+
+    /// Rung-3 Phase-1 (§7.1): a capture's body passages embed + persist into the
+    /// dedicated `session_passage_vectors` table (the conflict index's restart-safe
+    /// source) and survive a reopen, keyed by the capture's event id + passage ix.
+    #[test]
+    fn store_session_passages_persists_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let chunks = vec!["we deploy on Vercel".to_string(), "db is Postgres".to_string()];
+        {
+            let log = open_log(dir.path());
+            log.store_session_passages(&emb, "cap1", &chunks).unwrap();
+        }
+        let log = open_log(dir.path()); // reopen — the table is restart-durable
+        let rows = log.session_passages_for_model(emb.model_id()).unwrap();
+        assert_eq!(
+            rows.iter().filter(|(e, _, _)| e == "cap1").count(),
+            2,
+            "both passages persisted under cap1 and survive a reopen"
+        );
+    }
+
+    /// Rung-3 Phase-1 (§7.1): the SEPARATE conflict index retrieves a captured
+    /// session's passages keyed by the fold-resolved `session_id` (not the raw
+    /// capture event id), and building it leaves the recall `vector_index`
+    /// byte-untouched (its `len` is the guard). `k ≥ #passages` ⇒ set-membership is
+    /// stable across HNSW rank non-determinism (spec §13).
+    #[test]
+    fn conflict_index_retrieves_by_session_and_leaves_recall_len_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap(); // real capture → fold head "s1"
+        let chunks = vec!["we deploy on Vercel".to_string(), "db is Postgres".to_string()];
+        log.store_session_passages(&emb, &ev, &chunks).unwrap();
+        log.rebuild_indexes(&emb).unwrap();
+        let recall_len = log.vector_index_len();
+        assert_eq!(recall_len, 1, "one capture event is in the recall index");
+        log.rebuild_conflict_index(&emb).unwrap();
+        let hits = log.conflict_search(&emb.embed(&["Vercel".into()]).unwrap()[0], 8); // k ≥ #chunks → membership stable
+        assert!(hits.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0)); // session id resolved via fold head
+        assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
+    }
+
+    /// Rung-3 Phase-1 (§7.1): a BUILT-but-EMPTY conflict index yields no hits. This
+    /// pins the empty-result contract via the legitimate "rebuild first" path (a
+    /// fresh log has no passages, so the rebuild produces an empty index) — so it
+    /// respects `conflict_search`'s dev/test `debug_assert` that the index was built,
+    /// rather than probing the unbuilt-`None` path (which is a caller bug the assert
+    /// deliberately trips).
+    #[test]
+    fn conflict_search_on_empty_built_index_yields_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        log.rebuild_conflict_index(&emb).unwrap(); // no passages ⇒ empty index (but built)
+        let hits = log.conflict_search(&emb.embed(&["x".into()]).unwrap()[0], 8);
+        assert!(hits.is_empty(), "an empty (built) conflict index yields no hits");
+    }
+
+    /// Rung-3 §7.2/§7.3: the passage-retire ACTION — retiring one passage hides
+    /// exactly that passage from `conflict_search`, siblings stay, the retire
+    /// survives a sweeper cycle (same-sha re-capture is an A2 dedup no-op that
+    /// keeps the marker), and `unretire_passage` reverses it.
+    #[test]
+    fn passage_retire_hides_one_survives_sweep_and_reverses() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        let chunks = vec!["Vercel".to_string(), "Postgres".to_string()];
+        log.store_session_passages(&emb, &ev, &chunks).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        log.retire_passage("s1", 0).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        let hit = |q: &str| {
+            log.conflict_search(&emb.embed(&[q.into()]).unwrap()[0], 8)
+                .iter()
+                .any(|(s, p, _)| s == "s1" && *p == 0)
+        };
+        assert!(!hit("Vercel"), "retired passage 0 hidden");
+        assert!(
+            log.conflict_search(&emb.embed(&["Postgres".into()]).unwrap()[0], 8)
+                .iter()
+                .any(|(s, p, _)| s == "s1" && *p == 1),
+            "sibling kept"
+        );
+        // Reject branches, asserted WHILE passage 0 is still retired (all three are
+        // read-only rejects that append nothing, so they never disturb the flow below).
+        assert!(
+            matches!(log.retire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
+            "double-retire of a still-retired passage is rejected (I6)"
+        );
+        assert!(
+            matches!(log.retire_passage("s1", 9), Err(BossclawError::InvalidInput(_))),
+            "out-of-range passage_id (≥ N=2) is rejected"
+        );
+        assert!(
+            matches!(log.retire_passage("ghost", 0), Err(BossclawError::InvalidInput(_))),
+            "retire against a non-current session is rejected"
+        );
+        // SWEEP durability: same-sha re-capture is a no-op (returns the same id); marker persists across rebuild.
+        log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        assert!(!hit("Vercel"), "retire survives a sweeper cycle");
+        log.unretire_passage("s1", 0).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        assert!(hit("Vercel"), "unretire restores the passage");
+        assert!(
+            matches!(log.unretire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
+            "unretiring a no-longer-retired passage is rejected (I6)"
+        );
+    }
+
+    /// Rung-3 §9/§13 recall-NEUTRALITY (by construction + measured): building the SEPARATE
+    /// conflict index and retiring a body passage write ONLY `conflict_index` / append a
+    /// `passage_retired` marker — they NEVER touch the recall `vector_index`. So a note recall
+    /// over a fixed corpus is BYTE-IDENTICAL before and after the whole conflict-side sequence,
+    /// and the recall index's element count is unchanged. This is the core (by-construction) half
+    /// of the harness recall-neutrality proof; the `memharness` `compare`/`recall_regressed` guard
+    /// is the frozen-corpus statistical half. The recall index is built ONCE and never rebuilt
+    /// between the two recalls, so it is the SAME instance — the assertion is a true byte-identity,
+    /// not a re-embedding round-trip (no HNSW rank non-determinism is in play).
+    #[test]
+    fn conflict_index_and_passage_retire_leave_note_recall_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A small fixed note corpus + one built recall index.
+        for text in [
+            "ferris the crab loves rust",
+            "postgres is the datastore",
+            "we deploy on vercel",
+        ] {
+            log.remember(&emb, text).unwrap();
+        }
+        log.rebuild_indexes(&emb).unwrap();
+
+        // Baseline: the ORDERED note-recall hit-id sequence for a fixed query + the recall index's
+        // element count. The query overlaps only the notes, never the session title captured below.
+        let recall_ids = |q: &str| -> Vec<String> {
+            log.recall(&emb, q, 5, &RecallOptions::default())
+                .unwrap()
+                .into_iter()
+                .map(|h| h.event_id)
+                .collect()
+        };
+        let baseline_ids = recall_ids("datastore postgres");
+        let baseline_len = log.vector_index_len();
+        assert!(!baseline_ids.is_empty(), "the query recalls ≥1 note (non-vacuous baseline)");
+
+        // The ENTIRE conflict-side sequence: capture a session, persist its body passages, build
+        // the conflict index, retire a passage, rebuild the conflict index to reflect the retire.
+        // NONE of these calls rebuild the recall index, so the recall `vector_index` box is the
+        // SAME instance the baseline searched.
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        let chunks = vec!["we deploy on vercel".to_string(), "db is postgres".to_string()];
+        log.store_session_passages(&emb, &ev, &chunks).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+        log.retire_passage("s1", 0).unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+
+        // Byte-identity: same ordered hit ids, same recall-index element count. The conflict index
+        // build + passage retire provably could not perturb note recall.
+        assert_eq!(
+            recall_ids("datastore postgres"),
+            baseline_ids,
+            "note recall hit sequence is byte-identical after the conflict-side sequence"
+        );
+        assert_eq!(
+            log.vector_index_len(),
+            baseline_len,
+            "recall vector_index element count unchanged"
+        );
+    }
+
     /// A `SessionMeta` for `session_id` at content-hash `sha`; all other fields
     /// fixed so a test varies only the two axes the fold decisions turn on.
     fn session_meta(session_id: &str, sha: &str) -> SessionMeta {
@@ -8094,6 +8810,114 @@ mod tests {
             log.delete_session("never-existed"),
             Err(BossclawError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn note_retire_folds_reversibly_and_leaves_edit_supersedes_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A real note + a real edit-supersede of it (existing public path).
+        let n = log.remember(&emb, "uses Vercel").unwrap();
+        let edited = log.supersede_note(&emb, &n, "left Vercel").unwrap(); // n now in fold.superseded
+
+        // Retire the (edited) head via a DISTINCT note_retired marker, appended
+        // inline exactly like `delete_session` builds its tombstone.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "retires": edited }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(fold.retired_notes.contains(&edited));
+        assert!(fold.superseded.contains(&n), "the ORIGINAL edit-supersede is untouched");
+
+        // Unretire removes ONLY from retired_notes, never from superseded.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "unretires": edited }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(!fold.retired_notes.contains(&edited));
+        assert!(fold.superseded.contains(&n), "unretire did NOT reverse the edit");
+    }
+
+    #[test]
+    fn passage_retire_folds_reversibly_by_session_and_passage_id_leaving_supersede_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A live edit-supersede so `superseded` is non-empty — the passage cycle
+        // below must never disturb it (the disjointness invariant holds for
+        // passages too, not just notes).
+        let n = log.remember(&emb, "uses Vercel").unwrap();
+        log.supersede_note(&emb, &n, "left Vercel").unwrap(); // n now in fold.superseded
+
+        // A passage is keyed on (session_id, passage_id) — passage_id is a chunk
+        // ordinal stored as a JSON number, so the fold must read it back as usize.
+        let sess = "sess-abc";
+        let passage: usize = 3;
+        let key = (sess.to_string(), passage);
+
+        // Retire the passage via a DISTINCT passage_retired marker, appended
+        // inline exactly like `delete_session` builds its tombstone.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::PASSAGE_RETIRED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": sess, "passage_id": passage }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(fold.retired_passages.contains(&key));
+        assert!(fold.superseded.contains(&n), "the edit-supersede is untouched by a passage retire");
+
+        // Unretire (passage form) removes ONLY from retired_passages.
+        log.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::UNRETIRE_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "session_id": sess, "passage_id": passage }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: log.signer_did(),
+            signature: None,
+        })
+        .unwrap();
+
+        let fold = fold_sessions(&log.session_events_ordered().unwrap());
+        assert!(!fold.retired_passages.contains(&key));
+        assert!(fold.superseded.contains(&n), "unretire of a passage did NOT reverse the edit");
     }
 
     #[test]
@@ -8243,6 +9067,29 @@ mod tests {
             .unwrap();
         assert!(hits.iter().all(|h| h.event_id != old), "old (superseded) head excluded");
         assert!(!hits.is_empty(), "the replacement note surfaces");
+    }
+
+    #[test]
+    fn retire_memory_note_excludes_from_recall_and_list_and_unretire_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let ev = log.remember(&emb, "we deploy on Vercel").unwrap();
+        log.rebuild_indexes(&emb).unwrap();
+        assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev));
+        log.retire_memory(&ev).unwrap();
+        assert!(!log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "retired note excluded from recall");
+        assert!(!log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "retired note excluded from the Library list");
+        // (a) retiring an already-retired note rejects (guard path).
+        assert!(matches!(log.retire_memory(&ev), Err(BossclawError::InvalidInput(_))), "cannot retire an already-retired note");
+        assert!(matches!(log.unretire("not-a-retired-id"), Err(BossclawError::InvalidInput(_))), "unretire refuses a non-retired id");
+        log.unretire(&ev).unwrap();
+        assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "unretire restores recall");
+        // (c) the Library list restores too — a SEPARATE path (`fold_notes` builds its own retired set).
+        assert!(log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "unretire restores the Library list");
+        // (b) double unretire rejects: it is no longer in `retired_notes`.
+        assert!(matches!(log.unretire(&ev), Err(BossclawError::InvalidInput(_))), "cannot unretire a note that is not retired");
+        assert!(matches!(log.retire_memory("nope"), Err(BossclawError::InvalidInput(_))));
     }
 
     #[test]

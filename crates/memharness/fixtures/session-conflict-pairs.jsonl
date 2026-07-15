@@ -1,0 +1,12 @@
+{"session_id":"sess-01","title":"deployment notes","body":"we switched the frontend hosting from netlify to vercel","conflicting_query":"vercel hosting","label":"contradicts"}
+{"session_id":"sess-02","title":"meeting notes","body":"the primary datastore is now postgres replacing mysql","conflicting_query":"postgres datastore","label":"contradicts"}
+{"session_id":"sess-03","title":"standup log","body":"authentication moved to oauth using the okta provider","conflicting_query":"okta oauth","label":"contradicts"}
+{"session_id":"sess-04","title":"release checklist","body":"the payment integration switched to stripe from braintree","conflicting_query":"stripe payment","label":"contradicts"}
+{"session_id":"sess-05","title":"infra review","body":"containers now run on kubernetes instead of nomad","conflicting_query":"kubernetes containers","label":"contradicts"}
+{"session_id":"sess-06","title":"planning doc","body":"the search backend migrated to elasticsearch from solr","conflicting_query":"elasticsearch backend","label":"contradicts"}
+{"session_id":"sess-07","title":"retro summary","body":"the cache layer is redis after dropping memcached","conflicting_query":"redis layer","label":"contradicts"}
+{"session_id":"sess-08","title":"config changes","body":"the pipeline moved to github actions off jenkins","conflicting_query":"github actions","label":"contradicts"}
+{"session_id":"sess-09","title":"weekly update","body":"the onboarding flow added a welcome tour for new hires","conflicting_query":"quarterly budget forecast","label":"coexist"}
+{"session_id":"sess-10","title":"sync notes","body":"the mobile app now supports offline drafts","conflicting_query":"hiking trail conditions","label":"coexist"}
+{"session_id":"sess-11","title":"sprint review","body":"the dashboard shows latency percentiles per region","conflicting_query":"lunch menu options","label":"coexist"}
+{"session_id":"sess-12","title":"ops log","body":"the alerting rules were split by severity tier","conflicting_query":"movie ticket prices","label":"coexist"}

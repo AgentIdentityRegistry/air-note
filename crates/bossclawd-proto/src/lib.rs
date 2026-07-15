@@ -223,6 +223,14 @@ pub enum Request {
     ListNotes { onboarded: bool },
     /// SP3 Memory-browser edit: supersede a note with new text, yielding the new event id. App-only.
     SupersedeNote { onboarded: bool, event_id: String, text: String },
+    /// Rung 3 §7.3: retire a memory — a REVERSIBLE hide, distinct from `SupersedeNote`'s edit.
+    /// `RetireTarget::Note` appends a distinct `note_retired` marker (recall/list drop it fold-time,
+    /// no index rebuild); `RetireTarget::Passage` is the Task 7 passage-granularity variant (dispatched
+    /// as a clean `Rejected` until then). App-only (guest-refused).
+    RetireMemory { onboarded: bool, target: RetireTarget },
+    /// Rung 3 §7.3: reverse a prior note retire, appending an `unretire` marker so the target is
+    /// recalled/listed again. `Rejected` if the id is not CURRENTLY retired. App-only (guest-refused).
+    Unretire { onboarded: bool, retired_event_id: String },
     /// SP3 recall-miss telemetry: the recall hit/miss counters + recent misses for the tuning UI.
     /// App-only.
     RecallStats { onboarded: bool },
@@ -234,6 +242,19 @@ pub enum Request {
     /// SP3 capture-toggle query: whether ongoing session capture is enabled. App-only. Mirrors
     /// `MandatesEnabled`.
     CaptureEnabled { onboarded: bool },
+}
+
+/// The subject of a [`Request::RetireMemory`]: either a whole `remember` note (by its event id) or a
+/// single session passage (by `session_id` + passage index). Externally tagged like the request
+/// enums; derives match the other payload types so it nests inside [`Request`]. The `Passage` arm is
+/// carried on the wire now but its engine dispatch lands in Task 7 (§7.3) — until then the daemon
+/// answers it with a clean `Rejected`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum RetireTarget {
+    /// A whole `remember` note, addressed by its event id (obtained from `ListNotes`).
+    Note { event_id: String },
+    /// A single session passage, addressed by `session_id` + passage index (Task 7).
+    Passage { session_id: String, passage_id: usize },
 }
 
 /// One response from the daemon to the client. Each success variant carries the
@@ -312,6 +333,8 @@ pub enum Response {
     ListNotes(Vec<NoteWire>),
     /// `SupersedeNote` result — the id of the new (superseding) note event.
     Superseded(String),
+    /// `RetireMemory` / `Unretire` result — the id of the newly appended retire/unretire marker event.
+    Retired(String),
     /// `RecallStats` result — recall hit/miss telemetry for the tuning UI.
     RecallStats(RecallStatsWire),
     /// `CaptureEnabled` result — the sticky capture-enabled flag.
@@ -836,6 +859,8 @@ mod protocol_tests {
             RecallStats { onboarded: true },
             SetCaptureEnabled { onboarded: true, enabled: true, backfill: false },
             CaptureEnabled { onboarded: true },
+            RetireMemory { onboarded: true, target: RetireTarget::Note { event_id: "e".into() } },
+            Unretire { onboarded: true, retired_event_id: "r".into() },
         ];
         for r in no { assert!(!Role::MemoryClient.allows(&r), "{r:?}"); }
     }
@@ -849,6 +874,23 @@ mod protocol_tests {
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();
         assert!(matches!(back, Request::Snapshot { .. }));
+
+        // Rung 3 retire ops: both `RetireTarget` shapes and `Unretire` survive the externally-tagged
+        // JSON round-trip unchanged (the same "add variants" back-compat contract).
+        let note = Request::RetireMemory { onboarded: true, target: RetireTarget::Note { event_id: "e1".into() } };
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&note).unwrap()).unwrap();
+        assert_eq!(back, note);
+
+        let passage = Request::RetireMemory {
+            onboarded: true,
+            target: RetireTarget::Passage { session_id: "s1".into(), passage_id: 3 },
+        };
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&passage).unwrap()).unwrap();
+        assert_eq!(back, passage);
+
+        let unretire = Request::Unretire { onboarded: true, retired_event_id: "r1".into() };
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&unretire).unwrap()).unwrap();
+        assert_eq!(back, unretire);
     }
 
     /// SP3 adds only new externally-tagged variants (backward-safe); the wire version must NOT bump — a

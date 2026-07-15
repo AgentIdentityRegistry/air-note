@@ -3674,9 +3674,11 @@ name = "memharness"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bossclaw-core",
  "bossclawd",
  "bossclawd-proto",
  "clap",
+ "ed25519-dalek",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "serde",

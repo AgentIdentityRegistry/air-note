@@ -28,7 +28,21 @@ enum Command {
     Run(RunArgs),
     /// Compare two frozen runs PAIRED (per-case, same case-list sha) — the rung-gate stats.
     Compare(CompareArgs),
+    /// Grade the rung-3 conflict judge on a frozen labelled set (spec §9).
+    ConflictGrade(ConflictGradeArgs),
 }
+
+/// Which INDEX the judge-free retrieval grader searches (Rung-3 §9/§13). `title` = the pre-Rung-3
+/// title-only arm; `passage` = the body-passage conflict index.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RetrievalArm {
+    Title,
+    Passage,
+}
+
+/// Workspace-root-relative path to the retrieval grader's fixture (a DIFFERENT schema from the
+/// judge fixtures, so it lives in its own file). Run `conflict-grade --retrieval …` from repo root.
+const SESSION_PAIRS_FIXTURE: &str = "crates/memharness/fixtures/session-conflict-pairs.jsonl";
 
 /// Which model judges open-query answer quality (known-item scoring is mechanical, no judge).
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -80,6 +94,36 @@ struct RunArgs {
 }
 
 #[derive(clap::Args)]
+struct ConflictGradeArgs {
+    /// Path to the frozen labelled-pair JSONL. NOTE: the default is workspace-root-relative —
+    /// run `conflict-grade` from the repo root, or pass an absolute --cases path.
+    #[arg(long, default_value = "crates/memharness/fixtures/conflict-seed.jsonl")]
+    cases: std::path::PathBuf,
+    /// Ollama model tag for the local judge (mirrors RunArgs' model arg).
+    #[arg(long, default_value = memharness::ollama::DEFAULT_OLLAMA_MODEL)]
+    model: String,
+    /// Bootstrap seed (deterministic CI).
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// Report the §9 statistical BINDING gate (precision CI-lower ≥ 0.90 at recall ≥ 0.30) as the
+    /// PASS/FAIL verdict, instead of the tiny-seed plumbing SMOKE. Use ONLY on the 50+-pair binding
+    /// set — the precision CI is degenerate on the ~10-row seed.
+    #[arg(long)]
+    binding: bool,
+    /// Print every MISCLASSIFIED pair (false positive / false negative) with the model's
+    /// self-reported confidence + rationale — the evidence for tuning `CONFLICT_CONF_MIN`.
+    #[arg(long)]
+    verbose: bool,
+    /// Run the judge-FREE retrieval grader (Rung-3 §9/§13) instead of the judge grade: score the
+    /// body-passage conflict index (`passage`) or the pre-Rung-3 title-only index (`title`) over
+    /// `session-conflict-pairs.jsonl`, printing recall/precision. When set, REPLACES the judge path
+    /// (different fixture + schema); the model/cases/binding args do not apply. The CI gate is the
+    /// `#[test]`; this is the owner's live-run view.
+    #[arg(long, value_enum)]
+    retrieval: Option<RetrievalArm>,
+}
+
+#[derive(clap::Args)]
 struct CompareArgs {
     /// Baseline run's scores.json (e.g. the frozen Phase 1 baseline).
     #[arg(long)]
@@ -97,7 +141,89 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Compare(args) => compare(args),
+        Command::ConflictGrade(args) => conflict_grade_cmd(args),
     }
+}
+
+/// Grade the rung-3 conflict judge on a frozen labelled set (spec §9). Drives the real local
+/// judge (Ollama over the daemon's `Reasoner` seam) and prints TP/FP/FN + the Phase-0 SMOKE
+/// verdict. The precision CI is DEFERRED (tiny-N seed); `smoke_ok` is the honest Phase-0 gate.
+fn conflict_grade_cmd(args: ConflictGradeArgs) -> anyhow::Result<()> {
+    // Judge-FREE retrieval grader (Rung-3 §9/§13) fully replaces the judge path when requested:
+    // a different fixture + schema, no model call.
+    if let Some(arm) = args.retrieval {
+        return retrieval_grade_cmd(arm);
+    }
+    use memharness::conflict_grade::{parse_pairs, run_grade_detailed, verdict_line};
+    let body = std::fs::read_to_string(&args.cases)
+        .with_context(|| format!("reading conflict cases {}", args.cases.display()))?;
+    let pairs = parse_pairs(&body)?;
+    // Real local judge = the daemon's model via Ollama — the SAME `Reasoner` seam Phase 2 uses.
+    // `OllamaReasoner::new` POSTs /api/chat with `format = schema` + a system channel, so the
+    // verdict schema is actually enforced (unlike memharness::ollama::generate → /api/generate).
+    let judge = bossclaw_core::ollama::OllamaReasoner::new(&args.model);
+    let (g, graded) = run_grade_detailed(&pairs, &judge, args.seed)?;
+    if args.verbose {
+        // Show only the errors — a false positive (flagged a non-conflict) or a false negative
+        // (missed a real one). The FP confidences tell us whether raising CONFLICT_CONF_MIN helps.
+        for gp in graded.iter().filter(|gp| gp.is_error()) {
+            let kind = if gp.flagged() { "FP" } else { "FN" };
+            let (conf, why) = gp
+                .verdict
+                .as_ref()
+                .map(|v| (v.confidence, v.why.as_str()))
+                .unwrap_or((0, "(dropped: below floor or not a contradiction)"));
+            println!(
+                "  [{kind}] truth={:?} conf={conf} a={:?} b={:?} why={:?}",
+                gp.label, gp.a, gp.b, why,
+            );
+        }
+    }
+    if args.binding && pairs.len() < 50 {
+        eprintln!(
+            "warning: --binding wants a 50+-pair set for a non-degenerate precision CI; got {} pairs",
+            pairs.len(),
+        );
+    }
+    println!(
+        "conflict-grade: n={} TP={} FP={} FN={} recall={:.3} precision={:.3} ci_lower={:.3} \
+         cry_wolf={:.3} → {}",
+        pairs.len(),
+        g.metrics.true_positives,
+        g.metrics.false_positives,
+        g.metrics.false_negatives,
+        g.metrics.recall,
+        g.metrics.precision,
+        g.precision_ci_lower,
+        g.metrics.cry_wolf_rate,
+        verdict_line(&g, args.binding),
+    );
+    Ok(())
+}
+
+/// The judge-FREE retrieval grader surface (Rung-3 §9/§13): load the session-conflict pairs and
+/// print the chosen arm's recall/precision. The CI gate is the `#[test]`
+/// (`passage_index_meaningfully_beats_title_only`); this owner-facing line is the live-run view of
+/// one arm at a time (run once with `title`, once with `passage` to see the gap).
+fn retrieval_grade_cmd(arm: RetrievalArm) -> anyhow::Result<()> {
+    use memharness::retrieval_grade::{grade_retrieval, load_session_pairs, Retrieval};
+    let body = std::fs::read_to_string(SESSION_PAIRS_FIXTURE).with_context(|| {
+        format!("reading session-conflict pairs {SESSION_PAIRS_FIXTURE} (run from repo root)")
+    })?;
+    let pairs = load_session_pairs(&body)?;
+    let (mode, label) = match arm {
+        RetrievalArm::Title => (Retrieval::TitleOnly, "title"),
+        RetrievalArm::Passage => (Retrieval::PassageIndex, "passage"),
+    };
+    let g = grade_retrieval(&pairs, mode);
+    println!(
+        "retrieval-grade: mode={} n={} recall={:.3} precision={:.3}",
+        label,
+        pairs.len(),
+        g.recall,
+        g.precision,
+    );
+    Ok(())
 }
 
 /// Print the paired comparison table (spec §3.0.3). The GATE read: only the two gating
