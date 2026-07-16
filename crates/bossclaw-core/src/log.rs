@@ -434,6 +434,29 @@ pub struct CurrentNote {
     pub superseded_by: Option<String>,
 }
 
+/// One OPEN conflict proposal for the read surface (spec §3.5). Both refs are still current
+/// (withdrawn proposals are absent). Ungated (portable data type). `#![deny(missing_docs)]`
+/// requires a `///` on every pub field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictProposalRow {
+    /// The `conflict_proposal` event id.
+    pub id: String,
+    /// The first ref as recorded by the proposer (by convention the OLDER side, ordered upstream by
+    /// ingest ts); this projection passes it through, it does not enforce the ordering.
+    pub a_ref: crate::index::ConflictRef,
+    /// The second ref as recorded by the proposer (by convention the NEWER side, ordered upstream by
+    /// ingest ts); this projection passes it through, it does not enforce the ordering.
+    pub b_ref: crate::index::ConflictRef,
+    /// Advisory winner label ("newer"/"older"/"unclear") — the engine resolves by ts.
+    pub winner_hint: String,
+    /// Coarse confidence band ("high"/"med") — the raw numeric confidence is never persisted.
+    pub confidence_band: String,
+    /// The CONTENT-FREE templated reason (`conflict::templated_why`); never memory text.
+    pub why: String,
+    /// Wall-clock instant detection recorded this proposal (Unix seconds).
+    pub detected_at: i64,
+}
+
 /// One conflict-detection SUBJECT: a memory appended after the cursor. A `memory` event yields
 /// ONE `Note` subject; a `session_captured` event yields one `Passage` subject per live
 /// (non-retired) passage.
@@ -2748,12 +2771,12 @@ impl EventLog {
 
     /// Every `conflict_proposal` whose BOTH refs STILL resolve to a current memory — the OPEN set.
     /// Auto-withdraw (I-gc, no withdrawal event) is exact for a NOTE ref (retire/delete/edit ⇒ a new
-    /// event id, so it leaves `current_notes`) and for a WHOLE-session delete. A PASSAGE ref on a
-    /// session BODY edit is only partly covered here: a supersede keeps the same `session_id` and
-    /// emits no `passage_retired`, so an ordinal the re-chunked head no longer has stays "current" in
-    /// this fold — that ordinal-existence check is Task 7's projection, not this function. Oldest
-    /// first (`events_of_types` is `seq ASC`). Shared by `pending_conflict_proposals` (Task 7) and
-    /// `is_conflict_proposal_suppressed`. `#[cfg(unix)]` (feeds the append/projection/sweep family).
+    /// event id, so it leaves `current_notes`) and for a WHOLE-session delete. A PASSAGE ref is
+    /// current only when its session is current, it is not in `retired_passages`, AND its ordinal
+    /// still exists in the current head capture — so a same-`session_id` supersede that re-chunks to
+    /// fewer passages (emitting no `passage_retired`) withdraws a proposal on the vanished ordinal.
+    /// Oldest first (`events_of_types` is `seq ASC`). Shared by `pending_conflict_proposals` (Task 7)
+    /// and `is_conflict_proposal_suppressed`. `#[cfg(unix)]` (feeds the append/projection/sweep family).
     #[cfg(unix)]
     fn open_conflict_proposals(&self) -> Result<Vec<OpenConflictProposal>, BossclawError> {
         use crate::index::ConflictRef;
@@ -2763,12 +2786,28 @@ impl EventLog {
         let fold = fold_sessions(&self.session_events_ordered()?);
         let current_sessions: std::collections::HashSet<&str> =
             fold.current.iter().map(|cs| cs.session_id.as_str()).collect();
+        // Passage count of each CURRENT session's head capture. A Passage ref is only "current" if its
+        // ordinal still EXISTS in that head: a same-`session_id` supersede that re-chunks to fewer
+        // passages emits no `passage_retired`, so a dropped ordinal would otherwise stay open.
+        // `session_passage_count` is model-agnostic and can OVER-count in a multi-model state (an
+        // accepted property — see the Task 3 caveat); over-count is CONSERVATIVE here (keeps a proposal
+        // open slightly too long, never withdraws a valid one), and the default single-model config is
+        // exact.
+        let mut head_passage_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(fold.current.len());
+        for cs in &fold.current {
+            head_passage_counts.insert(cs.session_id.clone(), self.session_passage_count(&cs.event_id)?);
+        }
         let ref_is_current = |r: &ConflictRef| -> bool {
             match r {
                 ConflictRef::Note { event_id } => current_note_ids.contains(event_id),
                 ConflictRef::Passage { session_id, passage_id } => {
                     current_sessions.contains(session_id.as_str())
                         && !fold.retired_passages.contains(&(session_id.clone(), *passage_id))
+                        // Some() is guaranteed by the current_sessions check above; the 0 fallback is
+                        // unreachable but fails safe (treat as no passages → withdraw).
+                        && *passage_id < *head_passage_counts.get(session_id.as_str()).unwrap_or(&0)
+                    // ordinal still exists in the current head
                 }
             }
         };
@@ -2783,9 +2822,38 @@ impl EventLog {
             if !ref_is_current(&a_ref) || !ref_is_current(&b_ref) {
                 continue; // GC: a side is gone → withdrawn
             }
-            out.push(OpenConflictProposal { a_ref, b_ref });
+            out.push(OpenConflictProposal {
+                id: ev.id.clone(),
+                a_ref,
+                b_ref,
+                winner_hint: ev.content.get("winner_hint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                confidence_band: ev.content.get("confidence_band").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                why: ev.content.get("why").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                detected_at: ev.content.get("detected_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            });
         }
         Ok(out)
+    }
+
+    /// Every OPEN conflict proposal (both refs current), oldest first — the read behind a later
+    /// App-only `ListConflicts` (spec §3.5). GC is inherent: `open_conflict_proposals` already
+    /// drops any proposal whose referenced memory was retired/deleted/edited (I-gc). Fold-derived,
+    /// so it survives restart with no cursor. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    pub fn pending_conflict_proposals(&self) -> Result<Vec<ConflictProposalRow>, BossclawError> {
+        Ok(self
+            .open_conflict_proposals()?
+            .into_iter()
+            .map(|p| ConflictProposalRow {
+                id: p.id,
+                a_ref: p.a_ref,
+                b_ref: p.b_ref,
+                winner_hint: p.winner_hint,
+                confidence_band: p.confidence_band,
+                why: p.why,
+                detected_at: p.detected_at,
+            })
+            .collect())
     }
 
     /// The unordered pair key for two typed refs (sorted `pair_key`s). Two refs in either order
@@ -8651,14 +8719,19 @@ struct SessionFold {
     retired_passages: std::collections::HashSet<(String, usize)>,
 }
 
-/// One OPEN conflict proposal, reduced to the idempotency identity Task 6 needs (both refs still
-/// current). Task 7's `pending_conflict_proposals` projection GROWS this with `id`/`winner_hint`/
-/// `confidence_band`/`why`/`detected_at` when it first reads them. Internal; the PUBLIC row is
+/// One OPEN conflict proposal, folded from a `conflict_proposal` event whose BOTH refs are still
+/// current. Carries the full persisted shape (idempotency reads only `a_ref`/`b_ref`; the
+/// `pending_conflict_proposals` projection reads all seven). Internal; the PUBLIC row is
 /// [`ConflictProposalRow`] (Task 7). Private, so no field docs.
 #[cfg(unix)]
 struct OpenConflictProposal {
+    id: String,
     a_ref: crate::index::ConflictRef,
     b_ref: crate::index::ConflictRef,
+    winner_hint: String,
+    confidence_band: String,
+    why: String,
+    detected_at: i64,
 }
 
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
@@ -8934,6 +9007,96 @@ mod tests {
         // A note↔different-passage pair is not suppressed.
         let p_other = ConflictRef::Passage { session_id: "s1".into(), passage_id: 1 };
         assert!(!log.is_conflict_proposal_suppressed(&a, &p_other).unwrap(), "note↔different-passage not suppressed");
+    }
+
+    /// Rung-3 Phase-2 (§6.4, I-gc): pending lists an open proposal; retiring / deleting / editing a
+    /// referenced memory withdraws it (fold-derived → restart-safe) and frees the pair to re-propose.
+    /// `#[cfg(unix)]` (uses the append/projection family).
+    #[cfg(unix)]
+    #[test]
+    fn pending_conflict_proposals_project_and_gc_withdraw() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let log = open_log(dir.path());
+        let n1 = log.remember(&emb, "branch is master").unwrap();
+        let n2 = log.remember(&emb, "renamed default branch to main").unwrap();
+        let a = ConflictRef::Note { event_id: n1.clone() };
+        let b = ConflictRef::Note { event_id: n2.clone() };
+        let why = crate::conflict::templated_why("newer", "high", "note", "note");
+        log.append_conflict_proposal(&a, &b, "newer", "high", &why, 1, &[n1.clone(), n2.clone()]).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "one open proposal");
+
+        // Retire one referenced note → the proposal is GC-withdrawn and the pair is re-proposable.
+        log.retire_memory(&n1).unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "withdrawn on retire");
+        assert!(!log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "pair freed to re-propose");
+
+        // Unretire restores currency → the SAME signed proposal is open again (fold-derived).
+        log.unretire(&n1).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "restored on unretire");
+
+        // Editing (supersede) a referenced note mints a NEW id → old ref no longer current → withdrawn.
+        log.supersede_note(&emb, &n2, "default branch is main now").unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "withdrawn on edit (supersede)");
+    }
+
+    /// Rung-3 Phase-2 (§6.4, I-gc): a session BODY edit (a same-`session_id` supersede that emits no
+    /// `passage_retired`) that re-chunks to FEWER passages withdraws any open proposal referencing an
+    /// ordinal the NEW head no longer has — the ordinal-existence half of the passage GC story, proven
+    /// at the shared open set so suppression and the projection agree. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn pending_conflict_proposals_withdraws_passage_when_ordinal_vanishes_on_recapture() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let log = open_log(dir.path());
+
+        // A current note + a capture of s1 with THREE passages (ordinals 0,1,2).
+        let n = log.remember(&emb, "branch is master").unwrap();
+        let cap_old = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(
+            &emb,
+            &cap_old,
+            &["p0".to_string(), "p1".to_string(), "p2".to_string()],
+        )
+        .unwrap();
+        let note_ref = ConflictRef::Note { event_id: n.clone() };
+        let p0 = ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 };
+        let p2 = ConflictRef::Passage { session_id: "s1".into(), passage_id: 2 };
+        let why = crate::conflict::templated_why("newer", "high", "note", "passage");
+        // TWO proposals: one on the SOON-TO-VANISH ordinal 2, one on the SURVIVING ordinal 0. Both
+        // refs currently resolve (ordinals 0 and 2 both exist in the 3-passage head) → both are open.
+        log.append_conflict_proposal(&note_ref, &p2, "newer", "high", &why, 1, &[n.clone(), cap_old.clone()])
+            .unwrap();
+        log.append_conflict_proposal(&note_ref, &p0, "newer", "high", &why, 2, &[n.clone(), cap_old.clone()])
+            .unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 2, "ordinals 0 and 2 both exist → both open");
+
+        // Re-capture s1 (different sha ⇒ supersedes the old capture) re-chunked to only TWO passages
+        // (ordinals 0,1). Ordinal 2 no longer exists in the current head, yet no `passage_retired`
+        // marker was emitted — only the ordinal-existence check can withdraw it.
+        let cap_new = log.capture_session(&emb, &session_meta("s1", "bb")).unwrap();
+        assert_ne!(cap_old, cap_new, "different-sha recapture supersedes the old capture");
+        log.store_session_passages(&emb, &cap_new, &["q0".to_string(), "q1".to_string()]).unwrap();
+
+        // SELECTIVE withdrawal: ONLY the vanished-ordinal proposal drops; the surviving-ordinal one
+        // stays open. A whole-session over-withdrawal (e.g. a mis-wired 0 count) would empty BOTH, so
+        // asserting the survivor remains is what distinguishes correct from over-aggressive GC.
+        assert_eq!(
+            log.pending_conflict_proposals().unwrap().len(),
+            1,
+            "only the ordinal-2 proposal withdrew; the ordinal-0 proposal remains open"
+        );
+        assert!(
+            !log.is_conflict_proposal_suppressed(&note_ref, &p2).unwrap(),
+            "the vanished-ordinal pair (ordinal 2) is freed to re-propose"
+        );
+        assert!(
+            log.is_conflict_proposal_suppressed(&note_ref, &p0).unwrap(),
+            "the surviving-ordinal pair (ordinal 0) is STILL suppressed — not over-withdrawn"
+        );
     }
 
     #[test]
