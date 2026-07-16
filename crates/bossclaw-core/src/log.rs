@@ -265,6 +265,12 @@ const BACKFILL_CONSENTED_KEY: &str = "backfill_consented";
 /// sticky (capture is off, so it is not consulted).
 const CAPTURE_ENABLED_AT_KEY: &str = "capture_enabled_at";
 
+/// The `content` key carrying the Rung-3 Phase-2 conflict-detection on/off switch (spec §3.6).
+/// Single-sourced (one writer [`EventLog::set_conflict_detect_enabled`], one reader
+/// [`EventLog::conflict_detect_enabled`]). DEFAULT CLOSED — detection never runs for a user who
+/// never consented (invariant I3), exactly like [`CAPTURE_ENABLED_KEY`].
+const CONFLICT_DETECT_ENABLED_KEY: &str = "conflict_detect_enabled";
+
 /// A typed identifier for a control-`config` key, mapping to the private `*_KEY` consts. Used by
 /// `EventLog::explicitly_set` (and the capture getters) so callers (e.g. the desktop
 /// `prime_switches`) reference a compile-checked variant instead of a stringly-typed key that could
@@ -287,6 +293,8 @@ pub enum ConfigFlag {
     CaptureEnabled,
     /// The SP3 one-time backfill consent ([`BACKFILL_CONSENTED_KEY`]). Default CLOSED.
     BackfillConsented,
+    /// The Rung-3 Phase-2 conflict-detection on/off switch ([`CONFLICT_DETECT_ENABLED_KEY`]). Default CLOSED.
+    ConflictDetect,
 }
 
 impl ConfigFlag {
@@ -301,6 +309,7 @@ impl ConfigFlag {
             ConfigFlag::LanguagePack => LANGUAGE_PACK_KEY,
             ConfigFlag::CaptureEnabled => CAPTURE_ENABLED_KEY,
             ConfigFlag::BackfillConsented => BACKFILL_CONSENTED_KEY,
+            ConfigFlag::ConflictDetect => CONFLICT_DETECT_ENABLED_KEY,
         }
     }
 }
@@ -6629,6 +6638,42 @@ impl EventLog {
         Ok(())
     }
 
+    /// Whether Rung-3 conflict detection is enabled (spec §3.6). STICKY / fail-closed via
+    /// [`EventLog::latest_config_value`]'s newest-first scan; DEFAULT CLOSED (a never-set flag
+    /// reads `false`), so the sweep never runs for a user who never consented (I3).
+    pub fn conflict_detect_enabled(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(ConfigFlag::ConflictDetect.key())?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// Flip the conflict-detection switch by appending ONE signed + hash-chained control `config`
+    /// event `{ "conflict_detect_enabled": <enabled> }`. The ONLY writer of the key (so the reader
+    /// can never drift the shape). Carries no model fields → never disturbs `active_model`. Mirrors
+    /// [`EventLog::set_mandates_enabled`].
+    pub fn set_conflict_detect_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(CONFLICT_DETECT_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
     /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
     ///
@@ -9607,6 +9652,22 @@ mod tests {
             "never-set means explicitly_set is false (the boot cascade keys off this)"
         );
         assert_eq!(log.capture_enabled_at().unwrap(), None, "no ON transition yet ⇒ no timestamp");
+    }
+
+    /// Rung-3 Phase-2 (§3.6, I3): conflict-detect is DEFAULT-CLOSED, is sticky once set, and
+    /// registers as explicitly-set (what the boot force-off keys off).
+    #[test]
+    fn conflict_detect_flag_is_default_closed_and_sticky() {
+        use crate::ConfigFlag;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        assert!(!log.conflict_detect_enabled().unwrap(), "default CLOSED");
+        assert!(!log.explicitly_set(ConfigFlag::ConflictDetect).unwrap(), "never set yet");
+        log.set_conflict_detect_enabled(true).unwrap();
+        assert!(log.conflict_detect_enabled().unwrap(), "sticky ON after set");
+        assert!(log.explicitly_set(ConfigFlag::ConflictDetect).unwrap(), "now explicit");
+        log.set_conflict_detect_enabled(false).unwrap();
+        assert!(!log.conflict_detect_enabled().unwrap(), "sticky OFF");
     }
 
     /// SP3 §6a: the Integrations-toggle path — enable ongoing capture WITHOUT backfill. Records the

@@ -549,6 +549,13 @@ impl EngineHandle {
         if !log.explicitly_set(ConfigFlag::CaptureEnabled)? {
             log.set_capture_enabled(false, false, 0)?;
         }
+        // Rung-3 Phase-2 (§3.6, I3): conflict detection is default-CLOSED — its getter already
+        // returns false when unset — so, like capture above, we persist an EXPLICIT OFF the first
+        // time it was never set (a tamper-evident "this brain has conflict-detect off" record).
+        // Idempotent: `explicitly_set` is true afterward.
+        if !log.explicitly_set(ConfigFlag::ConflictDetect)? {
+            log.set_conflict_detect_enabled(false)?;
+        }
         Ok(())
     }
 
@@ -1008,6 +1015,20 @@ impl EngineHandle {
             Ok((status, _telemetry)) => status.enabled,
             Err(_) => false,
         }
+    }
+
+    /// The conflict-detection off-switch verdict, defaulting to `false` (OFF) on ANY error (not
+    /// onboarded, open failure, …). The gate the conflict sweep reads each cycle — it must never
+    /// propagate an error (a transient read failure must not trip detection ON). Mirrors
+    /// [`Self::mandates_enabled_or_false`] (a direct getter read); semantically the same fail-closed
+    /// gate as [`Self::evolve_enabled_or_false`].
+    pub async fn conflict_detect_enabled_or_false(&self, onboarded: bool) -> bool {
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return false;
+        };
+        spawn_blocking(move || log.conflict_detect_enabled().unwrap_or(false))
+            .await
+            .unwrap_or(false)
     }
 
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
@@ -1925,9 +1946,10 @@ mod tests {
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
         // First open primes the autonomy switches OFF (SP3 `prime_switches`): the three original
-        // flags (evolve/proposals/mandates) plus the SP3 capture force-off — so a fresh brain holds
-        // exactly those 4 sticky `config` events, not zero.
-        assert_eq!(st.event_count, 4);
+        // flags (evolve/proposals/mandates), the SP3 capture force-off, and the Rung-3 Phase-2
+        // conflict-detect force-off — so a fresh brain holds exactly those 5 sticky `config` events,
+        // not zero.
+        assert_eq!(st.event_count, 5);
         assert!(st.chain_ok);
         // Second call reuses the same instance (Arc ptr identical).
         let a = h.get_or_open(true).await.unwrap();
@@ -2100,6 +2122,36 @@ mod tests {
         let handle2 = new_test_handle(vault, &dir);
         let log3 = handle2.get_or_open(true).await.unwrap();
         assert!(log3.capture_enabled().unwrap(), "an explicit capture ON MUST persist across opens");
+    }
+
+    /// Rung-3 Phase-2 (§3.6, I3): a fresh brain reports conflict-detect OFF through the infallible
+    /// daemon read, and the boot cascade persists an EXPLICIT OFF (`explicitly_set` true) so the
+    /// getter-default can never later flip it on.
+    #[tokio::test]
+    async fn prime_switches_forces_conflict_detect_off_and_or_false_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = TestVault::new(); // TestVault::new() already returns Arc<TestVault>
+        let h = EngineHandle::new(
+            vault,
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+            std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        );
+        let onboarded = true;
+        // Fresh brain: prime_switches (run inside get_or_open's first-open) forced an explicit OFF,
+        // and the infallible daemon read reports false.
+        assert!(!h.conflict_detect_enabled_or_false(onboarded).await, "off by default after boot");
+        // Prove prime_switches wrote the tamper-evident EXPLICIT-OFF record (not just that the
+        // default reads false): explicitly_set must be true after boot.
+        let log = h.get_or_open(onboarded).await.unwrap();
+        assert!(
+            spawn_blocking(move || log
+                .explicitly_set(bossclaw_core::ConfigFlag::ConflictDetect)
+                .unwrap())
+            .await
+            .unwrap(),
+            "prime_switches persisted an explicit OFF (explicitly_set == true after boot)"
+        );
     }
 
     /// SP3 A8: the EngineHandle wrappers mirror the mandates wrappers end to end, and carry the
