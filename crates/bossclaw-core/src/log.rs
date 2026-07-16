@@ -2746,6 +2746,74 @@ impl EventLog {
         ))
     }
 
+    /// Every `conflict_proposal` whose BOTH refs STILL resolve to a current memory — the OPEN set.
+    /// Auto-withdraw (I-gc, no withdrawal event) is exact for a NOTE ref (retire/delete/edit ⇒ a new
+    /// event id, so it leaves `current_notes`) and for a WHOLE-session delete. A PASSAGE ref on a
+    /// session BODY edit is only partly covered here: a supersede keeps the same `session_id` and
+    /// emits no `passage_retired`, so an ordinal the re-chunked head no longer has stays "current" in
+    /// this fold — that ordinal-existence check is Task 7's projection, not this function. Oldest
+    /// first (`events_of_types` is `seq ASC`). Shared by `pending_conflict_proposals` (Task 7) and
+    /// `is_conflict_proposal_suppressed`. `#[cfg(unix)]` (feeds the append/projection/sweep family).
+    #[cfg(unix)]
+    fn open_conflict_proposals(&self) -> Result<Vec<OpenConflictProposal>, BossclawError> {
+        use crate::index::ConflictRef;
+        // Current membership: notes by event id; sessions by session_id; retired passages.
+        let current_note_ids: std::collections::HashSet<String> =
+            self.current_notes()?.into_iter().map(|n| n.event_id).collect();
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let current_sessions: std::collections::HashSet<&str> =
+            fold.current.iter().map(|cs| cs.session_id.as_str()).collect();
+        let ref_is_current = |r: &ConflictRef| -> bool {
+            match r {
+                ConflictRef::Note { event_id } => current_note_ids.contains(event_id),
+                ConflictRef::Passage { session_id, passage_id } => {
+                    current_sessions.contains(session_id.as_str())
+                        && !fold.retired_passages.contains(&(session_id.clone(), *passage_id))
+                }
+            }
+        };
+        let mut out = Vec::new();
+        for ev in self.events_of_types(&[crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE])? {
+            let (Some(a_ref), Some(b_ref)) = (
+                ev.content.get("a_ref").and_then(ConflictRef::from_json),
+                ev.content.get("b_ref").and_then(ConflictRef::from_json),
+            ) else {
+                continue; // malformed — never open
+            };
+            if !ref_is_current(&a_ref) || !ref_is_current(&b_ref) {
+                continue; // GC: a side is gone → withdrawn
+            }
+            out.push(OpenConflictProposal { a_ref, b_ref });
+        }
+        Ok(out)
+    }
+
+    /// The unordered pair key for two typed refs (sorted `pair_key`s). Two refs in either order
+    /// map to the SAME key — the idempotency identity (spec §3.5). `#[cfg(unix)]` (only the sweep +
+    /// idempotency predicate — both `#[cfg(unix)]` — use it).
+    #[cfg(unix)]
+    fn conflict_pair_key(a: &crate::index::ConflictRef, b: &crate::index::ConflictRef) -> String {
+        let (ka, kb) = (a.pair_key(), b.pair_key());
+        if ka <= kb { format!("{ka}\u{1e}{kb}") } else { format!("{kb}\u{1e}{ka}") }
+    }
+
+    /// True iff an OPEN `conflict_proposal` already exists for the unordered typed pair `(a, b)`
+    /// (spec §3.5). A GC-withdrawn proposal (a referenced memory gone) does NOT suppress — the
+    /// pair may re-propose (so a materially-changed / re-added memory re-opens, resolved Q3).
+    /// `#[cfg(unix)]` (consumes `open_conflict_proposals`).
+    #[cfg(unix)]
+    pub fn is_conflict_proposal_suppressed(
+        &self,
+        a: &crate::index::ConflictRef,
+        b: &crate::index::ConflictRef,
+    ) -> Result<bool, BossclawError> {
+        let want = Self::conflict_pair_key(a, b);
+        Ok(self
+            .open_conflict_proposals()?
+            .iter()
+            .any(|p| Self::conflict_pair_key(&p.a_ref, &p.b_ref) == want))
+    }
+
     /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
     /// Thin wrapper over [`Self::append_write_rejected_with`].
     #[cfg(unix)]
@@ -8583,6 +8651,16 @@ struct SessionFold {
     retired_passages: std::collections::HashSet<(String, usize)>,
 }
 
+/// One OPEN conflict proposal, reduced to the idempotency identity Task 6 needs (both refs still
+/// current). Task 7's `pending_conflict_proposals` projection GROWS this with `id`/`winner_hint`/
+/// `confidence_band`/`why`/`detected_at` when it first reads them. Internal; the PUBLIC row is
+/// [`ConflictProposalRow`] (Task 7). Private, so no field docs.
+#[cfg(unix)]
+struct OpenConflictProposal {
+    a_ref: crate::index::ConflictRef,
+    b_ref: crate::index::ConflictRef,
+}
+
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
 /// `session_captured` + `session_deleted` + `supersede` + the Rung-3 retire
 /// markers (`note_retired` / `passage_retired` / `unretire`) in `seq ASC`
@@ -8814,6 +8892,48 @@ mod tests {
         // Lineage is the referenced memory event ids.
         let sources = ev.model_meta.as_ref().unwrap().source_event_ids.clone();
         assert_eq!(sources, vec!["n_old".to_string(), "cap_ev".to_string()]);
+    }
+
+    /// Rung-3 Phase-2 (§3.5, I9): a proposal for an unordered typed pair suppresses a duplicate for
+    /// the SAME pair (either order) but not a different pair — covering both a note↔note pair and a
+    /// cross-kind note↔passage pair (whose `pair_key`s have different shapes, so the sort bites).
+    /// `#[cfg(unix)]` (uses the append family).
+    #[cfg(unix)]
+    #[test]
+    fn conflict_proposal_idempotency_is_unordered_by_typed_pair() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let log = open_log(dir.path());
+        // Two CURRENT notes so both refs resolve (open).
+        let n1 = log.remember(&emb, "branch is master").unwrap();
+        let n2 = log.remember(&emb, "renamed default branch to main").unwrap();
+        let a = ConflictRef::Note { event_id: n1.clone() };
+        let b = ConflictRef::Note { event_id: n2.clone() };
+        let why = crate::conflict::templated_why("newer", "high", "note", "note");
+        assert!(!log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "no proposal yet");
+        log.append_conflict_proposal(&a, &b, "newer", "high", &why, 1, &[n1.clone(), n2.clone()]).unwrap();
+        assert!(log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "same pair suppressed");
+        assert!(log.is_conflict_proposal_suppressed(&b, &a).unwrap(), "reversed order also suppressed");
+        // A different pair is not suppressed.
+        let n3 = log.remember(&emb, "unrelated note").unwrap();
+        let c = ConflictRef::Note { event_id: n3 };
+        assert!(!log.is_conflict_proposal_suppressed(&a, &c).unwrap(), "different pair not suppressed");
+
+        // Cross-kind: a Note pair_key vs a Passage pair_key differ in shape, so `conflict_pair_key`
+        // must still map either order to the same unordered identity. Capture a CURRENT session with
+        // one passage so the passage ref resolves (open).
+        let cap = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cap, &["we deploy on vercel".to_string()]).unwrap();
+        let p = ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 };
+        let why_np = crate::conflict::templated_why("newer", "high", "note", "passage");
+        assert!(!log.is_conflict_proposal_suppressed(&a, &p).unwrap(), "no cross-kind proposal yet");
+        log.append_conflict_proposal(&a, &p, "newer", "high", &why_np, 2, &[n1.clone(), cap.clone()]).unwrap();
+        assert!(log.is_conflict_proposal_suppressed(&a, &p).unwrap(), "cross-kind pair suppressed");
+        assert!(log.is_conflict_proposal_suppressed(&p, &a).unwrap(), "cross-kind reversed order also suppressed");
+        // A note↔different-passage pair is not suppressed.
+        let p_other = ConflictRef::Passage { session_id: "s1".into(), passage_id: 1 };
+        assert!(!log.is_conflict_proposal_suppressed(&a, &p_other).unwrap(), "note↔different-passage not suppressed");
     }
 
     #[test]
