@@ -5982,6 +5982,29 @@ impl EventLog {
             // `decode_chunk_key` in `conflict_search`.
             index.add(&crate::index::encode_chunk_key(session_id, ix), &vec);
         }
+        // Note arm (Rung-3 Phase-2 §2): add each CURRENT, non-superseded, non-retired memory
+        // note's body vector under a DISTINCT note key so notes and passages share ONE fights
+        // index without colliding. `current_notes` already applies the supersede + `note_retired`
+        // exclusion, so no extra filtering is needed here. Empty-body notes cannot contradict on
+        // content and are skipped (a zero-length body would embed to a meaningless vector).
+        //
+        // I4 / design open-question #2: we RE-EMBED every current note each rebuild rather than
+        // persisting note vectors in a dedicated `note_conflict_vectors` table (like
+        // `session_passage_vectors`). This is acceptable at Phase-2 scale because the embedder is a
+        // STATIC model2vec (a token-vector lookup + mean-pool, NOT a transformer forward pass), so
+        // per-note cost is a cheap table lookup. The `note_conflict_vectors` table is DEFERRED (add
+        // only if this cost proves material). The `log::debug!` below is the trip-wire that makes
+        // the re-embed count observable before any production-enable.
+        let mut notes_embedded = 0usize;
+        for note in self.current_notes()? {
+            if note.text.trim().is_empty() {
+                continue;
+            }
+            let vec = embed_one(embedder, &note.text)?;
+            index.add(&crate::index::encode_note_key(&note.event_id), &vec);
+            notes_embedded += 1;
+        }
+        log::debug!("rebuild_conflict_index: re-embedded {notes_embedded} note bodies (I4 trip-wire)");
         let boxed: Box<dyn VectorIndex> = Box::new(index);
         *self.conflict_index.lock().expect(POISON) = Some(boxed);
         Ok(())
@@ -5997,8 +6020,14 @@ impl EventLog {
     /// non-fatal policy for this detector (in release, "no index built yet" simply
     /// flags no conflicts), whereas entity resolution errors on an unbuilt index. A
     /// `debug_assert` guards the "called before rebuild" bug in dev/test, where it
-    /// is always a mistake. Keys that fail to decode are dropped (never happens — we
-    /// encoded them via `encode_chunk_key`).
+    /// is always a mistake. Keys that fail to decode are dropped — since Rung-3 Phase-2
+    /// the UNIFIED index also holds NOTE keys (`encode_note_key`), which `decode_chunk_key`
+    /// returns `None` for; that intentional drop is what preserves this method's passage-only
+    /// tuple contract for the memharness caller. NOTE the behavioral consequence: `index.search`
+    /// returns the `k` nearest keys BEFORE this passage filter, so a note ranking in the top-`k`
+    /// consumes a slot — `conflict_search(qv, k)` can therefore return FEWER than `k` passages
+    /// once the index is note-populated. Callers needing typed note+passage hits use
+    /// [`EventLog::conflict_search_refs`].
     pub fn conflict_search(&self, qv: &[f32], k: usize) -> Vec<(String, usize, f32)> {
         let guard = self.conflict_index.lock().expect(POISON);
         debug_assert!(
@@ -6014,6 +6043,23 @@ impl EventLog {
             .filter_map(|(key, score)| {
                 crate::index::decode_chunk_key(&key).map(|(sid, ix)| (sid.to_string(), ix, score))
             })
+            .collect()
+    }
+
+    /// Typed sibling of [`EventLog::conflict_search`] (Rung-3 Phase-2 §2): returns the `k` nearest
+    /// `(ConflictRef, distance)` pairs over the UNIFIED conflict index, decoding both note keys and
+    /// passage chunk keys. `conflict_search` (passage-only tuples) is left byte-identical for the
+    /// harness caller. Same empty-when-unbuilt policy + `debug_assert` as `conflict_search`.
+    pub fn conflict_search_refs(&self, qv: &[f32], k: usize) -> Vec<(crate::index::ConflictRef, f32)> {
+        let guard = self.conflict_index.lock().expect(POISON);
+        debug_assert!(guard.is_some(), "conflict_search_refs called before rebuild_conflict_index");
+        let Some(index) = guard.as_ref() else {
+            return Vec::new();
+        };
+        index
+            .search(qv, k)
+            .into_iter()
+            .filter_map(|(key, score)| crate::index::ConflictRef::decode_key(&key).map(|r| (r, score)))
             .collect()
     }
 
@@ -8608,6 +8654,74 @@ mod tests {
         let hits = log.conflict_search(&emb.embed(&["Vercel".into()]).unwrap()[0], 8); // k ≥ #chunks → membership stable
         assert!(hits.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0)); // session id resolved via fold head
         assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
+    }
+
+    /// Rung-3 Phase-2 (§2): the conflict index holds BOTH a note body and a session passage; the
+    /// typed search returns each as its `ConflictRef` kind; the recall `vector_index` stays untouched.
+    #[test]
+    fn conflict_index_note_arm_and_passage_arm_are_both_typed_searchable() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A note whose body is embeddable.
+        let note_id = log.remember(&emb, "the default git branch is main").unwrap();
+        // A captured session with one passage.
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &ev, &["we deploy on vercel".to_string()]).unwrap();
+
+        log.rebuild_indexes(&emb).unwrap();
+        let recall_len = log.vector_index_len();
+        log.rebuild_conflict_index(&emb).unwrap();
+
+        // The note is retrievable as a Note ref.
+        let note_hits =
+            log.conflict_search_refs(&emb.embed(&["default git branch".into()]).unwrap()[0], 8);
+        assert!(
+            note_hits.iter().any(|(r, _)| *r == ConflictRef::Note { event_id: note_id.clone() }),
+            "note body is a typed Note hit"
+        );
+        // The passage is retrievable as a Passage ref.
+        let pass_hits = log.conflict_search_refs(&emb.embed(&["vercel".into()]).unwrap()[0], 8);
+        assert!(
+            pass_hits
+                .iter()
+                .any(|(r, _)| *r == ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 }),
+            "passage is a typed Passage hit"
+        );
+        // The recall index was not perturbed by adding the note arm.
+        assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
+
+        // The legacy passage-tuple search still works (memharness contract).
+        let legacy = log.conflict_search(&emb.embed(&["vercel".into()]).unwrap()[0], 8);
+        assert!(legacy.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0));
+    }
+
+    /// Rung-3 Phase-2 (§2): the note arm inherits `current_notes`' supersede exclusion — a
+    /// SUPERSEDED note's old head must NOT enter the fights index (a phantom-conflict false
+    /// positive is the worst detector failure), while its live replacement MUST. Pins the
+    /// exclusion AT the conflict-index level, not just at recall.
+    #[test]
+    fn superseded_note_is_excluded_from_conflict_index_but_replacement_is_present() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        let old = log.remember(&emb, "the default git branch is master").unwrap();
+        let replacement = log.supersede_note(&emb, &old, "the default git branch is main").unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+
+        let hits = log.conflict_search_refs(&emb.embed(&["default git branch".into()]).unwrap()[0], 8);
+        assert!(
+            !hits.iter().any(|(r, _)| *r == ConflictRef::Note { event_id: old.clone() }),
+            "superseded note head is NOT in the fights index"
+        );
+        assert!(
+            hits.iter().any(|(r, _)| *r == ConflictRef::Note { event_id: replacement.clone() }),
+            "the live replacement note IS in the fights index"
+        );
     }
 
     /// Rung-3 Phase-1 (§7.1): a BUILT-but-EMPTY conflict index yields no hits. This
