@@ -157,6 +157,9 @@ mod unix_main {
         // windows and import quiet transcripts, then every SWEEP_INTERVAL).
         scheduler::spawn(engine.clone(), data_dir.clone());
         bossclawd::capture::sweeper::spawn(engine.clone(), data_dir.clone());
+        // Rung-3 Phase-2: the conflict-detection sweep. OFF by default (gated inside the loop on
+        // the owner's `conflict_detect_enabled` flag), so merging ships detection dormant.
+        bossclawd::conflict::sweeper::spawn(engine.clone(), data_dir.clone());
 
         eprintln!(
             "bossclawd: serving on {} (pid {})",

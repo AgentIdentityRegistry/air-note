@@ -6318,6 +6318,12 @@ impl EventLog {
         use crate::index::ConflictRef;
         let mut report = ConflictDetectReport::default();
 
+        // De-conflict with the extract path (spec §8): Rung-3 memory-level detection (this method) and
+        // the evolve/extract path's EDGE-level reconciliation (`ProposedRetraction` →
+        // `reconcile_confirmed_contradiction`) are two INDEPENDENT, complementary axes. There is no
+        // reverse "memory-claim → invalidated-edge" index and Phase 2 adds none; de-dup happens only
+        // WITHIN rung-3 via the proposal-idempotency fold (`is_conflict_proposal_suppressed`).
+
         // (1) Gate FIRST — no scan, no rebuild, no model when CLOSED (I3).
         if !self.conflict_detect_enabled()? {
             report.skipped_disabled = true;
@@ -10974,5 +10980,45 @@ mod tests {
         assert!(r.dropped >= 1, "a non-contradiction verdict is counted as dropped");
         assert_eq!(r.proposed, 0, "a declined pair is never proposed");
         assert!(log.pending_conflict_proposals().unwrap().is_empty(), "no proposal persisted");
+    }
+
+    /// Rung-3 Phase-2 (§7, I9): on the FIRST enable over a big existing memory set, day one is a
+    /// budget-bounded TRICKLE, not a wall — one cycle judges/proposes at most the per-cycle budget.
+    /// `#[cfg(unix)]` (drives the append family).
+    #[cfg(unix)]
+    #[test]
+    fn first_enable_is_a_trickle_not_a_wall() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_JUDGE_PER_SWEEP, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64); // dim=64 so the near-identical notes clear CANDIDATE_SIM_MIN
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // Seed many near-identical "the flag is X" notes so every pair is a candidate.
+        let mut reasoner = ScriptedReasoner::new("test");
+        let mut texts = Vec::new();
+        for i in 0..12 {
+            let t = format!("the feature flag is value {i} in the shared config");
+            log.remember(&emb, &t).unwrap();
+            texts.push(t);
+        }
+        // Script EVERY ordered pair as a contradiction so nothing is dropped for lack of a response.
+        for i in 0..texts.len() {
+            for j in 0..texts.len() {
+                if i != j {
+                    reasoner = reasoner.with_response(
+                        CONFLICT_SYSTEM,
+                        &build_conflict_prompt(&texts[i], &texts[j]),
+                        serde_json::json!({ "contradicts": true, "winner": "newer", "confidence": 90, "why": "same flag" }),
+                    );
+                }
+            }
+        }
+        let no_passages = |_: &str, _: usize| None;
+        let empty = std::collections::HashSet::new();
+        let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 1).unwrap();
+        assert!(r.judged <= CONFLICT_JUDGE_PER_SWEEP, "day-one judging is budget-bounded ({})", r.judged);
+        assert!(r.proposed <= CONFLICT_JUDGE_PER_SWEEP, "day-one proposals are a trickle ({})", r.proposed);
     }
 }
