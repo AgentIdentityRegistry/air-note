@@ -149,6 +149,11 @@ pub const CONFLICT_OPEN_CEILING: usize = 20;
 /// most `budget` above-floor candidates and ALL of them are kept + judged — never found-then-dropped
 /// (owner decision: "never skip"). `search_k <= budget` is the only fully-lossless config that also
 /// preserves the no-stall guarantee (one subject's pairs always fit one fresh full budget).
+///
+/// NOTE: the caller retrieves `CONFLICT_SEARCH_K + 1` neighbours, not `K`. The subject's OWN vector
+/// lives in the rebuilt unified index at distance ~0, so it is ALWAYS the nearest hit and is then
+/// dropped by the finder's `excluded_refs`. The `+1` reclaims that guaranteed self-slot so a full
+/// `budget` of REAL candidates survives — without it, effective retrieval would silently be `K-1`.
 pub const CONFLICT_SEARCH_K: usize = CONFLICT_JUDGE_PER_SWEEP;
 /// Max candidate pairs kept per subject (top-similarity). Equals the judge budget so a single
 /// subject is always fully judgeable within one full budget — no permanent cursor stall.
