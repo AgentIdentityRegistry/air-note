@@ -922,19 +922,11 @@ impl EngineHandle {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         // Serialize manual + scheduled ticks: a second overlapping tick is Busy, not queued.
         let _guard = self.evolve_lock.try_lock().map_err(|_| EngineOpError::Busy("evolve"))?;
-        // Consent chokepoint for BOTH the scheduler AND manual `engine_evolve_now`:
-        // in cloud mode, refuse to build/run the reasoner unless a signed consent
-        // record matches the current config+key (reasoner_ready_or_false is
-        // fail-closed). Placed BEFORE the reasoner is built (and before any
-        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner
-        // and egresses nothing. Closes the manual-evolve consent-bypass (R1/R5/R8).
-        // The scheduler already pre-gates on readiness, so on that path this is a
-        // cheap re-confirm (2 log reads) — redundant but correct.
-        if matches!(
-            self.reasoner_config_or_default(onboarded).await.mode,
-            crate::engine::reason::ReasonerMode::Cloud
-        ) && !self.reasoner_ready_or_false(onboarded).await
-        {
+        // Consent chokepoint for BOTH the scheduler AND manual `engine_evolve_now` (R1/R5/R8),
+        // shared with the conflict sweep (I2). Placed BEFORE the reasoner is built (and any
+        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner and egresses
+        // nothing.
+        if !self.cloud_consent_ok(onboarded).await {
             return Err(EngineOpError::Reasoner(
                 "cloud reasoner not ready — signed consent or provider key missing".to_string(),
             ));
@@ -1454,6 +1446,21 @@ impl EngineHandle {
         let config = parse_reasoner_config(raw_config);
         let fp = self.current_key_fingerprint(&config);
         reason::reasoner_ready(&config, consent.as_ref(), fp.as_deref(), false)
+    }
+
+    /// The shared cloud-egress consent barrier (spec I2). `true` when it is safe to run the
+    /// reasoner: Local mode (no egress at all), or Cloud mode with a signed consent record matching
+    /// the current config + vault key (`reasoner_ready_or_false`, fail-closed). Both `evolve_once`
+    /// and the conflict sweep gate on this before building the reasoner.
+    pub async fn cloud_consent_ok(&self, onboarded: bool) -> bool {
+        if matches!(
+            self.reasoner_config_or_default(onboarded).await.mode,
+            crate::engine::reason::ReasonerMode::Cloud
+        ) {
+            self.reasoner_ready_or_false(onboarded).await
+        } else {
+            true
+        }
     }
 
     /// Persist the NON-security reasoner config (mode/provider/model/base_url). Does NOT grant
@@ -2759,6 +2766,34 @@ mod tests {
             err.to_string().contains("not ready"),
             "error explains the cloud reasoner is not ready, got {err}"
         );
+    }
+
+    /// Task 9 (spec I2): the shared cloud-consent pre-gate `cloud_consent_ok` — the SINGLE
+    /// signed-consent barrier both `evolve_once` AND the conflict sweep (Task 11/12) gate on.
+    /// BOTH halves of its contract are pinned directly here so the sweep's dependency on
+    /// `cloud_consent_ok → false` stays guarded even if `evolve_once`'s gate is later rewritten.
+    /// `test_vault_and_dir` seeds an EMPTY provider-key cache, so the Cloud branch is keychain-free
+    /// and sub-second — the same setup `evolve_once_refuses_cloud_without_signed_consent` drives
+    /// through this exact path.
+    #[tokio::test]
+    async fn cloud_consent_ok_is_true_for_local_and_gates_unready_cloud() {
+        let (vault, dir) = test_vault_and_dir();
+        let h = new_test_handle(vault, &dir);
+        // Local (default) config → trivially OK: the reasoner egresses nothing.
+        assert!(h.cloud_consent_ok(true).await, "local mode is always consent-ok");
+        // Cloud config written but NO signed consent → fail-closed to false (no egress path open).
+        h.set_reasoner_config(
+            true,
+            serde_json::json!({
+                "mode": "cloud",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "base_url": null
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!h.cloud_consent_ok(true).await, "cloud without signed consent is NOT ok");
     }
 
     /// Task 7 (evolve_lock): a second concurrent `evolve_once` returns `Busy("evolve")`.
