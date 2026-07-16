@@ -425,6 +425,20 @@ pub struct CurrentNote {
     pub superseded_by: Option<String>,
 }
 
+/// One conflict-detection SUBJECT: a memory appended after the cursor. A `memory` event yields
+/// ONE `Note` subject; a `session_captured` event yields one `Passage` subject per live
+/// (non-retired) passage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictSubject {
+    /// The source event's `seq` (the cursor's first coordinate).
+    pub seq: i64,
+    /// This subject's within-`seq` id — its `passage_id` for a passage, `0` for a note. The
+    /// cursor's second coordinate advances to `within_seq_id + 1` once this subject is judged.
+    pub within_seq_id: usize,
+    /// The typed reference this subject searches the fights index for.
+    pub subject: crate::index::ConflictRef,
+}
+
 /// The serialized, signed event log.
 pub struct EventLog {
     inner: Mutex<Store>,
@@ -870,6 +884,18 @@ impl EventLog {
             "CREATE TABLE IF NOT EXISTS evolve_cursor (
                 id       INTEGER PRIMARY KEY CHECK (id = 0),
                 last_seq INTEGER NOT NULL
+            )",
+        )?;
+        // Conflict-detection progress (Rung-3 Phase-2 §3.2 — re-derivable progress state, NOT a
+        // Tier-A fold). Single row (id pinned to 0). `(last_seq, subject_offset)` advances
+        // subject-by-subject: all subjects of the event at `last_seq` with within-seq id
+        // < subject_offset are judged. Losing it only re-searches (idempotent: an already-open
+        // pair is never re-proposed).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS conflict_cursor (
+                id             INTEGER PRIMARY KEY CHECK (id = 0),
+                last_seq       INTEGER NOT NULL,
+                subject_offset INTEGER NOT NULL
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -6146,6 +6172,38 @@ impl EventLog {
         Ok(())
     }
 
+    /// Read the conflict cursor `(last_seq, subject_offset)`; `(0, 0)` if never set. All subjects of
+    /// the event at `last_seq` with within-seq id `< subject_offset` are fully judged (a note is one
+    /// subject at id 0; a capture's passages use `passage_id`). Persistent progress state, NOT a fold
+    /// (spec §3.2) — losing it only re-searches idempotently.
+    pub fn conflict_cursor(&self) -> Result<(i64, usize), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let row: Option<(i64, i64)> = store
+            .conn()
+            .query_row(
+                "SELECT last_seq, subject_offset FROM conflict_cursor WHERE id = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(s, o)| (s, o as usize)).unwrap_or((0, 0)))
+    }
+
+    /// Advance the conflict cursor to `(last_seq, subject_offset)` (idempotent single-row upsert).
+    pub fn set_conflict_cursor(
+        &self,
+        last_seq: i64,
+        subject_offset: usize,
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO conflict_cursor (id, last_seq, subject_offset) VALUES (0, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET last_seq = ?1, subject_offset = ?2",
+            rusqlite::params![last_seq, subject_offset as i64],
+        )?;
+        Ok(())
+    }
+
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
@@ -6605,6 +6663,93 @@ impl EventLog {
             }
         }
         Ok(out)
+    }
+
+    /// New conflict subjects at or after the cursor position, `(seq ASC, within_seq_id ASC)`, from
+    /// at most `limit` source EVENTS (a capture expands to its passages, so the returned Vec may
+    /// exceed `limit`). For the IN-PROGRESS event (`seq == cursor_seq`) subjects with within-seq id
+    /// `< subject_offset` are skipped (already judged); newer events skip nothing. Notes: only
+    /// CURRENT memory events. Passages: only a capture that is the CURRENT head for its `session_id`
+    /// (not superseded / tombstoned) and only its non-retired passages, ordered by `passage_id`
+    /// (retiring a passage skips it but does NOT renumber siblings, so `subject_offset` stays valid
+    /// across cycles).
+    ///
+    /// This is a best-effort forward-looking snapshot; its correctness rests on the cursor being
+    /// forward-only, idempotent (an already-open pair is never re-proposed downstream), and advanced
+    /// by a SINGLE caller (the sweeper). A memory superseded / retired / capture-superseded between
+    /// this events-read and the later folds is only ever DROPPED (safe — a phantom conflict is worse
+    /// than a missed one), and anything newly appended lands beyond the `LIMIT` window and is caught
+    /// next cycle. Cost: a full `fold_sessions` + `current_notes` per call regardless of `limit`
+    /// (acceptable at Phase-2 scale; a later sweeper may compute the fold once and pass it in).
+    pub fn unprocessed_conflict_subjects_since(
+        &self,
+        cursor_seq: i64,
+        subject_offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ConflictSubject>, BossclawError> {
+        use crate::index::ConflictRef;
+        // Source events at OR after the cursor's seq (the in-progress event is re-scanned so its
+        // not-yet-judged subjects resume), oldest first, bounded.
+        let rows: Vec<(i64, String, String)> = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            let mut stmt = conn.prepare(
+                "SELECT seq, id, event_type FROM events
+                 WHERE event_type IN (?1, ?2) AND seq >= ?3 ORDER BY seq ASC LIMIT ?4",
+            )?;
+            let mapped = stmt.query_map(
+                rusqlite::params![
+                    MEMORY_EVENT_TYPE,
+                    crate::graph::SESSION_CAPTURED_EVENT_TYPE,
+                    cursor_seq,
+                    limit as i64
+                ],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            out
+        };
+        // Fold once for the current-head + retired-passage checks (deterministic).
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let current_note_ids: std::collections::HashSet<String> =
+            self.current_notes()?.into_iter().map(|n| n.event_id).collect();
+
+        let mut subjects = Vec::new();
+        for (seq, id, etype) in rows {
+            // Skip the already-judged prefix ONLY for the in-progress event; newer events skip 0.
+            let skip_below = if seq == cursor_seq { subject_offset } else { 0 };
+            if etype == MEMORY_EVENT_TYPE {
+                // A note is ONE subject at within-seq id 0 — included iff not already judged.
+                if skip_below == 0 && current_note_ids.contains(&id) {
+                    subjects.push(ConflictSubject {
+                        seq,
+                        within_seq_id: 0,
+                        subject: ConflictRef::Note { event_id: id },
+                    });
+                }
+                continue;
+            }
+            // session_captured: only the CURRENT head for its session_id contributes passages.
+            let Some(cs) = fold.current.iter().find(|cs| cs.event_id == id) else {
+                continue; // superseded by a newer capture, or tombstoned — not a subject
+            };
+            let sid = cs.session_id.clone();
+            let n = self.session_passage_count(&id)?;
+            for pid in skip_below..n {
+                if fold.retired_passages.contains(&(sid.clone(), pid)) {
+                    continue; // retired passage — never a subject
+                }
+                subjects.push(ConflictSubject {
+                    seq,
+                    within_seq_id: pid,
+                    subject: ConflictRef::Passage { session_id: sid.clone(), passage_id: pid },
+                });
+            }
+        }
+        Ok(subjects)
     }
 
     /// Every `Event` whose `event_type` is in `types`, in `seq ASC` (append) order.
@@ -8632,6 +8777,122 @@ mod tests {
             2,
             "both passages persisted under cap1 and survive a reopen"
         );
+    }
+
+    /// Rung-3 Phase-2 (§3.2/§3.3): the `(seq, subject_offset)` cursor round-trips + survives reopen; the
+    /// enumeration returns each NEW note (within-seq id 0) and each NEW capture's live passages (within-
+    /// seq ids = passage_id); and RESUMING at a within-capture offset skips already-judged passages.
+    #[test]
+    fn conflict_cursor_and_subject_enumeration_are_incremental() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+
+        let (persisted_seq, persisted_off) = {
+            let log = open_log(dir.path());
+            assert_eq!(log.conflict_cursor().unwrap(), (0, 0), "unset cursor defaults to (0, 0)");
+            let note_id = log.remember(&emb, "branch is main").unwrap();
+            let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+            log.store_session_passages(&emb, &ev, &["p0".to_string(), "p1".to_string()]).unwrap();
+
+            // From (0, 0): the note (within-seq id 0) + the capture's two passages (within-seq ids 0, 1).
+            let subjects = log.unprocessed_conflict_subjects_since(0, 0, 64).unwrap();
+            let refs: Vec<ConflictRef> = subjects.iter().map(|s| s.subject.clone()).collect();
+            assert!(refs.contains(&ConflictRef::Note { event_id: note_id.clone() }));
+            assert!(refs.contains(&ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 }));
+            assert!(refs.contains(&ConflictRef::Passage { session_id: "s1".into(), passage_id: 1 }));
+
+            // Within-capture resume: from the capture's seq at offset 1, passage 0 is skipped (judged),
+            // passage 1 still pends — this is the anti-stall resume.
+            let cap_seq = subjects
+                .iter()
+                .find(|s| matches!(s.subject, ConflictRef::Passage { .. }))
+                .unwrap()
+                .seq;
+            let resumed = log.unprocessed_conflict_subjects_since(cap_seq, 1, 64).unwrap();
+            assert!(
+                !resumed.iter().any(|s| matches!(&s.subject, ConflictRef::Passage { passage_id: 0, .. })),
+                "passage 0 of the in-progress capture is skipped at offset 1"
+            );
+            assert!(
+                resumed.iter().any(|s| matches!(&s.subject, ConflictRef::Passage { passage_id: 1, .. })),
+                "passage 1 still pending at offset 1"
+            );
+
+            // Advancing past the last subject empties the queue.
+            let max_seq = subjects.iter().map(|s| s.seq).max().unwrap();
+            let last_off =
+                subjects.iter().filter(|s| s.seq == max_seq).map(|s| s.within_seq_id).max().unwrap();
+            log.set_conflict_cursor(max_seq, last_off + 1).unwrap();
+            assert!(log.unprocessed_conflict_subjects_since(max_seq, last_off + 1, 64).unwrap().is_empty());
+            (max_seq, last_off + 1)
+        };
+        // Restart: the cursor is persistent progress state (survives reopen) — assert the EXACT
+        // round-trip, so a column swap or wrong-offset persist can't slip through.
+        let log = open_log(dir.path());
+        let (cseq, coff) = log.conflict_cursor().unwrap();
+        assert_eq!(
+            (cseq, coff),
+            (persisted_seq, persisted_off),
+            "cursor round-trips exactly across reopen"
+        );
+        assert!(
+            log.unprocessed_conflict_subjects_since(cseq, coff, 64).unwrap().is_empty(),
+            "nothing new after restart"
+        );
+    }
+
+    /// Rung-3 Phase-2 (§3.3): the enumeration's exclusion GATES — the whole point of the fold — are
+    /// each a live subject that must NOT appear. Pins all three negative paths (a positive-only test
+    /// would still pass if a gate were deleted): a superseded note's old head is dropped (its live
+    /// replacement kept); a `note_retired` note is dropped; a retired passage is dropped (its sibling
+    /// kept); and a supersede-replaced capture contributes ZERO passage subjects (only the current
+    /// head for the `session_id` does).
+    #[test]
+    fn conflict_subject_enumeration_respects_current_head_and_retire_gates() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // (1) A note that gets SUPERSEDED (edited) — old head must drop, replacement must stay.
+        let note_old = log.remember(&emb, "the branch is main").unwrap();
+        let note_new = log.supersede_note(&emb, &note_old, "the branch is trunk").unwrap();
+        // (2) A note that gets RETIRED via the distinct note_retired marker — must drop.
+        let note_retired = log.remember(&emb, "db is postgres").unwrap();
+        log.retire_memory(&note_retired).unwrap();
+        // (3) A capture whose passage 0 is RETIRED — passage 0 drops, passage 1 stays.
+        let cap_s2 = log.capture_session(&emb, &session_meta("s2", "cc")).unwrap();
+        log.store_session_passages(&emb, &cap_s2, &["p0".to_string(), "p1".to_string()]).unwrap();
+        log.retire_passage("s2", 0).unwrap();
+        // (4) A capture SUPERSEDED by a newer capture of the SAME session_id (different sha) — the
+        // OLD capture event must contribute zero passage subjects; only the new head's do.
+        let cap_s1_old = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cap_s1_old, &["a0".to_string(), "a1".to_string()]).unwrap();
+        let cap_s1_new = log.capture_session(&emb, &session_meta("s1", "bb")).unwrap();
+        log.store_session_passages(&emb, &cap_s1_new, &["b0".to_string(), "b1".to_string()]).unwrap();
+        assert_ne!(cap_s1_old, cap_s1_new, "the different-sha recapture supersedes the old capture");
+
+        let subjects = log.unprocessed_conflict_subjects_since(0, 0, 64).unwrap();
+        let has = |r: ConflictRef| subjects.iter().any(|s| s.subject == r);
+
+        // (1) supersede: old head excluded, replacement present.
+        assert!(!has(ConflictRef::Note { event_id: note_old.clone() }), "superseded note's old head is excluded");
+        assert!(has(ConflictRef::Note { event_id: note_new.clone() }), "the live replacement note IS enumerated");
+        // (2) note_retired: excluded.
+        assert!(!has(ConflictRef::Note { event_id: note_retired.clone() }), "a note_retired note is excluded");
+        // (3) passage retire: passage 0 excluded, sibling present.
+        assert!(!has(ConflictRef::Passage { session_id: "s2".into(), passage_id: 0 }), "retired passage 0 of s2 is excluded");
+        assert!(has(ConflictRef::Passage { session_id: "s2".into(), passage_id: 1 }), "non-retired sibling passage 1 of s2 is enumerated");
+        // (4) capture supersede: only the current head contributes — exactly 2 s1 passage subjects,
+        // not 4 (a broken current-head gate would double them from the superseded old capture too).
+        let s1_passages = subjects
+            .iter()
+            .filter(|s| matches!(&s.subject, ConflictRef::Passage { session_id, .. } if session_id == "s1"))
+            .count();
+        assert_eq!(s1_passages, 2, "only the current-head capture of s1 contributes its 2 passages (the superseded old capture contributes none)");
+        assert!(has(ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 }));
+        assert!(has(ConflictRef::Passage { session_id: "s1".into(), passage_id: 1 }));
     }
 
     /// Rung-3 Phase-1 (§7.1): the SEPARATE conflict index retrieves a captured
