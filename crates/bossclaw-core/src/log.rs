@@ -2858,11 +2858,12 @@ impl EventLog {
 
     /// The unordered pair key for two typed refs (sorted `pair_key`s). Two refs in either order
     /// map to the SAME key — the idempotency identity (spec §3.5). `#[cfg(unix)]` (only the sweep +
-    /// idempotency predicate — both `#[cfg(unix)]` — use it).
+    /// idempotency predicate — both `#[cfg(unix)]` — use it). Delegates to the single source of
+    /// truth ([`crate::index::ConflictRef::unordered_pair_key`]) shared with the finder so the two
+    /// can never drift.
     #[cfg(unix)]
     fn conflict_pair_key(a: &crate::index::ConflictRef, b: &crate::index::ConflictRef) -> String {
-        let (ka, kb) = (a.pair_key(), b.pair_key());
-        if ka <= kb { format!("{ka}\u{1e}{kb}") } else { format!("{kb}\u{1e}{ka}") }
+        crate::index::ConflictRef::unordered_pair_key(a, b)
     }
 
     /// True iff an OPEN `conflict_proposal` already exists for the unordered typed pair `(a, b)`

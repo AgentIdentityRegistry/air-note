@@ -126,6 +126,14 @@ impl ConflictRef {
         }
     }
 
+    /// Unordered pair identity: the two `pair_key`s, sorted, joined by `\u{1e}` (record separator).
+    /// Both orders of (a, b) map to the SAME key — the idempotency identity (spec §3.5). Portable:
+    /// the single source of truth for the pair key used by the finder AND log.rs `conflict_pair_key`.
+    pub fn unordered_pair_key(a: &ConflictRef, b: &ConflictRef) -> String {
+        let (ka, kb) = (a.pair_key(), b.pair_key());
+        if ka <= kb { format!("{ka}\u{1e}{kb}") } else { format!("{kb}\u{1e}{ka}") }
+    }
+
     /// The persisted (signed-proposal) JSON shape for this ref.
     pub fn to_json(&self) -> serde_json::Value {
         match self {

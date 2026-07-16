@@ -215,6 +215,78 @@ pub fn templated_why(winner_hint: &str, band: &str, a_kind: &str, b_kind: &str) 
     format!("{subjects} may conflict: {relation}; {band_phrase}")
 }
 
+/// The hermetic input to [`decide_conflict_sweep`]: a subject, its already-retrieved neighbours
+/// (`(ref, cosine_distance)`), the similarity floor, and the exclusion sets. NO ANN / clock / log
+/// — the caller supplies neighbours (stubbable), so the decision is deterministic.
+///
+/// The two `HashSet<String>` fields hold DIFFERENT key shapes (nothing at the type level tells them
+/// apart): `excluded_refs` holds SINGLE-ref `pair_key()` identities, while `open_pairs` holds
+/// UNORDERED two-ref keys ([`crate::index::ConflictRef::unordered_pair_key`]).
+pub struct FinderInput<'a> {
+    /// The memory being searched for conflicts.
+    pub subject: &'a crate::index::ConflictRef,
+    /// `(neighbour_ref, cosine_distance)` from `conflict_search_refs`. `sim = 1.0 - distance`.
+    pub neighbors: &'a [(crate::index::ConflictRef, f32)],
+    /// Cosine-similarity floor a neighbour must clear ([`CANDIDATE_SIM_MIN`]).
+    pub sim_min: f32,
+    /// `pair_key`s of refs to skip entirely: the subject itself, plus (Phase 3) resolution-excluded
+    /// refs. In Phase 2 this is just `{subject.pair_key()}` (superseded/retired refs are already
+    /// absent from the freshly-rebuilt index, so they never appear as neighbours).
+    pub excluded_refs: &'a std::collections::HashSet<String>,
+    /// Unordered pair keys already OPEN — pre-filtered so the judge is never spent on a duplicate.
+    pub open_pairs: &'a std::collections::HashSet<String>,
+    /// Max pairs kept for this subject ([`MAX_CANDIDATE_PAIRS_PER_SUBJECT`]).
+    pub max_pairs: usize,
+}
+
+/// Pure candidate-finder (spec §3.4): the unordered `(subject, neighbour)` pairs worth judging,
+/// highest-similarity first, capped at `max_pairs`. Excludes: sub-floor neighbours; the subject
+/// itself / any `excluded_refs`; and pairs already OPEN (`open_pairs`). Deterministic; no side
+/// effects. Sublinear by construction (operates on a top-k neighbour list).
+pub fn decide_conflict_sweep(
+    input: &FinderInput,
+) -> Vec<(crate::index::ConflictRef, crate::index::ConflictRef)> {
+    use crate::index::ConflictRef;
+    let mut scored: Vec<(f32, &ConflictRef)> = input
+        .neighbors
+        .iter()
+        .filter_map(|(r, dist)| {
+            let sim = 1.0 - *dist;
+            // Keep only when sim is DEFINITELY at/above the floor. `partial_cmp` returns `None` for a
+            // NaN distance (→ NaN sim), so NaN is REJECTED rather than slipping past a raw `<`/`>=`
+            // and sorting non-deterministically. `Equal` is kept → the floor is inclusive.
+            let at_or_above_floor = matches!(
+                sim.partial_cmp(&input.sim_min),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            );
+            if !at_or_above_floor {
+                return None; // below the similarity floor (or NaN / incomparable)
+            }
+            if input.excluded_refs.contains(&r.pair_key()) {
+                return None; // self / resolution-excluded
+            }
+            if input.open_pairs.contains(&ConflictRef::unordered_pair_key(input.subject, r)) {
+                return None; // already open (idempotency pre-filter)
+            }
+            Some((sim, r))
+        })
+        .collect();
+    // Highest similarity first; stable tie-break on the ref's pair_key for determinism.
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.pair_key().cmp(&b.1.pair_key()))
+    });
+    // Dedup by unordered pair key (a neighbour can appear once), then cap.
+    let mut seen = std::collections::HashSet::new();
+    scored
+        .into_iter()
+        .filter(|(_, r)| seen.insert(ConflictRef::unordered_pair_key(input.subject, r)))
+        .take(input.max_pairs)
+        .map(|(_, r)| (input.subject.clone(), r.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +468,122 @@ mod tests {
             "contradicts": true, "winner": "newer", "confidence": CONFLICT_CONF_MIN - 1, "why": "edge"
         }));
         assert!(judge_pair(&below, a, b).expect("ok").is_none(), "confidence just below the floor is dropped");
+    }
+
+    #[test]
+    fn decide_conflict_sweep_gates_excludes_caps_and_orders() {
+        use crate::index::ConflictRef;
+        use std::collections::HashSet;
+        let subj = ConflictRef::Note { event_id: "x".into() };
+        let near = ConflictRef::Note { event_id: "near".into() };   // sim 0.90 (dist 0.10)
+        let far = ConflictRef::Passage { session_id: "s".into(), passage_id: 0 }; // sim 0.50 → gated out
+        // dist = 1 - sim.
+        let neighbors = vec![
+            (subj.clone(), 0.00_f32),  // self → excluded
+            (near.clone(), 0.10_f32),  // sim 0.90 → kept
+            (far.clone(), 0.50_f32),   // sim 0.50 < 0.82 → gated
+        ];
+        let excluded: HashSet<String> = [subj.pair_key()].into_iter().collect(); // self-exclusion
+        let empty: HashSet<String> = HashSet::new();
+        let pairs = decide_conflict_sweep(&FinderInput {
+            subject: &subj,
+            neighbors: &neighbors,
+            sim_min: CANDIDATE_SIM_MIN,
+            excluded_refs: &excluded,
+            open_pairs: &empty,
+            max_pairs: MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+        });
+        assert_eq!(pairs, vec![(subj.clone(), near.clone())], "only the above-floor non-self neighbour");
+
+        // Open-pair exclusion: mark (subj, near) already open → dropped.
+        let open: HashSet<String> = [{
+            let (ka, kb) = (subj.pair_key(), near.pair_key());
+            if ka <= kb { format!("{ka}\u{1e}{kb}") } else { format!("{kb}\u{1e}{ka}") }
+        }]
+        .into_iter()
+        .collect();
+        assert!(decide_conflict_sweep(&FinderInput {
+            subject: &subj, neighbors: &neighbors, sim_min: CANDIDATE_SIM_MIN,
+            excluded_refs: &excluded, open_pairs: &open, max_pairs: MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+        }).is_empty(), "already-open pair excluded (idempotency pre-filter)");
+
+        // Near-duplicate flood: 50 above-floor neighbours cap to max_pairs, highest-sim first.
+        let flood: Vec<(ConflictRef, f32)> = (0..50)
+            .map(|i| (ConflictRef::Note { event_id: format!("d{i}") }, 0.01_f32 + (i as f32) * 0.001))
+            .collect();
+        let capped = decide_conflict_sweep(&FinderInput {
+            subject: &subj, neighbors: &flood, sim_min: CANDIDATE_SIM_MIN,
+            excluded_refs: &excluded, open_pairs: &empty, max_pairs: MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+        });
+        assert_eq!(capped.len(), MAX_CANDIDATE_PAIRS_PER_SUBJECT, "flood capped to the per-subject max");
+        // Kept set is EXACTLY the highest-sim `max_pairs` neighbours (d0..=d{max-1}), in order — not
+        // just "8 that include d0". `d{i}` has dist `0.01 + i*0.001`, so sim strictly decreases with i;
+        // the top-`max_pairs` by sim are d0..d{max-1}. (Coupled to the const, not a hardcoded 8.)
+        let kept: Vec<ConflictRef> = capped.iter().map(|(_, r)| r.clone()).collect();
+        let expected_top: Vec<ConflictRef> = (0..MAX_CANDIDATE_PAIRS_PER_SUBJECT)
+            .map(|i| ConflictRef::Note { event_id: format!("d{i}") })
+            .collect();
+        assert_eq!(kept, expected_top, "kept exactly the highest-sim d0..d(max-1), in descending-sim order");
+        assert!(capped.iter().all(|(s, _)| *s == subj), "subject is the left side of every emitted pair");
+    }
+
+    #[test]
+    fn decide_conflict_sweep_is_reorder_deterministic_and_dedups() {
+        use crate::index::ConflictRef;
+        use std::collections::HashSet;
+        let subj = ConflictRef::Note { event_id: "subj".into() };
+        let excluded: HashSet<String> = [subj.pair_key()].into_iter().collect();
+        let empty: HashSet<String> = HashSet::new();
+        let run = |neighbors: &[(ConflictRef, f32)]| {
+            decide_conflict_sweep(&FinderInput {
+                subject: &subj, neighbors, sim_min: CANDIDATE_SIM_MIN,
+                excluded_refs: &excluded, open_pairs: &empty, max_pairs: MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+            })
+        };
+
+        // (a) DETERMINISM UNDER REORDER — the raison d'être. The ANN layer returns neighbours in a
+        // non-deterministic rank, so the SAME set in a different order must yield byte-identical
+        // output. Includes a sim TIE (a & passage-3 both at 0.90) so the stable pair_key tie-break is
+        // exercised: "N\u{1f}a" < "P\u{1f}s\u{1f}3", so `a` precedes `passage-3` regardless of input order.
+        let neighbors: Vec<(ConflictRef, f32)> = vec![
+            (ConflictRef::Note { event_id: "a".into() }, 0.10),                       // sim 0.90
+            (ConflictRef::Passage { session_id: "s".into(), passage_id: 3 }, 0.10),   // sim 0.90 — TIE with a
+            (ConflictRef::Note { event_id: "b".into() }, 0.02),                       // sim 0.98
+            (ConflictRef::Passage { session_id: "s".into(), passage_id: 1 }, 0.15),   // sim 0.85
+        ];
+        let mut reversed = neighbors.clone();
+        reversed.reverse();
+        let forward = run(&neighbors);
+        assert_eq!(forward, run(&reversed), "output is invariant to neighbour input order (ANN rank non-determinism)");
+        // And the order is the expected sim-descending, tie-broken sequence.
+        assert_eq!(
+            forward,
+            vec![
+                (subj.clone(), ConflictRef::Note { event_id: "b".into() }),                     // 0.98
+                (subj.clone(), ConflictRef::Note { event_id: "a".into() }),                     // 0.90, N<P tie-break
+                (subj.clone(), ConflictRef::Passage { session_id: "s".into(), passage_id: 3 }), // 0.90
+                (subj.clone(), ConflictRef::Passage { session_id: "s".into(), passage_id: 1 }), // 0.85
+            ],
+            "descending-sim order with a deterministic pair_key tie-break",
+        );
+
+        // (b) DEDUP — the SAME ref at two distances collapses to ONE pair, keeping the higher-sim
+        // (lower-dist) instance. Observable via a `mid` neighbour whose sim sits BETWEEN the two dup
+        // instances: keeping the 0.95 instance sorts `dup` AHEAD of `mid`; keeping the 0.90 one would
+        // sort it behind. So the emitted order proves which instance survived.
+        let dup = ConflictRef::Note { event_id: "dup".into() };
+        let mid = ConflictRef::Note { event_id: "mid".into() };
+        let with_dup: Vec<(ConflictRef, f32)> = vec![
+            (dup.clone(), 0.10), // sim 0.90 — the LOWER-sim duplicate
+            (mid.clone(), 0.07), // sim 0.93 — between the two dup instances
+            (dup.clone(), 0.05), // sim 0.95 — the HIGHER-sim duplicate
+        ];
+        let out = run(&with_dup);
+        assert_eq!(out.iter().filter(|(_, r)| *r == dup).count(), 1, "duplicate neighbour collapses to exactly one pair");
+        assert_eq!(
+            out,
+            vec![(subj.clone(), dup.clone()), (subj.clone(), mid.clone())],
+            "kept the higher-sim (0.95) dup instance — it sorts ahead of mid (0.93)",
+        );
     }
 }
