@@ -103,6 +103,32 @@ pub fn read_capture_markdown(md_path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Recover a captured session's passage TEXT by index (Rung-3 Phase-2): the daemon's side of the
+/// conflict judge, since core holds only passage vectors. Reads `<data_dir>/sessions/<id>.md`,
+/// strips the front-matter ([`capture_body`]), and re-chunks with the SAME [`bossclaw_core::chunk_text`]
+/// the capture used, so `passage_id` maps to the identical chunk. `None` on an invalid id (never
+/// touches the filesystem), a missing/unreadable `.md`, or an out-of-range index.
+///
+/// Shares the heal path's pre-existing 16-MiB caveat: [`read_capture_markdown`] caps at
+/// [`MAX_CAPTURE_MD_BYTES`] (16 MiB) — a >16-MiB body re-reads truncated, so its chunk indices
+/// would diverge from the original capture's. Narrow (needs a >16-MiB session body) and already
+/// accepted in Phase 1's `persist_passages_if_absent` heal-window; a divergent index yields an
+/// absent snippet (out-of-range → `None` → dropped) or, for the single boundary chunk straddling the
+/// truncation, a truncated PREFIX that is judged on degraded input — never a corrupted proposal,
+/// since the record carries no snippet text (content-free `templated_why` + refs).
+pub(crate) fn session_passage_text(
+    data_dir: &Path,
+    session_id: &str,
+    passage_id: usize,
+) -> Option<String> {
+    if !valid_session_id(session_id) {
+        return None;
+    }
+    let md_path = sessions_dir(data_dir).join(format!("{session_id}.md"));
+    let full = read_capture_markdown(&md_path).ok()?;
+    bossclaw_core::chunk_text(capture_body(&full)).into_iter().nth(passage_id)
+}
+
 /// Store a rendered capture: validate → compose → atomic-write `0600` under a `0700` dir →
 /// signed event (file-THEN-event, spec §4b). Idempotent: A2's same-`sha256` dedup makes a
 /// repeat store a no-op (the atomic rename is safe to redo). See the module docs.
@@ -577,5 +603,48 @@ mod tests {
             body,
             "recovered body must equal the composed body, even with an embedded `---` line"
         );
+    }
+
+    /// Rung-3 Phase-2 (§3.5): `session_passage_text` is the daemon's side of the conflict judge —
+    /// it recovers a captured session's passage TEXT by index from the stored `.md`. Writing a real
+    /// capture the way `store_capture` composes it (front-matter + body), then recovering
+    /// `passage[0]`, must equal `chunk_text(body).first()` — the SAME chunk the capture persisted.
+    /// An invalid session id is refused before any path is built (never touches the filesystem).
+    #[tokio::test]
+    async fn session_passage_text_recovers_the_chunk_by_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let body = "First passage about vercel.\n\nSecond passage about postgres.";
+
+        // Write a REAL capture `.md` at <data_dir>/sessions/s1.md exactly as `store_capture`
+        // composes it (one sorted front-matter block + the body), using this module's own
+        // `compose_document` + the shared 0600/0700 write primitives.
+        let sessions = sessions_dir(data_dir);
+        make_private_dir(&sessions).unwrap();
+        let doc = compose_document(
+            "s1",
+            "A Title",
+            "proj",
+            CAPTURE_TOOL,
+            "abc123",
+            10,   // started_at
+            20,   // ended_at
+            4096, // approx_bytes
+            0,    // lines_oversized
+            0,    // lines_skipped
+            false, // torn_tail
+            /*recovered_stub=*/ false,
+            body,
+        );
+        atomic_write_0600(&sessions.join("s1.md"), doc.as_bytes()).unwrap();
+
+        let expected = bossclaw_core::chunk_text(body);
+        assert_eq!(
+            session_passage_text(data_dir, "s1", 0).as_deref(),
+            expected.first().map(String::as_str),
+            "passage 0 recovers the first chunk"
+        );
+        // An invalid session id never touches the filesystem.
+        assert_eq!(session_passage_text(data_dir, "../etc", 0), None);
     }
 }

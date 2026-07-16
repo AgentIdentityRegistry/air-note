@@ -43,6 +43,11 @@ pub mod net_guard;
 pub mod secrets;
 #[cfg(unix)]
 pub mod server;
+// Rung-3 Phase-2 conflict DETECTION — the off-by-default background sweep that records signed
+// `conflict_proposal`s for contradictions between the brain's own memories (no UI, no mutation).
+// Unix-gated like `server`/`telemetry`: it calls the cfg(unix) `engine`/`identity`.
+#[cfg(unix)]
+pub mod conflict;
 // Recall-miss telemetry (SP3 A12): the rung-1/2 retrieval-floor tuning signal. Records every
 // recall's hit/miss outcome under `<data_dir>/telemetry/` (best-effort, rotation-proof counters,
 // queries-only recent-miss ring) and backs the App-only `RecallStats` op. Unix-only to reuse

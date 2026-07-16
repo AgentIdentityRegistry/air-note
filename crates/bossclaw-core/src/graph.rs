@@ -101,6 +101,13 @@ pub const WRITE_DECLINED_EVENT_TYPE: &str = "write_declined";
 /// Producer stamped on M6b-authored events (distinct from ACTUATOR_PRODUCER "m6a-actuator").
 pub const M6B_PROPOSER_PRODUCER: &str = "m6b-reconciler";
 
+/// Rung-3 Phase-2 conflict-detection proposal event type (signed): a "possible conflict" record
+/// listing both sides as typed refs, awaiting an owner decision. Detection-only — carries NO
+/// mutation. Single-sourced so the builder and every fold/projection filter share the string.
+pub const CONFLICT_PROPOSAL_EVENT_TYPE: &str = "conflict_proposal";
+/// `model_meta.model_id` producer stamp for Rung-3 conflict proposals.
+pub const CONFLICT_PROPOSER_PRODUCER: &str = "rung3-conflict-detector";
+
 /// Event type for a granted mandate (a signed standing sync goal). Ground-truth.
 pub const MANDATE_GRANT_EVENT_TYPE: &str = "mandate_grant";
 /// Event type that revokes a mandate by its grant event id. Sticky.

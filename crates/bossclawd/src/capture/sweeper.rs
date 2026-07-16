@@ -409,8 +409,9 @@ async fn build_current_map(
 }
 
 /// A `SystemTime` → Unix epoch second. A missing/pre-epoch time → 0 (reads as "very old", so
-/// such a file is only ever imported under explicit backfill consent — the safe default).
-fn system_time_to_epoch(t: Option<SystemTime>) -> i64 {
+/// such a file is only ever imported under explicit backfill consent — the safe default). Shared
+/// with `crate::conflict::sweeper::spawn`, which reads the same wall clock at its loop boundary.
+pub(crate) fn system_time_to_epoch(t: Option<SystemTime>) -> i64 {
     t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)

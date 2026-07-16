@@ -265,6 +265,12 @@ const BACKFILL_CONSENTED_KEY: &str = "backfill_consented";
 /// sticky (capture is off, so it is not consulted).
 const CAPTURE_ENABLED_AT_KEY: &str = "capture_enabled_at";
 
+/// The `content` key carrying the Rung-3 Phase-2 conflict-detection on/off switch (spec §3.6).
+/// Single-sourced (one writer [`EventLog::set_conflict_detect_enabled`], one reader
+/// [`EventLog::conflict_detect_enabled`]). DEFAULT CLOSED — detection never runs for a user who
+/// never consented (invariant I3), exactly like [`CAPTURE_ENABLED_KEY`].
+const CONFLICT_DETECT_ENABLED_KEY: &str = "conflict_detect_enabled";
+
 /// A typed identifier for a control-`config` key, mapping to the private `*_KEY` consts. Used by
 /// `EventLog::explicitly_set` (and the capture getters) so callers (e.g. the desktop
 /// `prime_switches`) reference a compile-checked variant instead of a stringly-typed key that could
@@ -287,6 +293,8 @@ pub enum ConfigFlag {
     CaptureEnabled,
     /// The SP3 one-time backfill consent ([`BACKFILL_CONSENTED_KEY`]). Default CLOSED.
     BackfillConsented,
+    /// The Rung-3 Phase-2 conflict-detection on/off switch ([`CONFLICT_DETECT_ENABLED_KEY`]). Default CLOSED.
+    ConflictDetect,
 }
 
 impl ConfigFlag {
@@ -301,6 +309,7 @@ impl ConfigFlag {
             ConfigFlag::LanguagePack => LANGUAGE_PACK_KEY,
             ConfigFlag::CaptureEnabled => CAPTURE_ENABLED_KEY,
             ConfigFlag::BackfillConsented => BACKFILL_CONSENTED_KEY,
+            ConfigFlag::ConflictDetect => CONFLICT_DETECT_ENABLED_KEY,
         }
     }
 }
@@ -423,6 +432,69 @@ pub struct CurrentNote {
     /// note returned is a live head). Carried to mirror `NoteWire`'s shape for a
     /// possible future edit-history view; this projection never populates it.
     pub superseded_by: Option<String>,
+}
+
+/// One OPEN conflict proposal for the read surface (spec §3.5). Both refs are still current
+/// (withdrawn proposals are absent). Ungated (portable data type). `#![deny(missing_docs)]`
+/// requires a `///` on every pub field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictProposalRow {
+    /// The `conflict_proposal` event id.
+    pub id: String,
+    /// The first ref as recorded by the proposer (by convention the OLDER side, ordered upstream by
+    /// ingest ts); this projection passes it through, it does not enforce the ordering.
+    pub a_ref: crate::index::ConflictRef,
+    /// The second ref as recorded by the proposer (by convention the NEWER side, ordered upstream by
+    /// ingest ts); this projection passes it through, it does not enforce the ordering.
+    pub b_ref: crate::index::ConflictRef,
+    /// Advisory winner label ("newer"/"older"/"unclear") — the engine resolves by ts.
+    pub winner_hint: String,
+    /// Coarse confidence band ("high"/"med") — the raw numeric confidence is never persisted.
+    pub confidence_band: String,
+    /// The CONTENT-FREE templated reason (`conflict::templated_why`); never memory text.
+    pub why: String,
+    /// Wall-clock instant detection recorded this proposal (Unix seconds).
+    pub detected_at: i64,
+}
+
+/// One conflict-detection SUBJECT: a memory appended after the cursor. A `memory` event yields
+/// ONE `Note` subject; a `session_captured` event yields one `Passage` subject per live
+/// (non-retired) passage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictSubject {
+    /// The source event's `seq` (the cursor's first coordinate).
+    pub seq: i64,
+    /// This subject's within-`seq` id — its `passage_id` for a passage, `0` for a note. The
+    /// cursor's second coordinate advances to `within_seq_id + 1` once this subject is judged.
+    pub within_seq_id: usize,
+    /// The typed reference this subject searches the fights index for.
+    pub subject: crate::index::ConflictRef,
+}
+
+/// What one [`EventLog::detect_conflicts_once`] cycle did (spec §3.3). All-zero + `skipped_disabled`
+/// when the flag is off (I3).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConflictDetectReport {
+    /// The flag was CLOSED — no scan, no model, no proposals (I3).
+    pub skipped_disabled: bool,
+    /// New subjects ENUMERATED since the cursor this cycle (`subjects.len()`; may exceed the number
+    /// actually examined when the cycle breaks early on budget/reasoner-stop). 0 → dirty-gate
+    /// short-circuit, no rebuild.
+    pub scanned_subjects: usize,
+    /// Judge calls made (bounded by [`crate::conflict::CONFLICT_JUDGE_PER_SWEEP`]).
+    pub judged: usize,
+    /// Proposals emitted.
+    pub proposed: usize,
+    /// Pairs not turned into a proposal without a positive verdict: the judge declined (`Ok(None)`,
+    /// which DID consume a judge-budget slot), OR a side's text could not be resolved at judge time
+    /// (no judge call, no budget consumed).
+    pub dropped: usize,
+    /// Reasoner transport/decode failures (`Err`) — the cycle stops + retries next time (I6).
+    pub reasoner_errors: usize,
+    /// The per-cycle judge budget was hit (backlog drips to the next cycle).
+    pub budget_hit: bool,
+    /// The open-proposal ceiling was hit (stop proposing; surface one quiet count).
+    pub ceiling_hit: bool,
 }
 
 /// The serialized, signed event log.
@@ -870,6 +942,18 @@ impl EventLog {
             "CREATE TABLE IF NOT EXISTS evolve_cursor (
                 id       INTEGER PRIMARY KEY CHECK (id = 0),
                 last_seq INTEGER NOT NULL
+            )",
+        )?;
+        // Conflict-detection progress (Rung-3 Phase-2 §3.2 — re-derivable progress state, NOT a
+        // Tier-A fold). Single row (id pinned to 0). `(last_seq, subject_offset)` advances
+        // subject-by-subject: all subjects of the event at `last_seq` with within-seq id
+        // < subject_offset are judged. Losing it only re-searches (idempotent: an already-open
+        // pair is never re-proposed).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS conflict_cursor (
+                id             INTEGER PRIMARY KEY CHECK (id = 0),
+                last_seq       INTEGER NOT NULL,
+                subject_offset INTEGER NOT NULL
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -2675,6 +2759,154 @@ impl EventLog {
             "rationale": rationale, "inducing_key": inducing_key, "verdict_summary": verdict_summary,
         });
         self.append(self.build_proposer_event(producer, crate::graph::WRITE_PROPOSAL_EVENT_TYPE, content, source_event_ids))
+    }
+
+    /// Append a signed Rung-3 `conflict_proposal` (spec §3.5). Content: `{ a_ref, b_ref,
+    /// winner_hint, confidence_band, why, detected_at }` — typed stable refs only, NO memory
+    /// bodies (I7). `winner_hint`/`confidence_band` are the coarsened forms; `why` MUST be the
+    /// CONTENT-FREE `conflict::templated_why` output (never model text). `source_event_ids` is the
+    /// referenced memories' lineage (note event id / session capture event id). Mirrors the
+    /// `#[cfg(unix)]` `build_proposer_event` shape used by the write-proposal family.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_conflict_proposal(
+        &self,
+        a_ref: &crate::index::ConflictRef,
+        b_ref: &crate::index::ConflictRef,
+        winner_hint: &str,
+        confidence_band: &str,
+        why: &str,
+        detected_at: i64,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        let content = serde_json::json!({
+            "a_ref": a_ref.to_json(),
+            "b_ref": b_ref.to_json(),
+            "winner_hint": winner_hint,
+            "confidence_band": confidence_band,
+            "why": why,
+            "detected_at": detected_at,
+        });
+        self.append(self.build_proposer_event(
+            crate::graph::CONFLICT_PROPOSER_PRODUCER,
+            crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE,
+            content,
+            source_event_ids,
+        ))
+    }
+
+    /// Every `conflict_proposal` whose BOTH refs STILL resolve to a current memory — the OPEN set.
+    /// Auto-withdraw (I-gc, no withdrawal event) is exact for a NOTE ref (retire/delete/edit ⇒ a new
+    /// event id, so it leaves `current_notes`) and for a WHOLE-session delete. A PASSAGE ref is
+    /// current only when its session is current, it is not in `retired_passages`, AND its ordinal
+    /// still exists in the current head capture — so a same-`session_id` supersede that re-chunks to
+    /// fewer passages (emitting no `passage_retired`) withdraws a proposal on the vanished ordinal.
+    /// Oldest first (`events_of_types` is `seq ASC`). Shared by `pending_conflict_proposals` (Task 7)
+    /// and `is_conflict_proposal_suppressed`. `#[cfg(unix)]` (feeds the append/projection/sweep family).
+    #[cfg(unix)]
+    fn open_conflict_proposals(&self) -> Result<Vec<OpenConflictProposal>, BossclawError> {
+        use crate::index::ConflictRef;
+        // Current membership: notes by event id; sessions by session_id; retired passages.
+        let current_note_ids: std::collections::HashSet<String> =
+            self.current_notes()?.into_iter().map(|n| n.event_id).collect();
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let current_sessions: std::collections::HashSet<&str> =
+            fold.current.iter().map(|cs| cs.session_id.as_str()).collect();
+        // Passage count of each CURRENT session's head capture. A Passage ref is only "current" if its
+        // ordinal still EXISTS in that head: a same-`session_id` supersede that re-chunks to fewer
+        // passages emits no `passage_retired`, so a dropped ordinal would otherwise stay open.
+        // `session_passage_count` is model-agnostic and can OVER-count in a multi-model state (an
+        // accepted property — see the Task 3 caveat); over-count is CONSERVATIVE here (keeps a proposal
+        // open slightly too long, never withdraws a valid one), and the default single-model config is
+        // exact.
+        let mut head_passage_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(fold.current.len());
+        for cs in &fold.current {
+            head_passage_counts.insert(cs.session_id.clone(), self.session_passage_count(&cs.event_id)?);
+        }
+        let ref_is_current = |r: &ConflictRef| -> bool {
+            match r {
+                ConflictRef::Note { event_id } => current_note_ids.contains(event_id),
+                ConflictRef::Passage { session_id, passage_id } => {
+                    current_sessions.contains(session_id.as_str())
+                        && !fold.retired_passages.contains(&(session_id.clone(), *passage_id))
+                        // Some() is guaranteed by the current_sessions check above; the 0 fallback is
+                        // unreachable but fails safe (treat as no passages → withdraw).
+                        && *passage_id < *head_passage_counts.get(session_id.as_str()).unwrap_or(&0)
+                    // ordinal still exists in the current head
+                }
+            }
+        };
+        let mut out = Vec::new();
+        for ev in self.events_of_types(&[crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE])? {
+            let (Some(a_ref), Some(b_ref)) = (
+                ev.content.get("a_ref").and_then(ConflictRef::from_json),
+                ev.content.get("b_ref").and_then(ConflictRef::from_json),
+            ) else {
+                continue; // malformed — never open
+            };
+            if !ref_is_current(&a_ref) || !ref_is_current(&b_ref) {
+                continue; // GC: a side is gone → withdrawn
+            }
+            out.push(OpenConflictProposal {
+                id: ev.id.clone(),
+                a_ref,
+                b_ref,
+                winner_hint: ev.content.get("winner_hint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                confidence_band: ev.content.get("confidence_band").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                why: ev.content.get("why").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                detected_at: ev.content.get("detected_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every OPEN conflict proposal (both refs current), oldest first — the read behind a later
+    /// App-only `ListConflicts` (spec §3.5). GC is inherent: `open_conflict_proposals` already
+    /// drops any proposal whose referenced memory was retired/deleted/edited (I-gc). Fold-derived,
+    /// so it survives restart with no cursor. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    pub fn pending_conflict_proposals(&self) -> Result<Vec<ConflictProposalRow>, BossclawError> {
+        Ok(self
+            .open_conflict_proposals()?
+            .into_iter()
+            .map(|p| ConflictProposalRow {
+                id: p.id,
+                a_ref: p.a_ref,
+                b_ref: p.b_ref,
+                winner_hint: p.winner_hint,
+                confidence_band: p.confidence_band,
+                why: p.why,
+                detected_at: p.detected_at,
+            })
+            .collect())
+    }
+
+    /// The unordered pair key for two typed refs (sorted `pair_key`s). Two refs in either order
+    /// map to the SAME key — the idempotency identity (spec §3.5). `#[cfg(unix)]` (only the sweep +
+    /// idempotency predicate — both `#[cfg(unix)]` — use it). Delegates to the single source of
+    /// truth ([`crate::index::ConflictRef::unordered_pair_key`]) shared with the finder so the two
+    /// can never drift.
+    #[cfg(unix)]
+    fn conflict_pair_key(a: &crate::index::ConflictRef, b: &crate::index::ConflictRef) -> String {
+        crate::index::ConflictRef::unordered_pair_key(a, b)
+    }
+
+    /// True iff an OPEN `conflict_proposal` already exists for the unordered typed pair `(a, b)`
+    /// (spec §3.5). A GC-withdrawn proposal (a referenced memory gone) does NOT suppress — the
+    /// pair may re-propose (so a materially-changed / re-added memory re-opens, resolved Q3).
+    /// `#[cfg(unix)]` (consumes `open_conflict_proposals`).
+    #[cfg(unix)]
+    pub fn is_conflict_proposal_suppressed(
+        &self,
+        a: &crate::index::ConflictRef,
+        b: &crate::index::ConflictRef,
+    ) -> Result<bool, BossclawError> {
+        let want = Self::conflict_pair_key(a, b);
+        Ok(self
+            .open_conflict_proposals()?
+            .iter()
+            .any(|p| Self::conflict_pair_key(&p.a_ref, &p.b_ref) == want))
     }
 
     /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
@@ -5982,6 +6214,29 @@ impl EventLog {
             // `decode_chunk_key` in `conflict_search`.
             index.add(&crate::index::encode_chunk_key(session_id, ix), &vec);
         }
+        // Note arm (Rung-3 Phase-2 §2): add each CURRENT, non-superseded, non-retired memory
+        // note's body vector under a DISTINCT note key so notes and passages share ONE fights
+        // index without colliding. `current_notes` already applies the supersede + `note_retired`
+        // exclusion, so no extra filtering is needed here. Empty-body notes cannot contradict on
+        // content and are skipped (a zero-length body would embed to a meaningless vector).
+        //
+        // I4 / design open-question #2: we RE-EMBED every current note each rebuild rather than
+        // persisting note vectors in a dedicated `note_conflict_vectors` table (like
+        // `session_passage_vectors`). This is acceptable at Phase-2 scale because the embedder is a
+        // STATIC model2vec (a token-vector lookup + mean-pool, NOT a transformer forward pass), so
+        // per-note cost is a cheap table lookup. The `note_conflict_vectors` table is DEFERRED (add
+        // only if this cost proves material). The `log::debug!` below is the trip-wire that makes
+        // the re-embed count observable before any production-enable.
+        let mut notes_embedded = 0usize;
+        for note in self.current_notes()? {
+            if note.text.trim().is_empty() {
+                continue;
+            }
+            let vec = embed_one(embedder, &note.text)?;
+            index.add(&crate::index::encode_note_key(&note.event_id), &vec);
+            notes_embedded += 1;
+        }
+        log::debug!("rebuild_conflict_index: re-embedded {notes_embedded} note bodies (I4 trip-wire)");
         let boxed: Box<dyn VectorIndex> = Box::new(index);
         *self.conflict_index.lock().expect(POISON) = Some(boxed);
         Ok(())
@@ -5997,8 +6252,14 @@ impl EventLog {
     /// non-fatal policy for this detector (in release, "no index built yet" simply
     /// flags no conflicts), whereas entity resolution errors on an unbuilt index. A
     /// `debug_assert` guards the "called before rebuild" bug in dev/test, where it
-    /// is always a mistake. Keys that fail to decode are dropped (never happens — we
-    /// encoded them via `encode_chunk_key`).
+    /// is always a mistake. Keys that fail to decode are dropped — since Rung-3 Phase-2
+    /// the UNIFIED index also holds NOTE keys (`encode_note_key`), which `decode_chunk_key`
+    /// returns `None` for; that intentional drop is what preserves this method's passage-only
+    /// tuple contract for the memharness caller. NOTE the behavioral consequence: `index.search`
+    /// returns the `k` nearest keys BEFORE this passage filter, so a note ranking in the top-`k`
+    /// consumes a slot — `conflict_search(qv, k)` can therefore return FEWER than `k` passages
+    /// once the index is note-populated. Callers needing typed note+passage hits use
+    /// [`EventLog::conflict_search_refs`].
     pub fn conflict_search(&self, qv: &[f32], k: usize) -> Vec<(String, usize, f32)> {
         let guard = self.conflict_index.lock().expect(POISON);
         debug_assert!(
@@ -6015,6 +6276,250 @@ impl EventLog {
                 crate::index::decode_chunk_key(&key).map(|(sid, ix)| (sid.to_string(), ix, score))
             })
             .collect()
+    }
+
+    /// Typed sibling of [`EventLog::conflict_search`] (Rung-3 Phase-2 §2): returns the `k` nearest
+    /// `(ConflictRef, distance)` pairs over the UNIFIED conflict index, decoding both note keys and
+    /// passage chunk keys. `conflict_search` (passage-only tuples) is left byte-identical for the
+    /// harness caller. Same empty-when-unbuilt policy + `debug_assert` as `conflict_search`.
+    pub fn conflict_search_refs(&self, qv: &[f32], k: usize) -> Vec<(crate::index::ConflictRef, f32)> {
+        let guard = self.conflict_index.lock().expect(POISON);
+        debug_assert!(guard.is_some(), "conflict_search_refs called before rebuild_conflict_index");
+        let Some(index) = guard.as_ref() else {
+            return Vec::new();
+        };
+        index
+            .search(qv, k)
+            .into_iter()
+            .filter_map(|(key, score)| crate::index::ConflictRef::decode_key(&key).map(|r| (r, score)))
+            .collect()
+    }
+
+    /// Run ONE conflict-detection cycle (spec §3.3). Gated on the owner flag (I3). Advances the
+    /// `(seq, subject_offset)` cursor past each FULLY-judged subject, so a budget-truncated or
+    /// reasoner-interrupted cycle resumes exactly (I6). `passage_text(session_id, passage_id)`
+    /// supplies a passage's real text (the daemon reads the `.md`); note text comes from core.
+    /// `resolution_excluded_refs` is EMPTY in Phase 2 (Phase 3 fills it). `detected_at` stamps each
+    /// proposal. `#[cfg(unix)]` (uses `append_conflict_proposal` / the idempotency fold).
+    #[cfg(unix)]
+    pub fn detect_conflicts_once(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+        passage_text: &dyn Fn(&str, usize) -> Option<String>,
+        resolution_excluded_refs: &std::collections::HashSet<String>,
+        detected_at: i64,
+    ) -> Result<ConflictDetectReport, BossclawError> {
+        use crate::conflict::{
+            bound_judge_text, confidence_band, decide_conflict_sweep, templated_why, winner_str,
+            FinderInput, CANDIDATE_SIM_MIN, CONFLICT_JUDGE_PER_SWEEP, CONFLICT_OPEN_CEILING,
+            CONFLICT_SCAN_BOUND, CONFLICT_SEARCH_K, MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+        };
+        use crate::index::ConflictRef;
+        let mut report = ConflictDetectReport::default();
+
+        // De-conflict with the extract path (spec §8): Rung-3 memory-level detection (this method) and
+        // the evolve/extract path's EDGE-level reconciliation (`ProposedRetraction` →
+        // `reconcile_confirmed_contradiction`) are two INDEPENDENT, complementary axes. There is no
+        // reverse "memory-claim → invalidated-edge" index and Phase 2 adds none; de-dup happens only
+        // WITHIN rung-3 via the proposal-idempotency fold (`is_conflict_proposal_suppressed`).
+
+        // (1) Gate FIRST — no scan, no rebuild, no model when CLOSED (I3).
+        if !self.conflict_detect_enabled()? {
+            report.skipped_disabled = true;
+            return Ok(report);
+        }
+
+        // (2) Dirty-gate: nothing new since the cursor → no rebuild, no model (I4).
+        let (cursor_seq, cursor_off) = self.conflict_cursor()?;
+        let subjects =
+            self.unprocessed_conflict_subjects_since(cursor_seq, cursor_off, CONFLICT_SCAN_BOUND)?;
+        if subjects.is_empty() {
+            return Ok(report);
+        }
+        report.scanned_subjects = subjects.len();
+
+        // (3) Rebuild the unified fights index so BOTH sides of any conflict are present + current.
+        self.rebuild_conflict_index(embedder)?;
+
+        // (4) One-shot lookups: the passage-vector map, the session fold, and the OPEN pair set.
+        let mut passage_vec: std::collections::HashMap<(String, usize), Vec<f32>> =
+            std::collections::HashMap::new();
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let head_of: std::collections::HashMap<String, String> = fold
+            .current
+            .iter()
+            .map(|cs| (cs.session_id.clone(), cs.event_id.clone()))
+            .collect();
+        let session_of_event: std::collections::HashMap<String, String> = fold
+            .current
+            .iter()
+            .map(|cs| (cs.event_id.clone(), cs.session_id.clone()))
+            .collect();
+        for (event_id, ix, vec) in self.session_passages_for_model(embedder.model_id())? {
+            if let Some(sid) = session_of_event.get(&event_id) {
+                passage_vec.insert((sid.clone(), ix), vec);
+            }
+        }
+        let opens = self.open_conflict_proposals()?;
+        let mut open_pairs: std::collections::HashSet<String> =
+            opens.iter().map(|p| Self::conflict_pair_key(&p.a_ref, &p.b_ref)).collect();
+        let mut open_count = opens.len();
+
+        // Text / lineage / ts / kind resolvers for a ref (notes from core; passages via the closure).
+        let ref_text = |r: &ConflictRef| -> Option<String> {
+            match r {
+                ConflictRef::Note { event_id } => self
+                    .event_by_id(event_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.content.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                    .map(|t| bound_judge_text(&t).to_string()),
+                ConflictRef::Passage { session_id, passage_id } => {
+                    passage_text(session_id, *passage_id).map(|t| bound_judge_text(&t).to_string())
+                }
+            }
+        };
+        let ref_source_event = |r: &ConflictRef| -> Option<String> {
+            match r {
+                ConflictRef::Note { event_id } => Some(event_id.clone()),
+                ConflictRef::Passage { session_id, .. } => head_of.get(session_id).cloned(),
+            }
+        };
+        let ref_ts = |r: &ConflictRef| -> i64 {
+            ref_source_event(r)
+                .and_then(|id| self.event_by_id(&id).ok().flatten())
+                .and_then(|e| DateTime::parse_from_rfc3339(&e.ts).ok().map(|d| d.timestamp()))
+                .unwrap_or(0)
+        };
+        let ref_kind = |r: &ConflictRef| -> &'static str {
+            match r {
+                ConflictRef::Note { .. } => "note",
+                ConflictRef::Passage { .. } => "passage",
+            }
+        };
+
+        // (5) SUBJECT-BY-SUBJECT (the anti-stall fix). The cursor advances to (seq, within+1) after
+        //     EACH fully-judged subject, so a crash / reasoner-stop mid-cycle resumes exactly (I6).
+        let mut budget_left = CONFLICT_JUDGE_PER_SWEEP;
+        for cs in &subjects {
+            let subject = &cs.subject;
+            let qv = match subject {
+                ConflictRef::Note { event_id } => {
+                    match self.event_by_id(event_id)?.and_then(|e| {
+                        e.content.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                    }) {
+                        Some(t) if !t.trim().is_empty() => embed_one(embedder, &t)?,
+                        _ => {
+                            self.set_conflict_cursor(cs.seq, cs.within_seq_id + 1)?;
+                            continue;
+                        }
+                    }
+                }
+                ConflictRef::Passage { session_id, passage_id } => {
+                    match passage_vec.get(&(session_id.clone(), *passage_id)) {
+                        Some(v) => v.clone(),
+                        None => {
+                            // A transiently-unavailable passage vector is best-effort SKIPPED: advance
+                            // the cursor past it rather than stall the whole cycle (a re-embed under a
+                            // new model repopulates it and a fresh capture re-enqueues it downstream).
+                            self.set_conflict_cursor(cs.seq, cs.within_seq_id + 1)?;
+                            continue;
+                        }
+                    }
+                }
+            };
+            let mut excluded_refs = resolution_excluded_refs.clone();
+            excluded_refs.insert(subject.pair_key());
+            // +1 for the guaranteed self-match slot: the subject's own vector is in the rebuilt index
+            // at distance ~0, always returned then dropped by excluded_refs; +1 keeps a full `budget`
+            // of REAL candidates (never-skip). decide_conflict_sweep still caps at
+            // MAX_CANDIDATE_PAIRS_PER_SUBJECT == CONFLICT_JUDGE_PER_SWEEP, so pairs.len() <= budget.
+            let neighbors = self.conflict_search_refs(&qv, CONFLICT_SEARCH_K + 1);
+            let pairs = decide_conflict_sweep(&FinderInput {
+                subject,
+                neighbors: &neighbors,
+                sim_min: CANDIDATE_SIM_MIN,
+                excluded_refs: &excluded_refs,
+                open_pairs: &open_pairs,
+                max_pairs: MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+            });
+            if pairs.len() > budget_left {
+                report.budget_hit = true;
+                break;
+            }
+            let mut reasoner_failed = false;
+            for (a, b) in pairs {
+                let (older, newer) = if ref_ts(&a) <= ref_ts(&b) { (a, b) } else { (b, a) };
+                let (Some(ot), Some(nt)) = (ref_text(&older), ref_text(&newer)) else {
+                    report.dropped += 1;
+                    continue;
+                };
+                report.judged += 1;
+                budget_left -= 1;
+                match crate::conflict::judge_pair(reasoner, &ot, &nt) {
+                    Ok(Some(v)) => {
+                        // [I7 FIX — do NOT use the plan's `log::debug!("... {}", v.why)`. This runs as
+                        // a daemon under launchd/systemd, which capture BOTH stdout and stderr to
+                        // persistent log files, so neither `log::` nor `eprintln!` is ephemeral. The
+                        // model's raw `v.why` is attacker-influenceable free text, so it is DISCARDED
+                        // ENTIRELY — never logged/printed. Only structured, non-sensitive verdict
+                        // fields are traced. The persisted `why` (below) is the content-free template.]
+                        log::debug!(
+                            "conflict verdict: winner={} confidence={}",
+                            winner_str(v.winner),
+                            v.confidence
+                        );
+                        let pk = Self::conflict_pair_key(&older, &newer);
+                        if open_count >= CONFLICT_OPEN_CEILING {
+                            report.ceiling_hit = true;
+                            continue;
+                        }
+                        // Durable authoritative re-check against PERSISTED proposals before the signed
+                        // append — an independent-source guard (the in-memory open_pairs pre-filter in
+                        // decide_conflict_sweep is the fast path that already screened candidates and
+                        // saved judge calls; this backstops an open_pairs-maintenance bug on the
+                        // highest-stakes write).
+                        if self.is_conflict_proposal_suppressed(&older, &newer)? {
+                            continue;
+                        }
+                        let why = templated_why(
+                            winner_str(v.winner),
+                            confidence_band(v.confidence),
+                            ref_kind(&older),
+                            ref_kind(&newer),
+                        );
+                        let sources: Vec<String> = [ref_source_event(&older), ref_source_event(&newer)]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        self.append_conflict_proposal(
+                            &older,
+                            &newer,
+                            winner_str(v.winner),
+                            confidence_band(v.confidence),
+                            &why,
+                            detected_at,
+                            &sources,
+                        )?;
+                        open_pairs.insert(pk);
+                        open_count += 1;
+                        report.proposed += 1;
+                    }
+                    Ok(None) => report.dropped += 1,
+                    Err(_) => {
+                        report.reasoner_errors += 1;
+                        reasoner_failed = true;
+                        break;
+                    }
+                }
+            }
+            if reasoner_failed {
+                break;
+            }
+            self.set_conflict_cursor(cs.seq, cs.within_seq_id + 1)?;
+        }
+        Ok(report)
     }
 
     /// Resolve one entity `mention` against the existing entity nodes (spec §6):
@@ -6096,6 +6601,38 @@ impl EventLog {
             "INSERT INTO evolve_cursor (id, last_seq) VALUES (0, ?1)
              ON CONFLICT(id) DO UPDATE SET last_seq = ?1",
             rusqlite::params![last_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Read the conflict cursor `(last_seq, subject_offset)`; `(0, 0)` if never set. All subjects of
+    /// the event at `last_seq` with within-seq id `< subject_offset` are fully judged (a note is one
+    /// subject at id 0; a capture's passages use `passage_id`). Persistent progress state, NOT a fold
+    /// (spec §3.2) — losing it only re-searches idempotently.
+    pub fn conflict_cursor(&self) -> Result<(i64, usize), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let row: Option<(i64, i64)> = store
+            .conn()
+            .query_row(
+                "SELECT last_seq, subject_offset FROM conflict_cursor WHERE id = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(s, o)| (s, o as usize)).unwrap_or((0, 0)))
+    }
+
+    /// Advance the conflict cursor to `(last_seq, subject_offset)` (idempotent single-row upsert).
+    pub fn set_conflict_cursor(
+        &self,
+        last_seq: i64,
+        subject_offset: usize,
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO conflict_cursor (id, last_seq, subject_offset) VALUES (0, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET last_seq = ?1, subject_offset = ?2",
+            rusqlite::params![last_seq, subject_offset as i64],
         )?;
         Ok(())
     }
@@ -6525,6 +7062,42 @@ impl EventLog {
         Ok(())
     }
 
+    /// Whether Rung-3 conflict detection is enabled (spec §3.6). STICKY / fail-closed via
+    /// [`EventLog::latest_config_value`]'s newest-first scan; DEFAULT CLOSED (a never-set flag
+    /// reads `false`), so the sweep never runs for a user who never consented (I3).
+    pub fn conflict_detect_enabled(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(ConfigFlag::ConflictDetect.key())?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// Flip the conflict-detection switch by appending ONE signed + hash-chained control `config`
+    /// event `{ "conflict_detect_enabled": <enabled> }`. The ONLY writer of the key (so the reader
+    /// can never drift the shape). Carries no model fields → never disturbs `active_model`. Mirrors
+    /// [`EventLog::set_mandates_enabled`].
+    pub fn set_conflict_detect_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(CONFLICT_DETECT_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
     /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
     ///
@@ -6559,6 +7132,93 @@ impl EventLog {
             }
         }
         Ok(out)
+    }
+
+    /// New conflict subjects at or after the cursor position, `(seq ASC, within_seq_id ASC)`, from
+    /// at most `limit` source EVENTS (a capture expands to its passages, so the returned Vec may
+    /// exceed `limit`). For the IN-PROGRESS event (`seq == cursor_seq`) subjects with within-seq id
+    /// `< subject_offset` are skipped (already judged); newer events skip nothing. Notes: only
+    /// CURRENT memory events. Passages: only a capture that is the CURRENT head for its `session_id`
+    /// (not superseded / tombstoned) and only its non-retired passages, ordered by `passage_id`
+    /// (retiring a passage skips it but does NOT renumber siblings, so `subject_offset` stays valid
+    /// across cycles).
+    ///
+    /// This is a best-effort forward-looking snapshot; its correctness rests on the cursor being
+    /// forward-only, idempotent (an already-open pair is never re-proposed downstream), and advanced
+    /// by a SINGLE caller (the sweeper). A memory superseded / retired / capture-superseded between
+    /// this events-read and the later folds is only ever DROPPED (safe — a phantom conflict is worse
+    /// than a missed one), and anything newly appended lands beyond the `LIMIT` window and is caught
+    /// next cycle. Cost: a full `fold_sessions` + `current_notes` per call regardless of `limit`
+    /// (acceptable at Phase-2 scale; a later sweeper may compute the fold once and pass it in).
+    pub fn unprocessed_conflict_subjects_since(
+        &self,
+        cursor_seq: i64,
+        subject_offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ConflictSubject>, BossclawError> {
+        use crate::index::ConflictRef;
+        // Source events at OR after the cursor's seq (the in-progress event is re-scanned so its
+        // not-yet-judged subjects resume), oldest first, bounded.
+        let rows: Vec<(i64, String, String)> = {
+            let store = self.inner.lock().expect(POISON);
+            let conn = store.conn();
+            let mut stmt = conn.prepare(
+                "SELECT seq, id, event_type FROM events
+                 WHERE event_type IN (?1, ?2) AND seq >= ?3 ORDER BY seq ASC LIMIT ?4",
+            )?;
+            let mapped = stmt.query_map(
+                rusqlite::params![
+                    MEMORY_EVENT_TYPE,
+                    crate::graph::SESSION_CAPTURED_EVENT_TYPE,
+                    cursor_seq,
+                    limit as i64
+                ],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            out
+        };
+        // Fold once for the current-head + retired-passage checks (deterministic).
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let current_note_ids: std::collections::HashSet<String> =
+            self.current_notes()?.into_iter().map(|n| n.event_id).collect();
+
+        let mut subjects = Vec::new();
+        for (seq, id, etype) in rows {
+            // Skip the already-judged prefix ONLY for the in-progress event; newer events skip 0.
+            let skip_below = if seq == cursor_seq { subject_offset } else { 0 };
+            if etype == MEMORY_EVENT_TYPE {
+                // A note is ONE subject at within-seq id 0 — included iff not already judged.
+                if skip_below == 0 && current_note_ids.contains(&id) {
+                    subjects.push(ConflictSubject {
+                        seq,
+                        within_seq_id: 0,
+                        subject: ConflictRef::Note { event_id: id },
+                    });
+                }
+                continue;
+            }
+            // session_captured: only the CURRENT head for its session_id contributes passages.
+            let Some(cs) = fold.current.iter().find(|cs| cs.event_id == id) else {
+                continue; // superseded by a newer capture, or tombstoned — not a subject
+            };
+            let sid = cs.session_id.clone();
+            let n = self.session_passage_count(&id)?;
+            for pid in skip_below..n {
+                if fold.retired_passages.contains(&(sid.clone(), pid)) {
+                    continue; // retired passage — never a subject
+                }
+                subjects.push(ConflictSubject {
+                    seq,
+                    within_seq_id: pid,
+                    subject: ConflictRef::Passage { session_id: sid.clone(), passage_id: pid },
+                });
+            }
+        }
+        Ok(subjects)
     }
 
     /// Every `Event` whose `event_type` is in `types`, in `seq ASC` (append) order.
@@ -8313,6 +8973,21 @@ struct SessionFold {
     retired_passages: std::collections::HashSet<(String, usize)>,
 }
 
+/// One OPEN conflict proposal, folded from a `conflict_proposal` event whose BOTH refs are still
+/// current. Carries the full persisted shape (idempotency reads only `a_ref`/`b_ref`; the
+/// `pending_conflict_proposals` projection reads all seven). Internal; the PUBLIC row is
+/// [`ConflictProposalRow`] (Task 7). Private, so no field docs.
+#[cfg(unix)]
+struct OpenConflictProposal {
+    id: String,
+    a_ref: crate::index::ConflictRef,
+    b_ref: crate::index::ConflictRef,
+    winner_hint: String,
+    confidence_band: String,
+    why: String,
+    detected_at: i64,
+}
+
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
 /// `session_captured` + `session_deleted` + `supersede` + the Rung-3 retire
 /// markers (`note_retired` / `passage_retired` / `unretire`) in `seq ASC`
@@ -8514,6 +9189,170 @@ mod tests {
         EventLog::open(&dir.join("m.db"), &DEK, key).unwrap()
     }
 
+    /// Rung-3 Phase-2 (§3.5, I5/I7): a conflict proposal is a signed event carrying ONLY typed refs,
+    /// an advisory winner hint, a coarse band, a CONTENT-FREE templated `why`, and `detected_at` —
+    /// never a memory body. `#[cfg(unix)]` (mirrors the write_proposal family / `build_proposer_event`).
+    #[cfg(unix)]
+    #[test]
+    fn append_conflict_proposal_stores_typed_refs_and_no_body() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let a = ConflictRef::Note { event_id: "n_old".into() };
+        let b = ConflictRef::Passage { session_id: "s1".into(), passage_id: 2 };
+        let why = crate::conflict::templated_why("newer", "high", "note", "passage");
+        let id = log
+            .append_conflict_proposal(&a, &b, "newer", "high", &why, 1_720_000_000, &["n_old".into(), "cap_ev".into()])
+            .unwrap();
+        let ev = log.event_by_id(&id).unwrap().unwrap();
+        assert_eq!(ev.event_type, crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE);
+        assert_eq!(ConflictRef::from_json(&ev.content["a_ref"]), Some(a));
+        assert_eq!(ConflictRef::from_json(&ev.content["b_ref"]), Some(b));
+        assert_eq!(ev.content["winner_hint"], "newer");
+        assert_eq!(ev.content["confidence_band"], "high");
+        assert_eq!(ev.content["why"], why, "stored why is the content-free template");
+        assert_eq!(ev.content["detected_at"], 1_720_000_000i64);
+        // I7: no memory-body / raw-text / raw-confidence field is persisted (only refs + template why).
+        for forbidden in ["text", "a_text", "b_text", "body", "confidence"] {
+            assert!(ev.content.get(forbidden).is_none(), "no {forbidden} field on the proposal");
+        }
+        // Lineage is the referenced memory event ids.
+        let sources = ev.model_meta.as_ref().unwrap().source_event_ids.clone();
+        assert_eq!(sources, vec!["n_old".to_string(), "cap_ev".to_string()]);
+    }
+
+    /// Rung-3 Phase-2 (§3.5, I9): a proposal for an unordered typed pair suppresses a duplicate for
+    /// the SAME pair (either order) but not a different pair — covering both a note↔note pair and a
+    /// cross-kind note↔passage pair (whose `pair_key`s have different shapes, so the sort bites).
+    /// `#[cfg(unix)]` (uses the append family).
+    #[cfg(unix)]
+    #[test]
+    fn conflict_proposal_idempotency_is_unordered_by_typed_pair() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let log = open_log(dir.path());
+        // Two CURRENT notes so both refs resolve (open).
+        let n1 = log.remember(&emb, "branch is master").unwrap();
+        let n2 = log.remember(&emb, "renamed default branch to main").unwrap();
+        let a = ConflictRef::Note { event_id: n1.clone() };
+        let b = ConflictRef::Note { event_id: n2.clone() };
+        let why = crate::conflict::templated_why("newer", "high", "note", "note");
+        assert!(!log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "no proposal yet");
+        log.append_conflict_proposal(&a, &b, "newer", "high", &why, 1, &[n1.clone(), n2.clone()]).unwrap();
+        assert!(log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "same pair suppressed");
+        assert!(log.is_conflict_proposal_suppressed(&b, &a).unwrap(), "reversed order also suppressed");
+        // A different pair is not suppressed.
+        let n3 = log.remember(&emb, "unrelated note").unwrap();
+        let c = ConflictRef::Note { event_id: n3 };
+        assert!(!log.is_conflict_proposal_suppressed(&a, &c).unwrap(), "different pair not suppressed");
+
+        // Cross-kind: a Note pair_key vs a Passage pair_key differ in shape, so `conflict_pair_key`
+        // must still map either order to the same unordered identity. Capture a CURRENT session with
+        // one passage so the passage ref resolves (open).
+        let cap = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cap, &["we deploy on vercel".to_string()]).unwrap();
+        let p = ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 };
+        let why_np = crate::conflict::templated_why("newer", "high", "note", "passage");
+        assert!(!log.is_conflict_proposal_suppressed(&a, &p).unwrap(), "no cross-kind proposal yet");
+        log.append_conflict_proposal(&a, &p, "newer", "high", &why_np, 2, &[n1.clone(), cap.clone()]).unwrap();
+        assert!(log.is_conflict_proposal_suppressed(&a, &p).unwrap(), "cross-kind pair suppressed");
+        assert!(log.is_conflict_proposal_suppressed(&p, &a).unwrap(), "cross-kind reversed order also suppressed");
+        // A note↔different-passage pair is not suppressed.
+        let p_other = ConflictRef::Passage { session_id: "s1".into(), passage_id: 1 };
+        assert!(!log.is_conflict_proposal_suppressed(&a, &p_other).unwrap(), "note↔different-passage not suppressed");
+    }
+
+    /// Rung-3 Phase-2 (§6.4, I-gc): pending lists an open proposal; retiring / deleting / editing a
+    /// referenced memory withdraws it (fold-derived → restart-safe) and frees the pair to re-propose.
+    /// `#[cfg(unix)]` (uses the append/projection family).
+    #[cfg(unix)]
+    #[test]
+    fn pending_conflict_proposals_project_and_gc_withdraw() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let log = open_log(dir.path());
+        let n1 = log.remember(&emb, "branch is master").unwrap();
+        let n2 = log.remember(&emb, "renamed default branch to main").unwrap();
+        let a = ConflictRef::Note { event_id: n1.clone() };
+        let b = ConflictRef::Note { event_id: n2.clone() };
+        let why = crate::conflict::templated_why("newer", "high", "note", "note");
+        log.append_conflict_proposal(&a, &b, "newer", "high", &why, 1, &[n1.clone(), n2.clone()]).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "one open proposal");
+
+        // Retire one referenced note → the proposal is GC-withdrawn and the pair is re-proposable.
+        log.retire_memory(&n1).unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "withdrawn on retire");
+        assert!(!log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "pair freed to re-propose");
+
+        // Unretire restores currency → the SAME signed proposal is open again (fold-derived).
+        log.unretire(&n1).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "restored on unretire");
+
+        // Editing (supersede) a referenced note mints a NEW id → old ref no longer current → withdrawn.
+        log.supersede_note(&emb, &n2, "default branch is main now").unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "withdrawn on edit (supersede)");
+    }
+
+    /// Rung-3 Phase-2 (§6.4, I-gc): a session BODY edit (a same-`session_id` supersede that emits no
+    /// `passage_retired`) that re-chunks to FEWER passages withdraws any open proposal referencing an
+    /// ordinal the NEW head no longer has — the ordinal-existence half of the passage GC story, proven
+    /// at the shared open set so suppression and the projection agree. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn pending_conflict_proposals_withdraws_passage_when_ordinal_vanishes_on_recapture() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+        let log = open_log(dir.path());
+
+        // A current note + a capture of s1 with THREE passages (ordinals 0,1,2).
+        let n = log.remember(&emb, "branch is master").unwrap();
+        let cap_old = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(
+            &emb,
+            &cap_old,
+            &["p0".to_string(), "p1".to_string(), "p2".to_string()],
+        )
+        .unwrap();
+        let note_ref = ConflictRef::Note { event_id: n.clone() };
+        let p0 = ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 };
+        let p2 = ConflictRef::Passage { session_id: "s1".into(), passage_id: 2 };
+        let why = crate::conflict::templated_why("newer", "high", "note", "passage");
+        // TWO proposals: one on the SOON-TO-VANISH ordinal 2, one on the SURVIVING ordinal 0. Both
+        // refs currently resolve (ordinals 0 and 2 both exist in the 3-passage head) → both are open.
+        log.append_conflict_proposal(&note_ref, &p2, "newer", "high", &why, 1, &[n.clone(), cap_old.clone()])
+            .unwrap();
+        log.append_conflict_proposal(&note_ref, &p0, "newer", "high", &why, 2, &[n.clone(), cap_old.clone()])
+            .unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 2, "ordinals 0 and 2 both exist → both open");
+
+        // Re-capture s1 (different sha ⇒ supersedes the old capture) re-chunked to only TWO passages
+        // (ordinals 0,1). Ordinal 2 no longer exists in the current head, yet no `passage_retired`
+        // marker was emitted — only the ordinal-existence check can withdraw it.
+        let cap_new = log.capture_session(&emb, &session_meta("s1", "bb")).unwrap();
+        assert_ne!(cap_old, cap_new, "different-sha recapture supersedes the old capture");
+        log.store_session_passages(&emb, &cap_new, &["q0".to_string(), "q1".to_string()]).unwrap();
+
+        // SELECTIVE withdrawal: ONLY the vanished-ordinal proposal drops; the surviving-ordinal one
+        // stays open. A whole-session over-withdrawal (e.g. a mis-wired 0 count) would empty BOTH, so
+        // asserting the survivor remains is what distinguishes correct from over-aggressive GC.
+        assert_eq!(
+            log.pending_conflict_proposals().unwrap().len(),
+            1,
+            "only the ordinal-2 proposal withdrew; the ordinal-0 proposal remains open"
+        );
+        assert!(
+            !log.is_conflict_proposal_suppressed(&note_ref, &p2).unwrap(),
+            "the vanished-ordinal pair (ordinal 2) is freed to re-propose"
+        );
+        assert!(
+            log.is_conflict_proposal_suppressed(&note_ref, &p0).unwrap(),
+            "the surviving-ordinal pair (ordinal 0) is STILL suppressed — not over-withdrawn"
+        );
+    }
+
     #[test]
     fn remember_appends_external_tainted_recallable_memory() {
         let dir = tempfile::tempdir().unwrap();
@@ -8588,6 +9427,122 @@ mod tests {
         );
     }
 
+    /// Rung-3 Phase-2 (§3.2/§3.3): the `(seq, subject_offset)` cursor round-trips + survives reopen; the
+    /// enumeration returns each NEW note (within-seq id 0) and each NEW capture's live passages (within-
+    /// seq ids = passage_id); and RESUMING at a within-capture offset skips already-judged passages.
+    #[test]
+    fn conflict_cursor_and_subject_enumeration_are_incremental() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(8);
+
+        let (persisted_seq, persisted_off) = {
+            let log = open_log(dir.path());
+            assert_eq!(log.conflict_cursor().unwrap(), (0, 0), "unset cursor defaults to (0, 0)");
+            let note_id = log.remember(&emb, "branch is main").unwrap();
+            let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+            log.store_session_passages(&emb, &ev, &["p0".to_string(), "p1".to_string()]).unwrap();
+
+            // From (0, 0): the note (within-seq id 0) + the capture's two passages (within-seq ids 0, 1).
+            let subjects = log.unprocessed_conflict_subjects_since(0, 0, 64).unwrap();
+            let refs: Vec<ConflictRef> = subjects.iter().map(|s| s.subject.clone()).collect();
+            assert!(refs.contains(&ConflictRef::Note { event_id: note_id.clone() }));
+            assert!(refs.contains(&ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 }));
+            assert!(refs.contains(&ConflictRef::Passage { session_id: "s1".into(), passage_id: 1 }));
+
+            // Within-capture resume: from the capture's seq at offset 1, passage 0 is skipped (judged),
+            // passage 1 still pends — this is the anti-stall resume.
+            let cap_seq = subjects
+                .iter()
+                .find(|s| matches!(s.subject, ConflictRef::Passage { .. }))
+                .unwrap()
+                .seq;
+            let resumed = log.unprocessed_conflict_subjects_since(cap_seq, 1, 64).unwrap();
+            assert!(
+                !resumed.iter().any(|s| matches!(&s.subject, ConflictRef::Passage { passage_id: 0, .. })),
+                "passage 0 of the in-progress capture is skipped at offset 1"
+            );
+            assert!(
+                resumed.iter().any(|s| matches!(&s.subject, ConflictRef::Passage { passage_id: 1, .. })),
+                "passage 1 still pending at offset 1"
+            );
+
+            // Advancing past the last subject empties the queue.
+            let max_seq = subjects.iter().map(|s| s.seq).max().unwrap();
+            let last_off =
+                subjects.iter().filter(|s| s.seq == max_seq).map(|s| s.within_seq_id).max().unwrap();
+            log.set_conflict_cursor(max_seq, last_off + 1).unwrap();
+            assert!(log.unprocessed_conflict_subjects_since(max_seq, last_off + 1, 64).unwrap().is_empty());
+            (max_seq, last_off + 1)
+        };
+        // Restart: the cursor is persistent progress state (survives reopen) — assert the EXACT
+        // round-trip, so a column swap or wrong-offset persist can't slip through.
+        let log = open_log(dir.path());
+        let (cseq, coff) = log.conflict_cursor().unwrap();
+        assert_eq!(
+            (cseq, coff),
+            (persisted_seq, persisted_off),
+            "cursor round-trips exactly across reopen"
+        );
+        assert!(
+            log.unprocessed_conflict_subjects_since(cseq, coff, 64).unwrap().is_empty(),
+            "nothing new after restart"
+        );
+    }
+
+    /// Rung-3 Phase-2 (§3.3): the enumeration's exclusion GATES — the whole point of the fold — are
+    /// each a live subject that must NOT appear. Pins all three negative paths (a positive-only test
+    /// would still pass if a gate were deleted): a superseded note's old head is dropped (its live
+    /// replacement kept); a `note_retired` note is dropped; a retired passage is dropped (its sibling
+    /// kept); and a supersede-replaced capture contributes ZERO passage subjects (only the current
+    /// head for the `session_id` does).
+    #[test]
+    fn conflict_subject_enumeration_respects_current_head_and_retire_gates() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // (1) A note that gets SUPERSEDED (edited) — old head must drop, replacement must stay.
+        let note_old = log.remember(&emb, "the branch is main").unwrap();
+        let note_new = log.supersede_note(&emb, &note_old, "the branch is trunk").unwrap();
+        // (2) A note that gets RETIRED via the distinct note_retired marker — must drop.
+        let note_retired = log.remember(&emb, "db is postgres").unwrap();
+        log.retire_memory(&note_retired).unwrap();
+        // (3) A capture whose passage 0 is RETIRED — passage 0 drops, passage 1 stays.
+        let cap_s2 = log.capture_session(&emb, &session_meta("s2", "cc")).unwrap();
+        log.store_session_passages(&emb, &cap_s2, &["p0".to_string(), "p1".to_string()]).unwrap();
+        log.retire_passage("s2", 0).unwrap();
+        // (4) A capture SUPERSEDED by a newer capture of the SAME session_id (different sha) — the
+        // OLD capture event must contribute zero passage subjects; only the new head's do.
+        let cap_s1_old = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cap_s1_old, &["a0".to_string(), "a1".to_string()]).unwrap();
+        let cap_s1_new = log.capture_session(&emb, &session_meta("s1", "bb")).unwrap();
+        log.store_session_passages(&emb, &cap_s1_new, &["b0".to_string(), "b1".to_string()]).unwrap();
+        assert_ne!(cap_s1_old, cap_s1_new, "the different-sha recapture supersedes the old capture");
+
+        let subjects = log.unprocessed_conflict_subjects_since(0, 0, 64).unwrap();
+        let has = |r: ConflictRef| subjects.iter().any(|s| s.subject == r);
+
+        // (1) supersede: old head excluded, replacement present.
+        assert!(!has(ConflictRef::Note { event_id: note_old.clone() }), "superseded note's old head is excluded");
+        assert!(has(ConflictRef::Note { event_id: note_new.clone() }), "the live replacement note IS enumerated");
+        // (2) note_retired: excluded.
+        assert!(!has(ConflictRef::Note { event_id: note_retired.clone() }), "a note_retired note is excluded");
+        // (3) passage retire: passage 0 excluded, sibling present.
+        assert!(!has(ConflictRef::Passage { session_id: "s2".into(), passage_id: 0 }), "retired passage 0 of s2 is excluded");
+        assert!(has(ConflictRef::Passage { session_id: "s2".into(), passage_id: 1 }), "non-retired sibling passage 1 of s2 is enumerated");
+        // (4) capture supersede: only the current head contributes — exactly 2 s1 passage subjects,
+        // not 4 (a broken current-head gate would double them from the superseded old capture too).
+        let s1_passages = subjects
+            .iter()
+            .filter(|s| matches!(&s.subject, ConflictRef::Passage { session_id, .. } if session_id == "s1"))
+            .count();
+        assert_eq!(s1_passages, 2, "only the current-head capture of s1 contributes its 2 passages (the superseded old capture contributes none)");
+        assert!(has(ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 }));
+        assert!(has(ConflictRef::Passage { session_id: "s1".into(), passage_id: 1 }));
+    }
+
     /// Rung-3 Phase-1 (§7.1): the SEPARATE conflict index retrieves a captured
     /// session's passages keyed by the fold-resolved `session_id` (not the raw
     /// capture event id), and building it leaves the recall `vector_index`
@@ -8608,6 +9563,74 @@ mod tests {
         let hits = log.conflict_search(&emb.embed(&["Vercel".into()]).unwrap()[0], 8); // k ≥ #chunks → membership stable
         assert!(hits.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0)); // session id resolved via fold head
         assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
+    }
+
+    /// Rung-3 Phase-2 (§2): the conflict index holds BOTH a note body and a session passage; the
+    /// typed search returns each as its `ConflictRef` kind; the recall `vector_index` stays untouched.
+    #[test]
+    fn conflict_index_note_arm_and_passage_arm_are_both_typed_searchable() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A note whose body is embeddable.
+        let note_id = log.remember(&emb, "the default git branch is main").unwrap();
+        // A captured session with one passage.
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &ev, &["we deploy on vercel".to_string()]).unwrap();
+
+        log.rebuild_indexes(&emb).unwrap();
+        let recall_len = log.vector_index_len();
+        log.rebuild_conflict_index(&emb).unwrap();
+
+        // The note is retrievable as a Note ref.
+        let note_hits =
+            log.conflict_search_refs(&emb.embed(&["default git branch".into()]).unwrap()[0], 8);
+        assert!(
+            note_hits.iter().any(|(r, _)| *r == ConflictRef::Note { event_id: note_id.clone() }),
+            "note body is a typed Note hit"
+        );
+        // The passage is retrievable as a Passage ref.
+        let pass_hits = log.conflict_search_refs(&emb.embed(&["vercel".into()]).unwrap()[0], 8);
+        assert!(
+            pass_hits
+                .iter()
+                .any(|(r, _)| *r == ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 }),
+            "passage is a typed Passage hit"
+        );
+        // The recall index was not perturbed by adding the note arm.
+        assert_eq!(log.vector_index_len(), recall_len, "recall vector_index byte-untouched");
+
+        // The legacy passage-tuple search still works (memharness contract).
+        let legacy = log.conflict_search(&emb.embed(&["vercel".into()]).unwrap()[0], 8);
+        assert!(legacy.iter().any(|(sid, pid, _)| sid == "s1" && *pid == 0));
+    }
+
+    /// Rung-3 Phase-2 (§2): the note arm inherits `current_notes`' supersede exclusion — a
+    /// SUPERSEDED note's old head must NOT enter the fights index (a phantom-conflict false
+    /// positive is the worst detector failure), while its live replacement MUST. Pins the
+    /// exclusion AT the conflict-index level, not just at recall.
+    #[test]
+    fn superseded_note_is_excluded_from_conflict_index_but_replacement_is_present() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        let old = log.remember(&emb, "the default git branch is master").unwrap();
+        let replacement = log.supersede_note(&emb, &old, "the default git branch is main").unwrap();
+        log.rebuild_conflict_index(&emb).unwrap();
+
+        let hits = log.conflict_search_refs(&emb.embed(&["default git branch".into()]).unwrap()[0], 8);
+        assert!(
+            !hits.iter().any(|(r, _)| *r == ConflictRef::Note { event_id: old.clone() }),
+            "superseded note head is NOT in the fights index"
+        );
+        assert!(
+            hits.iter().any(|(r, _)| *r == ConflictRef::Note { event_id: replacement.clone() }),
+            "the live replacement note IS in the fights index"
+        );
     }
 
     /// Rung-3 Phase-1 (§7.1): a BUILT-but-EMPTY conflict index yields no hits. This
@@ -9234,6 +10257,22 @@ mod tests {
         assert_eq!(log.capture_enabled_at().unwrap(), None, "no ON transition yet ⇒ no timestamp");
     }
 
+    /// Rung-3 Phase-2 (§3.6, I3): conflict-detect is DEFAULT-CLOSED, is sticky once set, and
+    /// registers as explicitly-set (what the boot force-off keys off).
+    #[test]
+    fn conflict_detect_flag_is_default_closed_and_sticky() {
+        use crate::ConfigFlag;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        assert!(!log.conflict_detect_enabled().unwrap(), "default CLOSED");
+        assert!(!log.explicitly_set(ConfigFlag::ConflictDetect).unwrap(), "never set yet");
+        log.set_conflict_detect_enabled(true).unwrap();
+        assert!(log.conflict_detect_enabled().unwrap(), "sticky ON after set");
+        assert!(log.explicitly_set(ConfigFlag::ConflictDetect).unwrap(), "now explicit");
+        log.set_conflict_detect_enabled(false).unwrap();
+        assert!(!log.conflict_detect_enabled().unwrap(), "sticky OFF");
+    }
+
     /// SP3 §6a: the Integrations-toggle path — enable ongoing capture WITHOUT backfill. Records the
     /// `capture_enabled_at` timestamp, marks the flag explicitly set, and leaves backfill un-granted
     /// (a later plain toggle is NOT history consent — critic M4).
@@ -9570,5 +10609,416 @@ mod tests {
             b"v1 edited bytes",
             "the tampered undo must not write the injected bytes"
         );
+    }
+
+    /// Rung-3 Phase-2 (§3.3–§3.5, I3/I4/I6/I7): one cycle over two contradicting notes emits exactly
+    /// one proposal with a CONTENT-FREE `why` (the model's raw rationale never persists); a second
+    /// cycle with nothing new does ZERO judge calls (proven with a PanicReasoner); gate-off is a no-op.
+    /// `#[cfg(unix)]` (drives the append family).
+    #[cfg(unix)]
+    #[test]
+    fn detect_conflicts_once_proposes_then_is_incremental_and_gated() {
+        use crate::conflict::build_conflict_prompt;
+        use crate::reason::{Reasoner, ScriptedReasoner};
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64); // dim=64: the dim=8 marquee pair falls below CANDIDATE_SIM_MIN
+        let log = open_log(dir.path());
+
+        // Two near-duplicate notes (one token apart) so the finder clears the similarity floor.
+        let older_text = "the default deploy target is vercel";
+        let newer_text = "the default deploy target is fly";
+        let _older = log.remember(&emb, older_text).unwrap();
+        let _newer = log.remember(&emb, newer_text).unwrap();
+
+        // Script the pair as a contradiction whose model `why` embeds a memory fragment SENTINEL — the
+        // stored `why` must NOT contain it (I7: persisted why is a content-free template).
+        let reasoner = ScriptedReasoner::new("test").with_response(
+            crate::conflict::CONFLICT_SYSTEM,
+            &build_conflict_prompt(older_text, newer_text),
+            serde_json::json!({ "contradicts": true, "winner": "newer", "confidence": 92, "why": "SENTINEL_LEAK vercel vs fly verbatim" }),
+        );
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        // Gate OFF → skipped, no proposal (I3). PanicReasoner proves zero model calls.
+        struct PanicReasoner;
+        impl Reasoner for PanicReasoner {
+            fn complete_json(&self, _s: &str, _p: &str, _sc: &serde_json::Value) -> Result<serde_json::Value, BossclawError> {
+                panic!("reasoner must not be called");
+            }
+            fn model_id(&self) -> &str { "panic" }
+        }
+        let off = log.detect_conflicts_once(&emb, &PanicReasoner, &no_passages, &empty, 100).unwrap();
+        assert!(off.skipped_disabled && off.proposed == 0, "gate off is a no-op with no model call");
+
+        // Enable + run: exactly one proposal, with a content-free `why`.
+        log.set_conflict_detect_enabled(true).unwrap();
+        let r1 = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 100).unwrap();
+        assert_eq!(r1.proposed, 1, "one contradiction proposed");
+        let pending = log.pending_conflict_proposals().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].why.contains("SENTINEL_LEAK"), "I7: model's raw why never persisted");
+        assert!(pending[0].why.contains("confidence"), "why is the content-free template");
+
+        // Second cycle, nothing new since the cursor → ZERO judge calls (PanicReasoner must not fire).
+        let r2 = log.detect_conflicts_once(&emb, &PanicReasoner, &no_passages, &empty, 100).unwrap();
+        assert_eq!(r2.judged, 0, "no new subjects → no judging (cursor incrementality, I4)");
+        assert_eq!(r2.proposed, 0);
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "still exactly one (idempotent)");
+    }
+
+    /// Rung-3 Phase-2 (§3.3, I4 — the multi-passage NO-STALL fix): a single capture whose near-
+    /// duplicate passages produce MORE candidate pairs (up to C(5,2)=10) than one cycle's budget (8)
+    /// must NOT defer the whole seq-group. Detection advances SUBJECT-BY-SUBJECT across cycles, emits
+    /// passage-pair proposals, judges every subject with no mid-pipeline drop, fully drains (no
+    /// permanent stall), and is restart-safe. The OLD whole-seq-group-deferral bug would leave `r1`
+    /// with ZERO proposals and never advance the cursor within the capture — both asserted below.
+    ///
+    /// The fights index is an APPROXIMATE ANN rebuilt each cycle, so over a tight cluster of near-
+    /// identical passages (tied distances) the EXACT number of the ≤10 pairs surfaced is not
+    /// deterministic (correlated misses within one build can leave a few unsurfaced). This test
+    /// therefore asserts the ENGINE invariants (no-stall / drip / no-drop / restart), which ARE
+    /// deterministic — not exhaustive ANN recall, which is not an engine guarantee.
+    #[cfg(unix)]
+    #[test]
+    fn detect_conflicts_once_advances_multi_passage_capture_without_stall() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64);
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        let chunks: Vec<String> = ["alpha", "bravo", "charlie", "delta", "echo"]
+            .iter()
+            .map(|w| format!("config {w} sets the deploy target to vercel"))
+            .collect();
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &ev, &chunks).unwrap();
+
+        let chunks2 = chunks.clone();
+        let passage_text = move |sid: &str, pid: usize| -> Option<String> {
+            if sid == "s1" { chunks2.get(pid).cloned() } else { None }
+        };
+        // Script BOTH orderings of every pair. The passages are near-identical (tied cosine distances),
+        // so the ANN fights index may surface a pair from either endpoint across runs; a real reasoner
+        // answers either order, so the double MUST too (else a reversed pair would spuriously error and
+        // stall — an artifact of the mock, not of the engine).
+        let mut reasoner = ScriptedReasoner::new("test");
+        for i in 0..chunks.len() {
+            for j in 0..chunks.len() {
+                if i == j {
+                    continue;
+                }
+                reasoner = reasoner.with_response(
+                    CONFLICT_SYSTEM,
+                    &build_conflict_prompt(&chunks[i], &chunks[j]),
+                    serde_json::json!({ "contradicts": true, "winner": "unclear", "confidence": 90, "why": "same target" }),
+                );
+            }
+        }
+        let empty = std::collections::HashSet::new();
+
+        let before = log.conflict_cursor().unwrap();
+        let r1 = log.detect_conflicts_once(&emb, &reasoner, &passage_text, &empty, 1).unwrap();
+        assert!(r1.judged <= 8, "cycle judging is budget-bounded ({})", r1.judged);
+        assert!(r1.proposed >= 1, "passage-pair proposals ARE emitted (0 under the old whole-group stall)");
+        assert_ne!(log.conflict_cursor().unwrap(), before, "cursor advanced subject-by-subject");
+
+        // Drive to steady state. Each cycle drips a budget-bounded slice; the cursor advances
+        // subject-by-subject and MUST fully drain (a whole-group deferral or a subject stall would
+        // spin `scanned_subjects > 0` forever). `dropped` must stay 0 across every cycle — every
+        // JUDGED pair became a proposal, nothing was judged-then-discarded mid-pipeline.
+        let mut total_dropped = r1.dropped;
+        let mut drained = false;
+        for _ in 0..12 {
+            let rr = log.detect_conflicts_once(&emb, &reasoner, &passage_text, &empty, 1).unwrap();
+            total_dropped += rr.dropped;
+            if rr.scanned_subjects == 0 {
+                drained = true; // no more subjects to enumerate → the cursor consumed all passages
+                break;
+            }
+        }
+        assert!(drained, "the cursor fully drains within a bounded number of cycles (no permanent stall)");
+        assert_eq!(total_dropped, 0, "every judged pair became a proposal — nothing dropped mid-pipeline");
+        let pending = log.pending_conflict_proposals().unwrap().len();
+        assert!(pending >= 1, "passage-pair proposals accumulated across cycles ({pending})");
+
+        drop(log);
+        let log = open_log(dir.path());
+        let r = log.detect_conflicts_once(&emb, &reasoner, &passage_text, &empty, 1).unwrap();
+        assert_eq!(r.judged, 0, "restart: cursor persisted, nothing re-judged");
+        assert_eq!(
+            log.pending_conflict_proposals().unwrap().len(),
+            pending,
+            "no duplicates + no loss after restart (fold-derived open set is stable)"
+        );
+    }
+
+    /// Rung-3 Phase-2 (§3.3, I4): one cycle NEVER exceeds the per-cycle judge budget even when many
+    /// subjects each carry candidate pairs — it stops at `CONFLICT_JUDGE_PER_SWEEP`, flags
+    /// `budget_hit`, and the backlog drips to the next cycle (the cursor keeps advancing).
+    #[cfg(unix)]
+    #[test]
+    fn detect_conflicts_once_caps_judges_at_budget() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_JUDGE_PER_SWEEP, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64);
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // 9 near-duplicate NOTES (8 shared tokens, 1 distinct) — each a distinct subject/seq, all
+        // pairwise clearing the similarity floor (≈8/9 cosine, well above 0.82).
+        let words = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+        let notes: Vec<String> = words
+            .iter()
+            .map(|w| format!("the shared default config parameter setting value is {w}"))
+            .collect();
+        for n in &notes {
+            log.remember(&emb, n).unwrap();
+        }
+        // Script EVERY unordered pair as a contradiction (either prompt order the sweep might build).
+        let mut reasoner = ScriptedReasoner::new("test");
+        for i in 0..notes.len() {
+            for j in 0..notes.len() {
+                if i == j {
+                    continue;
+                }
+                reasoner = reasoner.with_response(
+                    CONFLICT_SYSTEM,
+                    &build_conflict_prompt(&notes[i], &notes[j]),
+                    serde_json::json!({ "contradicts": true, "winner": "unclear", "confidence": 88, "why": "x" }),
+                );
+            }
+        }
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        let r1 = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 1).unwrap();
+        assert!(r1.judged <= CONFLICT_JUDGE_PER_SWEEP, "judging capped at the budget ({})", r1.judged);
+        assert!(r1.budget_hit, "the per-cycle budget was hit (more pairs than one cycle can judge)");
+        assert!(r1.proposed >= 1, "at least one proposal emitted before the budget bit");
+
+        // A follow-up cycle keeps making progress: the cursor advances past ≥1 more subject.
+        let c1 = log.conflict_cursor().unwrap();
+        let _ = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 1).unwrap();
+        assert_ne!(log.conflict_cursor().unwrap(), c1, "backlog drips: the cursor advanced next cycle");
+    }
+
+    /// Rung-3 Phase-2 (§3.3, I6): a reasoner transport/decode failure is a NO-OP for that subject —
+    /// the cycle stops, counts the error, proposes nothing, and does NOT advance the cursor past the
+    /// failed subject, so a LATER cycle with a working reasoner still proposes it (fail-safe resume).
+    #[cfg(unix)]
+    #[test]
+    fn detect_conflicts_once_reasoner_error_is_noop_and_resumable() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64);
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        let older_text = "the default deploy target is vercel";
+        let newer_text = "the default deploy target is fly";
+        log.remember(&emb, older_text).unwrap();
+        log.remember(&emb, newer_text).unwrap();
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        // A reasoner with NO canned response for this pair → `complete_json` errors → `judge_pair` Err.
+        let broken = ScriptedReasoner::new("broken");
+        let before = log.conflict_cursor().unwrap();
+        let r_err = log.detect_conflicts_once(&emb, &broken, &no_passages, &empty, 1).unwrap();
+        assert!(r_err.reasoner_errors >= 1, "the reasoner failure is counted");
+        assert_eq!(r_err.proposed, 0, "a failed judge proposes nothing (I6)");
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 0);
+        assert_eq!(log.conflict_cursor().unwrap(), before, "cursor did NOT skip the failed subject");
+
+        // A later cycle with a correctly-scripted reasoner proposes the SAME pair (nothing was lost).
+        let good = ScriptedReasoner::new("good").with_response(
+            CONFLICT_SYSTEM,
+            &build_conflict_prompt(older_text, newer_text),
+            serde_json::json!({ "contradicts": true, "winner": "newer", "confidence": 91, "why": "y" }),
+        );
+        let r_ok = log.detect_conflicts_once(&emb, &good, &no_passages, &empty, 2).unwrap();
+        assert_eq!(r_ok.proposed, 1, "the once-failed pair proposes on a later working cycle");
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1);
+    }
+
+    /// Rung-3 Phase-2 (§3.5, I9): the open-proposal ceiling caps the pending set. A note cluster whose
+    /// pairwise contradictions EXCEED `CONFLICT_OPEN_CEILING` drains to EXACTLY the ceiling, and at
+    /// least one cycle reports `ceiling_hit` (the quiet "many pending" signal). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn detect_conflicts_once_stops_proposing_at_open_ceiling() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_OPEN_CEILING, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64);
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // 8 near-duplicate notes → C(8,2) = 28 pairwise contradictions > CONFLICT_OPEN_CEILING (20).
+        let words = ["one", "two", "three", "four", "five", "six", "seven", "eight"];
+        let notes: Vec<String> = words
+            .iter()
+            .map(|w| format!("the shared default config parameter setting value is {w}"))
+            .collect();
+        for n in &notes {
+            log.remember(&emb, n).unwrap();
+        }
+        let mut reasoner = ScriptedReasoner::new("test");
+        for i in 0..notes.len() {
+            for j in 0..notes.len() {
+                if i == j {
+                    continue;
+                }
+                reasoner = reasoner.with_response(
+                    CONFLICT_SYSTEM,
+                    &build_conflict_prompt(&notes[i], &notes[j]),
+                    serde_json::json!({ "contradicts": true, "winner": "unclear", "confidence": 88, "why": "x" }),
+                );
+            }
+        }
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        // Drive to steady state (cursor fully drained → a cycle enumerates no new subjects).
+        let mut saw_ceiling = false;
+        for _ in 0..40 {
+            let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 1).unwrap();
+            saw_ceiling |= r.ceiling_hit;
+            if r.scanned_subjects == 0 {
+                break; // nothing left to enumerate — drained
+            }
+        }
+        assert_eq!(
+            log.pending_conflict_proposals().unwrap().len(),
+            CONFLICT_OPEN_CEILING,
+            "the open set is capped at exactly the ceiling"
+        );
+        assert!(saw_ceiling, "some cycle reported ceiling_hit (the quiet 'many pending' signal)");
+    }
+
+    /// Rung-3 Phase-2 (§3.3, the unified fights index headline): a note↔passage cross-kind conflict is
+    /// detected end-to-end through one full cycle — the emitted proposal binds ONE `Note` ref and ONE
+    /// `Passage` ref. `#[cfg(unix)]`, `MockEmbedder::new(64)`.
+    #[cfg(unix)]
+    #[test]
+    fn detect_conflicts_once_detects_note_vs_passage_cross_kind() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_SYSTEM};
+        use crate::index::ConflictRef;
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64);
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // A note and a session passage that are near-duplicates (5/6 shared tokens ≈ 0.833 > 0.82).
+        let note_text = "the default deploy target is vercel";
+        let passage = "the default deploy target is fly".to_string();
+        log.remember(&emb, note_text).unwrap();
+        let ev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &ev, std::slice::from_ref(&passage)).unwrap();
+
+        let passage_owned = passage.clone();
+        let passage_text = move |sid: &str, pid: usize| -> Option<String> {
+            if sid == "s1" && pid == 0 { Some(passage_owned.clone()) } else { None }
+        };
+        // The note is older (remembered first), the passage newer → prompt order (note, passage).
+        let reasoner = ScriptedReasoner::new("test").with_response(
+            CONFLICT_SYSTEM,
+            &build_conflict_prompt(note_text, &passage),
+            serde_json::json!({ "contradicts": true, "winner": "newer", "confidence": 90, "why": "z" }),
+        );
+        let empty = std::collections::HashSet::new();
+
+        let r = log.detect_conflicts_once(&emb, &reasoner, &passage_text, &empty, 5).unwrap();
+        assert_eq!(r.proposed, 1, "the note↔passage contradiction is proposed once");
+        let pending = log.pending_conflict_proposals().unwrap();
+        assert_eq!(pending.len(), 1);
+        let a_is_note = matches!(pending[0].a_ref, ConflictRef::Note { .. });
+        let b_is_note = matches!(pending[0].b_ref, ConflictRef::Note { .. });
+        let a_is_passage = matches!(pending[0].a_ref, ConflictRef::Passage { .. });
+        let b_is_passage = matches!(pending[0].b_ref, ConflictRef::Passage { .. });
+        assert!(
+            (a_is_note && b_is_passage) || (a_is_passage && b_is_note),
+            "the proposal binds exactly one Note ref and one Passage ref (cross-kind)"
+        );
+    }
+
+    /// Rung-3 Phase-2 (§3.3): the judge-declines path — a non-contradiction verdict makes `judge_pair`
+    /// return `Ok(None)`, which is COUNTED as `dropped` and NEVER proposed. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn detect_conflicts_once_counts_judge_declines_as_dropped() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64);
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        let older_text = "the default deploy target is vercel";
+        let newer_text = "the default deploy target is fly";
+        log.remember(&emb, older_text).unwrap();
+        log.remember(&emb, newer_text).unwrap();
+
+        // `contradicts: false` → `judge_pair` returns `Ok(None)` (a decline), even at high confidence.
+        // Script BOTH orderings: a declined pair is not opened, so the second note re-judges the pair
+        // from its own endpoint (reversed order) — a real reasoner answers either order.
+        let decline = serde_json::json!({ "contradicts": false, "winner": "unclear", "confidence": 95, "why": "different scope" });
+        let reasoner = ScriptedReasoner::new("test")
+            .with_response(CONFLICT_SYSTEM, &build_conflict_prompt(older_text, newer_text), decline.clone())
+            .with_response(CONFLICT_SYSTEM, &build_conflict_prompt(newer_text, older_text), decline);
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 3).unwrap();
+        assert!(r.judged >= 1, "the pair WAS judged");
+        assert!(r.dropped >= 1, "a non-contradiction verdict is counted as dropped");
+        assert_eq!(r.proposed, 0, "a declined pair is never proposed");
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "no proposal persisted");
+    }
+
+    /// Rung-3 Phase-2 (§7, I9): on the FIRST enable over a big existing memory set, day one is a
+    /// budget-bounded TRICKLE, not a wall — one cycle judges/proposes at most the per-cycle budget.
+    /// `#[cfg(unix)]` (drives the append family).
+    #[cfg(unix)]
+    #[test]
+    fn first_enable_is_a_trickle_not_a_wall() {
+        use crate::conflict::{build_conflict_prompt, CONFLICT_JUDGE_PER_SWEEP, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let emb = MockEmbedder::new(64); // dim=64 so the near-identical notes clear CANDIDATE_SIM_MIN
+        let log = open_log(dir.path());
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // Seed many near-identical "the flag is X" notes so every pair is a candidate.
+        let mut reasoner = ScriptedReasoner::new("test");
+        let mut texts = Vec::new();
+        for i in 0..12 {
+            let t = format!("the feature flag is value {i} in the shared config");
+            log.remember(&emb, &t).unwrap();
+            texts.push(t);
+        }
+        // Script EVERY ordered pair as a contradiction so nothing is dropped for lack of a response.
+        for i in 0..texts.len() {
+            for j in 0..texts.len() {
+                if i != j {
+                    reasoner = reasoner.with_response(
+                        CONFLICT_SYSTEM,
+                        &build_conflict_prompt(&texts[i], &texts[j]),
+                        serde_json::json!({ "contradicts": true, "winner": "newer", "confidence": 90, "why": "same flag" }),
+                    );
+                }
+            }
+        }
+        let no_passages = |_: &str, _: usize| None;
+        let empty = std::collections::HashSet::new();
+        let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 1).unwrap();
+        assert!(r.judged <= CONFLICT_JUDGE_PER_SWEEP, "day-one judging is budget-bounded ({})", r.judged);
+        assert!(r.proposed <= CONFLICT_JUDGE_PER_SWEEP, "day-one proposals are a trickle ({})", r.proposed);
     }
 }

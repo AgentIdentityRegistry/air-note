@@ -65,6 +65,102 @@ pub fn event_id_of(key: &str) -> &str {
     key.split_once(CHUNK_KEY_SEP).map_or(key, |(id, _)| id)
 }
 
+/// Sentinel prefixing a NOTE key in the unified conflict index. `0x1e` (RS) — like
+/// `CHUNK_KEY_SEP` (`0x1f`) — cannot appear in a Crockford-base32 ULID or an A5-validated
+/// session id (`[A-Za-z0-9_-]`), so a note key and a `(session_id, passage_ix)` chunk key can
+/// never collide. Distinct from `CHUNK_KEY_SEP` so `decode_chunk_key` returns `None` on a note key.
+pub const NOTE_KEY_SENTINEL: char = '\u{1e}';
+
+/// Encode a note body's conflict-index key: the sentinel followed by the note event id.
+pub fn encode_note_key(event_id: &str) -> String {
+    format!("{NOTE_KEY_SENTINEL}{event_id}")
+}
+
+/// Decode a note key back to its event id, or `None` if `key` is not a note key.
+pub fn decode_note_key(key: &str) -> Option<&str> {
+    key.strip_prefix(NOTE_KEY_SENTINEL)
+}
+
+/// A typed reference to a conflict-index member: a current memory note, or a live session
+/// passage. The stable-identity scheme Phase 1 already uses (event id for notes; the
+/// fold-resolved `session_id` + passage ordinal for passages). Hashable/comparable so it can
+/// key exclusion + open-pair sets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConflictRef {
+    /// A current memory note, identified by its `memory` event id.
+    Note {
+        /// The `memory` event id of the note body.
+        event_id: String,
+    },
+    /// A live captured-session passage, identified by the session's stable id + passage ordinal.
+    Passage {
+        /// The fold-resolved stable id of the session the passage belongs to.
+        session_id: String,
+        /// The passage's ordinal within that session.
+        passage_id: usize,
+    },
+}
+
+impl ConflictRef {
+    /// Decode a conflict-index key to its typed ref. Note keys (sentinel-prefixed) are checked
+    /// first; everything else falls through to the passage chunk codec. `None` for a malformed key.
+    pub fn decode_key(key: &str) -> Option<ConflictRef> {
+        if let Some(id) = decode_note_key(key) {
+            return Some(ConflictRef::Note { event_id: id.to_string() });
+        }
+        decode_chunk_key(key).map(|(sid, pid)| ConflictRef::Passage {
+            session_id: sid.to_string(),
+            passage_id: pid,
+        })
+    }
+
+    /// A stable, kind-tagged string identity for this ref. Used to build unordered pair keys
+    /// (sort two `pair_key`s) and exclusion sets. The `0x1f` field separator can appear in
+    /// neither a ULID nor an A5 session id, so distinct refs never collide by concatenation.
+    pub fn pair_key(&self) -> String {
+        match self {
+            ConflictRef::Note { event_id } => format!("N\u{1f}{event_id}"),
+            ConflictRef::Passage { session_id, passage_id } => {
+                format!("P\u{1f}{session_id}\u{1f}{passage_id}")
+            }
+        }
+    }
+
+    /// Unordered pair identity: the two `pair_key`s, sorted, joined by `\u{1e}` (record separator).
+    /// Both orders of (a, b) map to the SAME key — the idempotency identity (spec §3.5). Portable:
+    /// the single source of truth for the pair key used by the finder AND log.rs `conflict_pair_key`.
+    pub fn unordered_pair_key(a: &ConflictRef, b: &ConflictRef) -> String {
+        let (ka, kb) = (a.pair_key(), b.pair_key());
+        if ka <= kb { format!("{ka}\u{1e}{kb}") } else { format!("{kb}\u{1e}{ka}") }
+    }
+
+    /// The persisted (signed-proposal) JSON shape for this ref.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            ConflictRef::Note { event_id } => {
+                serde_json::json!({ "kind": "note", "event_id": event_id })
+            }
+            ConflictRef::Passage { session_id, passage_id } => serde_json::json!({
+                "kind": "passage", "session_id": session_id, "passage_id": passage_id
+            }),
+        }
+    }
+
+    /// Parse a ref back from its persisted JSON, or `None` if malformed.
+    pub fn from_json(v: &serde_json::Value) -> Option<ConflictRef> {
+        match v.get("kind").and_then(|k| k.as_str())? {
+            "note" => Some(ConflictRef::Note {
+                event_id: v.get("event_id")?.as_str()?.to_string(),
+            }),
+            "passage" => Some(ConflictRef::Passage {
+                session_id: v.get("session_id")?.as_str()?.to_string(),
+                passage_id: usize::try_from(v.get("passage_id")?.as_u64()?).ok()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// An in-memory ANN index over the vectors of a single (active) embedding model.
 ///
 /// NOT persisted in v1 — rebuilt from the encrypted log on open (zero plaintext
@@ -301,5 +397,60 @@ mod tests {
         assert_eq!(ix.len(), 2, "two distinct vectors ⇒ len 2");
         ix.add("a", &[0.0, 0.0, 1.0]); // duplicate id: dedup no-op
         assert_eq!(ix.len(), 2, "re-adding an existing id does not grow len");
+    }
+
+    #[test]
+    fn note_key_and_passage_key_are_disjoint_and_typed() {
+        // A note key round-trips and is NOT mistaken for a passage key.
+        let nk = encode_note_key("01J8Z3ABCDXYZ");
+        assert_eq!(decode_note_key(&nk), Some("01J8Z3ABCDXYZ"));
+        assert_eq!(decode_chunk_key(&nk), None, "a note key is never a valid chunk key");
+        assert_eq!(
+            ConflictRef::decode_key(&nk),
+            Some(ConflictRef::Note { event_id: "01J8Z3ABCDXYZ".into() })
+        );
+
+        // A passage key still decodes as a Passage (existing chunk codec is untouched).
+        let pk = encode_chunk_key("s1", 3);
+        assert_eq!(decode_note_key(&pk), None, "a passage key has no note sentinel");
+        assert_eq!(
+            ConflictRef::decode_key(&pk),
+            Some(ConflictRef::Passage { session_id: "s1".into(), passage_id: 3 })
+        );
+
+        // The sentinel is distinct from the chunk separator, and neither appears in a ULID.
+        assert_ne!(NOTE_KEY_SENTINEL, CHUNK_KEY_SEP);
+
+        // pair_key is a stable, kind-tagged identity used to build unordered pair keys.
+        assert_eq!(
+            ConflictRef::Note { event_id: "a".into() }.pair_key(),
+            ConflictRef::Note { event_id: "a".into() }.pair_key()
+        );
+        assert_ne!(
+            ConflictRef::Note { event_id: "a".into() }.pair_key(),
+            ConflictRef::Passage { session_id: "a".into(), passage_id: 0 }.pair_key()
+        );
+
+        // JSON round-trips both variants (the persisted proposal shape).
+        for r in [
+            ConflictRef::Note { event_id: "n1".into() },
+            ConflictRef::Passage { session_id: "s1".into(), passage_id: 2 },
+        ] {
+            assert_eq!(ConflictRef::from_json(&r.to_json()), Some(r));
+        }
+
+        // from_json is the deserialization boundary for the persisted, signed proposal
+        // shape — it MUST fail closed (None) on every malformed input, never a wrong ref.
+        use serde_json::json;
+        assert_eq!(ConflictRef::from_json(&json!({"kind": "bogus"})), None);
+        assert_eq!(ConflictRef::from_json(&json!({"kind": "note"})), None); // missing event_id
+        assert_eq!(
+            ConflictRef::from_json(&json!({"kind": "passage", "session_id": "s"})),
+            None // missing passage_id
+        );
+        assert_eq!(
+            ConflictRef::from_json(&json!({"kind": "passage", "session_id": "s", "passage_id": -1})),
+            None // negative → not a u64
+        );
     }
 }

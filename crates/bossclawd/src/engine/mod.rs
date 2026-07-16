@@ -69,7 +69,8 @@ pub enum EngineOpError {
     /// the same seam; the `?` on `reasoner()` in `evolve_once` already routes to it.
     #[allow(dead_code)]
     Reasoner(String),
-    /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve").
+    /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve" |
+    /// "conflict").
     Busy(&'static str),
     /// The on-disk file changed since the proposal was drafted; the re-gate at confirm
     /// fails closed. Carries the reason. Nothing is written.
@@ -251,6 +252,21 @@ pub struct EvolveTelemetry {
     pub last_tainted_snippets: Option<usize>,
 }
 
+/// Session-scoped conflict-detection telemetry (mirrors [`EvolveTelemetry`]; in-memory, cleared
+/// on restart — a durable lifetime count is derivable from the append-only `conflict_proposal`
+/// events, so no table is needed). Written by `record_conflict_tick` + read by `conflict_telemetry`.
+#[derive(Debug, Default, Clone)]
+pub struct ConflictTelemetry {
+    /// Wall-clock duration of the most recent cycle, ms.
+    pub last_cycle_ms: Option<u128>,
+    /// Cumulative proposals emitted this session.
+    pub proposed_total: usize,
+    /// Cumulative pairs the judge declined this session.
+    pub dropped_total: usize,
+    /// Cumulative reasoner errors this session.
+    pub reasoner_errors_total: usize,
+}
+
 /// The single chokepoint for engine access. Holds one lazily-opened `Arc<EventLog>`
 /// behind an async mutex; `get_or_open` serializes first-open and gates on onboarding.
 pub struct EngineHandle {
@@ -263,12 +279,18 @@ pub struct EngineHandle {
     ingest_lock: Mutex<()>,
     /// Serializes manual + scheduled evolve ticks (`try_lock` → `Busy("evolve")`).
     evolve_lock: Mutex<()>,
+    /// Serializes manual + scheduled conflict-detection cycles (`try_lock` → `Busy("conflict")`).
+    /// Mirrors `evolve_lock`.
+    conflict_lock: Mutex<()>,
     /// `true` once the in-memory recall index reflects persisted vectors this session.
     /// Set ONLY after a successful rebuild (a failure stays retryable). See `ensure_indexed`.
     indexed: Mutex<bool>,
     /// The evolve status read path (a `std::sync::Mutex`, poison-recovered on read).
     /// Written by `record_tick` + read by `evolve_status` (SP3 Task 7).
     evolve_tel: std::sync::Mutex<EvolveTelemetry>,
+    /// Session conflict-detection telemetry (a `std::sync::Mutex`, poison-recovered on read).
+    /// Written by `record_conflict_tick` + read by `conflict_telemetry`. Mirrors `evolve_tel`.
+    conflict_tel: std::sync::Mutex<ConflictTelemetry>,
     /// The shared reasoner-config cell the daemon's `ConfigReasonerProvider` closure reads on
     /// every evolve tick (attached by `main.rs` via [`Self::with_reasoner_cell`]; `None` in unit
     /// tests that don't care). Held HERE so BOTH config-writing ops (`set_reasoner_config`,
@@ -303,8 +325,10 @@ impl EngineHandle {
             reasoner_provider,
             ingest_lock: Mutex::new(()),
             evolve_lock: Mutex::new(()),
+            conflict_lock: Mutex::new(()),
             indexed: Mutex::new(false),
             evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
+            conflict_tel: std::sync::Mutex::new(ConflictTelemetry::default()),
             reasoner_cell: None,
             probe_reasoner_for_test: None,
         }
@@ -548,6 +572,13 @@ impl EngineHandle {
         // re-open writes nothing. The timestamp arg is inert on the disable (off) path.
         if !log.explicitly_set(ConfigFlag::CaptureEnabled)? {
             log.set_capture_enabled(false, false, 0)?;
+        }
+        // Rung-3 Phase-2 (§3.6, I3): conflict detection is default-CLOSED — its getter already
+        // returns false when unset — so, like capture above, we persist an EXPLICIT OFF the first
+        // time it was never set (a tamper-evident "this brain has conflict-detect off" record).
+        // Idempotent: `explicitly_set` is true afterward.
+        if !log.explicitly_set(ConfigFlag::ConflictDetect)? {
+            log.set_conflict_detect_enabled(false)?;
         }
         Ok(())
     }
@@ -915,19 +946,11 @@ impl EngineHandle {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         // Serialize manual + scheduled ticks: a second overlapping tick is Busy, not queued.
         let _guard = self.evolve_lock.try_lock().map_err(|_| EngineOpError::Busy("evolve"))?;
-        // Consent chokepoint for BOTH the scheduler AND manual `engine_evolve_now`:
-        // in cloud mode, refuse to build/run the reasoner unless a signed consent
-        // record matches the current config+key (reasoner_ready_or_false is
-        // fail-closed). Placed BEFORE the reasoner is built (and before any
-        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner
-        // and egresses nothing. Closes the manual-evolve consent-bypass (R1/R5/R8).
-        // The scheduler already pre-gates on readiness, so on that path this is a
-        // cheap re-confirm (2 log reads) — redundant but correct.
-        if matches!(
-            self.reasoner_config_or_default(onboarded).await.mode,
-            crate::engine::reason::ReasonerMode::Cloud
-        ) && !self.reasoner_ready_or_false(onboarded).await
-        {
+        // Consent chokepoint for BOTH the scheduler AND manual `engine_evolve_now` (R1/R5/R8),
+        // shared with the conflict sweep (I2). Placed BEFORE the reasoner is built (and any
+        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner and egresses
+        // nothing.
+        if !self.cloud_consent_ok(onboarded).await {
             return Err(EngineOpError::Reasoner(
                 "cloud reasoner not ready — signed consent or provider key missing".to_string(),
             ));
@@ -1008,6 +1031,113 @@ impl EngineHandle {
             Ok((status, _telemetry)) => status.enabled,
             Err(_) => false,
         }
+    }
+
+    /// The conflict-detection off-switch verdict, defaulting to `false` (OFF) on ANY error (not
+    /// onboarded, open failure, …). The gate the conflict sweep reads each cycle — it must never
+    /// propagate an error (a transient read failure must not trip detection ON). Mirrors
+    /// [`Self::mandates_enabled_or_false`] (a direct getter read); semantically the same fail-closed
+    /// gate as [`Self::evolve_enabled_or_false`].
+    pub async fn conflict_detect_enabled_or_false(&self, onboarded: bool) -> bool {
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return false;
+        };
+        spawn_blocking(move || log.conflict_detect_enabled().unwrap_or(false))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Run ONE conflict-detection cycle (gated, serialized). Gate → `conflict_lock.try_lock()`
+    /// (`Busy("conflict")` on overlap) → shared cloud-consent pre-gate (I2) → `ensure_indexed`
+    /// (embedder) → build reasoner → `spawn_blocking(log.detect_conflicts_once)` with the daemon
+    /// passage-text resolver → record session telemetry. Mirrors [`Self::evolve_once`]'s op pattern.
+    ///
+    /// Off-by-default: the core flag gate makes the cycle emit nothing, but the scheduler MUST still
+    /// gate on [`Self::conflict_detect_enabled_or_false`] before calling (as the evolve loop does) —
+    /// calling this on a disabled brain still does lock/consent/index/reasoner-build work and, for a
+    /// cloud-configured-but-unconsented brain, returns `Err(Reasoner(..))` rather than a clean
+    /// `Ok(skipped_disabled)`.
+    pub async fn detect_conflicts_once(
+        &self,
+        onboarded: bool,
+        now: i64,
+    ) -> Result<bossclaw_core::ConflictDetectReport, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        // Serialize manual + scheduled cycles: a second overlapping cycle is Busy, not queued.
+        let _guard = self.conflict_lock.try_lock().map_err(|_| EngineOpError::Busy("conflict"))?;
+        // Shared cloud-egress consent barrier (I2), placed BEFORE the reasoner is built (and any
+        // spawn_blocking/network), so a cloud-not-ready cycle constructs no reasoner and egresses
+        // nothing — the same chokepoint `evolve_once` uses.
+        if !self.cloud_consent_ok(onboarded).await {
+            return Err(EngineOpError::Reasoner(
+                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
+            ));
+        }
+        // Core holds only passage VECTORS; the daemon supplies passage TEXT by reading the `.md`.
+        // Resolve the data dir now (fail-safe) for the resolver closure below.
+        let Some(data_dir) = self.data_dir().map(|p| p.to_path_buf()) else {
+            return Err(EngineOpError::Core("data dir unresolvable".to_string()));
+        };
+        let embedder = self.ensure_indexed(&log).await?;
+        let reasoner = self.reasoner_provider.reasoner()?;
+        let t0 = std::time::Instant::now();
+        let result =
+            spawn_blocking(move || -> Result<bossclaw_core::ConflictDetectReport, EngineOpError> {
+                // The daemon's side of the judge: re-chunk the stored `.md` with the SAME
+                // `chunk_text` the capture used, so `passage_id` maps to the identical chunk.
+                let passage_text = |session_id: &str, passage_id: usize| -> Option<String> {
+                    crate::capture::store::session_passage_text(&data_dir, session_id, passage_id)
+                };
+                // Phase 2: `resolution_excluded_refs` is EMPTY (Phase 3 fills it).
+                log.detect_conflicts_once(
+                    &*embedder,
+                    &*reasoner,
+                    &passage_text,
+                    &std::collections::HashSet::new(),
+                    now,
+                )
+                .map_err(|e| EngineOpError::Core(e.to_string()))
+            })
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))?;
+        self.record_conflict_tick(t0.elapsed().as_millis(), &result);
+        result
+    }
+
+    /// Accumulate one cycle's outcome into the session telemetry (poison-tolerant, like evolve's).
+    /// `last_cycle_ms` is the wall-clock of the just-finished cycle; the totals accrue only on `Ok`.
+    fn record_conflict_tick(
+        &self,
+        ms: u128,
+        result: &Result<bossclaw_core::ConflictDetectReport, EngineOpError>,
+    ) {
+        let mut tel = self.conflict_tel.lock().unwrap_or_else(|p| p.into_inner());
+        tel.last_cycle_ms = Some(ms);
+        if let Ok(r) = result {
+            tel.proposed_total += r.proposed;
+            tel.dropped_total += r.dropped;
+            tel.reasoner_errors_total += r.reasoner_errors;
+        }
+    }
+
+    /// A clone of the session conflict telemetry (poison-recovered). Mirrors the evolve telemetry read.
+    pub fn conflict_telemetry(&self) -> ConflictTelemetry {
+        self.conflict_tel.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Flip the sticky conflict-detection off-switch. Gated + `spawn_blocking`. Mirrors
+    /// [`Self::set_evolve_enabled`].
+    pub async fn set_conflict_detect_enabled(
+        &self,
+        onboarded: bool,
+        enabled: bool,
+    ) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_conflict_detect_enabled(enabled).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
@@ -1433,6 +1563,21 @@ impl EngineHandle {
         let config = parse_reasoner_config(raw_config);
         let fp = self.current_key_fingerprint(&config);
         reason::reasoner_ready(&config, consent.as_ref(), fp.as_deref(), false)
+    }
+
+    /// The shared cloud-egress consent barrier (spec I2). `true` when it is safe to run the
+    /// reasoner: Local mode (no egress at all), or Cloud mode with a signed consent record matching
+    /// the current config + vault key (`reasoner_ready_or_false`, fail-closed). Both `evolve_once`
+    /// and the conflict sweep gate on this before building the reasoner.
+    pub async fn cloud_consent_ok(&self, onboarded: bool) -> bool {
+        if matches!(
+            self.reasoner_config_or_default(onboarded).await.mode,
+            crate::engine::reason::ReasonerMode::Cloud
+        ) {
+            self.reasoner_ready_or_false(onboarded).await
+        } else {
+            true
+        }
     }
 
     /// Persist the NON-security reasoner config (mode/provider/model/base_url). Does NOT grant
@@ -1925,9 +2070,10 @@ mod tests {
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
         // First open primes the autonomy switches OFF (SP3 `prime_switches`): the three original
-        // flags (evolve/proposals/mandates) plus the SP3 capture force-off — so a fresh brain holds
-        // exactly those 4 sticky `config` events, not zero.
-        assert_eq!(st.event_count, 4);
+        // flags (evolve/proposals/mandates), the SP3 capture force-off, and the Rung-3 Phase-2
+        // conflict-detect force-off — so a fresh brain holds exactly those 5 sticky `config` events,
+        // not zero.
+        assert_eq!(st.event_count, 5);
         assert!(st.chain_ok);
         // Second call reuses the same instance (Arc ptr identical).
         let a = h.get_or_open(true).await.unwrap();
@@ -2100,6 +2246,36 @@ mod tests {
         let handle2 = new_test_handle(vault, &dir);
         let log3 = handle2.get_or_open(true).await.unwrap();
         assert!(log3.capture_enabled().unwrap(), "an explicit capture ON MUST persist across opens");
+    }
+
+    /// Rung-3 Phase-2 (§3.6, I3): a fresh brain reports conflict-detect OFF through the infallible
+    /// daemon read, and the boot cascade persists an EXPLICIT OFF (`explicitly_set` true) so the
+    /// getter-default can never later flip it on.
+    #[tokio::test]
+    async fn prime_switches_forces_conflict_detect_off_and_or_false_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = TestVault::new(); // TestVault::new() already returns Arc<TestVault>
+        let h = EngineHandle::new(
+            vault,
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(embed::MockEmbedderProvider::new(8)),
+            std::sync::Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
+        );
+        let onboarded = true;
+        // Fresh brain: prime_switches (run inside get_or_open's first-open) forced an explicit OFF,
+        // and the infallible daemon read reports false.
+        assert!(!h.conflict_detect_enabled_or_false(onboarded).await, "off by default after boot");
+        // Prove prime_switches wrote the tamper-evident EXPLICIT-OFF record (not just that the
+        // default reads false): explicitly_set must be true after boot.
+        let log = h.get_or_open(onboarded).await.unwrap();
+        assert!(
+            spawn_blocking(move || log
+                .explicitly_set(bossclaw_core::ConfigFlag::ConflictDetect)
+                .unwrap())
+            .await
+            .unwrap(),
+            "prime_switches persisted an explicit OFF (explicitly_set == true after boot)"
+        );
     }
 
     /// SP3 A8: the EngineHandle wrappers mirror the mandates wrappers end to end, and carry the
@@ -2709,6 +2885,34 @@ mod tests {
         );
     }
 
+    /// Task 9 (spec I2): the shared cloud-consent pre-gate `cloud_consent_ok` — the SINGLE
+    /// signed-consent barrier both `evolve_once` AND the conflict sweep (Task 11/12) gate on.
+    /// BOTH halves of its contract are pinned directly here so the sweep's dependency on
+    /// `cloud_consent_ok → false` stays guarded even if `evolve_once`'s gate is later rewritten.
+    /// `test_vault_and_dir` seeds an EMPTY provider-key cache, so the Cloud branch is keychain-free
+    /// and sub-second — the same setup `evolve_once_refuses_cloud_without_signed_consent` drives
+    /// through this exact path.
+    #[tokio::test]
+    async fn cloud_consent_ok_is_true_for_local_and_gates_unready_cloud() {
+        let (vault, dir) = test_vault_and_dir();
+        let h = new_test_handle(vault, &dir);
+        // Local (default) config → trivially OK: the reasoner egresses nothing.
+        assert!(h.cloud_consent_ok(true).await, "local mode is always consent-ok");
+        // Cloud config written but NO signed consent → fail-closed to false (no egress path open).
+        h.set_reasoner_config(
+            true,
+            serde_json::json!({
+                "mode": "cloud",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "base_url": null
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!h.cloud_consent_ok(true).await, "cloud without signed consent is NOT ok");
+    }
+
     /// Task 7 (evolve_lock): a second concurrent `evolve_once` returns `Busy("evolve")`.
     /// The first tick holds `evolve_lock` across its `spawn_blocking`; the second `try_lock`
     /// fails. We force overlap by holding the lock guard directly while issuing a call.
@@ -2810,6 +3014,101 @@ mod tests {
         handle.set_evolve_enabled(true, true).await.unwrap();
         let (status1, _t) = handle.evolve_status(true).await.unwrap();
         assert!(status1.enabled, "toggle on takes effect");
+    }
+
+    /// Task 11: the engine `detect_conflicts_once` wrapper drives the full op pattern (get_or_open →
+    /// serialize → Local consent-ok → ensure_indexed → build reasoner → spawn_blocking the core
+    /// cycle → record telemetry). Two contradicting NOTES + a scripted judge → exactly one proposal,
+    /// and the session telemetry records it. Built INLINE with `MockEmbedderProvider::new(64)` (the
+    /// shared `new_test_handle` uses dim=8, which drops the marquee pair below `CANDIDATE_SIM_MIN`).
+    #[tokio::test]
+    async fn engine_detect_conflicts_once_emits_a_proposal_when_enabled() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = TestVault::new(); // already Arc<TestVault>
+        let a = "the default deploy target is vercel";
+        let b = "the default deploy target is fly";
+        // Two distinct-timestamp notes: older = the first `remember`, so the finder presents the
+        // pair in (a, b) order deterministically — one scripted ordering suffices.
+        let reasoner: Arc<dyn bossclaw_core::Reasoner> =
+            Arc::new(bossclaw_core::ScriptedReasoner::new("test").with_response(
+                bossclaw_core::conflict::CONFLICT_SYSTEM,
+                &bossclaw_core::conflict::build_conflict_prompt(a, b),
+                serde_json::json!({ "contradicts": true, "winner": "newer", "confidence": 92, "why": "renamed" }),
+            ));
+        let h = EngineHandle::new(
+            vault,
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::from_reasoner(reasoner)),
+        );
+        let onboarded = true;
+        h.remember(onboarded, a.to_string()).await.unwrap();
+        h.remember(onboarded, b.to_string()).await.unwrap();
+        h.set_conflict_detect_enabled(onboarded, true).await.unwrap();
+        let report = h.detect_conflicts_once(onboarded, 100).await.unwrap();
+        assert_eq!(report.proposed, 1, "engine cycle emits one proposal");
+        assert_eq!(h.conflict_telemetry().proposed_total, 1, "telemetry recorded the proposal");
+    }
+
+    /// Task 11 (off-by-default THROUGH the wrapper): with conflict-detect left default-OFF, the
+    /// wrapper still opens/consents/indexes/builds the reasoner, but the core flag gate makes the
+    /// cycle emit nothing — `skipped_disabled` is true, no proposal, and the session telemetry is
+    /// unchanged. Proves the off-switch holds through the engine layer, not just in core.
+    #[tokio::test]
+    async fn engine_detect_conflicts_once_is_a_no_op_when_disabled() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = TestVault::new();
+        let a = "the default deploy target is vercel";
+        let b = "the default deploy target is fly";
+        // A bare (response-less) scripted reasoner: the core gate skips before any judge call, so it
+        // is never consulted — its absence of responses would only bite if the gate leaked.
+        let reasoner: Arc<dyn bossclaw_core::Reasoner> =
+            Arc::new(bossclaw_core::ScriptedReasoner::new("test"));
+        let h = EngineHandle::new(
+            vault,
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::from_reasoner(reasoner)),
+        );
+        let onboarded = true;
+        h.remember(onboarded, a.to_string()).await.unwrap();
+        h.remember(onboarded, b.to_string()).await.unwrap();
+        // Deliberately DO NOT enable conflict-detect (it defaults off via prime_switches).
+        let report = h.detect_conflicts_once(onboarded, 100).await.unwrap();
+        assert!(report.skipped_disabled, "disabled brain: the core flag gate skips the cycle");
+        assert_eq!(report.proposed, 0, "no proposal on a skipped cycle");
+        assert_eq!(
+            h.conflict_telemetry().proposed_total,
+            0,
+            "telemetry proposed_total unchanged on a no-op cycle"
+        );
+    }
+
+    /// Task 11 (conflict_lock): a second overlapping `detect_conflicts_once` returns
+    /// `Busy("conflict")`. Mirrors the reliable `second_concurrent_evolve_is_busy` pattern — hold the
+    /// lock guard DIRECTLY (deterministic, not a racy two-task overlap) so the guarded call's
+    /// `try_lock` fails, then confirm release lets a cycle run again.
+    #[tokio::test]
+    async fn second_concurrent_detect_conflicts_is_busy() {
+        let (vault, dir) = test_vault_and_dir();
+        let handle =
+            new_test_handle_with_reasoner(vault, &dir, Arc::new(StubReasoner::new("stub-v1")));
+        // Open first: `get_or_open` runs BEFORE the lock acquire in the wrapper.
+        let _ = handle.get_or_open(true).await.unwrap();
+
+        // Hold the conflict lock to simulate an in-flight cycle, then a real call must be Busy.
+        let guard = handle.conflict_lock.try_lock().expect("first lock acquired");
+        let err = handle.detect_conflicts_once(true, 100).await.unwrap_err();
+        assert!(
+            matches!(err, EngineOpError::Busy("conflict")),
+            "overlapping cycle is Busy(\"conflict\")"
+        );
+        drop(guard);
+        // After release, a cycle runs again (flag default-off → clean skip, no judge call).
+        let report = handle.detect_conflicts_once(true, 100).await.unwrap();
+        assert!(report.skipped_disabled, "post-release cycle runs (flag off → skipped)");
     }
 
     #[tokio::test]
