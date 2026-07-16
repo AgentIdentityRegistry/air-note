@@ -137,6 +137,84 @@ pub fn judge_pair(reasoner: &dyn Reasoner, a: &str, b: &str) -> Result<Option<Ve
     Ok(actionable.then_some(v))
 }
 
+/// Cosine-similarity floor a neighbour must clear to become a candidate pair (cost governor +
+/// precision). Conservative-high; harness/owner-tunable. `sim = 1.0 - cosine_distance`.
+pub const CANDIDATE_SIM_MIN: f32 = 0.82;
+/// Per-cycle judge-call budget; backlog drips across cycles (mirrors `CAPTURE_PER_SWEEP = 8`).
+pub const CONFLICT_JUDGE_PER_SWEEP: usize = 8;
+/// Open-proposal ceiling: on exceed, stop proposing and surface one quiet "many pending" count.
+pub const CONFLICT_OPEN_CEILING: usize = 20;
+/// Top-k neighbours pulled from the unified index per subject before the sim gate. Pinned EQUAL to
+/// the judge budget (= the per-subject cap) so the finder is STRICTLY LOSSLESS: a subject can find at
+/// most `budget` above-floor candidates and ALL of them are kept + judged — never found-then-dropped
+/// (owner decision: "never skip"). `search_k <= budget` is the only fully-lossless config that also
+/// preserves the no-stall guarantee (one subject's pairs always fit one fresh full budget).
+pub const CONFLICT_SEARCH_K: usize = CONFLICT_JUDGE_PER_SWEEP;
+/// Max candidate pairs kept per subject (top-similarity). Equals the judge budget so a single
+/// subject is always fully judgeable within one full budget — no permanent cursor stall.
+pub const MAX_CANDIDATE_PAIRS_PER_SUBJECT: usize = CONFLICT_JUDGE_PER_SWEEP;
+/// Max subject EVENTS scanned per cycle since the cursor (a capture expands to its passages).
+pub const CONFLICT_SCAN_BOUND: usize = 64;
+/// Byte cap on each snippet handed to the judge (inherits SP3's snapshot budget intent).
+pub const MAX_JUDGE_TEXT_BYTES: usize = 4096;
+/// Confidence at/above which a stored proposal's coarse band is "high" (else "med"). All stored
+/// verdicts are already >= CONFLICT_CONF_MIN (70), so this only splits the actionable range.
+pub const CONFLICT_BAND_HIGH_MIN: u8 = 85;
+
+/// Coarse confidence band for a STORED proposal (I7): the model's numeric confidence is never
+/// persisted, only "high"/"med". All stored verdicts already cleared `CONFLICT_CONF_MIN`.
+pub fn confidence_band(confidence: u8) -> &'static str {
+    if confidence >= CONFLICT_BAND_HIGH_MIN { "high" } else { "med" }
+}
+
+/// The stable wire label for an advisory `winner`. The engine resolves the true winner by
+/// timestamp; this is a hint only (spec §4d).
+pub fn winner_str(w: Winner) -> &'static str {
+    match w {
+        Winner::Newer => "newer",
+        Winner::Older => "older",
+        Winner::Unclear => "unclear",
+    }
+}
+
+/// Bound one snippet handed to the judge to `MAX_JUDGE_TEXT_BYTES`, truncating on a char
+/// boundary (never splits a multibyte scalar). The on-disk memory is untouched. Truncation is
+/// SILENT by design (no ellipsis/marker): this is judge INPUT only — never persisted, never
+/// owner-facing — so the judge simply sees less context.
+pub fn bound_judge_text(s: &str) -> &str {
+    if s.len() <= MAX_JUDGE_TEXT_BYTES {
+        return s;
+    }
+    let mut end = MAX_JUDGE_TEXT_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Build the CONTENT-FREE `why` persisted on a proposal (I7). Composed ONLY from structured,
+/// non-memory fields — the advisory `winner_hint` ("newer"/"older"/anything-else = unclear), the
+/// coarse `confidence_band` ("high"/other = medium), and the two ref KINDS ("note"/"passage") — so
+/// a signed proposal NEVER carries a verbatim memory fragment that could outlive the memory's
+/// deletion. `a_kind` is the OLDER side, `b_kind` the NEWER (the caller orders by ingest ts). The
+/// model's own free-text rationale is discarded (it may be `eprintln!`'d ephemerally for debug).
+pub fn templated_why(winner_hint: &str, band: &str, a_kind: &str, b_kind: &str) -> String {
+    let subjects = match (a_kind, b_kind) {
+        ("note", "note") => "an older note and a newer note",
+        ("passage", "passage") => "an older captured-session passage and a newer one",
+        ("note", "passage") => "an older note and a newer captured-session passage",
+        ("passage", "note") => "an older captured-session passage and a newer note",
+        _ => "two memories",
+    };
+    let relation = match winner_hint {
+        "newer" => "the newer appears to supersede the older",
+        "older" => "the older appears to remain correct over the newer",
+        _ => "they appear to conflict (winner unclear)",
+    };
+    let band_phrase = if band == "high" { "high confidence" } else { "medium confidence" };
+    format!("{subjects} may conflict: {relation}; {band_phrase}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +224,56 @@ mod tests {
     fn scripted(a: &str, b: &str, resp: serde_json::Value) -> ScriptedReasoner {
         let prompt = build_conflict_prompt(a, b);
         ScriptedReasoner::new("test-model").with_response(CONFLICT_SYSTEM, &prompt, resp)
+    }
+
+    #[test]
+    fn templated_why_is_content_free_band_coarse_and_text_bounded() {
+        // I7: the persisted `why` is built ONLY from winner + band + ref kinds — never memory text.
+        // Feed the two memory strings NOWHERE; the template cannot contain them.
+        let w = templated_why("newer", "high", "note", "passage");
+        assert!(w.contains("high confidence"), "band phrase present");
+        assert!(!w.is_empty());
+        // Coarse band: >=85 high, else med (all stored verdicts are already >=70).
+        assert_eq!(confidence_band(CONFLICT_BAND_HIGH_MIN), "high");
+        assert_eq!(confidence_band(CONFLICT_BAND_HIGH_MIN - 1), "med");
+        // Advisory winner serializes to the three stable labels.
+        assert_eq!(winner_str(Winner::Older), "older");
+        assert_eq!(winner_str(Winner::Newer), "newer");
+        assert_eq!(winner_str(Winner::Unclear), "unclear");
+        // Judge text is bounded on a char boundary (never panics on multibyte).
+        let multi = "€".repeat(MAX_JUDGE_TEXT_BYTES); // 3 bytes; byte 4096 lands mid-char
+        let out = bound_judge_text(&multi);
+        assert!(multi.is_char_boundary(out.len()), "never splits a scalar");
+        assert_eq!(out.len(), 4095, "actually backtracked one byte");
+        // pass-through: exact cap and short input are returned unchanged
+        let exact = "a".repeat(MAX_JUDGE_TEXT_BYTES);
+        assert_eq!(bound_judge_text(&exact).len(), MAX_JUDGE_TEXT_BYTES);
+        assert_eq!(bound_judge_text("hi"), "hi");
+    }
+
+    #[test]
+    fn templated_why_covers_every_relation_and_subject_arm() {
+        // Relation arms (winner_hint): newer / older / unclear-fallback.
+        assert!(templated_why("newer", "high", "note", "note").contains("supersede"));
+        assert!(templated_why("older", "high", "note", "note").contains("remain correct"));
+        assert!(templated_why("bogus", "high", "note", "note").contains("winner unclear"));
+        // Subject arms (kind pairs), including the `_` fallback for unknown kinds.
+        assert!(templated_why("newer", "med", "note", "note").contains("an older note and a newer note"));
+        assert!(templated_why("newer", "med", "passage", "passage").contains("captured-session passage"));
+        assert!(templated_why("newer", "med", "note", "passage").contains("newer captured-session passage"));
+        assert!(templated_why("newer", "med", "passage", "note").contains("older captured-session passage"));
+        assert!(templated_why("newer", "med", "zzz", "qqq").contains("two memories"));
+        // Band arms: high vs medium.
+        assert!(templated_why("newer", "high", "note", "note").contains("high confidence"));
+        assert!(templated_why("newer", "med", "note", "note").contains("medium confidence"));
+        // Lock the coupling to the REAL producers: `winner_str`/`confidence_band` output must keep
+        // driving `templated_why`'s actionable arms, so a future change to either can't silently
+        // degrade a stored proposal's `why` to unclear/medium.
+        assert!(
+            templated_why(winner_str(Winner::Older), confidence_band(70), "note", "note")
+                .contains("remain correct"),
+            "winner_str(Older) must still select the older-wins relation arm"
+        );
     }
 
     #[test]

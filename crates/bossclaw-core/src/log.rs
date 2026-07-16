@@ -2712,6 +2712,40 @@ impl EventLog {
         self.append(self.build_proposer_event(producer, crate::graph::WRITE_PROPOSAL_EVENT_TYPE, content, source_event_ids))
     }
 
+    /// Append a signed Rung-3 `conflict_proposal` (spec §3.5). Content: `{ a_ref, b_ref,
+    /// winner_hint, confidence_band, why, detected_at }` — typed stable refs only, NO memory
+    /// bodies (I7). `winner_hint`/`confidence_band` are the coarsened forms; `why` MUST be the
+    /// CONTENT-FREE `conflict::templated_why` output (never model text). `source_event_ids` is the
+    /// referenced memories' lineage (note event id / session capture event id). Mirrors the
+    /// `#[cfg(unix)]` `build_proposer_event` shape used by the write-proposal family.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_conflict_proposal(
+        &self,
+        a_ref: &crate::index::ConflictRef,
+        b_ref: &crate::index::ConflictRef,
+        winner_hint: &str,
+        confidence_band: &str,
+        why: &str,
+        detected_at: i64,
+        source_event_ids: &[String],
+    ) -> Result<String, BossclawError> {
+        let content = serde_json::json!({
+            "a_ref": a_ref.to_json(),
+            "b_ref": b_ref.to_json(),
+            "winner_hint": winner_hint,
+            "confidence_band": confidence_band,
+            "why": why,
+            "detected_at": detected_at,
+        });
+        self.append(self.build_proposer_event(
+            crate::graph::CONFLICT_PROPOSER_PRODUCER,
+            crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE,
+            content,
+            source_event_ids,
+        ))
+    }
+
     /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
     /// Thin wrapper over [`Self::append_write_rejected_with`].
     #[cfg(unix)]
@@ -8748,6 +8782,38 @@ mod tests {
     fn open_log(dir: &Path) -> EventLog {
         let key = SigningKey::from_bytes(&KEY_BYTES);
         EventLog::open(&dir.join("m.db"), &DEK, key).unwrap()
+    }
+
+    /// Rung-3 Phase-2 (§3.5, I5/I7): a conflict proposal is a signed event carrying ONLY typed refs,
+    /// an advisory winner hint, a coarse band, a CONTENT-FREE templated `why`, and `detected_at` —
+    /// never a memory body. `#[cfg(unix)]` (mirrors the write_proposal family / `build_proposer_event`).
+    #[cfg(unix)]
+    #[test]
+    fn append_conflict_proposal_stores_typed_refs_and_no_body() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let a = ConflictRef::Note { event_id: "n_old".into() };
+        let b = ConflictRef::Passage { session_id: "s1".into(), passage_id: 2 };
+        let why = crate::conflict::templated_why("newer", "high", "note", "passage");
+        let id = log
+            .append_conflict_proposal(&a, &b, "newer", "high", &why, 1_720_000_000, &["n_old".into(), "cap_ev".into()])
+            .unwrap();
+        let ev = log.event_by_id(&id).unwrap().unwrap();
+        assert_eq!(ev.event_type, crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE);
+        assert_eq!(ConflictRef::from_json(&ev.content["a_ref"]), Some(a));
+        assert_eq!(ConflictRef::from_json(&ev.content["b_ref"]), Some(b));
+        assert_eq!(ev.content["winner_hint"], "newer");
+        assert_eq!(ev.content["confidence_band"], "high");
+        assert_eq!(ev.content["why"], why, "stored why is the content-free template");
+        assert_eq!(ev.content["detected_at"], 1_720_000_000i64);
+        // I7: no memory-body / raw-text / raw-confidence field is persisted (only refs + template why).
+        for forbidden in ["text", "a_text", "b_text", "body", "confidence"] {
+            assert!(ev.content.get(forbidden).is_none(), "no {forbidden} field on the proposal");
+        }
+        // Lineage is the referenced memory event ids.
+        let sources = ev.model_meta.as_ref().unwrap().source_event_ids.clone();
+        assert_eq!(sources, vec!["n_old".to_string(), "cap_ev".to_string()]);
     }
 
     #[test]
