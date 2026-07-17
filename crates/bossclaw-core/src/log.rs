@@ -6707,6 +6707,13 @@ impl EventLog {
         let opens = self.open_conflict_proposals()?;
         let mut open_pairs: std::collections::HashSet<String> =
             opens.iter().map(|p| Self::conflict_pair_key(&p.a_ref, &p.b_ref)).collect();
+        // Rung-3 Phase-3 (§2.2 item 1, I9): a kept-both / live-dismissed pair must never be re-proposed.
+        // Union its `unordered_pair_key` into `open_pairs` (the SAME space the finder screens against) so the
+        // pure finder needs zero reshape. NOT the single-ref `resolution_excluded_refs` param, which feeds
+        // `decide_conflict_sweep`'s single-ref `excluded_refs` and would silently never match a pair key.
+        let resolution = self.resolution_exclusions()?;
+        open_pairs.extend(resolution.coexist_pairs.iter().cloned());
+        open_pairs.extend(resolution.dismissed_pairs.iter().cloned());
         let mut open_count = opens.len();
 
         // Text / lineage / ts / kind resolvers for a ref (notes from core; passages via the closure).
@@ -11367,6 +11374,63 @@ mod tests {
         assert_eq!(r2.judged, 0, "no new subjects → no judging (cursor incrementality, I4)");
         assert_eq!(r2.proposed, 0);
         assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "still exactly one (idempotent)");
+    }
+
+    /// Rung-3 Phase-3 (§2.2 item 1, I9 — the FINDER half of stop-nagging): a `coexist_allowed` marker
+    /// for a pair with NO open `conflict_proposal` must still suppress re-proposal. The finder unions
+    /// `resolution_exclusions().{coexist_pairs ∪ dismissed_pairs}` into `open_pairs` (the SAME
+    /// `unordered_pair_key` space it already screens against). The coexist-marker-WITHOUT-open-proposal
+    /// construction isolates this union from open-set membership: a still-open proposal would suppress
+    /// on its own, so without the union the judge fires and mints a proposal (`proposed == 1`) — the RED
+    /// failure; with it, the pair is screened out BEFORE judging (`proposed == 0`).
+    #[cfg(unix)]
+    #[test]
+    fn finder_union_suppresses_a_coexist_pair_with_no_open_proposal() {
+        // REAL test-double API (verified `reason.rs:56-112`, Phase-2 ref `log.rs:10620-10668`).
+        use crate::index::ConflictRef;
+        use crate::conflict::{build_conflict_prompt, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // MUST be 64: at dim=8 these near-dups fall below CANDIDATE_SIM_MIN → zero candidate pairs → the test
+        // would trivially pass for the wrong reason.
+        let emb = MockEmbedder::new(64);
+
+        // Proven near-duplicate texts (one token apart) that clear the similarity floor. n1 is remembered
+        // first, so ref_ts makes it the OLDER side; register BOTH orderings so the pair surfaces from either
+        // endpoint the finder judges first.
+        let t1 = "the default deploy target is vercel";
+        let t2 = "the default deploy target is fly";
+        let n1 = log.remember(&emb, t1).unwrap();
+        let n2 = log.remember(&emb, t2).unwrap();
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // The judge WOULD rule this pair a conflict (verdict keyed on SHA of (CONFLICT_SYSTEM, prompt)).
+        let verdict = serde_json::json!({
+            "contradicts": true, "winner": "newer", "confidence": 92, "why": "conflicting deploy targets"
+        });
+        let reasoner = ScriptedReasoner::new("test")
+            .with_response(CONFLICT_SYSTEM, &build_conflict_prompt(t1, t2), verdict.clone())
+            .with_response(CONFLICT_SYSTEM, &build_conflict_prompt(t2, t1), verdict);
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        // A `coexist_allowed` marker exists for this exact pair, but NO open `conflict_proposal` does. This
+        // ISOLATES the finder union from open-set membership: without the Task-7 union, `open_pairs` is empty,
+        // the judge returns a conflict, and a proposal is minted (`proposed == 1`) — the RED failure. With the
+        // union, `coexist_pairs` holds this pk → the finder screens it out BEFORE judging → `proposed == 0`.
+        let (a, b) = (ConflictRef::Note { event_id: n1.clone() }, ConflictRef::Note { event_id: n2.clone() });
+        let pk = ConflictRef::unordered_pair_key(&a, &b);
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "P", "pair_key": pk, "a_ref": a.to_json(), "b_ref": b.to_json() }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+
+        let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 100).unwrap();
+        assert_eq!(r.proposed, 0, "the coexist pair is never (re-)proposed by the finder (open_pairs union, I9)");
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "no proposal materializes for a coexist pair");
     }
 
     /// Rung-3 Phase-2 (§3.3, I4 — the multi-passage NO-STALL fix): a single capture whose near-
