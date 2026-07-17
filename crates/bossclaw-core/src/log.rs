@@ -2861,6 +2861,32 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Recover `(a_ref, b_ref)` for a `conflict_proposal` by id, REGARDLESS of open-ness (spec §2.3,
+    /// MAJOR-1). `open_conflict_proposals` withdraws a proposal whose ref went non-current (a retire), so
+    /// the idempotency/roll-forward path in [`EventLog::resolve_conflict`] cannot read refs from the open
+    /// set. This reads the raw `conflict_proposal` event by id. `None` for an unknown id or a non-proposal
+    /// event (a `memory` id must never resolve here). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    pub fn conflict_proposal_by_id(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<(crate::index::ConflictRef, crate::index::ConflictRef)>, BossclawError> {
+        use crate::index::ConflictRef;
+        let Some(ev) = self.event_by_id(proposal_id)? else {
+            return Ok(None);
+        };
+        if ev.event_type != crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE {
+            return Ok(None);
+        }
+        let (Some(a), Some(b)) = (
+            ev.content.get("a_ref").and_then(ConflictRef::from_json),
+            ev.content.get("b_ref").and_then(ConflictRef::from_json),
+        ) else {
+            return Ok(None); // malformed proposal — treat as unknown
+        };
+        Ok(Some((a, b)))
+    }
+
     /// Every OPEN conflict proposal (both refs current), oldest first — the read behind a later
     /// App-only `ListConflicts` (spec §3.5). GC is inherent: `open_conflict_proposals` already
     /// drops any proposal whose referenced memory was retired/deleted/edited (I-gc). Fold-derived,
@@ -9297,6 +9323,59 @@ mod tests {
         // Lineage is the referenced memory event ids.
         let sources = ev.model_meta.as_ref().unwrap().source_event_ids.clone();
         assert_eq!(sources, vec!["n_old".to_string(), "cap_ev".to_string()]);
+    }
+
+    /// Rung-3 Phase-3 (§2.3, §2.1 MAJOR-1): `conflict_proposal_by_id` recovers `(a_ref, b_ref)` for a
+    /// proposal by id REGARDLESS of open-ness. A successful retire withdraws the proposal from the OPEN
+    /// set (a non-current ref ⇒ `open_conflict_proposals` drops it), so the idempotency / roll-forward
+    /// path in `resolve_conflict` (Task 6) MUST recover the frozen refs from a by-id read that ignores
+    /// open-ness — reading over the open set alone would return "unknown id" for a legitimately-retried
+    /// retire. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn conflict_proposal_by_id_recovers_refs_even_after_a_ref_is_retired() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let n1 = log.remember(&emb, "branch is main").unwrap();
+        let n2 = log.remember(&emb, "branch is master").unwrap();
+        let (a, b) = (
+            ConflictRef::Note { event_id: n1.clone() },
+            ConflictRef::Note { event_id: n2.clone() },
+        );
+        let prop = log
+            .append_conflict_proposal(&a, &b, "newer", "high", "why", 7, &[n1.clone(), n2.clone()])
+            .unwrap();
+
+        // Before any retire: recovers both refs, and the proposal IS in the OPEN set.
+        let (ra, rb) = log.conflict_proposal_by_id(&prop).unwrap().expect("proposal exists");
+        assert_eq!(ra, a);
+        assert_eq!(rb, b);
+        assert!(
+            log.open_conflict_proposals().unwrap().iter().any(|p| p.id == prop),
+            "open before retire",
+        );
+
+        // Retire a_ref (withdraws the proposal from the OPEN set) — the by-id reader STILL recovers it.
+        log.retire_memory(&n1, Some(&prop)).unwrap();
+        assert!(
+            !log.open_conflict_proposals().unwrap().iter().any(|p| p.id == prop),
+            "withdrawn from the OPEN set once a_ref is non-current",
+        );
+        let (ra2, rb2) = log
+            .conflict_proposal_by_id(&prop)
+            .unwrap()
+            .expect("still readable by id after retire");
+        assert_eq!(ra2, a, "a_ref recovered by id regardless of open-ness (MAJOR-1)");
+        assert_eq!(rb2, b);
+
+        // Unknown / wrong-type id → None.
+        assert!(log.conflict_proposal_by_id("NOPE").unwrap().is_none());
+        assert!(
+            log.conflict_proposal_by_id(&n2).unwrap().is_none(),
+            "a memory id is not a proposal id",
+        );
     }
 
     /// Rung-3 Phase-3 (§2.2 / §3.1): the SINGLE `resolution_exclusions()` reader returns the coexist +
