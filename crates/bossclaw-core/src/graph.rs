@@ -108,6 +108,20 @@ pub const CONFLICT_PROPOSAL_EVENT_TYPE: &str = "conflict_proposal";
 /// `model_meta.model_id` producer stamp for Rung-3 conflict proposals.
 pub const CONFLICT_PROPOSER_PRODUCER: &str = "rung3-conflict-detector";
 
+/// Rung-3 Phase-3 terminal marker: a `conflict_proposal` was RESOLVED by a retire action (signed).
+/// Content: `{ "proposal_id": <id>, "action": "retire_older"|"retire_newer", "retired_event_id": <str> }`.
+/// The retire marker (written FIRST, provenance-tagged) is the torn-write-safe source the digest counts;
+/// this marker records the owner's decision for idempotency + audit. Single-sourced.
+pub const CONFLICT_RESOLVED_EVENT_TYPE: &str = "conflict_resolved";
+/// Rung-3 Phase-3 terminal marker: the owner chose KEEP BOTH (signed). Content:
+/// `{ "proposal_id", "pair_key", "a_ref", "b_ref" }`. Suppresses re-proposal AND drops the pair from
+/// the read surface (I9). Single-sourced.
+pub const COEXIST_ALLOWED_EVENT_TYPE: &str = "coexist_allowed";
+/// Rung-3 Phase-3 terminal marker: the owner DISMISSED (snoozed) the pair (signed). Content:
+/// `{ "proposal_id", "pair_key", "a_ref", "b_ref", "session_heads": {session_id: head_event_id} }`.
+/// The dismissal is LIVE only while every referenced session head is unchanged (§3.1). Single-sourced.
+pub const DISMISSED_EVENT_TYPE: &str = "dismissed";
+
 /// Event type for a granted mandate (a signed standing sync goal). Ground-truth.
 pub const MANDATE_GRANT_EVENT_TYPE: &str = "mandate_grant";
 /// Event type that revokes a mandate by its grant event id. Sticky.
@@ -908,5 +922,24 @@ mod tests {
             "a page-supersede must not retire a file");
         assert!(fold_pages(&[page, file, sup_page]).is_empty(),
             "the page-supersede retired its own page");
+    }
+
+    #[test]
+    fn rung3_phase3_terminal_event_types_are_distinct_and_stable() {
+        // The three terminal markers are pairwise distinct and distinct from the proposal + retire types.
+        let all = [
+            CONFLICT_RESOLVED_EVENT_TYPE,
+            COEXIST_ALLOWED_EVENT_TYPE,
+            DISMISSED_EVENT_TYPE,
+            CONFLICT_PROPOSAL_EVENT_TYPE,
+            NOTE_RETIRED_EVENT_TYPE,
+            PASSAGE_RETIRED_EVENT_TYPE,
+        ];
+        let uniq: std::collections::HashSet<&str> = all.iter().copied().collect();
+        assert_eq!(uniq.len(), all.len(), "all conflict/retire event types are distinct strings");
+        // Stable wire strings (a rename would orphan already-signed events).
+        assert_eq!(CONFLICT_RESOLVED_EVENT_TYPE, "conflict_resolved");
+        assert_eq!(COEXIST_ALLOWED_EVENT_TYPE, "coexist_allowed");
+        assert_eq!(DISMISSED_EVENT_TYPE, "dismissed");
     }
 }
