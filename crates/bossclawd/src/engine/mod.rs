@@ -817,7 +817,7 @@ impl EngineHandle {
         let onboarded = self.is_onboarded_local();
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
-            log.retire_memory(&event_id).map_err(|e| match e {
+            log.retire_memory(&event_id, None).map_err(|e| match e {
                 bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
                 other => EngineOpError::Core(other.to_string()),
             })
@@ -859,7 +859,7 @@ impl EngineHandle {
         let onboarded = self.is_onboarded_local();
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
-            log.retire_passage(&session_id, passage_id).map_err(|e| match e {
+            log.retire_passage(&session_id, passage_id, None).map_err(|e| match e {
                 bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
                 other => EngineOpError::Core(other.to_string()),
             })

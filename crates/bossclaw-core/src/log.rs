@@ -5053,14 +5053,28 @@ impl EventLog {
     /// the Library list, and the embed-rebuild gate, but does NOT yet remove
     /// already-minted entities/edges or dequeue it from extraction — that
     /// edge-invalidation is resolution-time (Phase 3 / Task 9), not a Phase-1 blocker.
-    pub fn retire_memory(&self, target_event_id: &str) -> Result<String, BossclawError> {
+    pub fn retire_memory(
+        &self,
+        target_event_id: &str,
+        source_proposal_id: Option<&str>,
+    ) -> Result<String, BossclawError> {
         self.assert_retirable_note(target_event_id)?;
+        // Base marker (byte-identical to today when `source_proposal_id` is None). The retire FOLD
+        // keys on `retires` only (fold_sessions, log.rs `.get("retires")`), so the additive
+        // `via`/`proposal_id` fields never disturb it — they exist ONLY to make the §3.4 digest
+        // R-count conflict-scoped AND torn-write-safe (same marker type, no distinct event).
+        let mut content = serde_json::Map::new();
+        content.insert("retires".to_string(), serde_json::Value::String(target_event_id.to_string()));
+        if let Some(pid) = source_proposal_id {
+            content.insert("via".to_string(), serde_json::Value::String("conflict".to_string()));
+            content.insert("proposal_id".to_string(), serde_json::Value::String(pid.to_string()));
+        }
         self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
             event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
-            content: serde_json::json!({ "retires": target_event_id }),
+            content: serde_json::Value::Object(content),
             model_meta: None,
             prev_hash: String::new(),
             hash: None,
@@ -5110,6 +5124,7 @@ impl EventLog {
         &self,
         session_id: &str,
         passage_id: usize,
+        source_proposal_id: Option<&str>,
     ) -> Result<String, BossclawError> {
         let fold = fold_sessions(&self.session_events_ordered()?);
         let cs = fold
@@ -5132,12 +5147,23 @@ impl EventLog {
                 "cannot retire passage {passage_id} of {session_id}: already retired"
             )));
         }
+        // Base marker (byte-identical to today when `source_proposal_id` is None). The retire FOLD
+        // keys on `session_id`+`passage_id` only, so the additive `via`/`proposal_id` fields never
+        // disturb it — they exist ONLY to make the §3.4 digest R-count conflict-scoped AND
+        // torn-write-safe (same marker type, no distinct event).
+        let mut content = serde_json::Map::new();
+        content.insert("session_id".to_string(), serde_json::Value::String(session_id.to_string()));
+        content.insert("passage_id".to_string(), serde_json::json!(passage_id));
+        if let Some(pid) = source_proposal_id {
+            content.insert("via".to_string(), serde_json::Value::String("conflict".to_string()));
+            content.insert("proposal_id".to_string(), serde_json::Value::String(pid.to_string()));
+        }
         self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
             event_type: crate::graph::PASSAGE_RETIRED_EVENT_TYPE.to_string(),
-            content: serde_json::json!({ "session_id": session_id, "passage_id": passage_id }),
+            content: serde_json::Value::Object(content),
             model_meta: None,
             prev_hash: String::new(),
             hash: None,
@@ -9282,7 +9308,7 @@ mod tests {
         assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "one open proposal");
 
         // Retire one referenced note → the proposal is GC-withdrawn and the pair is re-proposable.
-        log.retire_memory(&n1).unwrap();
+        log.retire_memory(&n1, None).unwrap();
         assert!(log.pending_conflict_proposals().unwrap().is_empty(), "withdrawn on retire");
         assert!(!log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "pair freed to re-propose");
 
@@ -9508,11 +9534,11 @@ mod tests {
         let note_new = log.supersede_note(&emb, &note_old, "the branch is trunk").unwrap();
         // (2) A note that gets RETIRED via the distinct note_retired marker — must drop.
         let note_retired = log.remember(&emb, "db is postgres").unwrap();
-        log.retire_memory(&note_retired).unwrap();
+        log.retire_memory(&note_retired, None).unwrap();
         // (3) A capture whose passage 0 is RETIRED — passage 0 drops, passage 1 stays.
         let cap_s2 = log.capture_session(&emb, &session_meta("s2", "cc")).unwrap();
         log.store_session_passages(&emb, &cap_s2, &["p0".to_string(), "p1".to_string()]).unwrap();
-        log.retire_passage("s2", 0).unwrap();
+        log.retire_passage("s2", 0, None).unwrap();
         // (4) A capture SUPERSEDED by a newer capture of the SAME session_id (different sha) — the
         // OLD capture event must contribute zero passage subjects; only the new head's do.
         let cap_s1_old = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
@@ -9662,7 +9688,7 @@ mod tests {
         let chunks = vec!["Vercel".to_string(), "Postgres".to_string()];
         log.store_session_passages(&emb, &ev, &chunks).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
-        log.retire_passage("s1", 0).unwrap();
+        log.retire_passage("s1", 0, None).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
         let hit = |q: &str| {
             log.conflict_search(&emb.embed(&[q.into()]).unwrap()[0], 8)
@@ -9679,15 +9705,15 @@ mod tests {
         // Reject branches, asserted WHILE passage 0 is still retired (all three are
         // read-only rejects that append nothing, so they never disturb the flow below).
         assert!(
-            matches!(log.retire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
+            matches!(log.retire_passage("s1", 0, None), Err(BossclawError::InvalidInput(_))),
             "double-retire of a still-retired passage is rejected (I6)"
         );
         assert!(
-            matches!(log.retire_passage("s1", 9), Err(BossclawError::InvalidInput(_))),
+            matches!(log.retire_passage("s1", 9, None), Err(BossclawError::InvalidInput(_))),
             "out-of-range passage_id (≥ N=2) is rejected"
         );
         assert!(
-            matches!(log.retire_passage("ghost", 0), Err(BossclawError::InvalidInput(_))),
+            matches!(log.retire_passage("ghost", 0, None), Err(BossclawError::InvalidInput(_))),
             "retire against a non-current session is rejected"
         );
         // SWEEP durability: same-sha re-capture is a no-op (returns the same id); marker persists across rebuild.
@@ -9701,6 +9727,49 @@ mod tests {
             matches!(log.unretire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
             "unretiring a no-longer-retired passage is rejected (I6)"
         );
+    }
+
+    /// Rung-3 §2.1 (MAJOR-2) / §3.4: the optional `source_proposal_id` provenance stamp. When
+    /// `Some`, the SAME `note_retired`/`passage_retired` marker gains `{"via":"conflict",
+    /// "proposal_id":id}` (additive, so the retire fold — keyed on `retires` / `session_id`+
+    /// `passage_id`, no `deny_unknown_fields` — is UNTOUCHED and still retires). When `None`
+    /// (the manual App path) the marker is byte-identical to today, carrying NO provenance tag.
+    #[test]
+    fn retire_stamps_conflict_provenance_but_fold_and_app_path_are_untouched() {
+        use crate::graph::{NOTE_RETIRED_EVENT_TYPE, PASSAGE_RETIRED_EVENT_TYPE};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // (a) App path (None) — the marker is byte-identical to today: {"retires": id}, no `via`.
+        let n_app = log.remember(&emb, "app-retired note").unwrap();
+        let m_app = log.retire_memory(&n_app, None).unwrap();
+        let ev = log.event_by_id(&m_app).unwrap().unwrap();
+        assert_eq!(ev.event_type, NOTE_RETIRED_EVENT_TYPE);
+        assert_eq!(ev.content.get("retires").and_then(|v| v.as_str()), Some(n_app.as_str()));
+        assert!(ev.content.get("via").is_none(), "App retire carries NO provenance tag");
+
+        // (b) Conflict path (Some) — same marker TYPE, plus the provenance tag; the fold still retires it.
+        let n_conf = log.remember(&emb, "conflict-retired note").unwrap();
+        let m_conf = log.retire_memory(&n_conf, Some("PROP1")).unwrap();
+        let ev = log.event_by_id(&m_conf).unwrap().unwrap();
+        assert_eq!(ev.event_type, NOTE_RETIRED_EVENT_TYPE, "SAME marker type as the App path");
+        assert_eq!(ev.content.get("retires").and_then(|v| v.as_str()), Some(n_conf.as_str()));
+        assert_eq!(ev.content.get("via").and_then(|v| v.as_str()), Some("conflict"));
+        assert_eq!(ev.content.get("proposal_id").and_then(|v| v.as_str()), Some("PROP1"));
+        // The retire fold is untouched: the note is no longer current (recall/list drop it).
+        assert!(!log.current_notes().unwrap().iter().any(|c| c.event_id == n_conf), "tagged retire still retires");
+
+        // (c) Passage retire carries the tag too, same shape.
+        let cev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cev, &["p0".to_string(), "p1".to_string()]).unwrap();
+        let pm = log.retire_passage("s1", 0, Some("PROP2")).unwrap();
+        let ev = log.event_by_id(&pm).unwrap().unwrap();
+        assert_eq!(ev.event_type, PASSAGE_RETIRED_EVENT_TYPE);
+        assert_eq!(ev.content.get("session_id").and_then(|v| v.as_str()), Some("s1"));
+        assert_eq!(ev.content.get("passage_id").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(ev.content.get("via").and_then(|v| v.as_str()), Some("conflict"));
+        assert_eq!(ev.content.get("proposal_id").and_then(|v| v.as_str()), Some("PROP2"));
     }
 
     /// Rung-3 §9/§13 recall-NEUTRALITY (by construction + measured): building the SEPARATE
@@ -9749,7 +9818,7 @@ mod tests {
         let chunks = vec!["we deploy on vercel".to_string(), "db is postgres".to_string()];
         log.store_session_passages(&emb, &ev, &chunks).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
-        log.retire_passage("s1", 0).unwrap();
+        log.retire_passage("s1", 0, None).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
 
         // Byte-identity: same ordered hit ids, same recall-index element count. The conflict index
@@ -10100,11 +10169,11 @@ mod tests {
         let ev = log.remember(&emb, "we deploy on Vercel").unwrap();
         log.rebuild_indexes(&emb).unwrap();
         assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev));
-        log.retire_memory(&ev).unwrap();
+        log.retire_memory(&ev, None).unwrap();
         assert!(!log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "retired note excluded from recall");
         assert!(!log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "retired note excluded from the Library list");
         // (a) retiring an already-retired note rejects (guard path).
-        assert!(matches!(log.retire_memory(&ev), Err(BossclawError::InvalidInput(_))), "cannot retire an already-retired note");
+        assert!(matches!(log.retire_memory(&ev, None), Err(BossclawError::InvalidInput(_))), "cannot retire an already-retired note");
         assert!(matches!(log.unretire("not-a-retired-id"), Err(BossclawError::InvalidInput(_))), "unretire refuses a non-retired id");
         log.unretire(&ev).unwrap();
         assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "unretire restores recall");
@@ -10112,7 +10181,7 @@ mod tests {
         assert!(log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "unretire restores the Library list");
         // (b) double unretire rejects: it is no longer in `retired_notes`.
         assert!(matches!(log.unretire(&ev), Err(BossclawError::InvalidInput(_))), "cannot unretire a note that is not retired");
-        assert!(matches!(log.retire_memory("nope"), Err(BossclawError::InvalidInput(_))));
+        assert!(matches!(log.retire_memory("nope", None), Err(BossclawError::InvalidInput(_))));
     }
 
     #[test]
