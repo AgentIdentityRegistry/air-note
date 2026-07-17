@@ -471,6 +471,52 @@ pub struct ConflictSubject {
     pub subject: crate::index::ConflictRef,
 }
 
+/// One of the four deterministic resolution actions (spec §1). NO LLM in the path. Portable data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveAction {
+    /// Retire the FROZEN older side (a_ref) — reversible.
+    RetireOlder,
+    /// Retire the FROZEN newer side (b_ref) — reversible.
+    RetireNewer,
+    /// Both memories coexist — never re-proposed, dropped from the read surface.
+    KeepBoth,
+    /// Snooze the pair — re-opens on a material change to a member (§3.1).
+    Dismiss,
+}
+
+/// The outcome of a [`EventLog::resolve_conflict`] call (spec §2.1). Portable data type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveOutcome {
+    /// The action was applied for the first time; carries the id of the terminal marker just appended.
+    Applied(String),
+    /// Idempotent no-op success: the proposal was already resolved by the SAME action, OR a torn-write
+    /// roll-forward completed the missing `conflict_resolved`. No fail-loud primitive was (re-)called.
+    NoOp,
+}
+
+/// Map a `ResolveAction` to its terminal `ResolutionKind` (the two retire actions map to the two retire
+/// kinds; KeepBoth/Dismiss map to their own).
+fn action_kind(a: ResolveAction) -> ResolutionKind {
+    match a {
+        ResolveAction::RetireOlder => ResolutionKind::RetireOlder,
+        ResolveAction::RetireNewer => ResolutionKind::RetireNewer,
+        ResolveAction::KeepBoth => ResolutionKind::KeepBoth,
+        ResolveAction::Dismiss => ResolutionKind::Dismiss,
+    }
+}
+
+/// The `retired_event_id` recorded in `conflict_resolved` (Open-Q7): well-formed from the proposal refs on
+/// BOTH the fresh and roll-forward paths. A Note → its event id; a Passage → a stable `session#passage`
+/// composite (informational; the digest R-count reads the tagged retire MARKERS, not this field).
+fn retired_id_of(loser: &crate::index::ConflictRef) -> String {
+    match loser {
+        crate::index::ConflictRef::Note { event_id } => event_id.clone(),
+        crate::index::ConflictRef::Passage { session_id, passage_id } => {
+            format!("{session_id}#{passage_id}")
+        }
+    }
+}
+
 /// What one [`EventLog::detect_conflicts_once`] cycle did (spec §3.3). All-zero + `skipped_disabled`
 /// when the flag is off (I3).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -3018,6 +3064,166 @@ impl EventLog {
             out.insert(pid.to_string(), record);
         }
         Ok(out)
+    }
+
+    /// Resolve a detected `conflict_proposal` (spec §2.1). Deterministic, no LLM, no egress. Owns its
+    /// idempotency via the ALL-proposals guard (a retire withdraws the proposal from the OPEN set, so the
+    /// guard must NOT key off open membership — MAJOR-1). The retire actions retire the FROZEN loser
+    /// (`RetireOlder`=a_ref, `RetireNewer`=b_ref — detection fixed older→a_ref at `log.rs:6453`; NO ts
+    /// recompute here, since a passage's ts tracks its session head, which a re-capture can flip). A
+    /// torn-write retry (loser already in the retired set, no `conflict_resolved`) rolls forward: append
+    /// the missing marker, return `NoOp` — never re-call the fail-loud primitive (`Err("already retired")`,
+    /// `log.rs:5214`/`:5130`). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    pub fn resolve_conflict(
+        &self,
+        proposal_id: &str,
+        action: ResolveAction,
+    ) -> Result<ResolveOutcome, BossclawError> {
+        use crate::index::ConflictRef;
+        // (1) Load refs by id (open-ness independent) — unknown id ⇒ error.
+        let Some((a_ref, b_ref)) = self.conflict_proposal_by_id(proposal_id)? else {
+            return Err(BossclawError::InvalidInput(format!("unknown conflict proposal {proposal_id}")));
+        };
+        let want = action_kind(action);
+        // (2) Terminal-state guard over ALL resolution markers.
+        if let Some(existing) = self.resolution_markers()?.get(proposal_id) {
+            if existing.kind == want {
+                return Ok(ResolveOutcome::NoOp); // idempotent same-action repeat
+            }
+            return Err(BossclawError::InvalidInput(format!(
+                "conflict proposal {proposal_id} is already resolved"
+            )));
+        }
+        // (3) No terminal marker yet — apply.
+        match action {
+            ResolveAction::RetireOlder | ResolveAction::RetireNewer => {
+                let loser = if matches!(action, ResolveAction::RetireOlder) { &a_ref } else { &b_ref };
+                let retired_event_id = retired_id_of(loser);
+                // Roll-forward gate: retired-SET membership (regardless of who retired it — §3.4). If the
+                // frozen loser is ALREADY retired, the primitive would fail loud → append the missing
+                // conflict_resolved instead and return no-op success.
+                let fold = fold_sessions(&self.session_events_ordered()?);
+                let already_retired = match loser {
+                    ConflictRef::Note { event_id } => fold.retired_notes.contains(event_id),
+                    ConflictRef::Passage { session_id, passage_id } => {
+                        fold.retired_passages.contains(&(session_id.clone(), *passage_id))
+                    }
+                };
+                if !already_retired {
+                    // Retire the frozen loser with conflict provenance (§2.1 MAJOR-2), written FIRST.
+                    match loser {
+                        ConflictRef::Note { event_id } => {
+                            self.retire_memory(event_id, Some(proposal_id))?;
+                        }
+                        ConflictRef::Passage { session_id, passage_id } => {
+                            self.retire_passage(session_id, *passage_id, Some(proposal_id))?;
+                        }
+                    }
+                }
+                let marker_id = self.append_conflict_resolved(proposal_id, want, &retired_event_id)?;
+                // A fresh retire → Applied; a roll-forward (loser was already retired) → NoOp success.
+                if already_retired {
+                    Ok(ResolveOutcome::NoOp)
+                } else {
+                    Ok(ResolveOutcome::Applied(marker_id))
+                }
+            }
+            ResolveAction::KeepBoth => {
+                let id = self.append_pair_terminal(
+                    crate::graph::COEXIST_ALLOWED_EVENT_TYPE, proposal_id, &a_ref, &b_ref, None,
+                )?;
+                Ok(ResolveOutcome::Applied(id))
+            }
+            ResolveAction::Dismiss => {
+                // Record the current head of every referenced session so the dismissal lapses on
+                // re-capture (§3.1). Notes contribute no head.
+                let fold = fold_sessions(&self.session_events_ordered()?);
+                let head_of: std::collections::HashMap<&str, &str> =
+                    fold.current.iter().map(|cs| (cs.session_id.as_str(), cs.event_id.as_str())).collect();
+                let mut heads = serde_json::Map::new();
+                for r in [&a_ref, &b_ref] {
+                    if let ConflictRef::Passage { session_id, .. } = r {
+                        if let Some(h) = head_of.get(session_id.as_str()) {
+                            heads.insert(session_id.clone(), serde_json::Value::String((*h).to_string()));
+                        }
+                    }
+                }
+                let id = self.append_pair_terminal(
+                    crate::graph::DISMISSED_EVENT_TYPE, proposal_id, &a_ref, &b_ref,
+                    Some(serde_json::Value::Object(heads)),
+                )?;
+                Ok(ResolveOutcome::Applied(id))
+            }
+        }
+    }
+
+    /// Append a `conflict_resolved{proposal_id, action, retired_event_id}` terminal marker (§2.1). Plain
+    /// signed `append` (like the retire markers — NOT `build_proposer_event`). Written AFTER the retire
+    /// marker (§3.4 ordering). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    fn append_conflict_resolved(
+        &self,
+        proposal_id: &str,
+        kind: ResolutionKind,
+        retired_event_id: &str,
+    ) -> Result<String, BossclawError> {
+        let action = match kind {
+            ResolutionKind::RetireOlder => "retire_older",
+            ResolutionKind::RetireNewer => "retire_newer",
+            _ => unreachable!("append_conflict_resolved is only for retire kinds"),
+        };
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::CONFLICT_RESOLVED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "proposal_id": proposal_id, "action": action, "retired_event_id": retired_event_id,
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Append a `coexist_allowed` / `dismissed` PAIR terminal marker with the shared shape
+    /// `{proposal_id, pair_key, a_ref, b_ref}` (+ optional `session_heads` for `dismissed`). §2.1.
+    /// `#[cfg(unix)]`.
+    #[cfg(unix)]
+    fn append_pair_terminal(
+        &self,
+        event_type: &str,
+        proposal_id: &str,
+        a_ref: &crate::index::ConflictRef,
+        b_ref: &crate::index::ConflictRef,
+        session_heads: Option<serde_json::Value>,
+    ) -> Result<String, BossclawError> {
+        let mut content = serde_json::Map::new();
+        content.insert("proposal_id".to_string(), serde_json::Value::String(proposal_id.to_string()));
+        content.insert(
+            "pair_key".to_string(),
+            serde_json::Value::String(crate::index::ConflictRef::unordered_pair_key(a_ref, b_ref)),
+        );
+        content.insert("a_ref".to_string(), a_ref.to_json());
+        content.insert("b_ref".to_string(), b_ref.to_json());
+        if let Some(h) = session_heads {
+            content.insert("session_heads".to_string(), h);
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: event_type.to_string(),
+            content: serde_json::Value::Object(content),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
     }
 
     /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
@@ -9557,6 +9763,121 @@ mod tests {
         assert_eq!(r1.retired_event_id.as_deref(), Some("E1"));
         assert_eq!(m.get("PROP2").unwrap().kind, ResolutionKind::KeepBoth);
         assert!(!m.contains_key("PROP_NONE")); // unresolved proposal folds to absent
+    }
+
+    /// Rung-3 Phase-3 (§2.1, §3.4, MAJOR-1/MAJOR-2): `resolve_conflict` settles a detected conflict.
+    /// The retire actions retire the FROZEN loser (`RetireOlder`=a_ref, `RetireNewer`=b_ref — NO ts
+    /// recompute) with conflict provenance, then append `conflict_resolved`. Idempotency is owned over the
+    /// ALL-proposals terminal fold (a retire withdraws the proposal from the OPEN set, so the guard must NOT
+    /// key off open membership): same-action repeat = clean `NoOp`, different action = reject, unknown id =
+    /// error. The torn-write / cross-source roll-forward gate is retired-SET membership (§3.4), NOT
+    /// tag-equality: if the frozen loser is already retired — by THIS proposal, a DIFFERENT one, or a manual
+    /// tagless App retire — `resolve_conflict` appends the missing `conflict_resolved` and returns `NoOp`,
+    /// never re-calling the fail-loud primitive. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_conflict_retires_frozen_loser_and_is_idempotent_and_rolls_forward() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // ── RetireOlder retires the FROZEN a_ref (no ts recompute) ──
+        let older = log.remember(&emb, "branch is main").unwrap();
+        let newer = log.remember(&emb, "branch is master").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: older.clone() }, ConflictRef::Note { event_id: newer.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "newer", "high", "why", 0, &[older.clone(), newer.clone()]).unwrap();
+
+        let out = log.resolve_conflict(&prop, ResolveAction::RetireOlder).unwrap();
+        assert!(matches!(out, ResolveOutcome::Applied(_)), "first resolution applies");
+        assert!(!log.current_notes().unwrap().iter().any(|c| c.event_id == older), "a_ref (older) retired");
+        assert!(log.current_notes().unwrap().iter().any(|c| c.event_id == newer), "b_ref (newer) survives");
+        // The conflict_resolved marker exists AND the retire marker carries the conflict provenance tag.
+        let resolved = log.resolution_markers_for_test(&prop); // helper: reads resolution_markers().get(prop).cloned()
+        assert!(resolved.is_some(), "conflict_resolved recorded");
+
+        // Idempotent repeat of the SAME action — EVEN THOUGH the retire withdrew the proposal from the open
+        // set — is a clean no-op success (no primitive Err bubbles up).
+        let again = log.resolve_conflict(&prop, ResolveAction::RetireOlder).unwrap();
+        assert!(matches!(again, ResolveOutcome::NoOp), "same-action repeat = no-op success");
+
+        // A DIFFERENT action on a resolved proposal is rejected (first resolution wins).
+        let diff = log.resolve_conflict(&prop, ResolveAction::KeepBoth);
+        assert!(matches!(diff, Err(BossclawError::InvalidInput(_))), "different action on resolved = reject");
+
+        // Unknown proposal id → error.
+        assert!(matches!(log.resolve_conflict("NOPE", ResolveAction::Dismiss), Err(BossclawError::InvalidInput(_))));
+
+        // ── KeepBoth + Dismiss append their markers ──
+        let k1 = log.remember(&emb, "x=1").unwrap();
+        let k2 = log.remember(&emb, "x=2").unwrap();
+        let kp = log.append_conflict_proposal(
+            &ConflictRef::Note { event_id: k1.clone() }, &ConflictRef::Note { event_id: k2.clone() },
+            "unclear", "med", "why", 0, &[k1.clone(), k2.clone()]).unwrap();
+        assert!(matches!(log.resolve_conflict(&kp, ResolveAction::KeepBoth).unwrap(), ResolveOutcome::Applied(_)));
+        assert_eq!(log.resolution_markers_for_test(&kp).unwrap(), ResolutionKind::KeepBoth);
+
+        // ── Torn-write roll-forward: loser retired, conflict_resolved MISSING → append it, no-op success ──
+        let o2 = log.remember(&emb, "y=old").unwrap();
+        let n2b = log.remember(&emb, "y=new").unwrap();
+        let (ra, rb) = (ConflictRef::Note { event_id: o2.clone() }, ConflictRef::Note { event_id: n2b.clone() });
+        let torn = log.append_conflict_proposal(&ra, &rb, "newer", "high", "why", 0, &[o2.clone(), n2b.clone()]).unwrap();
+        // Simulate the crash window: the tagged retire marker landed, the conflict_resolved did NOT.
+        log.retire_memory(&o2, Some(&torn)).unwrap();
+        assert!(log.resolution_markers_for_test(&torn).is_none(), "precondition: no conflict_resolved yet");
+        let rolled = log.resolve_conflict(&torn, ResolveAction::RetireOlder).unwrap();
+        assert!(matches!(rolled, ResolveOutcome::NoOp), "roll-forward returns no-op success (no primitive Err)");
+        assert_eq!(log.resolution_markers_for_test(&torn).unwrap(), ResolutionKind::RetireOlder, "missing marker appended");
+
+        // ── DISCRIMINATING roll-forward: the frozen loser is already retired by a DIFFERENT source (a MANUAL
+        // App retire, via=None), NOT by this proposal. The gate is retired-SET MEMBERSHIP (§3.4), NOT
+        // tag-equality — so a regression to a "was-this-proposal's-tag" gate would wrongly re-call the
+        // fail-loud primitive here and bubble an Err. resolve_conflict must still roll forward to a clean NoOp.
+        let o3 = log.remember(&emb, "z=old").unwrap();
+        let n3c = log.remember(&emb, "z=new").unwrap();
+        let (za, zb) = (ConflictRef::Note { event_id: o3.clone() }, ConflictRef::Note { event_id: n3c.clone() });
+        let cross = log.append_conflict_proposal(&za, &zb, "newer", "high", "why", 0, &[o3.clone(), n3c.clone()]).unwrap();
+        log.retire_memory(&o3, None).unwrap(); // MANUAL retire of the frozen loser — a DIFFERENT source, no tag
+        assert!(log.resolution_markers_for_test(&cross).is_none(), "precondition: proposal not yet resolved");
+        let crossed = log.resolve_conflict(&cross, ResolveAction::RetireOlder)
+            .expect("must NOT bubble a fail-loud `already retired` Err — the gate is retired-set membership");
+        assert!(matches!(crossed, ResolveOutcome::NoOp), "roll-forward on a differently-retired loser = no-op");
+        assert_eq!(log.resolution_markers_for_test(&cross).unwrap(), ResolutionKind::RetireOlder, "missing marker appended");
+    }
+
+    #[cfg(unix)]
+    impl EventLog {
+        fn resolution_markers_for_test(&self, prop: &str) -> Option<ResolutionKind> {
+            self.resolution_markers().unwrap().get(prop).map(|r| r.kind)
+        }
+    }
+
+    /// Rung-3 Phase-3 (§2.1, point-3 "frozen loser"): the loser is chosen by the ACTION→FROZEN-REF mapping
+    /// (`RetireNewer`=b_ref), NOT by any ts recompute at resolve time. Detection fixes older→a_ref /
+    /// newer→b_ref once; resolve time must retire exactly that frozen side. This deterministically pins the
+    /// `RetireNewer` retire path (the sibling of the main test's `RetireOlder`) with NO wall-clock/ts
+    /// dependence — a ts-flip discriminator would hinge on events landing in distinct seconds (flaky), which
+    /// this crate intentionally avoids; the impl is structurally ts-free, so the mapping is what matters.
+    /// `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_conflict_retire_newer_retires_frozen_b_ref() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        let older = log.remember(&emb, "port is 8080").unwrap();
+        let newer = log.remember(&emb, "port is 9090").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: older.clone() }, ConflictRef::Note { event_id: newer.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "older", "high", "why", 0, &[older.clone(), newer.clone()]).unwrap();
+
+        let out = log.resolve_conflict(&prop, ResolveAction::RetireNewer).unwrap();
+        assert!(matches!(out, ResolveOutcome::Applied(_)), "first resolution applies");
+        // RetireNewer retires the FROZEN b_ref (newer); the frozen a_ref (older) survives.
+        assert!(!log.current_notes().unwrap().iter().any(|c| c.event_id == newer), "b_ref (newer) retired");
+        assert!(log.current_notes().unwrap().iter().any(|c| c.event_id == older), "a_ref (older) survives");
+        assert_eq!(log.resolution_markers_for_test(&prop).unwrap(), ResolutionKind::RetireNewer);
     }
 
     /// Rung-3 Phase-2 (§3.5, I9): a proposal for an unordered typed pair suppresses a duplicate for
