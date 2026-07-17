@@ -2939,9 +2939,19 @@ impl EventLog {
     /// so it survives restart with no cursor. `#[cfg(unix)]`.
     #[cfg(unix)]
     pub fn pending_conflict_proposals(&self) -> Result<Vec<ConflictProposalRow>, BossclawError> {
+        // Rung-3 Phase-3 (§2.2 item 2, I9): a retire drops via the currency-GC in
+        // `open_conflict_proposals`; KeepBoth/Dismiss retire NOTHING, so the SAME live coexist/dismissed
+        // set that suppresses the finder (Task 7) must also drop them here — or the pending count /
+        // `ListConflicts` nags forever. Single-sourced `resolution_exclusions()` ⇒ reader and finder
+        // can never drift on `session_heads` liveness.
+        let excluded = self.resolution_exclusions()?;
         Ok(self
             .open_conflict_proposals()?
             .into_iter()
+            .filter(|p| {
+                let pk = Self::conflict_pair_key(&p.a_ref, &p.b_ref);
+                !excluded.coexist_pairs.contains(&pk) && !excluded.dismissed_pairs.contains(&pk)
+            })
             .map(|p| ConflictProposalRow {
                 id: p.id,
                 a_ref: p.a_ref,
@@ -10017,6 +10027,42 @@ mod tests {
             log.is_conflict_proposal_suppressed(&note_ref, &p0).unwrap(),
             "the surviving-ordinal pair (ordinal 0) is STILL suppressed — not over-withdrawn"
         );
+    }
+
+    /// Rung-3 Phase-3 (§2.2 item 2, I9): the READER complement to Task 7's finder suppression.
+    /// KeepBoth/Dismiss retire NOTHING, so both refs stay current and the proposal stays in the OPEN
+    /// set — without a filter the pending count / `ListConflicts` would nag every session forever.
+    /// `pending_conflict_proposals` drops any open proposal whose `unordered_pair_key` is in the SAME
+    /// live `resolution_exclusions()` set the finder consumes (single source → no drift): a KeepBoth'd
+    /// note↔note pair AND a Dismissed passage↔note pair both disappear from the read surface, and the
+    /// pending count drops with them. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn keep_both_and_dismiss_drop_the_proposal_from_the_read_surface() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let n1 = log.remember(&emb, "x=1").unwrap();
+        let n2 = log.remember(&emb, "x=2").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: n1.clone() }, ConflictRef::Note { event_id: n2.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "unclear", "med", "why", 0, &[n1.clone(), n2.clone()]).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "open before resolution");
+
+        // KeepBoth retires nothing — both refs stay current — but the reader must drop it (I9).
+        log.resolve_conflict(&prop, ResolveAction::KeepBoth).unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "kept-both drops from the read surface");
+
+        // A dismissed passage pair drops while live; re-appears if the head advances (covered in Task 3).
+        let cev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cev, &["deploy vercel".to_string()]).unwrap();
+        let n3 = log.remember(&emb, "deploy fly").unwrap();
+        let pa = ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 };
+        let pb = ConflictRef::Note { event_id: n3.clone() };
+        let prop2 = log.append_conflict_proposal(&pa, &pb, "unclear", "med", "why", 0, &[cev.clone(), n3.clone()]).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1);
+        log.resolve_conflict(&prop2, ResolveAction::Dismiss).unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "dismissed drops while the head is unchanged");
     }
 
     #[test]
