@@ -2974,6 +2974,52 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Fold ALL terminal markers into `proposal_id -> ResolutionRecord` (spec §2.1). The idempotency +
+    /// terminal-state guard in [`EventLog::resolve_conflict`] reads this over ALL proposals (NOT the open
+    /// set — a retire withdrew the proposal from open, MAJOR-1). FIRST marker per proposal wins (a second,
+    /// different action is rejected by the guard before it can append, so a well-formed log has at most one
+    /// per id; the fold defensively keeps the earliest). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[allow(dead_code)] // consumed by resolve_conflict's terminal-state guard (Task 6)
+    fn resolution_markers(&self) -> Result<std::collections::HashMap<String, ResolutionRecord>, BossclawError> {
+        let mut out: std::collections::HashMap<String, ResolutionRecord> = std::collections::HashMap::new();
+        for ev in self.events_of_types(&[
+            crate::graph::CONFLICT_RESOLVED_EVENT_TYPE,
+            crate::graph::COEXIST_ALLOWED_EVENT_TYPE,
+            crate::graph::DISMISSED_EVENT_TYPE,
+        ])? {
+            let Some(pid) = ev.content.get("proposal_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if out.contains_key(pid) {
+                continue; // earliest (seq ASC) wins — events_of_types is seq-ordered
+            }
+            let record = match ev.event_type.as_str() {
+                t if t == crate::graph::CONFLICT_RESOLVED_EVENT_TYPE => {
+                    let kind = match ev.content.get("action").and_then(|v| v.as_str()) {
+                        Some("retire_older") => ResolutionKind::RetireOlder,
+                        Some("retire_newer") => ResolutionKind::RetireNewer,
+                        _ => continue, // malformed conflict_resolved — ignore
+                    };
+                    ResolutionRecord {
+                        kind,
+                        retired_event_id: ev
+                            .content
+                            .get("retired_event_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    }
+                }
+                t if t == crate::graph::COEXIST_ALLOWED_EVENT_TYPE => {
+                    ResolutionRecord { kind: ResolutionKind::KeepBoth, retired_event_id: None }
+                }
+                _ => ResolutionRecord { kind: ResolutionKind::Dismiss, retired_event_id: None },
+            };
+            out.insert(pid.to_string(), record);
+        }
+        Ok(out)
+    }
+
     /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
     /// Thin wrapper over [`Self::append_write_rejected_with`].
     #[cfg(unix)]
@@ -9079,6 +9125,30 @@ struct OpenConflictProposal {
     detected_at: i64,
 }
 
+/// Which terminal action resolved a proposal (spec §2.1). Ordered so `conflict_resolved`'s `action`
+/// string maps here. Portable data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionKind {
+    /// `conflict_resolved` with `action == "retire_older"` — a_ref retired.
+    RetireOlder,
+    /// `conflict_resolved` with `action == "retire_newer"` — b_ref retired.
+    RetireNewer,
+    /// `coexist_allowed` — keep both.
+    KeepBoth,
+    /// `dismissed` — snoozed.
+    Dismiss,
+}
+
+/// One proposal's terminal record (spec §2.1). `retired_event_id` is present only for the two retire
+/// kinds. Internal to the resolution fold.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by resolve_conflict's terminal-state guard (Task 6)
+struct ResolutionRecord {
+    kind: ResolutionKind,
+    retired_event_id: Option<String>,
+}
+
 /// The two PAIR-key exclusion sets derived from the terminal resolution markers (spec §2.2). Both keyed
 /// by [`crate::index::ConflictRef::unordered_pair_key`] — the SAME space as the finder's `open_pairs` and
 /// `conflict_pair_key`. ONE reader ([`EventLog::resolution_exclusions`]) produces both, so the finder
@@ -9452,6 +9522,41 @@ mod tests {
         let excl2 = log.resolution_exclusions().unwrap();
         assert!(excl2.coexist_pairs.contains(&pk_notes), "coexist (note↔note) is unaffected by the re-capture");
         assert!(!excl2.dismissed_pairs.contains(&pk_pass), "dismissal LAPSED after the session head advanced");
+    }
+
+    /// Rung-3 Phase-3 (§2.1 idempotency universe): `resolution_markers` folds ALL terminal markers
+    /// (`conflict_resolved` / `coexist_allowed` / `dismissed`) into `proposal_id -> ResolutionRecord`, over
+    /// the WHOLE log — NOT the open set (a retire withdraws the proposal from open, MAJOR-1, but its terminal
+    /// marker persists so the SAME-vs-DIFFERENT-action guard in `resolve_conflict` (Task 6) still fires). A
+    /// `conflict_resolved` marker captures the ACTION (`retire_older` → `RetireOlder`) and the retired event
+    /// id; a `coexist_allowed` folds to `KeepBoth`; an unresolved proposal is absent. Seeded with LOCAL
+    /// hand-built markers (the natural producer `resolve_conflict` lands in Task 6) whose content shape
+    /// mirrors EXACTLY what it will write. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn resolution_markers_key_by_proposal_and_first_marker_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // Append a conflict_resolved (retire_older) for PROP1 and a coexist for PROP2.
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::CONFLICT_RESOLVED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "PROP1", "action": "retire_older", "retired_event_id": "E1" }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "PROP2", "pair_key": "PK", "a_ref": {"kind":"note","event_id":"a"}, "b_ref": {"kind":"note","event_id":"b"} }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+
+        let m = log.resolution_markers().unwrap();
+        let r1 = m.get("PROP1").expect("PROP1 resolved");
+        assert_eq!(r1.kind, ResolutionKind::RetireOlder);
+        assert_eq!(r1.retired_event_id.as_deref(), Some("E1"));
+        assert_eq!(m.get("PROP2").unwrap().kind, ResolutionKind::KeepBoth);
+        assert!(!m.contains_key("PROP_NONE")); // unresolved proposal folds to absent
     }
 
     /// Rung-3 Phase-2 (§3.5, I9): a proposal for an unordered typed pair suppresses a duplicate for
