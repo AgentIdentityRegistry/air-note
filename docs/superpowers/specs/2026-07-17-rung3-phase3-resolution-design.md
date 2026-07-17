@@ -67,8 +67,9 @@ non-current → `open_conflict_proposals` drops it, `log.rs:2827-2839`). One uni
   provenance — `retire_memory`/`retire_passage` gain an optional `source_proposal_id` that adds
   `{"via":"conflict","proposal_id":…}` to the marker content (same event *type*, so the retire fold is
   untouched; App path passes `None`). The digest's R-count reads `via=="conflict"` markers since the digest
-  cursor — conflict-scoped AND from the first-written marker. This tag also supplies MAJOR-1's "already
-  retired by me for this proposal" signal. §2.1/§2.4/§3.4 reconciled.
+  cursor — conflict-scoped AND from the first-written marker. (MAJOR-1's roll-forward gate is separately
+  keyed on **retired-set membership**, NOT on this tag — the tag is digest-scoping only.) §2.1/§2.4/§3.4
+  reconciled.
 - **[MINOR-1] `sanitize_injected` crate boundary.** It lives in `bossclawd` (`snapshot.rs:104`), but
   `air-memory-mcp` depends on `bossclawd` only as a **dev-dependency** — `mcp.rs` cannot call it in prod.
   **Fix:** sanitize **daemon-side** when building the `ListConflicts` response (in `bossclawd`, in-crate).
@@ -305,8 +306,11 @@ The retire marker itself already carries `{"via":"conflict","proposal_id":id}` (
 FIRST, so the digest's R-count sees it regardless of the torn write — **conflict-scoped AND torn-write-safe
 from one marker**. A torn write leaves: memory retired (reversible), proposal GC-withdrawn from the open
 set, tagged retire marker present (visible + attributable), `conflict_resolved` marker absent. A re-resolve
-is a **clean no-op** via §2.1's roll-forward (it detects "loser already retired for this proposal_id" and
-appends the missing `conflict_resolved`). No silent retire, no mis-attribution.
+is a **clean no-op** via §2.1's roll-forward, whose trigger is **retired-set membership** — the guard sees
+the frozen loser already in the fold's retired set (regardless of which action/proposal/manual-retire put it
+there) and appends the missing `conflict_resolved` instead of re-calling the fail-loud primitive. The
+`via`/`proposal_id` tag's job is **digest R-count scoping ONLY, not the roll-forward gate.** No silent
+retire, no mis-attribution.
 
 ## 4. Invariants — stated honestly
 - **I1 — HOLDS, meaning narrowed (precise wording).** "No retirement without an explicit `resolve_conflict`
@@ -443,3 +447,19 @@ appends the missing `conflict_resolved`). No silent retire, no mis-attribution.
    `is_conflict_proposal_suppressed` (`log.rs:6483`) is open-proposal-only; coexist/dismissed re-proposal
    suppression relies solely on the in-memory `open_pairs` union (rebuilt each cycle from the fold). Correct
    while the fold is authoritative; documented so the single-guard choice is deliberate, not an oversight.
+7. **Roll-forward `retired_event_id` source:** the `conflict_resolved` appended by a torn-write roll-forward
+   must record the frozen loser resolved via the **all-proposals by-id reader** (not an open-set read, which
+   is empty after withdrawal), so the marker is well-formed. Targeted test.
+8. **Digest window boundary = seq, not marker-id:** the R-count enumerates `via=="conflict"`
+   `note_retired`/`passage_retired` since `conflict_digest_cursor`; make that a **seq** boundary so a torn
+   write between the retire marker and `conflict_resolved` cannot slip the retire marker out of the counted
+   window.
+9. **Accepted benign edge (one-line note, no code):** a torn-write `RetireOlder` followed by a deliberate
+   `RetireNewer` on the same proposal can retire BOTH sides (the torn write left no `conflict_resolved`, and
+   `b_ref` is not yet retired, so the guard proceeds). Bounded, reversible, and both retires are
+   `via=="conflict"`-tagged (visible in the digest) — consistent with §0's reversibility+visibility model;
+   the idempotency guarantee is scoped to "repeat SAME action," so this is an accepted edge, not a
+   contradiction.
+10. **Executor precision (§2.4):** the two digest lines go in the `render_fence` **preamble** (right after
+    `FENCE_OPEN`, `snapshot.rs:446`), NOT as `entries` (which `assemble_fence` trailing-drops at `:439`) —
+    that is what makes them survive a max-overflow snapshot.
