@@ -46,6 +46,45 @@ Everything below is now grounded in re-verified source.
   enumerated (§2.3). Anchor line numbers corrected (§9). `session_heads` conservative-re-open caveat noted
   (§3.1). Stale-marker unbounded growth noted as an accepted append-only property (§4 I5).
 
+## Rev 3 — convergence re-verification findings folded (2026-07-17)
+Rev 2 went through a focused re-verification (fresh Opus security + correctness). Security returned **LOW /
+CONVERGED**; correctness returned **REVISE** with two MAJORs that **share one root cause** (both re-reviewers
+landed on it independently): the resolve path reuses Phase 1's `retire_memory`/`retire_passage`, whose
+markers are **byte-identical** whether the retire is conflict-driven or a manual App retire
+(`retire_memory` writes `{"retires": id}` `log.rs:5063`; the same primitive backs the App `RetireMemory` op
+`server.rs:450-459`), AND a successful retire **withdraws the proposal from the OPEN set** (retired ref →
+non-current → `open_conflict_proposals` drops it, `log.rs:2827-2839`). One unifying fix closes both:
+
+- **[MAJOR-1] Idempotency universe.** Reading the terminal check over the OPEN set breaks a *legitimate*
+  retire retry (the proposal is already withdrawn → "unknown id") and the torn-write case. **Fix:** the
+  idempotency/terminal check reads a fold of **ALL** `conflict_resolved`/`coexist_allowed`/`dismissed`
+  events keyed by `proposal_id`, and an **all-proposals** by-id reader recovers `a_ref`/`b_ref` (not
+  open-only). Torn-write retry (loser already retired, no `conflict_resolved`) → **roll forward** (append
+  the missing marker, no-op success). §2.1/§2.3 rewritten.
+- **[MAJOR-2 = security N1] Retire-marker provenance.** The digest can't be *both* conflict-scoped *and*
+  torn-write-safe from an untagged marker (counting all retire markers mislabels manual retires; joining to
+  `conflict_resolved` loses torn-write retires). **Fix:** the conflict path stamps the retire marker with
+  provenance — `retire_memory`/`retire_passage` gain an optional `source_proposal_id` that adds
+  `{"via":"conflict","proposal_id":…}` to the marker content (same event *type*, so the retire fold is
+  untouched; App path passes `None`). The digest's R-count reads `via=="conflict"` markers since the digest
+  cursor — conflict-scoped AND from the first-written marker. This tag also supplies MAJOR-1's "already
+  retired by me for this proposal" signal. §2.1/§2.4/§3.4 reconciled.
+- **[MINOR-1] `sanitize_injected` crate boundary.** It lives in `bossclawd` (`snapshot.rs:104`), but
+  `air-memory-mcp` depends on `bossclawd` only as a **dev-dependency** — `mcp.rs` cannot call it in prod.
+  **Fix:** sanitize **daemon-side** when building the `ListConflicts` response (in `bossclawd`, in-crate).
+  §2.4 corrected.
+- **[MINOR-2] Poison cursor-advance rule.** **Fix:** the cursor does **not** advance past a subject while it
+  has an outstanding *sub-budget* pair error (so a transient reasoner outage retries, preserving I6); once a
+  pair reaches `CONFLICT_PAIR_ERROR_BUDGET` it is `poison_skipped` and no longer blocks advance. Accepted
+  tradeoff (stated): a transient outage lasting > budget cycles could falsely poison-skip. §3.3.
+- **[MINOR-N2] Onboarding guard wording.** Even a flag-less op needs an explicit passthrough arm in
+  `override_onboarding_for_guest` (a missing arm → `None` → refused). §2.3 says "add a passthrough/rewrite
+  arm" unconditionally.
+- **[resolved Open-Q1] Single source of truth.** ONE `resolution_exclusions()` reader feeds BOTH the finder
+  union and the reader filter, so `session_heads` liveness is evaluated once (no drift). §2.2.
+- Everything else in Rev 2 verified accurate (all anchors, the frozen-loser, key-space, cursor-rewind,
+  stop-nagging-reader, and finder-union fixes). Cosmetic: `SNAPSHOT_MAX_BYTES` is `snapshot.rs:62` (not :60).
+
 ## Parent context
 - **Phase 0 — grading harness:** SHIPPED. **Phase 1 — engine prerequisites:** SHIPPED (reversible retire
   note+passage; separate `conflict_index`; session passages persisted at capture; PR #79 → `64207b5`).
@@ -113,22 +152,32 @@ DISMISSED_EVENT_TYPE         = "dismissed"          // {proposal_id, pair_key, a
 One new op `resolve_conflict(proposal_id, action) -> ResolveOutcome`, `action ∈ {RetireOlder, RetireNewer,
 KeepBoth, Dismiss}`:
 
-- **Load + terminal-state guard (idempotency, resolve_conflict OWNS it).** Look up the proposal by id over
-  the open set (§2.3 by-id reader). Then, BEFORE touching a primitive, check the resolution fold for an
-  existing terminal marker (`conflict_resolved`/`coexist_allowed`/`dismissed`) for this `proposal_id`:
-  - **Same proposal already resolved by the SAME action** → **no-op success** (idempotent retry).
+- **Load + terminal-state guard (idempotency, resolve_conflict OWNS it — MAJOR-1 fix).** A retire withdraws
+  the proposal from the OPEN set (retired ref → non-current), so the guard must NOT key off open-set
+  membership. Use an **all-proposals by-id reader** to load the `conflict_proposal` event by id (it always
+  exists in the log; open-ness is a derived filter) and a **resolution fold over ALL**
+  `conflict_resolved`/`coexist_allowed`/`dismissed` events keyed by `proposal_id`:
+  - **Unknown/never-existed `proposal_id`** (no `conflict_proposal` event) → **error**.
+  - **Already resolved by the SAME action** → **no-op success** (idempotent retry).
   - **Already resolved by a DIFFERENT action** → **reject** (`InvalidInput`, "already resolved"; first
     resolution wins — no `coexist`+`retire` for one pair).
-  - **Unknown/never-existed `proposal_id`** → **error** (distinct from already-resolved).
-  - **Open + unresolved** → proceed. This makes idempotency correct even though the retire primitives are
-    fail-loud (`Err("already retired")`, `log.rs:5130-5134`/`5214-5218`) — we never reach them on a repeat.
+  - **Torn-write retry** (a Retire action, no `conflict_resolved` marker, but the frozen loser is already in
+    the fold's retired set — the §3.4 crash window) → **roll forward**: append the missing
+    `conflict_resolved`, return no-op success. Do NOT call the primitive again (it is fail-loud,
+    `Err("already retired")`, `log.rs:5130-5134`/`5214-5218`).
+  - **Unresolved + loser not yet retired** → proceed. Because the guard runs first, the fail-loud primitives
+    are never reached on a repeat.
 - **RetireOlder / RetireNewer.** The loser is the **frozen** ref: `RetireOlder` retires `a_ref`,
   `RetireNewer` retires `b_ref` (detection already stored older→a_ref, newer→b_ref via
   `ref_ts(a) <= ref_ts(b)`, `log.rs:6453`). **Do NOT recompute "older by ts" at resolve time** — a passage's
-  `ref_ts` tracks the session's current head, which a re-capture can flip. Dispatch on the loser's kind:
-  `ConflictRef::Note{event_id}` → `retire_memory` (`log.rs:5056`); `ConflictRef::Passage{session_id,
-  passage_id}` → `retire_passage` (`:5109`). Append `conflict_resolved{proposal_id, action,
-  retired_event_id}` **after** the retire marker (§3.4 ordering).
+  `ref_ts` tracks the session's current head, which a re-capture can flip. Dispatch on the loser's kind to a
+  **provenance-stamped** retire (MAJOR-2 fix): `retire_memory(event_id, source_proposal_id=Some(id))`
+  (`log.rs:5056`) / `retire_passage(session_id, passage_id, source_proposal_id=Some(id))` (`:5109`) — a new
+  optional param that adds `{"via":"conflict","proposal_id":id}` to the SAME `note_retired`/`passage_retired`
+  marker content (the retire fold keys on `retires`/`session_id+passage_id` and is untouched; the App path
+  passes `None`, byte-identical to today). Then append `conflict_resolved{proposal_id, action,
+  retired_event_id}` **after** the retire marker (§3.4 ordering; the tagged retire marker — written first —
+  is the torn-write-safe, conflict-scoped source the digest counts).
 - **KeepBoth** → append `coexist_allowed{proposal_id, pair_key = unordered_pair_key(a,b), a_ref, b_ref}`.
 - **Dismiss** → append `dismissed{proposal_id, pair_key, a_ref, b_ref, session_heads}` (§3.1).
 
@@ -160,14 +209,18 @@ Both are fold-derived → restart-safe, no cursor.
   `ResolveAction` enum, a wire `ConflictProposal` DTO (mirroring `ConflictProposalRow` by hand, as proto
   already hand-mirrors core types — e.g. `RetireTarget`), a wire `ConflictRef` representation +
   core↔wire conversions, and `Response::ListConflicts(Vec<ConflictProposal>)` / a `ResolveConflict`
-  outcome arm. Core needs a **by-id open-proposal reader** (today `open_conflict_proposals` returns a `Vec`,
-  `log.rs:2807`; add a by-id lookup or filter).
+  outcome arm. Core needs a **by-id ALL-proposals reader** (find the `conflict_proposal` event by id
+  regardless of open-ness — MAJOR-1) to recover `a_ref`/`b_ref` for a retire retry after the proposal has
+  left the open set; `ListConflicts` still reads the open + resolution-filtered `pending_conflict_proposals`
+  (`log.rs:2869`).
 - **`Role::allows`** (`bossclawd-proto/src/lib.rs:71`): grant **both** ops to `MemoryClient`. **This single
   allowlist edit IS the I8 relaxation** — commented inline with the owner decision + date.
-- **`override_onboarding_for_guest`** (`server.rs:210`): add both ops (resolve onboarding from
-  `engine.is_onboarded_local()`), OR define `ResolveConflict`/`ListConflicts` to carry NO `onboarded` field.
-  Otherwise the guest dispatch's fail-closed `None` (`server.rs:253`) silently refuses them. (On a
-  not-onboarded brain there are no proposals, so the mint-forge risk is nil; this preserves parity.)
+- **`override_onboarding_for_guest`** (`server.rs:210`): add an explicit **passthrough/rewrite arm** for
+  BOTH ops — unconditionally, even if they carry no `onboarded` field. This function returns `None` for any
+  variant it does not list, and the guest dispatch maps `None → not_permitted_response` (`server.rs:253`),
+  so a missing arm silently refuses the op. If an op does carry `onboarded`, rewrite it from
+  `engine.is_onboarded_local()`; if not, return `Some(req)` unchanged. (On a not-onboarded brain there are
+  no proposals, so the mint-forge risk is nil; this preserves the fail-closed parity pattern.)
 - **Rate limiting:** `ListConflicts` and `ResolveConflict` are **NOT** added to `is_rate_limited_op`.
   Per §0 the per-connection limiter cannot bound a reconnecting client, so we do not pretend it is a
   security control here. (An anti-chatter guard is out of scope; §8.)
@@ -175,19 +228,22 @@ Both are fold-derived → restart-safe, no cursor.
 
 ### 2.4 MCP + snapshot digest — the Code-native surface (visibility MUST work)
 - `air-memory-mcp` (`mcp.rs`): two tools beside `TOOL_RECALL`/`TOOL_REMEMBER` (`:22`):
-  - `list_conflicts()` → the pending proposals (already excludes coexist/dismissed per §2.2 item 2). Every
-    rendered field routed through the snapshot sanitizer (`sanitize_injected`, `snapshot.rs:104`, `pub`) —
-    belt-and-suspenders even though fields are ids + the content-free `templated_why` today, so a future
-    change that puts model text in `why` cannot regress into an unfenced injection.
+  - `list_conflicts()` → the pending proposals (already excludes coexist/dismissed per §2.2 item 2). Fields
+    are sanitized **daemon-side** when the `bossclawd` handler builds the `ListConflicts` response, via
+    `sanitize_injected` (`snapshot.rs:104`, in-crate there — MINOR-1: `air-memory-mcp` has `bossclawd` only
+    as a dev-dependency and cannot call it in prod). Belt-and-suspenders even though fields are ids + the
+    content-free `templated_why` today, so a future change that puts model text in `why` cannot regress into
+    an unfenced injection.
   - `resolve_conflict(proposal_id, action)` → the `ResolveConflict` wire op.
 - **Snapshot digest (`capture/snapshot.rs`):** render the conflict digest in the **never-truncated region**
   — adjacent to `FENCE_OPEN`/the preamble, BEFORE the droppable entries that `assemble_fence` sheds trailing
-  (`snapshot.rs:60/426-441`). Two daemon-authored lines within the `SNAPSHOT_MAX_BYTES = 4096` budget:
+  (`snapshot.rs:62`/`:426-441`). Two daemon-authored lines within the `SNAPSHOT_MAX_BYTES = 4096` budget:
   - *"N memory conflicts pending — ask me to review"* (from the §2.2-filtered pending count).
   - *"Since last session: R retired, D dismissed, K kept-both via conflict resolution."* — counts **all**
     suppressive actions (not just retires), so Dismiss cannot silence a conflict with zero signal. **R is
-    derived from the retire markers** (`note_retired`/`passage_retired` whose source is a `conflict_resolved`
-    event), which are written FIRST, so a torn write (§3.4) is still counted.
+    derived from the provenance-stamped retire markers** (`note_retired`/`passage_retired` whose content has
+    `via=="conflict"` — the §2.1 MAJOR-2 tag), which are written FIRST, so the count is both conflict-scoped
+    (manual App retires, tagless, are excluded) AND torn-write-safe (§3.4).
   - Both lines pinned in the un-dropped region; an exit-gate test asserts they survive a max-overflow
     snapshot.
 - Boundary: a `conflict_digest_cursor` marks "last session's" position; advanced when a snapshot is served
@@ -234,15 +290,23 @@ so a deterministically-erroring pair re-stalls forever, AND pairs ordered after 
   once `>= CONFLICT_PAIR_ERROR_BUDGET` (3), mark the pair `poison_skipped` (telemetry) and stop judging it.
   A permanent stall becomes a bounded dropped-counter on ONE pair, never a frozen sweep, never a hidden
   sibling conflict.
+- **Cursor-advance rule (MINOR-2).** The subject cursor does **NOT** advance past a subject while it has an
+  outstanding *sub-budget* pair error (`0 < consecutive_errors < CONFLICT_PAIR_ERROR_BUDGET`) — so a
+  transient reasoner outage (all pairs erroring) simply retries that subject next cycle, preserving I6. Once
+  a pair reaches the budget it is `poison_skipped` and no longer holds the cursor. **Accepted tradeoff
+  (stated):** a transient outage lasting **>** `CONFLICT_PAIR_ERROR_BUDGET` consecutive cycles could falsely
+  poison-skip a real pair; the budget (3) is chosen so a brief blip retries but a genuinely deterministic
+  failure is bounded.
 
 ### 3.4 Non-atomic retire → still visible
-`RetireOlder/Newer` is two appends (retire marker, then `conflict_resolved`), not atomic (per-append lock).
-A crash between them retires the memory but drops the `conflict_resolved` marker. **Fix:** derive the
-digest's "retired" count from the **retire markers** (`note_retired`/`passage_retired`, written FIRST),
-tagged with their `conflict_resolved` source when present — so a torn write is still counted as a retire in
-the digest (§2.4). A torn write leaves: memory retired (reversible), proposal GC-withdrawn from the open
-set, retire marker present (visible), `conflict_resolved` marker absent (a re-resolve is a clean no-op via
-§2.1). No silent retire.
+`RetireOlder/Newer` is two appends (the provenance-stamped retire marker, then `conflict_resolved`), not
+atomic (per-append lock). A crash between them retires the memory but drops the `conflict_resolved` marker.
+The retire marker itself already carries `{"via":"conflict","proposal_id":id}` (§2.1 MAJOR-2) and is written
+FIRST, so the digest's R-count sees it regardless of the torn write — **conflict-scoped AND torn-write-safe
+from one marker**. A torn write leaves: memory retired (reversible), proposal GC-withdrawn from the open
+set, tagged retire marker present (visible + attributable), `conflict_resolved` marker absent. A re-resolve
+is a **clean no-op** via §2.1's roll-forward (it detects "loser already retired for this proposal_id" and
+appends the missing `conflict_resolved`). No silent retire, no mis-attribution.
 
 ## 4. Invariants — stated honestly
 - **I1 — HOLDS, meaning narrowed (precise wording).** "No retirement without an explicit `resolve_conflict`
@@ -273,9 +337,10 @@ set, retire marker present (visible), `conflict_resolved` marker absent (a re-re
 ## 5. Exit gate (Phase 3)
 1. **Resolve correctness:** each action → right marker + effect; loser = frozen a_ref/b_ref (NOT recomputed);
    right primitive per ref kind; restart-survival (fold-derived).
-2. **Idempotency + terminal state:** repeat same-action = no-op success; different action on a resolved
-   proposal = reject; unknown id = error; a mid-resolve crash leaves a re-resolvable or clean-no-op state
-   (never a primitive `Err` bubbling to the agent).
+2. **Idempotency + terminal state (all-proposals fold, not open-set):** repeat same-action = no-op success
+   EVEN AFTER the retire withdrew the proposal from the open set; different action on a resolved proposal =
+   reject; unknown id = error; a torn-write retry (loser retired, `conflict_resolved` missing) rolls forward
+   to no-op success — never a primitive `Err` bubbling to the agent.
 3. **Stop-nagging (both sides):** KeepBoth/Dismiss ⇒ the proposal disappears from `list_conflicts` AND the
    pending count drops AND it is not re-proposed by the finder.
 4. **Re-open rules:** edited note re-proposes; a re-captured session lapses a dismissed passage pair
@@ -285,16 +350,19 @@ set, retire marker present (visible), `conflict_resolved` marker absent (a re-re
 6. **Poison budget:** a deterministically-erroring pair is skipped after N cycles WITHOUT hiding the
    subject's other pairs; the counter persists across cycles and resets on success; the sweep never stalls.
 7. **Visibility:** the digest counts retire+dismiss+keep-both since the last session; the retire count comes
-   from the retire markers (survives a torn write); both digest lines survive a max-overflow snapshot
-   (never-truncated region).
+   from the `via=="conflict"`-tagged retire markers — conflict-scoped (a manual App retire is NOT counted)
+   AND torn-write-safe (counted even if `conflict_resolved` was lost); both digest lines survive a
+   max-overflow snapshot (never-truncated region).
 8. **Guest reachability + dormancy:** `MemoryClient` may call exactly the two new ops (positive-allowlist
    test) and still be refused `RetireMemory`/`Unretire`/`Teardown`/etc.; onboarding-assertion guard wired;
    with detection OFF the whole feature is inert (merging changes nothing at runtime).
 
 ## 6. Testing (mirrors Phase 2's discipline)
 - **Resolve ops (core, hermetic):** every action's marker + effect; frozen-side selection (re-capture does
-  not flip the loser); ref-kind dispatch; idempotent repeat = no-op; different-action-on-resolved = reject;
-  unknown id = error; restart-survival.
+  not flip the loser); ref-kind dispatch; **idempotent repeat = no-op EVEN after the retire withdrew the
+  proposal from the open set** (all-proposals fold); **torn-write retry rolls forward** (loser retired,
+  `conflict_resolved` missing → append it, no-op success — no primitive `Err`); different-action-on-resolved
+  = reject; unknown id = error; restart-survival.
 - **Reader exclusion:** KeepBoth/Dismiss drop the proposal from `pending_conflict_proposals` + pending count;
   retire drops via currency-GC; finder skips excluded pairs (reuse Phase 2 seeded/stubbed ANN determinism —
   assert engine invariants, not ANN counts).
@@ -307,8 +375,9 @@ set, retire marker present (visible), `conflict_resolved` marker absent (a re-re
 - **Proto/daemon:** `Role::allows` grants exactly the two new ops to `MemoryClient`, still refuses the other
   destructive ops (positive-allowlist, mirror `memory_client_allows_exactly_*`); onboarding-assertion guard;
   DTO round-trips; dispatch arms fail-closed.
-- **Visibility:** digest counts all three action kinds; retire count derived from retire markers (torn-write
-  test); both lines survive a max-overflow snapshot; digest cursor advances per served snapshot.
+- **Visibility:** digest counts all three action kinds; retire count derived from `via=="conflict"`-tagged
+  markers (torn-write test: count survives a dropped `conflict_resolved`; scope test: a **manual App retire
+  is NOT counted**); both lines survive a max-overflow snapshot; digest cursor advances per served snapshot.
 - **Dormant when detection off** (no model call, no proposals, no digest activity).
 
 ## 7. Constants (provisional; owner/harness-tunable)
@@ -337,9 +406,11 @@ set, retire marker present (visible), `conflict_resolved` marker absent (a re-re
   wrapper `bossclawd/src/engine/mod.rs` `detect_conflicts_once` `:1060`, empty excluded pass `:1091`.
 - **Cursor:** `log.rs` `conflict_cursor` `:6612` (2-D `last_seq`/`subject_offset`), `set_conflict_cursor`
   `:6626`, subject enumeration ~`:7190-7216`.
-- **Phase 1 retire primitives (fail-LOUD):** `retire_memory` `:5056`, `assert_retirable_note` err
-  `:5214-5218`, `unretire` `:5079`, `retire_passage` `:5109`, passage-already-retired err `:5130-5134`,
-  `unretire_passage` `:5160`.
+- **Phase 1 retire primitives (fail-LOUD; gain optional `source_proposal_id`):** `retire_memory` `:5056`
+  (marker `{"retires": id}` `:5063` — extend with `via`/`proposal_id`), `assert_retirable_note` err
+  `:5214-5218`, `unretire` `:5079`, `retire_passage` `:5109` (marker `{session_id, passage_id}` `:5140`),
+  passage-already-retired err `:5130-5134`, `unretire_passage` `:5160`. Manual App path that must keep
+  passing `None`: `bossclawd/src/server.rs` `RetireMemory` op `:450-459`.
 - **Pair/ref keys:** `index.rs` `ConflictRef::pair_key` `:120`, `unordered_pair_key` `:132`.
 - **Event types:** `graph.rs` `CONFLICT_PROPOSAL_EVENT_TYPE` `:107`, retire markers `NOTE_RETIRED`/
   `PASSAGE_RETIRED`/`UNRETIRE` `:40-44`, `SESSION_CAPTURED`/`SESSION_DELETED` `:35/:37`.
@@ -355,8 +426,9 @@ set, retire marker present (visible), `conflict_resolved` marker absent (a re-re
   dropped) `:426-441`, `FENCE_OPEN` `:84`.
 
 ## 10. Open questions for the plan
-1. **Exclusion reader shape:** one `resolution_exclusions()` reader consumed by BOTH the finder's `open_pairs`
-   union AND `pending_conflict_proposals`, vs two derivations. Prefer one (single source of truth).
+1. **~~Exclusion reader shape~~ (RESOLVED, Rev 3):** ONE `resolution_exclusions()` reader is consumed by BOTH
+   the finder's `open_pairs` union AND `pending_conflict_proposals`, so `session_heads` liveness is evaluated
+   once — no drift between finder and reader. Single source of truth.
 2. **`session_heads` cost:** the dismissed-passage liveness check reads each referenced session's head per
    fold; memoize per fold (mirror Phase 2's `head_passage_counts` memo ~`log.rs:2822`) if it approaches
    O(proposals × sessions) at the open-proposal ceiling.
@@ -364,3 +436,10 @@ set, retire marker present (visible), `conflict_resolved` marker absent (a re-re
    Plan picks the simplest restart-safe form.
 4. **Digest cursor:** confirm no reusable SP3 last-session boundary exists (review found none in the snapshot
    builder); if truly none, add a dedicated `conflict_digest_cursor` advanced on snapshot serve.
+5. **Cursor rewind on a never-enabled brain:** `unretire`/`unretire_passage` are callable via the App wire op
+   even when detection was never enabled; the rewind is a `conflict_cursor` upsert. Confirm the row is
+   created-if-absent (benign upsert) so the rewind never errors on a brain that never ran detection.
+6. **Backstop asymmetry (note, not a blocker):** the durable pre-append re-check
+   `is_conflict_proposal_suppressed` (`log.rs:6483`) is open-proposal-only; coexist/dismissed re-proposal
+   suppression relies solely on the in-memory `open_pairs` union (rebuilt each cycle from the fold). Correct
+   while the fold is authoritative; documented so the single-guard choice is deliberate, not an oversight.
