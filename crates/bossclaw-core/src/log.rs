@@ -2909,6 +2909,45 @@ impl EventLog {
             .any(|p| Self::conflict_pair_key(&p.a_ref, &p.b_ref) == want))
     }
 
+    /// The live coexist + dismissed PAIR exclusions (spec §2.2 / §3.1). ONE fold-derived read consumed by
+    /// BOTH the finder's `open_pairs` union (Task 7) AND `pending_conflict_proposals` (Task 8), so the two
+    /// honor resolution identically (resolved Open-Q1). A `coexist_allowed` pair is permanent; a
+    /// `dismissed` pair is included ONLY while every session in its stored `session_heads` still has that
+    /// exact current head (a re-capture advances the head → the dismissal lapses → the pair may
+    /// re-propose). Notes need no head: an edit mints a new event id → a new `unordered_pair_key` the
+    /// stored key no longer matches, so the stale key becomes inert. Restart-safe (pure fold, no cursor).
+    #[cfg(unix)]
+    #[allow(dead_code)] // consumed by the finder's open_pairs union (Task 7) + pending_conflict_proposals (Task 8)
+    fn resolution_exclusions(&self) -> Result<ResolutionExclusions, BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let head_of: std::collections::HashMap<String, String> =
+            fold.current.iter().map(|cs| (cs.session_id.clone(), cs.event_id.clone())).collect();
+        let mut out = ResolutionExclusions::default();
+        for ev in self.events_of_types(&[
+            crate::graph::COEXIST_ALLOWED_EVENT_TYPE,
+            crate::graph::DISMISSED_EVENT_TYPE,
+        ])? {
+            let Some(pk) = ev.content.get("pair_key").and_then(|v| v.as_str()) else {
+                continue; // malformed — never excludes
+            };
+            if ev.event_type == crate::graph::COEXIST_ALLOWED_EVENT_TYPE {
+                out.coexist_pairs.insert(pk.to_string());
+                continue;
+            }
+            // dismissed: live only while every stored session head is unchanged.
+            let live = match ev.content.get("session_heads").and_then(|v| v.as_object()) {
+                None => true, // no passage members (note↔note) → no head to lapse; key is inert on edit
+                Some(map) => map.iter().all(|(sid, stored)| {
+                    head_of.get(sid).map(String::as_str) == stored.as_str()
+                }),
+            };
+            if live {
+                out.dismissed_pairs.insert(pk.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
     /// Thin wrapper over [`Self::append_write_rejected_with`].
     #[cfg(unix)]
@@ -9014,6 +9053,19 @@ struct OpenConflictProposal {
     detected_at: i64,
 }
 
+/// The two PAIR-key exclusion sets derived from the terminal resolution markers (spec §2.2). Both keyed
+/// by [`crate::index::ConflictRef::unordered_pair_key`] — the SAME space as the finder's `open_pairs` and
+/// `conflict_pair_key`. ONE reader ([`EventLog::resolution_exclusions`]) produces both, so the finder
+/// union and the `pending_conflict_proposals` filter can never drift on `session_heads` liveness.
+#[cfg(unix)]
+#[derive(Debug, Default, Clone)]
+pub struct ResolutionExclusions {
+    /// `unordered_pair_key`s the owner chose KEEP-BOTH — never re-proposed, dropped from the read surface.
+    pub coexist_pairs: std::collections::HashSet<String>,
+    /// `unordered_pair_key`s DISMISSED and still LIVE (every referenced session head unchanged, §3.1).
+    pub dismissed_pairs: std::collections::HashSet<String>,
+}
+
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
 /// `session_captured` + `session_deleted` + `supersede` + the Rung-3 retire
 /// markers (`note_retired` / `passage_retired` / `unretire`) in `seq ASC`
@@ -9245,6 +9297,82 @@ mod tests {
         // Lineage is the referenced memory event ids.
         let sources = ev.model_meta.as_ref().unwrap().source_event_ids.clone();
         assert_eq!(sources, vec!["n_old".to_string(), "cap_ev".to_string()]);
+    }
+
+    /// Rung-3 Phase-3 (§2.2 / §3.1): the SINGLE `resolution_exclusions()` reader returns the coexist +
+    /// LIVE-dismissed pair keys. A `coexist_allowed` pair is permanent; a `dismissed` pair is live ONLY
+    /// while every referenced session's current head is unchanged (a re-capture advances the head → the
+    /// dismissal lapses), and a note↔note pair needs no head (an edit mints a new id → a new pair key
+    /// the stored key no longer matches). Seeded with LOCAL terminal-marker helpers (the natural producer
+    /// `resolve_conflict` lands in Task 6) whose content shape mirrors EXACTLY what it will write.
+    /// `#[cfg(unix)]` (the reader + `ResolutionExclusions` are part of the conflict subsystem).
+    #[cfg(unix)]
+    #[test]
+    fn resolution_exclusions_are_live_and_dismiss_lapses_on_session_head_change() {
+        use crate::index::ConflictRef;
+
+        /// Append a `coexist_allowed` terminal marker by hand (mirrors resolve_conflict's KeepBoth write).
+        fn append_coexist(log: &EventLog, pk: &str, a: &ConflictRef, b: &ConflictRef, prop: &str) {
+            log.append(crate::event::Event {
+                id: String::new(), ts: String::new(), valid_time: None,
+                event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+                content: serde_json::json!({ "proposal_id": prop, "pair_key": pk, "a_ref": a.to_json(), "b_ref": b.to_json() }),
+                model_meta: None, prev_hash: String::new(), hash: None,
+                signed_by_did: log.signer_did(), signature: None,
+            }).unwrap();
+        }
+        /// Append a `dismissed` marker whose `session_heads` records each passage member's session
+        /// CURRENT head event id AT SEED TIME (§3.1). A later re-capture mints a NEW head id, so
+        /// `resolution_exclusions` no longer matches → the dismissal lapses.
+        fn append_dismissed(
+            log: &EventLog, pk: &str, a: &ConflictRef, b: &ConflictRef, prop: &str,
+            session_heads: serde_json::Value,
+        ) {
+            log.append(crate::event::Event {
+                id: String::new(), ts: String::new(), valid_time: None,
+                event_type: crate::graph::DISMISSED_EVENT_TYPE.to_string(),
+                content: serde_json::json!({
+                    "proposal_id": prop, "pair_key": pk,
+                    "a_ref": a.to_json(), "b_ref": b.to_json(), "session_heads": session_heads,
+                }),
+                model_meta: None, prev_hash: String::new(), hash: None,
+                signed_by_did: log.signer_did(), signature: None,
+            }).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // Two notes → a note↔note coexist pair (KEEP-BOTH → a permanent exclusion).
+        let n1 = log.remember(&emb, "branch is main").unwrap();
+        let n2 = log.remember(&emb, "branch is master").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: n1.clone() }, ConflictRef::Note { event_id: n2.clone() });
+        let pk_notes = ConflictRef::unordered_pair_key(&a, &b);
+        append_coexist(&log, &pk_notes, &a, &b, "P1");
+
+        // A session-passage ↔ note pair → DISMISSED, with the session's CURRENT head recorded.
+        let head = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &head, &["deploy on vercel".to_string()]).unwrap();
+        let n3 = log.remember(&emb, "deploy on fly.io").unwrap();
+        let (pa, pb) = (
+            ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 },
+            ConflictRef::Note { event_id: n3.clone() },
+        );
+        let pk_pass = ConflictRef::unordered_pair_key(&pa, &pb);
+        append_dismissed(&log, &pk_pass, &pa, &pb, "P2", serde_json::json!({ "s1": head }));
+
+        let excl = log.resolution_exclusions().unwrap();
+        assert!(excl.coexist_pairs.contains(&pk_notes), "keep-both pair is a live coexist exclusion");
+        assert!(excl.dismissed_pairs.contains(&pk_pass), "dismissed pair is live while the head is unchanged");
+
+        // Re-capture the SAME session with a DIFFERENT body (advances its head) → the dismissal lapses (§3.1).
+        let head2 = log.capture_session(&emb, &session_meta("s1", "bb")).unwrap();
+        log.store_session_passages(&emb, &head2, &["deploy on vercel".to_string()]).unwrap();
+        assert_ne!(head, head2, "a re-capture with a new sha mints a new head event id");
+        let excl2 = log.resolution_exclusions().unwrap();
+        assert!(excl2.coexist_pairs.contains(&pk_notes), "coexist (note↔note) is unaffected by the re-capture");
+        assert!(!excl2.dismissed_pairs.contains(&pk_pass), "dismissal LAPSED after the session head advanced");
     }
 
     /// Rung-3 Phase-2 (§3.5, I9): a proposal for an unordered typed pair suppresses a duplicate for
