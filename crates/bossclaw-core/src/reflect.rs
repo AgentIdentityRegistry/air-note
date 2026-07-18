@@ -92,6 +92,19 @@ impl MissState {
     }
 }
 
+/// One OPEN row of the miss backlog as served to the tick loop (spec §2.2). Named fields on purpose:
+/// `key` and `query_text` are both `String`s, so a positional tuple would be a silently-swappable
+/// footgun for the T7 consumer. PORTABLE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenMiss {
+    /// The normalized backlog PK — [`normalized_query_key`] of the query.
+    pub key: String,
+    /// The raw query text as first seen (kept verbatim for the digest/UI and the replay recall).
+    pub query_text: String,
+    /// Attempts consumed so far (the caller parks at [`REFLECT_MISS_ATTEMPT_BUDGET`]).
+    pub attempts: u32,
+}
+
 /// The result of ONE `attempt_miss` (spec §2.2): the classification PLUS the number of REAL dossier
 /// revisions the attempt emitted (critic M2/OQ4: the digest's "refreshed" unit counts only true
 /// `TopicRefreshOutcome::Emitted`s — `candidate_repaired` alone never feeds it). PORTABLE.

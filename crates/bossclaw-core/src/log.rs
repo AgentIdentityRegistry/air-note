@@ -7264,9 +7264,12 @@ impl EventLog {
         Ok(())
     }
 
-    /// The `(key, query_text, attempts)` of open misses, oldest `first_seen` first, capped at `limit`.
-    /// The `normalized_query_key` tiebreak makes the order total (stable across ties).
-    pub fn open_misses(&self, limit: usize) -> Result<Vec<(String, String, u32)>, BossclawError> {
+    /// The open misses, oldest `first_seen` first, capped at `limit`. The `normalized_query_key`
+    /// tiebreak makes the order total (stable across ties).
+    pub fn open_misses(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::reflect::OpenMiss>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
         let mut stmt = conn.prepare(
@@ -7274,7 +7277,11 @@ impl EventLog {
              WHERE state = 'open' ORDER BY first_seen ASC, normalized_query_key ASC LIMIT ?1",
         )?;
         let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32))
+            Ok(crate::reflect::OpenMiss {
+                key: r.get(0)?,
+                query_text: r.get(1)?,
+                attempts: r.get::<_, i64>(2)? as u32,
+            })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -7291,7 +7298,11 @@ impl EventLog {
         Ok(n as usize)
     }
 
-    /// Move a miss to a terminal or intermediate state (spec §2.2).
+    /// Move a miss to a terminal or intermediate state (spec §2.2). Transition contract: the expected
+    /// flow is `open` → {`repaired_by_time` | `candidate_repaired` | `no_material` | `parked`};
+    /// terminal→open resurrection is NOT expected in v1 (no runtime guard — this is re-derivable
+    /// state with a benign blast radius; the T7 review decides whether an `AND state = 'open'` guard
+    /// is warranted).
     pub fn set_miss_state(
         &self,
         key: &str,
@@ -7321,18 +7332,16 @@ impl EventLog {
         Ok(n)
     }
 
-    /// Increment a miss's attempt count, returning the NEW count (spec §2.2).
+    /// Increment a miss's attempt count, returning the NEW count (spec §2.2). ONE atomic
+    /// `UPDATE … RETURNING` statement (bundled SQLCipher is SQLite ≥3.35, where RETURNING landed).
+    /// PRECONDITION: the key must already be seeded ([`EventLog::seed_miss`]); a missing key is a
+    /// loud `Err` (`QueryReturnedNoRows`) by design — callers always seed first (T7).
     pub fn bump_miss_attempt(&self, key: &str, now: i64) -> Result<u32, BossclawError> {
         let store = self.inner.lock().expect(POISON);
-        let conn = store.conn();
-        conn.execute(
+        Ok(store.conn().query_row(
             "UPDATE reflect_miss_backlog SET attempts = attempts + 1, updated_at = ?2
-             WHERE normalized_query_key = ?1",
+             WHERE normalized_query_key = ?1 RETURNING attempts",
             rusqlite::params![key, now],
-        )?;
-        Ok(conn.query_row(
-            "SELECT attempts FROM reflect_miss_backlog WHERE normalized_query_key = ?1",
-            rusqlite::params![key],
             |r| r.get::<_, i64>(0),
         )? as u32)
     }
@@ -7414,11 +7423,12 @@ impl EventLog {
     }
 
     /// Shared single-row upsert for `reflect_cursor` (the row is created with defaults if absent). The
-    /// `set_clause` is ALWAYS a compile-time literal from the three setters above (never user input), so
-    /// the `format!` is injection-impossible by construction; the mutated VALUES ride as bound `params`.
+    /// `set_clause` is `&'static str`, so the injection-impossibility is COMPILER-ENFORCED: a
+    /// runtime-built string cannot compile at the call site — only the compile-time SQL fragments the
+    /// three setters above pass; the mutated VALUES ride as bound `params`.
     fn upsert_reflect_cursor(
         &self,
-        set_clause: &str,
+        set_clause: &'static str,
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<(), BossclawError> {
         let store = self.inner.lock().expect(POISON);
@@ -11061,11 +11071,12 @@ mod tests {
         log.seed_miss(&k2, "what is beta?", 150).unwrap();
         let open = log.open_misses(10).unwrap();
         assert_eq!(open.len(), 2, "two open misses");
-        assert_eq!(open[0].0, k1, "oldest first_seen first"); // k1 seeded at 100 < k2 at 150
+        assert_eq!(open[0].key, k1, "oldest first_seen first"); // k1 seeded at 100 < k2 at 150
 
         // A terminal transition removes it from `open`; parked/no_material persist (spec §7.3).
         log.set_miss_state(&k1, MissState::NoMaterial, 300).unwrap();
         assert_eq!(log.open_misses(10).unwrap().len(), 1, "no_material is no longer open");
+        assert_eq!(log.open_miss_count().unwrap(), 1, "floor input counts only open misses");
 
         // Attempt bump returns the new count; at budget the caller parks (see T7).
         let a = log.bump_miss_attempt(&k2, 400).unwrap();
