@@ -1,40 +1,53 @@
 # Rung 4 — Reflection (sleep-time consolidation, miss-driven) — Design
 
-**Status:** Rev 1 — Peter-approved conversationally 2026-07-19 (driver, powers, architecture, decomposition);
-awaiting file-level owner review + independent design review before planning.
+**Status:** Rev 2 — Rev 1 owner-approved conversationally 2026-07-19; independently reviewed same day
+(architect SOUND-WITH-CHANGES + critic APPROVE-WITH-CHANGES); ALL findings folded below (changelog §9).
+Awaiting reviewer re-verification + file-level owner review before planning.
 **North Star anchor:** `air/memory-strategy-2026-07-03-beat-the-stack` Phase 4 — "M3 reflection,
 dossier-centric. Continuous sleep-time consolidation; evolve page dossiers as the primary answer substrate.
 (Dreaming-style +15pp is NOT yet neutrally verified — open question; build instrumented.)" Beat-the-stack
 criterion #6: continuous reflection (vs GBrain's batch ~11-min `dream`).
 **Prior art in-tree:** the evolve loop already performs *awake-time* reflection on NEW memories — entity
 extraction, machine links, invalidates, and citation-floored `page` dossiers (`log.rs:8270`
-`EventLog::evolve_once`, `log.rs:8111` `summarize_topics`). Rung 4 adds what nothing does today: working the
-EXISTING corpus during quiet time, driven by recorded recall failures.
+`EventLog::evolve_once`, `log.rs:8111` `summarize_topics`). Evolve already writes dossiers autonomously with
+no review surface; Rung 4 adds a new TRIGGER class (quiet-time, miss-driven), not a new writer power. What
+nothing does today: work the EXISTING corpus during quiet time, driven by recorded recall failures.
 
 ---
 
 ## §0 Goal + posture
 
 Give the daemon a **night cleaner**: a fourth background loop that, when the room is quiet, (1) repairs the
-specific gaps the owner actually hit — the SP3 recall-miss telemetry that today nothing reads — and (2) does
-bounded corpus tidying: refreshing dossiers whose cited sources went stale (the direct aftermath of Rung-3
-resolutions) and detecting duplicate entities. It **adds freely, asks to restructure**: dossier writes and
-links are autonomous (additive, originals untouched); entity merges are owner-approved proposals resolved
-from Claude Code, reusing the Rung-3 surface pattern. Every claim of benefit is measured, not asserted
-(§5) — the strategy's "build instrumented" requirement is a first-class deliverable, because the +15pp
-reflection literature is unverified.
+specific recall gaps the owner actually hit — consuming the SP3 recall-miss telemetry, which today has no
+consumer that *acts on* it (the App's read-only RecallStats panel displays it) — and (2) does bounded corpus
+tidying: refreshing dossiers whose cited sources went stale (the direct aftermath of Rung-3 resolutions) and
+detecting duplicate entities. It **adds freely, asks to restructure**: dossier revisions and links are
+autonomous (append-only; a revision supersedes the prior page IN RECALL while the prior stays recoverable in
+the log); entity merges are owner-approved proposals resolved from Claude Code, reusing the Rung-3 surface
+pattern. Benefit is measured, not asserted (§5) — and the operational scoreboard is deliberately NOT the
+evidence instrument (§5 separates the two, per review finding B1/M3-arch).
 
-A wrong reflection costs a superseded dossier revision or a reversible merge — never a lost memory.
+A wrong reflection costs a superseded dossier revision (a *good* prior revision can be displaced from recall
+until re-superseded — recoverable from the log, same posture evolve has today) or a reversible merge — never
+a lost memory.
+
+**Scope honesty (critic M5):** R4 builds the reflection machinery and PROVES IT HARMLESS; whether dossiers
+should become the PRIMARY answer substrate remains an open strategy question that R4's harness probe (§5.3)
+generates the first real evidence for. R4 does NOT re-rank recall in favor of pages (§6).
 
 ## §1 Scope — two sub-projects (each: own reviewed plan → subagent build → PR)
 
 - **R4-A — the sleep loop (additive-only; ships value alone).** `ConfigFlag::Reflect` + sweeper + the
-  miss-repair pipeline + the stale-dossier refresh job + the scoreboard + the harness non-regression gate.
-  NO new proposal types, NO merge machinery, NO new wire ops beyond telemetry surfacing.
+  miss-repair pipeline (§2.2) + the stale-dossier refresh (§2.3, including the shared gather-side
+  retired/superseded exclusion it requires) + the durable miss backlog + the scoreboard + the **memharness
+  reflection workstream** (§5.3 — net-new harness scope, named as such) + the **enable path** (§2.5).
+  Wire-op surface: exactly two additive App-only ops (`SetReflectEnabled` + telemetry surfacing in Status) —
+  no guest-reachable ops in R4-A.
 - **R4-B — entity merge (structural, owner-gated).** Duplicate detection → pair-keyed idempotent
   `merge_proposal` events → reversible `entity_merged`/`entity_unmerged` fold markers → Code-native
   `list_merge_proposals`/`resolve_merge_proposal` MCP tools mirroring the Rung-3 conflict surface (I8
-  precedent, daemon-side sanitize, guest onboarding-override).
+  precedent, daemon-side sanitize, guest onboarding-override) → **plus a read-only reflection-activity
+  listing** (the deferred review surface, §4 I-vis).
 
 R4-A merges before R4-B starts. Both ship dormant.
 
@@ -42,141 +55,239 @@ R4-A merges before R4-B starts. Both ship dormant.
 
 ### §2.1 The tick (sibling #4 of evolve/capture/conflict)
 
-Follows the proven three-sibling shape exactly (`crates/bossclawd/src/engine/scheduler.rs` pure
-`decide_tick` + 300s `spawn` + `MissedTickBehavior::Skip`; `capture/sweeper.rs`; `conflict/sweeper.rs`):
+Follows the proven three-sibling shape (`engine/scheduler.rs` pure decide fn + 300s `spawn` +
+`MissedTickBehavior::Skip`):
 
 - **Gate (all must hold, else `gated_off`/no-op):** onboarded ∧ `reflect_enabled_or_false()` (new
-  fail-closed getter) ∧ **quiet** ∧ reasoner ready (`select_ready`, cloud never silently falls back local).
-- **Quiet predicate (the "sleep-time" semantic):** no new memory-class appends since the previous reflect
-  tick — a max-seq watermark over capture/memory events, NOT a coupling to the Evolve flag (reflection must
-  be usable with evolve off; and when evolve is on, an idle evolve queue and an unchanged watermark
-  coincide). Exact event-class set is a plan-time detail; the watermark mechanism is the design.
-- **Serialization:** dedicated `reflect_lock.try_lock()` → `Busy` on overlap (the `evolve_lock` idiom;
-  Rung-3's dedicated-lock lesson — never share a lock with a loop that can hold it for minutes).
-- **Budget:** small fixed per-tick work caps (house style, `CAPTURE_PER_SWEEP=8`-class consts, provisional
-  and harness-tunable). Priority: sticky notes first, tidying with the remainder.
-- **Writes:** only through the single serialized `EventLog::append` / `emit_page` path. The loop is not a
-  privileged writer.
-- **Consent chokepoint:** `cloud_consent_ok` (`engine/mod.rs:1692`) before reasoner construction — byte-same
-  posture as evolve + conflict sweeps.
+  fail-closed getter) ∧ **quiet** ∧ reasoner ready (`select_ready`; cloud never silently falls back local).
+- **Quiet predicate (idle-window semantics, house pattern — NOT a bespoke watermark).** Quiet = no
+  memory-class append (memory + session-capture event types) within the last `REFLECT_QUIET_SECS`
+  (provisional 600, the capture sweeper's `QUIET_SECS` precedent). The recency check reads the newest
+  relevant event's timestamp/seq **fresh each tick** — there is no state that "latches," so the
+  deadlock reading (quiet-since-last-RUN) is explicitly ruled out: one append delays reflection by one quiet
+  window, never forever. Implementation note: per-class newest-seq is a table scan today (no `event_type`
+  index — acceptable at 300s cadence, same cost class as `dirty_entities_since`; add a partial index only if
+  measured to matter).
+- **Starvation floor (arch M5 / critic M3):** if the durable backlog (§2.2) holds unrepaired, unparked
+  misses AND more than `REFLECT_STALENESS_FLOOR_SECS` (provisional: 6h) have passed since the last completed
+  reflect run, run ONE budgeted tick even if not quiet. A perpetually-slightly-active brain still reflects;
+  the floor is bounded to one tick per floor interval.
+- **Evolve-backlog rule:** when Evolve is ENABLED and its unprocessed queue is non-empty, reflection defers
+  (the daytime helper goes first — its extraction feeds the entity graph reflection anchors on). When Evolve
+  is DISABLED, reflection still runs against whatever graph exists; misses that resolve to no known entity
+  are `no_material` (reflection never does evolve's extraction job — no minting, §2.2).
+- **Serialization:** dedicated `reflect_lock.try_lock()` → `Busy` (the Rung-3 dedicated-lock lesson).
+- **Budget:** small fixed per-tick caps (provisional, harness-tunable, single consts block): misses
+  attempted ≤ 4, dossiers refreshed ≤ 4. Priority: misses first, refresh with the remainder.
+- **Writes:** only through the single serialized `EventLog::append` / `emit_page` path — not a privileged
+  writer. **Consent chokepoint:** `cloud_consent_ok` before reasoner construction (byte-same posture as
+  evolve + conflict).
 
-### §2.2 Miss repair (the measurable heart)
+### §2.2 Miss repair (the operational heart — instrumented honestly)
 
-Input: the SP3 recall-miss telemetry (`crates/bossclawd/src/telemetry.rs` — recent-miss ring, queries only,
-`RECENT_MISSES_CAP=20`, plus durable counters). Today it has zero consumers. Per attempted miss, in order:
+**Input + durable backlog (critic M4).** The SP3 recent-miss ring holds only the 20 newest miss queries
+(`RECENT_MISSES_CAP=20`, queries only). Reflection therefore maintains its own re-derivable
+`reflect_miss_backlog` table (normalized-query key → first_seen, attempts, state ∈ open|repaired|no_material
+|parked), **seeded from the ring every tick** — so ring churn between ticks cannot silently drop a miss that
+was once seen. Normalization v1 = trimmed casefold hash (semantic dedup is NOT v1; the bloat risk is bounded
+because pages are ENTITY-keyed — near-duplicate queries about the same topic converge on the same dossier).
+Losing the table only re-learns misses from the ring; NOT a Tier-A fold input. Scope note (critic m3): a
+"miss" is strictly `hits == 0` — R4 targets COVERAGE gaps, not ranking quality (ranking lives in the
+harness).
 
-1. **Re-run recall** with the missed query. Hit now → outcome `repaired_by_time` (new memories arrived since;
-   no work, no reasoner call).
-2. **Gather material:** search raw substrates (memory notes, session passages — the same substrates recall
-   fuses) for candidates relevant to the query. Nothing relevant → outcome `no_material` (an honest "we never
-   knew this"; the gap is the owner's to fill, not the cleaner's to hallucinate).
-3. **Consolidate additively:** route the material through the EXISTING citation-floored dossier machinery
-   (`gather_fact_set` → compose → `citation_floor` → `emit_page` atomic supersede; `summarize.rs`), and/or
-   emit machine links on resolved entities — the same event types evolve emits. No new write primitives.
-4. **Replay the miss** — run the original query against recall again. Hit → `repaired`; still miss →
-   attempt recorded, and after `REFLECT_MISS_ATTEMPT_BUDGET` (provisional: 3) cumulative attempts →
-   `parked` (stops consuming nights — the Rung-3 poison-budget lesson: bounded loss, never a frozen loop,
-   never a hidden sibling work item).
+**Per attempted open miss, in order:**
 
-State: a small re-derivable `reflect_miss_attempts` table (normalized-query key → attempts, last outcome).
-Losing it only re-tries a miss. NOT a Tier-A fold input.
+1. **Re-run recall** with the missed query. Hit → state `repaired_by_time` (no reasoner call).
+2. **Resolve query → topics (the bridge — arch B1, read-only by design):** `entity_search(query)` over the
+   entity resolution index → top-N candidate KNOWN topics (N provisional 2, similarity floor provisional,
+   consts block). Reflection **never mints entities** — minting is evolve's job and a write; a miss that
+   resolves to no known entity above the floor → state `no_material` (an honest "we never knew this").
+   Consequence, stated plainly: R4-A repairs only misses about topics the graph already knows.
+3. **Refresh the resolved topics' dossiers additively** through the existing citation-floored machinery
+   (`gather_fact_set` → compose → `citation_floor` → `emit_page` atomic supersede), with the §2.3 lineage
+   exclusion applied. Emit machine links only on already-resolved entity ids. No new write primitives.
+4. **Replay the original query** against recall. Hit → state `candidate_repaired` — an OPERATIONAL counter,
+   not evidence (renamed from Rev 1's `repaired` per B1: a query-derived page ranking for its own query is
+   near-tautological; the citation floor guards fabrication, not answer quality — §5.3 carries the evidence
+   burden). Still miss → attempts += 1; at `REFLECT_MISS_ATTEMPT_BUDGET` (provisional 3) → `parked`
+   (bounded loss — the Rung-3 poison-budget lesson).
 
 **Prompt discipline:** any new reasoner phase copies the `conflict.rs` shape — trusted-frame system const,
-fenced untrusted data (`build_*_prompt` with defused embedded fences), structured JSON schema,
-`ScriptedReasoner`-testable pure builders. Model output is data, never authority; the citation floor is the
-gate that makes dossier content trustworthy, exactly as in evolve today.
+fenced+defused untrusted data, structured JSON schema, `ScriptedReasoner`-testable pure builders. Model
+output is data, never authority. Threat-model carry-forward (critic M2): reflection composes from whatever
+material exists, INCLUDING booby-trapped ingested files — the same Rung-3 residual risk; guards are the
+citation floor (provenance), taint propagation on sources, I7 output discipline, reversibility, and the §4
+I-vis visibility commitments.
 
-### §2.3 Tidy job (v1 = exactly one autonomous job)
+### §2.3 Tidy job (v1 = exactly one autonomous job) + the shared lineage exclusion
 
-**Stale-dossier refresh:** for current `page` events, detect pages whose cited `source_event_ids` are no
-longer current (retired or superseded per `SessionFold` — precisely what a Rung-3 `resolve_conflict` retire
-produces). Budgeted per tick; refresh through the existing summarize path (idempotency preserved: emit only
-when the cited-source set changes, `log.rs:8162`). This closes the loop Rung 3 opened: resolving a conflict
-retires a source → the dossier citing it is quietly wrong → the next night heals it.
+**Stale-dossier refresh:** for current `page` events, detect pages whose cited `source_event_ids` intersect
+`SessionFold.retired_notes ∪ superseded` — precisely what a Rung-3 `resolve_conflict` retire produces.
 
-Duplicate-entity detection is R4-B (it produces proposals, not autonomous writes). No other tidy jobs in v1
-— decay/archive, orphan adoption, Wide reach are all out (§6).
+**Load-bearing prerequisite (arch M2 — Rev 1's silent defect):** the gather path
+(`gather_fact_set`/`fact_texts_for_ids`) does NOT currently exclude retired/superseded lineage — so a
+refresh would re-gather the identical (stale-inclusive) set, the cited-set-diff idempotency guard
+(`log.rs:8162`) would skip the emit, and the job would detect rot nightly while never healing it. R4-A
+therefore adds **retired/superseded exclusion INSIDE the shared gather path** (one source, consumed by both
+evolve's summarize and reflection's refresh — the I9 single-source lesson; a refresh-only variant would let
+the two writers' cited sets diverge and fight). This changes evolve's own dossier output for
+stale-lineage topics (a healing, not a regression — dossiers stop citing retired memories); the §5.3 harness
+gate guards the blast radius.
+
+**Writer-coordination / stability note (critic gap):** evolve's summarize and reflection's refresh converge
+by construction — both route through the same gather (same exclusion) and the same set-diff idempotent
+`emit_page`; for a fixed corpus state they compute the same cited set, so alternation cannot oscillate.
+Churn occurs only when the corpus actually changes between runs; a later evolve supersede of a
+reflection-refreshed page is ACCEPTED, measured churn (it shows in the scoreboard as a re-miss/re-repair
+cycle), not a regression.
+
+**Page growth bound:** pages are entity-keyed (one current page per topic, superseded in place) and
+reflection mints no entities — so reflection cannot grow the page population at all; it only revises
+existing topics' pages. No new ceiling needed in R4-A (R4-B's proposals carry the conflict-style open-count
+cap instead).
+
+### §2.4 Scoreboard (operational telemetry — NOT the evidence instrument)
+
+`ReflectReport` per tick: `attempted / candidate_repaired / repaired_by_time / no_material / parked /
+dossiers_refreshed / merge_proposed (0 until R4-B) / gated_off / reasoner_errors` + cumulative counters in
+the telemetry family. Snapshot digest line (Rung-3 never-truncated preamble, integer-only): default-include
+"`N` memory gaps addressed, `M` unknown-topic gaps since last session" — `M` (= no_material) is the most
+actionable output for the owner ("your memory never knew this; consider telling it"), per critic's open
+question. Disclosure copy for the miss store updates in the same PR (critic m4): it is no longer a passive
+read-only signal; it actively drives reflection work (and, with cloud consent ON, gathered material may
+egress under the existing consent).
+
+### §2.5 Enable path (arch m8 — without this, §5.4 is impossible)
+
+None of the dormant sibling flags has a user-facing enable path today (conflict-detect included). R4-A adds
+the minimal one, inside the desktop's sanctioned settings/consent role (NOT a reflection UI): an App-only
+`SetReflectEnabled` wire op (the `SetCaptureEnabled` pattern, `server.rs:465`-family) + a single toggle in
+the desktop settings panel. Guest role cannot reach it. This also establishes the enable-path pattern the
+Rung-3 dogfood needs.
 
 ## §3 Architecture — R4-B, entity merge (summary; own spec-level detail at its plan)
 
 - **Detection (in the reflect tick, budgeted):** conservative duplicate candidates over the folded entity
   set — normalized-name equality / alias overlap / high name-embedding similarity (thresholds provisional,
-  harness-tunable). Entities are mint-once with `aliases` and NO merge primitive today (`graph.rs:283,308`)
-  — that primitive is R4-B's core deliverable.
-- **Proposal:** signed `merge_proposal` event — pair-keyed (unordered, the `unordered_pair_key` idiom),
-  idempotent, open-count-capped, stop-nagging (a dismissed pair is not re-proposed while both sides'
-  fold-relevant state is unchanged — the I9 single-source lesson: ONE exclusions reader feeds both the
-  proposer and the listing).
+  consts block, harness-tunable).
+- **Proposal:** signed `merge_proposal` — pair-keyed (`unordered_pair_key` idiom), idempotent,
+  open-count-capped, stop-nagging (dismissed pairs excluded via ONE exclusions reader feeding both proposer
+  and listing — I9).
 - **Resolution (owner, from Code):** `list_merge_proposals` / `resolve_merge_proposal{approve|dismiss}` MCP
-  tools → proto ops granted to `MemoryClient` under the established I8 relaxation posture; guest
-  onboarding-override; daemon-side sanitize on the listing; NOT rate-limited (same §0 rationale as Rung 3);
-  direct structural ops stay App-only.
-- **Apply (reversible, append-only):** `entity_merged{winner, loser}` marker; the fold projects the loser's
-  aliases and current edges onto the winner and drops the loser from entity listings; `entity_unmerged`
-  restores (the unretire philosophy). Winner's topic page goes dirty → the refresh job (§2.3) regenerates
-  its dossier next night. No event rewriting, no index surgery outside the normal rebuild paths.
+  tools → proto ops under the established I8 relaxation posture; guest onboarding-override; daemon-side
+  sanitize; NOT rate-limited (Rung-3 §0 rationale); direct structural ops stay App-only. Plus the read-only
+  reflection-activity listing (§4 I-vis).
+- **Apply (reversible, append-only):** `entity_merged{winner, loser}` marker; fold projects loser's aliases
+  + current edges onto winner and drops loser from listings; `entity_unmerged` restores. **Named blast
+  radius (arch m6):** the fold projection, `rebuild_entity_index` (the loser's resolution vector must not
+  keep winning `resolve_mention` — else mentions re-resolve to the merged-away id and diverge), the recall
+  graph boost (follows `rebuild_graph`), and summarize dirty-topics (winner goes dirty → §2.3 refreshes its
+  dossier next night). Positive finding carried from review: `ConflictRef` has NO Entity variant — merge
+  does not perturb conflict pair keys.
 
 ## §4 Invariants (house numbering, extended)
 
 | Inv | Statement | Where upheld |
 | --- | --- | --- |
-| I1 never-destroy | Reflection is additive (dossier supersede-revisions + links); merge is marker-based and reversible; originals never mutated or deleted. | §2.2/§2.3 write paths; §3 markers |
-| I2 no silent egress | Reasoner phases sit behind `cloud_consent_ok`; local default; cloud fail-closed. | §2.1 chokepoint |
-| I3 dormant | `ConfigFlag::Reflect` default-closed + `prime_switches` boot force-off; merging R4-A changes nothing at runtime. The fresh-brain config-event trip-wire moves **5 → 6** in BOTH sites (`bossclawd/tests/roundtrip.rs:173`, desktop `engine/client.rs:973`) as a conscious, documented act — the trip-wire firing loudly is it working. | §2.1 gate; plan task |
-| I5 append-only | All state via signed events; `reflect_miss_attempts` is re-derivable progress state, not history. | §2.2 |
-| I6 fail-safe | Per-miss attempt budget → `parked` (bounded loss); per-tick work caps; `Busy` on lock overlap; a torn tick re-tries idempotently (dossier emit is set-diff idempotent). | §2.2/§2.1 |
-| I7 hostile-output | Dossier content is citation-floored (subtract-only) — model text never becomes uncited "fact"; merge listings sanitized daemon-side; no raw model text logged (daemons persist stderr). | §2.2 prompt discipline; §3 |
-| I8 (relaxed, scoped) | Merge resolution reachable from `MemoryClient` per the Rung-3 owner decision; compensating controls: reversibility + signed log + visibility. Direct structural ops stay App-only. | §3 |
-| I9 stop-nagging | Merge proposals pair-keyed + exclusion-fed from one reader; parked misses stop being attempted. | §3; §2.2 |
+| I1 never-destroy | Reflection writes are append-only dossier REVISIONS (supersede = replace-in-recall; prior revision recoverable from the log — a good revision can be displaced until re-superseded, accepted and inherited from evolve's existing posture) + machine links; merge is marker-based and reversible; originals never mutated or deleted; reflection NEVER mints entities or retires anything. | §2.2/§2.3/§3 |
+| I2 no silent egress | Reasoner phases behind `cloud_consent_ok`; local default; cloud fail-closed. Miss QUERIES drive only local search; gathered MATERIAL reaches a reasoner only inside the consent envelope. | §2.1/§2.2 |
+| I3 dormant | `ConfigFlag::Reflect` default-closed + `prime_switches` force-off; merging R4-A changes no runtime behavior (loop gated off; enable requires the explicit App-only op §2.5). The fresh-brain config-event trip-wire moves **5 → 6** in ALL THREE sites (`bossclawd/tests/roundtrip.rs:173`, `engine/mod.rs:2237`, desktop `engine/client.rs:973`) as one conscious, documented act. | §2.1/§2.5 |
+| I5 append-only | All durable state via signed events; `reflect_miss_backlog` is re-derivable progress state, not history. | §2.2 |
+| I6 fail-safe | Per-miss attempt budget → parked; per-tick caps; starvation floor bounded to one tick per interval; `Busy` on overlap; torn ticks re-try idempotently (set-diff emit). | §2.1/§2.2 |
+| I7 hostile-output | Dossier content citation-floored (subtract-only); no raw model text logged; merge/activity listings sanitized daemon-side; digest lines integer-only. | §2.2/§2.4/§3 |
+| I8 (relaxed, scoped) | R4-B merge resolution reachable from `MemoryClient` per the Rung-3 owner decision + compensating controls. R4-A adds NO guest-reachable ops; `SetReflectEnabled` is App-only. | §2.5/§3 |
+| I9 stop-nagging | Merge proposals pair-keyed + single-source exclusions; parked misses stop being attempted; backlog dedup by normalized key. | §2.2/§3 |
+| I-vis visibility | Autonomous-writer visibility is staged, honestly: R4-A = scoreboard + digest counts + the signed log (accepted: no per-item review surface yet, matching evolve's existing dossier posture — reflection adds a trigger, not a power); R4-B ships the read-only reflection-activity listing alongside the merge tools. | §2.4/§3 |
 
 ## §5 Instrumentation + exit gates ("build instrumented" is a deliverable)
 
-1. **Scoreboard:** `ReflectReport` per tick (attempted / repaired / repaired_by_time / no_material / parked /
-   dossiers_refreshed / merge_proposed / gated_off / reasoner_errors) + cumulative counters in the telemetry
-   file family. The replay-the-miss check (§2.2 step 4) makes "repaired" a verified outcome, not a claim.
-   Plus one integer digest line in the session-start snapshot preamble, Rung-3 style ("N memory gaps
-   repaired since last session") — never-truncated placement + integer-only discipline already exist
-   (default per §7.3; drop only if plan review finds a concrete reason).
-2. **Harness non-regression gate (SHIP/NO-SHIP):** on the frozen corpus, a reflected brain (loop run to
-   quiescence) must not regress recall on ANY segment vs the unreflected baseline — the existing paired
-   Wilcoxon `recall_regressed` mechanism (`memharness/src/compare.rs:136`). Reflection artifacts (extra
-   pages) must earn their rank, not crowd out ground truth.
-3. **Dormancy proof:** trip-wire `==5 → ==6` updated in both sites within the same task that adds the flag,
-   with the design-doc citation in the diff; everything else byte-identical at boot.
-4. **Live evidence (Peter-gated, post-merge):** enable Reflect on the real brain, watch the scoreboard for a
-   week of nights; the recall-miss counters' trend is the honest field metric. (The strategy's open question
-   — do reflection gains replicate? — gets its first real data here.)
+Two instruments with different jobs — the scoreboard OPERATES, the harness EVIDENCES:
+
+1. **Operational scoreboard (§2.4).** `candidate_repaired` et al. are explicitly labeled operational (the
+   build-then-replay loop is self-confirming; it verifies the mechanism fired, not that memory improved).
+2. **Harness non-regression gate (SHIP/NO-SHIP).** On the frozen corpus: reflected brain (loop driven to
+   quiescence) vs unreflected baseline, paired per-case; `recall_regressed` must flag NO segment.
+3. **Harness reflection workstream (net-new memharness scope — critic B2; a named R4-A work item, not "the
+   existing mechanism"):**
+   (a) a run-to-quiescence reflection driver over the frozen corpus + a frozen synthetic miss set;
+   (b) a PAGE ARM: `PageResolver` today is fail-loud on any non-file hit (the Phase-0 no-evolve invariant,
+   `arms.rs:76,106`) — extend it so a dossier hit scores as the UNION of its cited source pages (a dossier
+   that cites gold sources earns the gold; one that cites none earns nothing);
+   (c) the reflected pass RUNS EVOLVE TOO (quiescence = both loops drained) so evolve↔reflect page
+   interaction is inside the gate, not invisible to it;
+   (d) **held-out generalization probe (B1 fix):** reflect on miss set A, then measure success@k on a
+   DISJOINT paraphrase/query set B over the same topics — repair must generalize past the verbatim query;
+   (e) **dossier-vs-source answer A/B (B1/M5 fix — the primacy evidence-generator):** blind position-swapped
+   judging of answers composed from the dossier page vs from its raw cited memories, on the open-case set.
+   Outputs (d)+(e) are REPORTED, not SHIP-gated in R4-A (the SHIP bar is non-regression; the lift data
+   informs the future dossier-primacy decision honestly).
+4. **Dormancy proof:** trip-wire `==5 → ==6` updated in all THREE sites in the same task that adds the flag.
+5. **Live evidence (Peter-gated, post-merge, via §2.5):** enable Reflect on the real brain; the field
+   metrics are the miss-counter trend + the digest counts over ≥1 week of nights. Field churn (evolve
+   re-superseding reflected pages) is measured, not hidden (§2.3).
 
 ## §6 Boundary — explicitly OUT of Rung 4
 
-- Wiring bi-temporal `as_of` into recall (`log.rs:6221`, currently test-only) — the strategy's Phase-3
-  leftover; deserves its own arc with its own measurement.
-- Decay / archive tiers (SP3-deferred remains deferred). Orphan-memory adoption. `Wide` dossier reach
-  (`summarize.rs:13,18` stays deferred).
-- Desktop UI (background-first: Code is the surface; desktop = settings/consent only — no reflection panel).
-- Codex parity; cross-machine sync; any change to recall ranking in favor of pages ("dossier-primacy"
-  re-ranking is future, evidence-gated by §5.2/§5.4 data).
-- Any autonomous structural mutation (merge without approval, retire-into-dossier consolidation).
+- Recall re-ranking in favor of pages ("dossier-primacy") — future, decided on §5.3(e) evidence.
+- Wiring bi-temporal `as_of` into recall (test-only today) — its own arc.
+- Decay/archive tiers; orphan adoption; `Wide` dossier reach; semantic miss dedup.
+- Desktop UI beyond the single settings toggle (§2.5); Codex parity; cross-machine sync.
+- Entity minting from reflection; any autonomous structural mutation.
+- Parsing rotated `recall.jsonl` history (backlog seeds from the live ring only, v1).
 
 ## §7 Open questions (defaults chosen; revisit at plan review)
 
-1. **Quiet-predicate event classes** — which append types reset the watermark (memory only, or memory +
-   capture)? Default: memory-class + session-capture appends (both mean "the room is active").
-2. **Miss normalization** — how a missed query keys `reflect_miss_attempts` (case/whitespace fold minimum;
-   semantic dedup is NOT v1). Default: trimmed casefold hash.
-3. **Digest line** — include the repaired-count line in the snapshot preamble in R4-A or defer? Default:
-   include (one integer line; the never-truncated preamble + integer-only discipline already exist).
-4. **R4-B thresholds** — duplicate-candidate similarity floors; conservative-first, harness-tunable consts
-   in one place (the `CONFLICT_PAIR_ERROR_BUDGET` documentation pattern).
+1. **Quiet event classes** — default: memory-class + session-capture appends reset the idle window.
+2. **entity_search floor + N** — question→entity-label similarity is unproven territory (arch B1 option-A
+   cost, accepted): start conservative (high floor, N=2); tune via §5.3(d); a floor too high just yields
+   more honest `no_material`.
+3. **Backlog hygiene** — `repaired_by_time`/`candidate_repaired` rows age out after a fixed horizon
+   (provisional 30d) to keep the table bounded; `parked`/`no_material` persist (they carry information).
+4. **R4-B thresholds** — conservative-first consts, one documented block (the
+   `CONFLICT_PAIR_ERROR_BUDGET` pattern).
 
-## §8 Key seam anchors (verified against main `7fb1e8a`, 2026-07-19)
+## §8 Key seam anchors (verified against main `7fb1e8a`, 2026-07-19; re-verified by independent review)
 
-`evolve_once` `log.rs:8270` · `summarize_topics` `log.rs:8111` · `gather_fact_set` `log.rs:8076` ·
-`emit_page` `log.rs:2772` · page idempotency `log.rs:8162` · scheduler pattern `engine/scheduler.rs:53,90` ·
-capture sweeper `capture/sweeper.rs:48-59` · conflict sweeper `conflict/sweeper.rs:40,68` · `prime_switches`
-`engine/mod.rs:564` (5 boot events at `:2233-2236`) · `cloud_consent_ok` `engine/mod.rs:1692` ·
-`select_ready` `scheduler.rs:70` · miss telemetry `bossclawd/src/telemetry.rs` (`RECENT_MISSES_CAP=20`) ·
-recall surfaces + per-kind retain `log.rs:1790,1981-2024` · `SessionFold` `log.rs:9439+` · entities
-mint-once/no-merge `graph.rs:283,308` · prompt pattern `conflict.rs:57,105,131` · `ScriptedReasoner`
-`reason.rs:56` · trip-wire sites `bossclawd/tests/roundtrip.rs:173` + desktop `engine/client.rs:973` ·
-`recall_regressed` `memharness/src/compare.rs:136`. Line anchors drift — re-grep at plan/build time.
+`evolve_once` `log.rs:8270` · `summarize_topics` `log.rs:8111` · `dirty_entities_since` `log.rs:7907` ·
+`gather_fact_set` `log.rs:8076` (entity-anchored) · `fact_texts_for_ids` `log.rs:7945` (pages-only filter
+today — §2.3 adds the exclusion) · `emit_page` `log.rs:2772` · page idempotency `log.rs:8162` ·
+`entity_search`/`resolve_mention` `log.rs:6988/:6979` (resolve MINTS — reflection uses entity_search only) ·
+recall excludes entity-kind `log.rs:972` · scheduler `engine/scheduler.rs:53,70,90` · capture sweeper
+`capture/sweeper.rs:48-59` (`QUIET_SECS=600` precedent) · conflict sweeper `conflict/sweeper.rs:40,68` ·
+`prime_switches` `engine/mod.rs:564` (force-off precedents `:584,:591`) · `cloud_consent_ok`
+`engine/mod.rs:1692` · miss telemetry `bossclawd/src/telemetry.rs` (`RECENT_MISSES_CAP=20`; `is_miss =
+hits==0`; RecallStats is the existing read-only consumer) · recall + per-kind retain `log.rs:1790,1981-2024`
+· `SessionFold` sets `log.rs:9519+` · entities mint-once `graph.rs:283,308` · `rebuild_entity_index`
+`log.rs:6425` (R4-B blast radius) · `ConflictRef` no-Entity `index.rs:89-96` · prompt pattern
+`conflict.rs:57,95,105` · `ScriptedReasoner` `reason.rs:56` · trip-wire sites ×3 `roundtrip.rs:173` +
+`engine/mod.rs:2237` + desktop `client.rs:973` · `PageResolver` fail-loud `memharness/src/arms.rs:76,106` ·
+`recall_regressed` `memharness/src/compare.rs:136` · `SetCaptureEnabled` op family `server.rs:465`. Line
+anchors drift — re-grep at plan/build time.
+
+## §9 Rev 2 changelog (findings → resolutions)
+
+- Arch B1 + critic M1 (query→topic bridge unspecified): §2.2 step 2 — read-only `entity_search`, no minting,
+  entity-keyed pages, unknown topic → `no_material`. Page growth thereby bounded (no ceiling needed).
+- Arch M2 (refresh never heals): §2.3 — retired/superseded exclusion added INSIDE the shared gather path.
+- Arch M3 + critic B1 (repaired tautology): renamed `candidate_repaired`, labeled operational; evidence
+  moved to §5.3(d) held-out probe + (e) dossier-vs-source A/B.
+- Critic B2 (gate cannot run): §5.3 harness workstream named as net-new R4-A scope — quiescence driver, page
+  arm with cited-union scoring, evolve runs in the reflected pass.
+- Arch M4 (third trip-wire): all three `==5` sites listed (I3, §5.4, §8).
+- Arch M5 + critic M3 (quiet ambiguity/starvation): §2.1 — idle-window semantics (no latch, deadlock reading
+  ruled out), `QUIET_SECS` house pattern, starvation floor, evolve-backlog defer rule.
+- Critic M4 (ring churn): §2.2 durable `reflect_miss_backlog` seeded from the ring.
+- Critic M2 (visibility): §4 I-vis — staged visibility, accepted-and-justified for R4-A (evolve precedent),
+  read-only listing committed in R4-B; threat-model carry-forward noted in §2.2.
+- Critic M5 (goal fit): §0 scope-honesty paragraph + §5.3(e) as the primacy evidence-generator.
+- Arch m6 (R4-B blast radius): §3 names `rebuild_entity_index` + graph boost + dirty-topics; ConflictRef
+  no-Entity positive carried.
+- Arch m7 (watermark scan cost): noted in §2.1.
+- Arch m8 (no enable path): §2.5 App-only `SetReflectEnabled` + settings toggle, named R4-A scope.
+- Critic m1 (false "nothing reads it"): reworded (§0). m2 (I1 wording): tightened (§0, §4). m3 (miss =
+  coverage): scoped (§2.2). m4 (disclosure copy): §2.4 task. m5 (normalization bloat): bounded by
+  entity-keyed pages (§2.2); semantic dedup stays out (§6).
+- Critic gaps (stability, contention-in-gate, ceiling, floor, backlog, positive-lift): §2.3 convergence
+  note, §5.3(c), §2.3 growth bound, §2.1 floor, §2.2 backlog, §5.3(d,e).
+- Critic open Qs: no_material surfaced in the digest (§2.4); evolve-supersede churn = accepted + measured
+  (§2.3); harness runs evolve (§5.3(c)).
