@@ -191,7 +191,11 @@ pub async fn tool_resolve_conflict(
     }
 }
 
-/// Render pending conflicts as a compact, agent-readable block.
+/// Render pending conflicts as a compact, agent-readable block — one line per conflict carrying the
+/// id, confidence band, older/newer refs, and the daemon-sanitized templated `why` (content-free by
+/// construction, I7). `a_ref` is the OLDER side, `b_ref` the NEWER (core `conflict.rs` orders every
+/// pair by ingest ts) — labeled explicitly so the agent can map `retire_older`/`retire_newer` to the
+/// right side. `winner_hint` and `detected_at` stay unrendered.
 fn render_conflicts(rows: &[bossclawd_proto::types::ConflictProposalWire]) -> String {
     if rows.is_empty() {
         return "No pending memory conflicts.".to_string();
@@ -199,15 +203,21 @@ fn render_conflicts(rows: &[bossclawd_proto::types::ConflictProposalWire]) -> St
     let mut out = format!("{} pending memory conflict(s):\n", rows.len());
     for (i, r) in rows.iter().enumerate() {
         out.push_str(&format!(
-            "{}. id={} [{}] {} vs {}\n",
-            i + 1, r.id, r.confidence_band, describe_ref(&r.a_ref), describe_ref(&r.b_ref)
+            "{}. id={} [{}] older={} newer={} — {}\n",
+            i + 1,
+            r.id,
+            r.confidence_band,
+            describe_ref(&r.a_ref),
+            describe_ref(&r.b_ref),
+            r.why
         ));
     }
     out.push_str("Use resolve_conflict with the id and an action (retire_older/retire_newer/keep_both/dismiss).");
     out
 }
 
-/// One-line, id-only description of a wire ref (no memory content — the daemon carries only ids + band).
+/// One-line, id-only rendering of a wire ref (which memory, never what it says). The row's
+/// human-readable context — the sanitized, templated `why` — is rendered by the caller.
 fn describe_ref(r: &bossclawd_proto::types::ConflictRefWire) -> String {
     match r {
         bossclawd_proto::types::ConflictRefWire::Note { event_id } => format!("note:{event_id}"),

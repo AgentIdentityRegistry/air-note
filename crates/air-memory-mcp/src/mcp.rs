@@ -127,8 +127,10 @@ fn tools_list_result() -> Value {
             {
                 "name": TOOL_RESOLVE_CONFLICT,
                 "description": "Resolve one AIR memory conflict by id. `action` is one of: retire_older, \
-                                retire_newer (reversibly hide one side), keep_both, dismiss. Retires are \
-                                reversible and reported to the user; never resolve without the user's intent.",
+                                retire_newer (reversibly hide one side), keep_both (permanently mark the \
+                                pair as fine to coexist — never re-proposed), dismiss (snooze it; it can \
+                                re-open if the memories materially change). Retires are reversible and \
+                                reported to the user; never resolve without the user's intent.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -244,6 +246,16 @@ mod tests {
         // A bad `action` is a model-correctable argument error → an isError tool result, not a panic (I4).
         let out = handle_message(std::path::Path::new("/nonexistent.sock"),
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"resolve_conflict","arguments":{"proposal_id":"P","action":"nope"}}}"#,
+        ).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v.pointer("/result/isError").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn resolve_conflict_missing_proposal_id_is_iserror() {
+        // Missing `proposal_id` is model-correctable → an isError tool result; the socket is never touched.
+        let out = handle_message(std::path::Path::new("/nonexistent.sock"),
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resolve_conflict","arguments":{"action":"dismiss"}}}"#,
         ).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v.pointer("/result/isError").and_then(Value::as_bool), Some(true));
