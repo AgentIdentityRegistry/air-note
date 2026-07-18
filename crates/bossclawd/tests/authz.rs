@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use bossclawd::server;
+use bossclawd_proto::types::ResolveActionWire;
 use bossclawd_proto::{
     read_frame, write_frame, Hello, HelloOk, OpErrorKindWire, Request, Response, RetireTarget, Role,
     PROTO_VERSION,
@@ -203,7 +204,7 @@ async fn memory_client_can_resolve_conflicts_but_still_cannot_retire_directly() 
         .call(Request::ResolveConflict {
             onboarded: true,
             proposal_id: "NOPE".into(),
-            action: bossclawd_proto::types::ResolveActionWire::Dismiss,
+            action: ResolveActionWire::Dismiss,
         })
         .await;
     assert!(

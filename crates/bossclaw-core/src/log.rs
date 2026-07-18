@@ -495,8 +495,9 @@ pub enum ResolveOutcome {
 }
 
 /// The visibility-digest counts since the last session boundary (spec §2.4). `max_seq` is the store's
-/// current max event seq — the daemon advances `conflict_digest_cursor` to it after serving a snapshot,
-/// so the next session's window starts fresh. Portable data type.
+/// current max event seq — the daemon advances `conflict_digest_cursor` to it after serving a STARTUP
+/// snapshot (compact/resume serves render without consuming the window), so the next session's window
+/// starts fresh. Portable data type.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConflictDigest {
     /// `note_retired`/`passage_retired` markers with `via=="conflict"` since the cursor (torn-write-safe).
@@ -3081,7 +3082,6 @@ impl EventLog {
     /// different action is rejected by the guard before it can append, so a well-formed log has at most one
     /// per id; the fold defensively keeps the earliest). `#[cfg(unix)]`.
     #[cfg(unix)]
-    #[allow(dead_code)] // consumed by resolve_conflict's terminal-state guard (Task 6)
     fn resolution_markers(&self) -> Result<std::collections::HashMap<String, ResolutionRecord>, BossclawError> {
         let mut out: std::collections::HashMap<String, ResolutionRecord> = std::collections::HashMap::new();
         for ev in self.events_of_types(&[
@@ -3223,6 +3223,8 @@ impl EventLog {
         kind: ResolutionKind,
         retired_event_id: &str,
     ) -> Result<String, BossclawError> {
+        // Unreachable for KeepBoth/Dismiss — resolve_conflict only calls this from its retire arm.
+        // (A bespoke 2-variant retire type would encode that structurally, but isn't worth it here.)
         let action = match kind {
             ResolutionKind::RetireOlder => "retire_older",
             ResolutionKind::RetireNewer => "retire_newer",
@@ -5584,9 +5586,9 @@ impl EventLog {
             signed_by_did: self.signer_did(),
             signature: None,
         })?;
-        // Rung-3 Phase-3 (§3.2): rewind to (current-head capture seq, passage_id). Resolve the head via
-        // the post-append fold so the un-retired passage is included.
-        let fold = fold_sessions(&self.session_events_ordered()?);
+        // Rung-3 Phase-3 (§3.2): rewind to (current-head capture seq, passage_id). The fold from the
+        // pre-append validation is still current — an unretire marker never changes `fold.current` (it
+        // only mutates `retired_passages`, which the current-head projection never consults).
         if let Some(cs) = fold.current.iter().find(|cs| cs.session_id == session_id) {
             if let Some(seq) = self.seq_of_event(&cs.event_id)? {
                 self.rewind_conflict_cursor(seq, passage_id)?;
@@ -6783,8 +6785,8 @@ impl EventLog {
         // pure finder needs zero reshape. NOT the single-ref `resolution_excluded_refs` param, which feeds
         // `decide_conflict_sweep`'s single-ref `excluded_refs` and would silently never match a pair key.
         let resolution = self.resolution_exclusions()?;
-        open_pairs.extend(resolution.coexist_pairs.iter().cloned());
-        open_pairs.extend(resolution.dismissed_pairs.iter().cloned());
+        open_pairs.extend(resolution.coexist_pairs);
+        open_pairs.extend(resolution.dismissed_pairs);
         let mut open_count = opens.len();
 
         // Text / lineage / ts / kind resolvers for a ref (notes from core; passages via the closure).
@@ -7136,6 +7138,7 @@ impl EventLog {
                     }
                 }
                 t if t == crate::graph::DISMISSED_EVENT_TYPE => d.dismissed += 1,
+                // coexist_allowed: keep-both
                 _ => d.kept += 1,
             }
         }
@@ -7148,7 +7151,11 @@ impl EventLog {
         let store = self.inner.lock().expect(POISON);
         let n: Option<i64> = store
             .conn()
-            .query_row("SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1", [pair_key], |r| r.get(0))
+            .query_row(
+                "SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1",
+                [pair_key],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(n.unwrap_or(0) as usize)
     }
@@ -7162,7 +7169,9 @@ impl EventLog {
             [pair_key],
         )?;
         let n: i64 = store.conn().query_row(
-            "SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1", [pair_key], |r| r.get(0),
+            "SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1",
+            [pair_key],
+            |r| r.get(0),
         )?;
         Ok(n as usize)
     }
@@ -7170,7 +7179,10 @@ impl EventLog {
     /// Reset a pair's consecutive-error count to 0 (on any successful judge of that pair — §3.3).
     fn reset_conflict_pair_error(&self, pair_key: &str) -> Result<(), BossclawError> {
         let store = self.inner.lock().expect(POISON);
-        store.conn().execute("DELETE FROM conflict_pair_errors WHERE pair_key = ?1", [pair_key])?;
+        store.conn().execute(
+            "DELETE FROM conflict_pair_errors WHERE pair_key = ?1",
+            [pair_key],
+        )?;
         Ok(())
     }
 
@@ -7179,7 +7191,13 @@ impl EventLog {
     /// re-scheduled without ever skipping unrelated newer subjects. Idempotent upsert via
     /// [`Self::set_conflict_cursor`], so it works on a brain that never ran detection (cursor defaults to
     /// `(0, 0)`). Caller appends the unretire marker FIRST; a torn write here leaves the cursor un-rewound
-    /// (a benign delay — the memory is current but re-examined only at the next natural sweep past it).
+    /// (the memory is current but not re-examined until something else rewinds below it — a benign,
+    /// bounded loss; once the cursor is already past the memory there is no future natural sweep back to it).
+    ///
+    /// Accepted benign race: unretire runs OUTSIDE the daemon's `conflict_lock`, so a concurrently-running
+    /// sweep cycle's cursor advance can overwrite this rewind — the same benign-miss class as the torn write
+    /// above. The fix would be a guarded compare-and-set UPDATE (rewind only if the row still holds the value
+    /// we read); deliberately not done in Phase 3.
     fn rewind_conflict_cursor(&self, seq: i64, within: usize) -> Result<(), BossclawError> {
         let current = self.conflict_cursor()?;
         let target = (seq, within);
@@ -9949,7 +9967,7 @@ mod tests {
     /// mirrors EXACTLY what it will write. `#[cfg(unix)]`.
     #[cfg(unix)]
     #[test]
-    fn resolution_markers_key_by_proposal_and_first_marker_wins() {
+    fn resolution_markers_key_by_proposal_and_map_each_kind() {
         let dir = tempfile::tempdir().unwrap();
         let log = open_log(dir.path());
         // Append a conflict_resolved (retire_older) for PROP1 and a coexist for PROP2.

@@ -524,9 +524,12 @@ impl From<ConflictRefWire> for bossclaw_core::index::ConflictRef {
     }
 }
 
-/// Wire mirror of [`bossclaw_core::ConflictProposalRow`] — one pending conflict for the read surface. The
-/// string fields (`winner_hint`/`confidence_band`/`why`) are daemon-sanitized when the `ListConflicts`
-/// response is BUILT (server-side), so the client always receives single-line, bounded text (MINOR-1).
+/// Wire mirror of [`bossclaw_core::ConflictProposalRow`] — one pending conflict for the read surface.
+/// Built ONLY by the daemon's sanitizing constructor (`bossclawd`'s `sanitize_conflict_row`): there is
+/// deliberately NO whole-row `From<ConflictProposalRow>` conversion, because that would pass the string
+/// fields through verbatim. The `winner_hint`/`confidence_band`/`why` fields are daemon-sanitized when the
+/// `ListConflicts` response is BUILT (server-side), so the client always receives single-line, bounded,
+/// fence-free text (MINOR-1).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct ConflictProposalWire {
     pub id: String,
@@ -538,20 +541,6 @@ pub struct ConflictProposalWire {
     pub detected_at: i64,
 }
 
-impl From<bossclaw_core::ConflictProposalRow> for ConflictProposalWire {
-    fn from(p: bossclaw_core::ConflictProposalRow) -> Self {
-        ConflictProposalWire {
-            id: p.id,
-            a_ref: p.a_ref.into(),
-            b_ref: p.b_ref.into(),
-            winner_hint: p.winner_hint,
-            confidence_band: p.confidence_band,
-            why: p.why,
-            detected_at: p.detected_at,
-        }
-    }
-}
-
 /// Wire mirror of [`bossclaw_core::ResolveAction`] (the four deterministic actions). Converts both ways.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResolveActionWire {
@@ -561,17 +550,6 @@ pub enum ResolveActionWire {
     Dismiss,
 }
 
-impl From<ResolveActionWire> for bossclaw_core::ResolveAction {
-    fn from(a: ResolveActionWire) -> Self {
-        match a {
-            ResolveActionWire::RetireOlder => bossclaw_core::ResolveAction::RetireOlder,
-            ResolveActionWire::RetireNewer => bossclaw_core::ResolveAction::RetireNewer,
-            ResolveActionWire::KeepBoth => bossclaw_core::ResolveAction::KeepBoth,
-            ResolveActionWire::Dismiss => bossclaw_core::ResolveAction::Dismiss,
-        }
-    }
-}
-
 impl From<bossclaw_core::ResolveAction> for ResolveActionWire {
     fn from(a: bossclaw_core::ResolveAction) -> Self {
         match a {
@@ -579,6 +557,17 @@ impl From<bossclaw_core::ResolveAction> for ResolveActionWire {
             bossclaw_core::ResolveAction::RetireNewer => ResolveActionWire::RetireNewer,
             bossclaw_core::ResolveAction::KeepBoth => ResolveActionWire::KeepBoth,
             bossclaw_core::ResolveAction::Dismiss => ResolveActionWire::Dismiss,
+        }
+    }
+}
+
+impl From<ResolveActionWire> for bossclaw_core::ResolveAction {
+    fn from(a: ResolveActionWire) -> Self {
+        match a {
+            ResolveActionWire::RetireOlder => bossclaw_core::ResolveAction::RetireOlder,
+            ResolveActionWire::RetireNewer => bossclaw_core::ResolveAction::RetireNewer,
+            ResolveActionWire::KeepBoth => bossclaw_core::ResolveAction::KeepBoth,
+            ResolveActionWire::Dismiss => bossclaw_core::ResolveAction::Dismiss,
         }
     }
 }
@@ -1050,21 +1039,21 @@ mod tests {
             let core: ConflictRef = back.into();
             assert_eq!(core, r, "ConflictRef survives core → wire → serde → core");
         }
-        let row = bossclaw_core::ConflictProposalRow {
+        // ConflictProposalWire is built ONLY by the daemon's sanitizing constructor (no whole-row `From`),
+        // so exercise the wire type directly via a struct literal → serde → back, asserting the WHOLE value
+        // (the exhaustive house idiom closes the a_ref/b_ref mismap gap a 3-field spot-check would miss).
+        let wire = ConflictProposalWire {
             id: "P1".into(),
-            a_ref: ConflictRef::Note { event_id: "a".into() },
-            b_ref: ConflictRef::Passage { session_id: "s".into(), passage_id: 0 },
+            a_ref: ConflictRefWire::Note { event_id: "a".into() },
+            b_ref: ConflictRefWire::Passage { session_id: "s".into(), passage_id: 0 },
             winner_hint: "newer".into(),
             confidence_band: "high".into(),
             why: "templated".into(),
             detected_at: 42,
         };
-        let wire: ConflictProposalWire = row.clone().into();
         let bytes = serde_json::to_vec(&wire).unwrap();
         let back: ConflictProposalWire = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.id, "P1");
-        assert_eq!(back.winner_hint, "newer");
-        assert_eq!(back.detected_at, 42);
+        assert_eq!(back, wire);
     }
 
     #[test]

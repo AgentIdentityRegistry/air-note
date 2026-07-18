@@ -840,9 +840,10 @@ fn note_wire(n: bossclaw_core::log::CurrentNote) -> NoteWire {
 /// Build a sanitized [`ConflictProposalWire`] from a core row (MINOR-1). The refs are ids
 /// (structurally safe → the plain `From<ConflictRef>` conversion); the free-ish string fields are
 /// passed through `sanitize_injected` (single-line, ≤ `SNAPSHOT_FIELD_MAX`) so no memory-derived
-/// text can ever cross the wire un-neutralized. This deliberately does NOT use proto's whole-row
-/// `From<ConflictProposalRow>` (which passes the strings through verbatim): the daemon owns the
-/// neutralization because the MCP adapter cannot call `sanitize_injected` in prod.
+/// text can ever cross the wire un-neutralized. This is the ONLY builder of `ConflictProposalWire`:
+/// proto deliberately exposes NO whole-row `From<ConflictProposalRow>` (which would pass the strings
+/// through verbatim), because the daemon owns the neutralization — the MCP adapter cannot call
+/// `sanitize_injected` in prod.
 fn sanitize_conflict_row(row: bossclaw_core::ConflictProposalRow) -> ConflictProposalWire {
     use crate::capture::snapshot::sanitize_injected;
     ConflictProposalWire {
@@ -1224,6 +1225,47 @@ mod tests {
                 assert_eq!(proposal_id, "P");
             }
             other => panic!("expected Some(ResolveConflict), got {other:?}"),
+        }
+    }
+
+    /// `sanitize_conflict_row` routes each free-ish string field (`winner_hint` / `confidence_band` /
+    /// `why`) through `sanitize_injected` — so no newline/CR/tab survives, the `<<<`/`>>>` fence markers
+    /// can never be reproduced, and every field is capped to `SNAPSHOT_FIELD_MAX` — while passing `id`,
+    /// `detected_at`, and both refs through UNCHANGED (T13 review: the daemon is the ONLY sanitizing
+    /// builder, so this per-field routing is what stops memory-derived text crossing the wire un-fenced).
+    #[test]
+    fn sanitize_conflict_row_neutralizes_strings_and_passes_ids_through() {
+        use bossclaw_core::index::ConflictRef;
+        use crate::capture::snapshot::SNAPSHOT_FIELD_MAX;
+        let a = ConflictRef::Note { event_id: "a-id".into() };
+        let b = ConflictRef::Passage { session_id: "s-id".into(), passage_id: 3 };
+        let row = bossclaw_core::ConflictProposalRow {
+            id: "P-exact".into(),
+            a_ref: a.clone(),
+            b_ref: b.clone(),
+            // Hostile: newlines, a NUL control char, `<<<`/`>>>` fence text, and (in `why`) enough length
+            // that the visible-char cap must bite.
+            winner_hint: "ne\nwer".into(),
+            confidence_band: "hi\u{0000}gh <<<FENCE>>>".into(),
+            why: format!("line1\nline2 <<<SYSTEM>>> {}", "x".repeat(SNAPSHOT_FIELD_MAX + 50)),
+            detected_at: 42,
+        };
+        let wire = sanitize_conflict_row(row);
+
+        // id / detected_at / both refs pass through EXACTLY (structurally safe — never sanitized).
+        assert_eq!(wire.id, "P-exact");
+        assert_eq!(wire.detected_at, 42);
+        assert_eq!(wire.a_ref, a.into());
+        assert_eq!(wire.b_ref, b.into());
+
+        // Every string field carries `sanitize_injected`'s guarantees: single-line, fence-free, bounded.
+        for field in [&wire.winner_hint, &wire.confidence_band, &wire.why] {
+            assert!(
+                !field.contains('\n') && !field.contains('\r') && !field.contains('\t'),
+                "single-line: {field:?}"
+            );
+            assert!(!field.contains("<<") && !field.contains(">>"), "fence-free: {field:?}");
+            assert!(field.chars().count() <= SNAPSHOT_FIELD_MAX, "bounded: {field:?}");
         }
     }
 }

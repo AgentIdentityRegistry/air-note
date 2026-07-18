@@ -820,7 +820,7 @@ mod protocol_tests {
     }
 
     /// Spot-checks that a representative set of pre-SP3 destructive/egress/read ops stay refused for
-    /// `MemoryClient` (SP3's `memory_client_allows_exactly_six_ops` covers the new SP3/Phase-3 ops). The true
+    /// `MemoryClient` (`memory_client_allows_exactly_six_ops` covers the new SP3/Phase-3 ops). The true
     /// fail-closed guarantee is structural: `Role::allows`'s positive `matches!` allowlist denies every
     /// non-listed variant, present or future; this test guards against a regression that admits one of
     /// these specific ops.
