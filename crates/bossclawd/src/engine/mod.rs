@@ -1179,6 +1179,49 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// The two Rung-3 visibility-digest lines for the SessionStart snapshot preamble (§2.4). INFALLIBLE
+    /// — returns an empty Vec on ANY error (not onboarded, open failure, join/core failure) or when
+    /// there is no conflict activity, so the snapshot builder never breaks (I1). Integer counts only —
+    /// no memory content, so nothing here needs sanitizing. Onboarding is the daemon's OWN verdict
+    /// (mirrors [`Self::current_sessions`]); this read holds NO conflict-sweep lock (a pure read is safe
+    /// concurrent with a sweep). Advances `conflict_digest_cursor` to the store's current max seq ONLY
+    /// when `source == "startup"`, so the window is honestly "since the last SESSION START":
+    /// [`crate::capture::snapshot::build`] also runs for `source == "compact"` (and resume), and
+    /// advancing there would let a mid-session compact CONSUME the "Since last session:" activity before
+    /// the real next start ever shows it. Non-startup serves still RENDER the (unconsumed) lines —
+    /// honest, just not window-advancing.
+    pub async fn conflict_digest_lines(&self, source: &str) -> Vec<String> {
+        let onboarded = self.is_onboarded_local();
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return Vec::new();
+        };
+        let advance = source == "startup";
+        spawn_blocking(move || {
+            let pending = log.pending_conflict_proposals().map(|v| v.len()).unwrap_or(0);
+            let since = log.conflict_digest_cursor().unwrap_or(0);
+            let d = log.conflict_digest_counts(since).unwrap_or_default();
+            // Advance the "since last session" window ONLY on a fresh startup (best-effort; a failed
+            // advance just re-counts next time). A compact/resume serve renders the lines but leaves the
+            // window open, so the activity is not consumed before the next real session start.
+            if advance {
+                let _ = log.set_conflict_digest_cursor(d.max_seq);
+            }
+            let mut lines = Vec::new();
+            if pending > 0 {
+                lines.push(format!("{pending} memory conflict(s) pending — ask me to review."));
+            }
+            if d.retired + d.dismissed + d.kept > 0 {
+                lines.push(format!(
+                    "Since last session: {} retired, {} dismissed, {} kept-both via conflict resolution.",
+                    d.retired, d.dismissed, d.kept
+                ));
+            }
+            lines
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
     /// default read the scheduler loop uses each tick (a `0` makes the tick a no-op, the safe
     /// default — never run a tick we can't size).
