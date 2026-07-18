@@ -69,3 +69,54 @@ async fn reasoner_unavailable_when_cloud_is_unconsented() {
     assert!(!report.gated_off, "detection is ENABLED — must NOT read as gated_off");
     assert_eq!(report.proposed, 0);
 }
+
+/// Whole-branch review (converged concurrency finding): the engine's `resolve_conflict` wrapper holds a
+/// dedicated `resolve_lock` across its whole body, so two concurrent `ResolveConflict` calls for the SAME
+/// proposal (realistic when a reconnecting MCP client double-submits) serialize into a deterministic
+/// first-wins outcome — exactly one `Applied`, the other a clean `NoOp` — never a raced fail-loud
+/// `Rejected("already retired"/"already resolved")` to one caller. We seed the proposal directly (the way
+/// the core resolve tests do) because this exercises resolve serialization, not detection: detection stays
+/// off, no reasoner is built, nothing egresses. Core stays unserialized BY DESIGN (its retired-set
+/// roll-forward gate makes an interleaving benign); the mutex is what removes the spurious-Err flakiness.
+#[tokio::test]
+async fn concurrent_resolve_same_proposal_is_first_wins_applied_then_noop() {
+    use bossclaw_core::{ConflictRef, ResolveAction, ResolveOutcome};
+    let (engine, _dir) = hermetic_engine();
+    let onboarded = true;
+
+    // Seed two conflicting notes (real, current memories) + a `conflict_proposal` over that exact pair.
+    let older = engine.remember(onboarded, "branch is main".to_string()).await.unwrap();
+    let newer = engine.remember(onboarded, "branch is master".to_string()).await.unwrap();
+    let log = engine.get_or_open(onboarded).await.unwrap();
+    let a = ConflictRef::Note { event_id: older.clone() };
+    let b = ConflictRef::Note { event_id: newer.clone() };
+    let prop = log
+        .append_conflict_proposal(&a, &b, "newer", "high", "why", 0, &[older, newer])
+        .unwrap();
+    drop(log); // do not hold the Arc across the concurrent resolves
+
+    // Two concurrent wrapper calls, SAME proposal + SAME action. `resolve_lock` serializes them: the
+    // first does the real work, the second WAITS then observes the terminal marker → clean NoOp.
+    let (r1, r2) = tokio::join!(
+        engine.resolve_conflict(onboarded, prop.clone(), ResolveAction::RetireOlder),
+        engine.resolve_conflict(onboarded, prop.clone(), ResolveAction::RetireOlder),
+    );
+    let o1 = r1.expect("first concurrent resolve is Ok — never a raced fail-loud Err");
+    let o2 = r2.expect("second concurrent resolve is Ok — never a raced fail-loud Err");
+
+    // Multiset assertion (which task wins the acquire is not fixed): exactly one Applied + one NoOp.
+    let applied = [&o1, &o2].iter().filter(|o| matches!(o, ResolveOutcome::Applied(_))).count();
+    let noop = [&o1, &o2].iter().filter(|o| matches!(o, ResolveOutcome::NoOp)).count();
+    assert_eq!(applied, 1, "exactly one call applies the resolution (first-wins)");
+    assert_eq!(noop, 1, "the serialized second call is a clean idempotent no-op");
+
+    // State corroboration: exactly ONE conflict-scoped retire marker (never a double-retire), and the
+    // resolved pair has left the pending set (the frozen loser is retired → non-current).
+    let log = engine.get_or_open(onboarded).await.unwrap();
+    let digest = log.conflict_digest_counts(0).unwrap();
+    assert_eq!(digest.retired, 1, "exactly one conflict-driven retire marker");
+    assert!(
+        log.pending_conflict_proposals().unwrap().is_empty(),
+        "the resolved pair is no longer pending",
+    );
+}

@@ -485,6 +485,93 @@ impl From<WriteOpMirror> for bossclaw_core::WriteOp {
     }
 }
 
+// ---- index.rs + log.rs (Rung-3 Phase-3 conflict resolution) ----
+// ConflictRef         ⇐⇒ bossclaw_core::index::ConflictRef   (both ways: daemon builds from core, client reads back)
+// ConflictProposalRow  ⇒ ConflictProposalWire                (one way: the daemon BUILDS the sanitized read row)
+// ResolveAction       ⇐⇒ bossclaw_core::ResolveAction        (both ways)
+// All three core types are UNGATED (portable data types — log.rs/index.rs), unlike the `#[cfg(unix)]`
+// `PendingProposal`/`MandateWriteRecord` above, so these mirrors + conversions are unconditional.
+
+/// Wire mirror of [`bossclaw_core::index::ConflictRef`]. Externally tagged so both variants are
+/// self-describing on the wire; converts BOTH ways (the daemon builds it from core, the client reads it).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum ConflictRefWire {
+    /// A memory note by event id.
+    Note { event_id: String },
+    /// A session passage by session id + ordinal.
+    Passage { session_id: String, passage_id: usize },
+}
+
+impl From<bossclaw_core::index::ConflictRef> for ConflictRefWire {
+    fn from(r: bossclaw_core::index::ConflictRef) -> Self {
+        match r {
+            bossclaw_core::index::ConflictRef::Note { event_id } => ConflictRefWire::Note { event_id },
+            bossclaw_core::index::ConflictRef::Passage { session_id, passage_id } => {
+                ConflictRefWire::Passage { session_id, passage_id }
+            }
+        }
+    }
+}
+
+impl From<ConflictRefWire> for bossclaw_core::index::ConflictRef {
+    fn from(r: ConflictRefWire) -> Self {
+        match r {
+            ConflictRefWire::Note { event_id } => bossclaw_core::index::ConflictRef::Note { event_id },
+            ConflictRefWire::Passage { session_id, passage_id } => {
+                bossclaw_core::index::ConflictRef::Passage { session_id, passage_id }
+            }
+        }
+    }
+}
+
+/// Wire mirror of [`bossclaw_core::ConflictProposalRow`] — one pending conflict for the read surface.
+/// Built ONLY by the daemon's sanitizing constructor (`bossclawd`'s `sanitize_conflict_row`): there is
+/// deliberately NO whole-row `From<ConflictProposalRow>` conversion, because that would pass the string
+/// fields through verbatim. The `winner_hint`/`confidence_band`/`why` fields are daemon-sanitized when the
+/// `ListConflicts` response is BUILT (server-side), so the client always receives single-line, bounded,
+/// fence-free text (MINOR-1).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ConflictProposalWire {
+    pub id: String,
+    pub a_ref: ConflictRefWire,
+    pub b_ref: ConflictRefWire,
+    pub winner_hint: String,
+    pub confidence_band: String,
+    pub why: String,
+    pub detected_at: i64,
+}
+
+/// Wire mirror of [`bossclaw_core::ResolveAction`] (the four deterministic actions). Converts both ways.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResolveActionWire {
+    RetireOlder,
+    RetireNewer,
+    KeepBoth,
+    Dismiss,
+}
+
+impl From<bossclaw_core::ResolveAction> for ResolveActionWire {
+    fn from(a: bossclaw_core::ResolveAction) -> Self {
+        match a {
+            bossclaw_core::ResolveAction::RetireOlder => ResolveActionWire::RetireOlder,
+            bossclaw_core::ResolveAction::RetireNewer => ResolveActionWire::RetireNewer,
+            bossclaw_core::ResolveAction::KeepBoth => ResolveActionWire::KeepBoth,
+            bossclaw_core::ResolveAction::Dismiss => ResolveActionWire::Dismiss,
+        }
+    }
+}
+
+impl From<ResolveActionWire> for bossclaw_core::ResolveAction {
+    fn from(a: ResolveActionWire) -> Self {
+        match a {
+            ResolveActionWire::RetireOlder => bossclaw_core::ResolveAction::RetireOlder,
+            ResolveActionWire::RetireNewer => bossclaw_core::ResolveAction::RetireNewer,
+            ResolveActionWire::KeepBoth => bossclaw_core::ResolveAction::KeepBoth,
+            ResolveActionWire::Dismiss => bossclaw_core::ResolveAction::Dismiss,
+        }
+    }
+}
+
 // ============================================================================
 // Family 2 — Desktop-crate summary wire structs (serde only; NO From/Into here)
 //
@@ -937,6 +1024,52 @@ mod tests {
         let back: MandateWriteRecordMirror = serde_json::from_slice(&bytes).unwrap();
         let core_again: bossclaw_core::MandateWriteRecord = back.into();
         assert_eq!(r, core_again);
+    }
+
+    #[test]
+    fn conflict_ref_and_proposal_wire_roundtrip_both_ways() {
+        use bossclaw_core::index::ConflictRef;
+        for r in [
+            ConflictRef::Note { event_id: "n1".into() },
+            ConflictRef::Passage { session_id: "s1".into(), passage_id: 4 },
+        ] {
+            let wire: ConflictRefWire = r.clone().into();
+            let bytes = serde_json::to_vec(&wire).unwrap();
+            let back: ConflictRefWire = serde_json::from_slice(&bytes).unwrap();
+            let core: ConflictRef = back.into();
+            assert_eq!(core, r, "ConflictRef survives core → wire → serde → core");
+        }
+        // ConflictProposalWire is built ONLY by the daemon's sanitizing constructor (no whole-row `From`),
+        // so exercise the wire type directly via a struct literal → serde → back, asserting the WHOLE value
+        // (the exhaustive house idiom closes the a_ref/b_ref mismap gap a 3-field spot-check would miss).
+        let wire = ConflictProposalWire {
+            id: "P1".into(),
+            a_ref: ConflictRefWire::Note { event_id: "a".into() },
+            b_ref: ConflictRefWire::Passage { session_id: "s".into(), passage_id: 0 },
+            winner_hint: "newer".into(),
+            confidence_band: "high".into(),
+            why: "templated".into(),
+            detected_at: 42,
+        };
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let back: ConflictProposalWire = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    #[test]
+    fn resolve_action_wire_maps_to_core_both_ways() {
+        use bossclaw_core::ResolveAction;
+        for (w, c) in [
+            (ResolveActionWire::RetireOlder, ResolveAction::RetireOlder),
+            (ResolveActionWire::RetireNewer, ResolveAction::RetireNewer),
+            (ResolveActionWire::KeepBoth, ResolveAction::KeepBoth),
+            (ResolveActionWire::Dismiss, ResolveAction::Dismiss),
+        ] {
+            let core: ResolveAction = w.into();
+            assert_eq!(core, c);
+            let back: ResolveActionWire = c.into();
+            assert_eq!(back, w);
+        }
     }
 
     // ---- Family 2: desktop summary wire structs (serde-only round-trips) ----

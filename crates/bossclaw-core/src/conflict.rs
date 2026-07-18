@@ -160,6 +160,10 @@ pub const CONFLICT_SEARCH_K: usize = CONFLICT_JUDGE_PER_SWEEP;
 pub const MAX_CANDIDATE_PAIRS_PER_SUBJECT: usize = CONFLICT_JUDGE_PER_SWEEP;
 /// Max subject EVENTS scanned per cycle since the cursor (a capture expands to its passages).
 pub const CONFLICT_SCAN_BOUND: usize = 64;
+/// Per-pair CONSECUTIVE reasoner-error cap (spec §3.3). At/above this the pair is `poison_skipped`
+/// (stops holding the cursor + stops being judged); below it the subject retries next cycle (I6).
+/// Chosen so a brief reasoner blip retries but a deterministically-erroring pair is bounded.
+pub const CONFLICT_PAIR_ERROR_BUDGET: usize = 3;
 /// Byte cap on each snippet handed to the judge (inherits SP3's snapshot budget intent).
 pub const MAX_JUDGE_TEXT_BYTES: usize = 4096;
 /// Confidence at/above which a stored proposal's coarse band is "high" (else "med"). All stored

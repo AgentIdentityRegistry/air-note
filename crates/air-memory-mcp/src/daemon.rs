@@ -166,6 +166,67 @@ pub async fn tool_remember(sock: &Path, text: &str) -> Result<String, DaemonErro
     }
 }
 
+/// The `list_conflicts` tool: send `Request::ListConflicts`, render the pending conflicts as text.
+pub async fn tool_list_conflicts(sock: &Path) -> Result<String, DaemonError> {
+    match call_daemon(sock, Request::ListConflicts { onboarded: true }).await? {
+        Response::ListConflicts(rows) => Ok(render_conflicts(&rows)),
+        other => Err(map_error_response(other)),
+    }
+}
+
+/// The `resolve_conflict` tool: send `Request::ResolveConflict`, confirm the outcome.
+pub async fn tool_resolve_conflict(
+    sock: &Path,
+    proposal_id: &str,
+    action: bossclawd_proto::types::ResolveActionWire,
+) -> Result<String, DaemonError> {
+    let req = Request::ResolveConflict { onboarded: true, proposal_id: proposal_id.to_string(), action };
+    match call_daemon(sock, req).await? {
+        Response::ResolveConflict { applied, marker_event_id } => Ok(if applied {
+            format!("Resolved conflict {proposal_id}. (marker {})", marker_event_id.as_deref().unwrap_or("-"))
+        } else {
+            format!("Conflict {proposal_id} was already resolved (no change).")
+        }),
+        other => Err(map_error_response(other)),
+    }
+}
+
+/// Render pending conflicts as a compact, agent-readable block — one line per conflict carrying the
+/// id, confidence band, older/newer refs, and the daemon-sanitized templated `why` (content-free by
+/// construction, I7). `a_ref` is the OLDER side, `b_ref` the NEWER (core `conflict.rs` orders every
+/// pair by ingest ts) — labeled explicitly so the agent can map `retire_older`/`retire_newer` to the
+/// right side. `winner_hint` and `detected_at` stay unrendered.
+fn render_conflicts(rows: &[bossclawd_proto::types::ConflictProposalWire]) -> String {
+    if rows.is_empty() {
+        return "No pending memory conflicts.".to_string();
+    }
+    let mut out = format!("{} pending memory conflict(s):\n", rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. id={} [{}] older={} newer={} — {}\n",
+            i + 1,
+            r.id,
+            r.confidence_band,
+            describe_ref(&r.a_ref),
+            describe_ref(&r.b_ref),
+            r.why
+        ));
+    }
+    out.push_str("Use resolve_conflict with the id and an action (retire_older/retire_newer/keep_both/dismiss).");
+    out
+}
+
+/// One-line, id-only rendering of a wire ref (which memory, never what it says). The row's
+/// human-readable context — the sanitized, templated `why` — is rendered by the caller.
+fn describe_ref(r: &bossclawd_proto::types::ConflictRefWire) -> String {
+    match r {
+        bossclawd_proto::types::ConflictRefWire::Note { event_id } => format!("note:{event_id}"),
+        bossclawd_proto::types::ConflictRefWire::Passage { session_id, passage_id } => {
+            format!("passage:{session_id}#{passage_id}")
+        }
+    }
+}
+
 /// Fire-and-forget capture poke (B2): a SHORT-timeout single round-trip asking the daemon to render
 /// the just-ended Claude Code session now. All failures map to Ok(()) at the CALLER (the
 /// `capture-notify` subcommand exits 0 regardless — the sweeper is the durability guarantee, I1/§6).

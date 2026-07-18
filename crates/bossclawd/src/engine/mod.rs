@@ -282,6 +282,16 @@ pub struct EngineHandle {
     /// Serializes manual + scheduled conflict-detection cycles (`try_lock` → `Busy("conflict")`).
     /// Mirrors `evolve_lock`.
     conflict_lock: Mutex<()>,
+    /// Serializes `resolve_conflict` wrapper calls against EACH OTHER, per daemon. A double-submit of
+    /// the SAME proposal (realistic when a reconnecting MCP client re-fires the op) becomes a
+    /// deterministic first-wins outcome: one caller does the real work (`Applied`), the serialized
+    /// second observes the terminal marker and returns a clean `NoOp` — never a spurious fail-loud
+    /// `Rejected("already retired"/"already resolved")`. DEDICATED, NOT reused `conflict_lock`: a sweep
+    /// cycle can hold `conflict_lock` for a long time (LLM judges) and must never block a user's
+    /// resolve. resolve-vs-sweep and resolve-vs-App-manual-retire stay UNSERIALIZED by design — core's
+    /// retired-set roll-forward gate + fail-loud primitives make those interleavings benign (design
+    /// Open-Q9).
+    resolve_lock: Mutex<()>,
     /// `true` once the in-memory recall index reflects persisted vectors this session.
     /// Set ONLY after a successful rebuild (a failure stays retryable). See `ensure_indexed`.
     indexed: Mutex<bool>,
@@ -326,6 +336,7 @@ impl EngineHandle {
             ingest_lock: Mutex::new(()),
             evolve_lock: Mutex::new(()),
             conflict_lock: Mutex::new(()),
+            resolve_lock: Mutex::new(()),
             indexed: Mutex::new(false),
             evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
             conflict_tel: std::sync::Mutex::new(ConflictTelemetry::default()),
@@ -817,7 +828,7 @@ impl EngineHandle {
         let onboarded = self.is_onboarded_local();
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
-            log.retire_memory(&event_id).map_err(|e| match e {
+            log.retire_memory(&event_id, None).map_err(|e| match e {
                 bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
                 other => EngineOpError::Core(other.to_string()),
             })
@@ -859,7 +870,7 @@ impl EngineHandle {
         let onboarded = self.is_onboarded_local();
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
-            log.retire_passage(&session_id, passage_id).map_err(|e| match e {
+            log.retire_passage(&session_id, passage_id, None).map_err(|e| match e {
                 bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
                 other => EngineOpError::Core(other.to_string()),
             })
@@ -1138,6 +1149,115 @@ impl EngineHandle {
         })
         .await
         .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-3 Phase-3: the pending conflict proposals (already coexist/dismissed-filtered by core).
+    /// Onboarding is the daemon's OWN verdict passed in by the dispatch layer (guest-reachable — the
+    /// I8 relaxation — but the daemon computes onboarding, never the client). Read-only: NO embedder,
+    /// NO reasoner, NO egress. Mirrors [`Self::deleted_session_ids`]'s pure-read idiom (`Core` on any
+    /// core failure).
+    pub async fn list_conflicts(
+        &self,
+        onboarded: bool,
+    ) -> Result<Vec<bossclaw_core::ConflictProposalRow>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.pending_conflict_proposals().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-3 Phase-3: resolve one conflict proposal. Deterministic, no LLM, no egress. An unknown or
+    /// already-resolved-by-a-different-action proposal folds to the typed `Rejected` (core reports
+    /// `InvalidInput`); any other core failure folds to `Core`. Onboarding is the daemon's OWN verdict
+    /// passed in by the dispatch layer. Mirrors [`Self::retire_memory`]'s marker-append idiom (same
+    /// `InvalidInput` → `Rejected` mapping).
+    ///
+    /// Holds `resolve_lock` across the WHOLE body (acquired before `get_or_open`, released after the
+    /// `spawn_blocking` completes) so concurrent resolves serialize against EACH OTHER per daemon: a
+    /// double-submit of one proposal (realistic when a reconnecting MCP client re-fires the op) is a
+    /// deterministic first-wins `Applied` + serialized `NoOp`, never a spurious fail-loud `Rejected`.
+    /// resolve-vs-sweep and resolve-vs-App-manual-retire stay unserialized by design — core's
+    /// retired-set roll-forward gate + fail-loud primitives make those interleavings benign (Open-Q9).
+    pub async fn resolve_conflict(
+        &self,
+        onboarded: bool,
+        proposal_id: String,
+        action: bossclaw_core::ResolveAction,
+    ) -> Result<bossclaw_core::ResolveOutcome, EngineOpError> {
+        // Serialize resolves against each other (see the doc + the `resolve_lock` field): held across
+        // the whole op — acquired before `get_or_open`, dropped at function return after the
+        // `spawn_blocking` await — so a double-submit is first-wins Applied + NoOp, never a raced
+        // fail-loud Err. `.lock().await` WAITS (does not `Busy`-reject like `conflict_lock`): the
+        // second submit must observe the first's terminal marker, which is what yields the clean NoOp.
+        let _resolve_guard = self.resolve_lock.lock().await;
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.resolve_conflict(&proposal_id, action).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// SERVE the two Rung-3 visibility-digest lines for the SessionStart snapshot preamble (§2.4) —
+    /// "serve" because this read has ONE deliberate side effect: it conditionally advances the digest
+    /// cursor. INFALLIBLE — returns an empty Vec on ANY error (not onboarded, open failure, join/core
+    /// failure) or when there is no conflict activity, so the snapshot builder never breaks (I1).
+    /// Integer counts only — no memory content, so nothing here needs sanitizing. Onboarding is the
+    /// daemon's OWN verdict (mirrors [`Self::current_sessions`]); this read holds NO conflict-sweep
+    /// lock (a pure read is safe concurrent with a sweep). Advances `conflict_digest_cursor` to the
+    /// store's current max seq ONLY when `source == "startup"`, so the window is honestly "since the
+    /// last SESSION START": [`crate::capture::snapshot::build`] also runs for `source == "compact"`
+    /// (and resume), and advancing there would let a mid-session compact CONSUME the "Since last
+    /// session:" activity before the real next start ever shows it; `clear` and unknown sources
+    /// likewise deliberately do not advance — only a true fresh startup consumes the window.
+    /// Non-startup serves still RENDER the (unconsumed) lines — honest, just not window-advancing.
+    /// `source` is CLIENT-supplied, so the advance is reachable by any guest snapshot claiming
+    /// `"startup"` — accepted: the digest is a cooperative-channel signal, not a tamper-evident alarm,
+    /// and the signed append-only log is the backstop (design §0).
+    pub async fn serve_conflict_digest_lines(&self, source: &str) -> Vec<String> {
+        let onboarded = self.is_onboarded_local();
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return Vec::new();
+        };
+        let advance = source == "startup";
+        spawn_blocking(move || {
+            let pending = log.pending_conflict_proposals().map(|v| v.len()).unwrap_or(0);
+            let since = log.conflict_digest_cursor().unwrap_or(0);
+            let d = log.conflict_digest_counts(since).unwrap_or_default();
+            // Advance the "since last session" window ONLY on a fresh startup (best-effort; a failed
+            // advance just re-counts next time). A compact/resume serve renders the lines but leaves the
+            // window open, so the activity is not consumed before the next real session start.
+            if advance {
+                let _ = log.set_conflict_digest_cursor(d.max_seq);
+            }
+            Self::build_digest_lines(pending, &d)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The PURE tail of [`Self::serve_conflict_digest_lines`]: render the two §2.4 digest lines from
+    /// the already-read counts. Split out so the exact `format!` bytes and the two non-zero gating
+    /// branches are unit-testable without a brain (the snapshot tests use hand-typed look-alike
+    /// strings; this is the real builder). A line is emitted only on a non-zero count: the pending
+    /// line when `pending > 0`, the activity line when any of retired/dismissed/kept is non-zero.
+    fn build_digest_lines(pending: usize, d: &bossclaw_core::ConflictDigest) -> Vec<String> {
+        let mut lines = Vec::new();
+        if pending > 0 {
+            lines.push(format!("{pending} memory conflict(s) pending — ask me to review."));
+        }
+        if d.retired + d.dismissed + d.kept > 0 {
+            lines.push(format!(
+                "Since last session: {} retired, {} dismissed, {} kept-both via conflict resolution.",
+                d.retired, d.dismissed, d.kept
+            ));
+        }
+        lines
     }
 
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
@@ -2000,6 +2120,47 @@ mod tests {
             Arc::new(embed::MockEmbedderProvider::new(8)),
             Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
         )
+    }
+
+    /// Task 14 review: the REAL digest line-builder's four gating-branch combinations, byte-exact.
+    /// The snapshot preamble tests exercise hand-typed look-alike strings; this pins the actual
+    /// `format!` output and both non-zero gates, so a format typo or a dropped branch cannot pass.
+    #[test]
+    fn build_digest_lines_four_branch_combinations_byte_exact() {
+        use bossclaw_core::ConflictDigest;
+        let zeros = ConflictDigest::default();
+        let activity = ConflictDigest { retired: 2, dismissed: 1, kept: 0, max_seq: 99 };
+
+        // (0, zeros) → no lines at all (an all-quiet brain adds nothing to the preamble).
+        assert!(EngineHandle::build_digest_lines(0, &zeros).is_empty());
+
+        // (n>0, zeros) → only the pending line, exact bytes.
+        assert_eq!(
+            EngineHandle::build_digest_lines(3, &zeros),
+            vec!["3 memory conflict(s) pending — ask me to review."]
+        );
+
+        // (0, nonzero) → only the activity line, exact bytes.
+        assert_eq!(
+            EngineHandle::build_digest_lines(0, &activity),
+            vec!["Since last session: 2 retired, 1 dismissed, 0 kept-both via conflict resolution."]
+        );
+
+        // (n>0, nonzero) → both lines, pending first, exact bytes.
+        assert_eq!(
+            EngineHandle::build_digest_lines(3, &activity),
+            vec![
+                "3 memory conflict(s) pending — ask me to review.",
+                "Since last session: 2 retired, 1 dismissed, 0 kept-both via conflict resolution.",
+            ]
+        );
+
+        // The activity gate is the SUM of the three counts — a kept-only window still emits.
+        let kept_only = ConflictDigest { retired: 0, dismissed: 0, kept: 4, max_seq: 1 };
+        assert_eq!(
+            EngineHandle::build_digest_lines(0, &kept_only),
+            vec!["Since last session: 0 retired, 0 dismissed, 4 kept-both via conflict resolution."]
+        );
     }
 
     #[test]

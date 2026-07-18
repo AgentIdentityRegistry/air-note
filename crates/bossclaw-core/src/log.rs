@@ -471,6 +471,68 @@ pub struct ConflictSubject {
     pub subject: crate::index::ConflictRef,
 }
 
+/// One of the four deterministic resolution actions (spec §1). NO LLM in the path. Portable data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveAction {
+    /// Retire the FROZEN older side (a_ref) — reversible.
+    RetireOlder,
+    /// Retire the FROZEN newer side (b_ref) — reversible.
+    RetireNewer,
+    /// Both memories coexist — never re-proposed, dropped from the read surface.
+    KeepBoth,
+    /// Snooze the pair — re-opens on a material change to a member (§3.1).
+    Dismiss,
+}
+
+/// The outcome of a [`EventLog::resolve_conflict`] call (spec §2.1). Portable data type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveOutcome {
+    /// The action was applied for the first time; carries the id of the terminal marker just appended.
+    Applied(String),
+    /// Idempotent no-op success: the proposal was already resolved by the SAME action, OR a torn-write
+    /// roll-forward completed the missing `conflict_resolved`. No fail-loud primitive was (re-)called.
+    NoOp,
+}
+
+/// The visibility-digest counts since the last session boundary (spec §2.4). `max_seq` is the store's
+/// current max event seq — the daemon advances `conflict_digest_cursor` to it after serving a STARTUP
+/// snapshot (compact/resume serves render without consuming the window), so the next session's window
+/// starts fresh. Portable data type.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConflictDigest {
+    /// `note_retired`/`passage_retired` markers with `via=="conflict"` since the cursor (torn-write-safe).
+    pub retired: usize,
+    /// `dismissed` markers since the cursor.
+    pub dismissed: usize,
+    /// `coexist_allowed` (keep-both) markers since the cursor.
+    pub kept: usize,
+    /// The store's current max event seq (the new cursor position).
+    pub max_seq: i64,
+}
+
+/// Map a `ResolveAction` to its terminal `ResolutionKind` (the two retire actions map to the two retire
+/// kinds; KeepBoth/Dismiss map to their own).
+fn action_kind(a: ResolveAction) -> ResolutionKind {
+    match a {
+        ResolveAction::RetireOlder => ResolutionKind::RetireOlder,
+        ResolveAction::RetireNewer => ResolutionKind::RetireNewer,
+        ResolveAction::KeepBoth => ResolutionKind::KeepBoth,
+        ResolveAction::Dismiss => ResolutionKind::Dismiss,
+    }
+}
+
+/// The `retired_event_id` recorded in `conflict_resolved` (Open-Q7): well-formed from the proposal refs on
+/// BOTH the fresh and roll-forward paths. A Note → its event id; a Passage → a stable `session#passage`
+/// composite (informational; the digest R-count reads the tagged retire MARKERS, not this field).
+fn retired_id_of(loser: &crate::index::ConflictRef) -> String {
+    match loser {
+        crate::index::ConflictRef::Note { event_id } => event_id.clone(),
+        crate::index::ConflictRef::Passage { session_id, passage_id } => {
+            format!("{session_id}#{passage_id}")
+        }
+    }
+}
+
 /// What one [`EventLog::detect_conflicts_once`] cycle did (spec §3.3). All-zero + `skipped_disabled`
 /// when the flag is off (I3).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -495,6 +557,9 @@ pub struct ConflictDetectReport {
     pub budget_hit: bool,
     /// The open-proposal ceiling was hit (stop proposing; surface one quiet count).
     pub ceiling_hit: bool,
+    /// Pairs abandoned this run after `CONFLICT_PAIR_ERROR_BUDGET` consecutive reasoner errors (§3.3) — a
+    /// bounded dropped counter on ONE pair, never a frozen sweep, never a hidden sibling conflict.
+    pub poison_skipped: usize,
 }
 
 /// The serialized, signed event log.
@@ -956,6 +1021,22 @@ impl EventLog {
                 subject_offset INTEGER NOT NULL
             )",
         )?;
+        // Rung-3 Phase-3 (§3.3): per-pair CONSECUTIVE reasoner-error counter. Re-derivable progress state
+        // (NOT a Tier-A fold): losing it only re-tries a poison pair. Keyed by `unordered_pair_key`.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS conflict_pair_errors (
+                pair_key           TEXT PRIMARY KEY,
+                consecutive_errors INTEGER NOT NULL
+            )",
+        )?;
+        // Rung-3 Phase-3 (§2.4): the "since last session" digest window boundary (a SEQ, Open-Q8). Single
+        // row (id = 0). Advanced when a snapshot is served (Task 14). Re-derivable progress state.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS conflict_digest_cursor (
+                id       INTEGER PRIMARY KEY CHECK (id = 0),
+                last_seq INTEGER NOT NULL
+            )",
+        )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
         // spill to the filesystem. This is a connection-level setting; it must be
         // re-applied on every open.
@@ -1113,6 +1194,17 @@ impl EventLog {
             .query_row("SELECT payload FROM events WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
             .optional()?;
         Ok(payload.map(|p| serde_json::from_str(&p)).transpose()?)
+    }
+
+    /// The append `seq` of the event with `event_id`, or `None` if no such event. A thin indexed lookup
+    /// (`events.id` is unique); used by the Rung-3 conflict-cursor rewind (§3.2) to map an un-retired
+    /// memory's event id back to its cursor coordinate.
+    pub fn seq_of_event(&self, event_id: &str) -> Result<Option<i64>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        Ok(store
+            .conn()
+            .query_row("SELECT seq FROM events WHERE id = ?1", [event_id], |r| r.get::<_, i64>(0))
+            .optional()?)
     }
 
     /// Number of events in the log.
@@ -2861,15 +2953,51 @@ impl EventLog {
         Ok(out)
     }
 
+    /// Recover `(a_ref, b_ref)` for a `conflict_proposal` by id, REGARDLESS of open-ness (spec §2.3,
+    /// MAJOR-1). `open_conflict_proposals` withdraws a proposal whose ref went non-current (a retire), so
+    /// the idempotency/roll-forward path in [`EventLog::resolve_conflict`] cannot read refs from the open
+    /// set. This reads the raw `conflict_proposal` event by id. `None` for an unknown id or a non-proposal
+    /// event (a `memory` id must never resolve here). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    pub fn conflict_proposal_by_id(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<(crate::index::ConflictRef, crate::index::ConflictRef)>, BossclawError> {
+        use crate::index::ConflictRef;
+        let Some(ev) = self.event_by_id(proposal_id)? else {
+            return Ok(None);
+        };
+        if ev.event_type != crate::graph::CONFLICT_PROPOSAL_EVENT_TYPE {
+            return Ok(None);
+        }
+        let (Some(a), Some(b)) = (
+            ev.content.get("a_ref").and_then(ConflictRef::from_json),
+            ev.content.get("b_ref").and_then(ConflictRef::from_json),
+        ) else {
+            return Ok(None); // malformed proposal — treat as unknown
+        };
+        Ok(Some((a, b)))
+    }
+
     /// Every OPEN conflict proposal (both refs current), oldest first — the read behind a later
     /// App-only `ListConflicts` (spec §3.5). GC is inherent: `open_conflict_proposals` already
     /// drops any proposal whose referenced memory was retired/deleted/edited (I-gc). Fold-derived,
     /// so it survives restart with no cursor. `#[cfg(unix)]`.
     #[cfg(unix)]
     pub fn pending_conflict_proposals(&self) -> Result<Vec<ConflictProposalRow>, BossclawError> {
+        // Rung-3 Phase-3 (§2.2 item 2, I9): a retire drops via the currency-GC in
+        // `open_conflict_proposals`; KeepBoth/Dismiss retire NOTHING, so the SAME live coexist/dismissed
+        // set that suppresses the finder (Task 7) must also drop them here — or the pending count /
+        // `ListConflicts` nags forever. Single-sourced `resolution_exclusions()` ⇒ reader and finder
+        // can never drift on `session_heads` liveness.
+        let excluded = self.resolution_exclusions()?;
         Ok(self
             .open_conflict_proposals()?
             .into_iter()
+            .filter(|p| {
+                let pk = Self::conflict_pair_key(&p.a_ref, &p.b_ref);
+                !excluded.coexist_pairs.contains(&pk) && !excluded.dismissed_pairs.contains(&pk)
+            })
             .map(|p| ConflictProposalRow {
                 id: p.id,
                 a_ref: p.a_ref,
@@ -2907,6 +3035,253 @@ impl EventLog {
             .open_conflict_proposals()?
             .iter()
             .any(|p| Self::conflict_pair_key(&p.a_ref, &p.b_ref) == want))
+    }
+
+    /// The live coexist + dismissed PAIR exclusions (spec §2.2 / §3.1). ONE fold-derived read consumed by
+    /// BOTH the finder's `open_pairs` union (Task 7) AND `pending_conflict_proposals` (Task 8), so the two
+    /// honor resolution identically (resolved Open-Q1). A `coexist_allowed` pair is permanent; a
+    /// `dismissed` pair is included ONLY while every session in its stored `session_heads` still has that
+    /// exact current head (a re-capture advances the head → the dismissal lapses → the pair may
+    /// re-propose). Notes need no head: an edit mints a new event id → a new `unordered_pair_key` the
+    /// stored key no longer matches, so the stale key becomes inert. Restart-safe (pure fold, no cursor).
+    #[cfg(unix)]
+    fn resolution_exclusions(&self) -> Result<ResolutionExclusions, BossclawError> {
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        let head_of: std::collections::HashMap<String, String> =
+            fold.current.iter().map(|cs| (cs.session_id.clone(), cs.event_id.clone())).collect();
+        let mut out = ResolutionExclusions::default();
+        for ev in self.events_of_types(&[
+            crate::graph::COEXIST_ALLOWED_EVENT_TYPE,
+            crate::graph::DISMISSED_EVENT_TYPE,
+        ])? {
+            let Some(pk) = ev.content.get("pair_key").and_then(|v| v.as_str()) else {
+                continue; // malformed — never excludes
+            };
+            if ev.event_type == crate::graph::COEXIST_ALLOWED_EVENT_TYPE {
+                out.coexist_pairs.insert(pk.to_string());
+                continue;
+            }
+            // dismissed: live only while every stored session head is unchanged.
+            let live = match ev.content.get("session_heads").and_then(|v| v.as_object()) {
+                None => true, // no passage members (note↔note) → no head to lapse; key is inert on edit
+                Some(map) => map.iter().all(|(sid, stored)| {
+                    head_of.get(sid).map(String::as_str) == stored.as_str()
+                }),
+            };
+            if live {
+                out.dismissed_pairs.insert(pk.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fold ALL terminal markers into `proposal_id -> ResolutionRecord` (spec §2.1). The idempotency +
+    /// terminal-state guard in [`EventLog::resolve_conflict`] reads this over ALL proposals (NOT the open
+    /// set — a retire withdrew the proposal from open, MAJOR-1). FIRST marker per proposal wins (a second,
+    /// different action is rejected by the guard before it can append, so a well-formed log has at most one
+    /// per id; the fold defensively keeps the earliest). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    fn resolution_markers(&self) -> Result<std::collections::HashMap<String, ResolutionRecord>, BossclawError> {
+        let mut out: std::collections::HashMap<String, ResolutionRecord> = std::collections::HashMap::new();
+        for ev in self.events_of_types(&[
+            crate::graph::CONFLICT_RESOLVED_EVENT_TYPE,
+            crate::graph::COEXIST_ALLOWED_EVENT_TYPE,
+            crate::graph::DISMISSED_EVENT_TYPE,
+        ])? {
+            let Some(pid) = ev.content.get("proposal_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if out.contains_key(pid) {
+                continue; // earliest (seq ASC) wins — events_of_types is seq-ordered
+            }
+            let record = match ev.event_type.as_str() {
+                t if t == crate::graph::CONFLICT_RESOLVED_EVENT_TYPE => {
+                    let kind = match ev.content.get("action").and_then(|v| v.as_str()) {
+                        Some("retire_older") => ResolutionKind::RetireOlder,
+                        Some("retire_newer") => ResolutionKind::RetireNewer,
+                        _ => continue, // malformed conflict_resolved — ignore
+                    };
+                    ResolutionRecord {
+                        kind,
+                        retired_event_id: ev
+                            .content
+                            .get("retired_event_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    }
+                }
+                t if t == crate::graph::COEXIST_ALLOWED_EVENT_TYPE => {
+                    ResolutionRecord { kind: ResolutionKind::KeepBoth, retired_event_id: None }
+                }
+                _ => ResolutionRecord { kind: ResolutionKind::Dismiss, retired_event_id: None },
+            };
+            out.insert(pid.to_string(), record);
+        }
+        Ok(out)
+    }
+
+    /// Resolve a detected `conflict_proposal` (spec §2.1). Deterministic, no LLM, no egress. Owns its
+    /// idempotency via the ALL-proposals guard (a retire withdraws the proposal from the OPEN set, so the
+    /// guard must NOT key off open membership — MAJOR-1). The retire actions retire the FROZEN loser
+    /// (`RetireOlder`=a_ref, `RetireNewer`=b_ref — detection fixed older→a_ref at `log.rs:6453`; NO ts
+    /// recompute here, since a passage's ts tracks its session head, which a re-capture can flip). A
+    /// torn-write retry (loser already in the retired set, no `conflict_resolved`) rolls forward: append
+    /// the missing marker, return `NoOp` — never re-call the fail-loud primitive (`Err("already retired")`,
+    /// `log.rs:5214`/`:5130`). Callers must SERIALIZE concurrent resolves per brain (the daemon's engine
+    /// wrapper holds `resolve_lock`); unserialized concurrent callers risk a spurious fail-loud `Err` to
+    /// one caller, never corruption. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    pub fn resolve_conflict(
+        &self,
+        proposal_id: &str,
+        action: ResolveAction,
+    ) -> Result<ResolveOutcome, BossclawError> {
+        use crate::index::ConflictRef;
+        // (1) Load refs by id (open-ness independent) — unknown id ⇒ error.
+        let Some((a_ref, b_ref)) = self.conflict_proposal_by_id(proposal_id)? else {
+            return Err(BossclawError::InvalidInput(format!("unknown conflict proposal {proposal_id}")));
+        };
+        let want = action_kind(action);
+        // (2) Terminal-state guard over ALL resolution markers.
+        if let Some(existing) = self.resolution_markers()?.get(proposal_id) {
+            if existing.kind == want {
+                return Ok(ResolveOutcome::NoOp); // idempotent same-action repeat
+            }
+            return Err(BossclawError::InvalidInput(format!(
+                "conflict proposal {proposal_id} is already resolved"
+            )));
+        }
+        // (3) No terminal marker yet — apply.
+        match action {
+            ResolveAction::RetireOlder | ResolveAction::RetireNewer => {
+                let loser = if matches!(action, ResolveAction::RetireOlder) { &a_ref } else { &b_ref };
+                let retired_event_id = retired_id_of(loser);
+                // Roll-forward gate: retired-SET membership (regardless of who retired it — §3.4). If the
+                // frozen loser is ALREADY retired, the primitive would fail loud → append the missing
+                // conflict_resolved instead and return no-op success.
+                let fold = fold_sessions(&self.session_events_ordered()?);
+                let already_retired = match loser {
+                    ConflictRef::Note { event_id } => fold.retired_notes.contains(event_id),
+                    ConflictRef::Passage { session_id, passage_id } => {
+                        fold.retired_passages.contains(&(session_id.clone(), *passage_id))
+                    }
+                };
+                if !already_retired {
+                    // Retire the frozen loser with conflict provenance (§2.1 MAJOR-2), written FIRST.
+                    match loser {
+                        ConflictRef::Note { event_id } => {
+                            self.retire_memory(event_id, Some(proposal_id))?;
+                        }
+                        ConflictRef::Passage { session_id, passage_id } => {
+                            self.retire_passage(session_id, *passage_id, Some(proposal_id))?;
+                        }
+                    }
+                }
+                let marker_id = self.append_conflict_resolved(proposal_id, want, &retired_event_id)?;
+                // A fresh retire → Applied; a roll-forward (loser was already retired) → NoOp success.
+                if already_retired {
+                    Ok(ResolveOutcome::NoOp)
+                } else {
+                    Ok(ResolveOutcome::Applied(marker_id))
+                }
+            }
+            ResolveAction::KeepBoth => {
+                let id = self.append_pair_terminal(
+                    crate::graph::COEXIST_ALLOWED_EVENT_TYPE, proposal_id, &a_ref, &b_ref, None,
+                )?;
+                Ok(ResolveOutcome::Applied(id))
+            }
+            ResolveAction::Dismiss => {
+                // Record the current head of every referenced session so the dismissal lapses on
+                // re-capture (§3.1). Notes contribute no head.
+                let fold = fold_sessions(&self.session_events_ordered()?);
+                let head_of: std::collections::HashMap<&str, &str> =
+                    fold.current.iter().map(|cs| (cs.session_id.as_str(), cs.event_id.as_str())).collect();
+                let mut heads = serde_json::Map::new();
+                for r in [&a_ref, &b_ref] {
+                    if let ConflictRef::Passage { session_id, .. } = r {
+                        if let Some(h) = head_of.get(session_id.as_str()) {
+                            heads.insert(session_id.clone(), serde_json::Value::String((*h).to_string()));
+                        }
+                    }
+                }
+                let id = self.append_pair_terminal(
+                    crate::graph::DISMISSED_EVENT_TYPE, proposal_id, &a_ref, &b_ref,
+                    Some(serde_json::Value::Object(heads)),
+                )?;
+                Ok(ResolveOutcome::Applied(id))
+            }
+        }
+    }
+
+    /// Append a `conflict_resolved{proposal_id, action, retired_event_id}` terminal marker (§2.1). Plain
+    /// signed `append` (like the retire markers — NOT `build_proposer_event`). Written AFTER the retire
+    /// marker (§3.4 ordering). `#[cfg(unix)]`.
+    #[cfg(unix)]
+    fn append_conflict_resolved(
+        &self,
+        proposal_id: &str,
+        kind: ResolutionKind,
+        retired_event_id: &str,
+    ) -> Result<String, BossclawError> {
+        // Unreachable for KeepBoth/Dismiss — resolve_conflict only calls this from its retire arm.
+        // (A bespoke 2-variant retire type would encode that structurally, but isn't worth it here.)
+        let action = match kind {
+            ResolutionKind::RetireOlder => "retire_older",
+            ResolutionKind::RetireNewer => "retire_newer",
+            _ => unreachable!("append_conflict_resolved is only for retire kinds"),
+        };
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: crate::graph::CONFLICT_RESOLVED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({
+                "proposal_id": proposal_id, "action": action, "retired_event_id": retired_event_id,
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
+    }
+
+    /// Append a `coexist_allowed` / `dismissed` PAIR terminal marker with the shared shape
+    /// `{proposal_id, pair_key, a_ref, b_ref}` (+ optional `session_heads` for `dismissed`). §2.1.
+    /// `#[cfg(unix)]`.
+    #[cfg(unix)]
+    fn append_pair_terminal(
+        &self,
+        event_type: &str,
+        proposal_id: &str,
+        a_ref: &crate::index::ConflictRef,
+        b_ref: &crate::index::ConflictRef,
+        session_heads: Option<serde_json::Value>,
+    ) -> Result<String, BossclawError> {
+        let mut content = serde_json::Map::new();
+        content.insert("proposal_id".to_string(), serde_json::Value::String(proposal_id.to_string()));
+        content.insert(
+            "pair_key".to_string(),
+            serde_json::Value::String(crate::index::ConflictRef::unordered_pair_key(a_ref, b_ref)),
+        );
+        content.insert("a_ref".to_string(), a_ref.to_json());
+        content.insert("b_ref".to_string(), b_ref.to_json());
+        if let Some(h) = session_heads {
+            content.insert("session_heads".to_string(), h);
+        }
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: event_type.to_string(),
+            content: serde_json::Value::Object(content),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })
     }
 
     /// Append a signed Tier-B `write_rejected` stamped with the M6b reconciler producer.
@@ -5053,14 +5428,28 @@ impl EventLog {
     /// the Library list, and the embed-rebuild gate, but does NOT yet remove
     /// already-minted entities/edges or dequeue it from extraction — that
     /// edge-invalidation is resolution-time (Phase 3 / Task 9), not a Phase-1 blocker.
-    pub fn retire_memory(&self, target_event_id: &str) -> Result<String, BossclawError> {
+    pub fn retire_memory(
+        &self,
+        target_event_id: &str,
+        source_proposal_id: Option<&str>,
+    ) -> Result<String, BossclawError> {
         self.assert_retirable_note(target_event_id)?;
+        // Base marker (byte-identical to today when `source_proposal_id` is None). The retire FOLD
+        // keys on `retires` only (fold_sessions, log.rs `.get("retires")`), so the additive
+        // `via`/`proposal_id` fields never disturb it — they exist ONLY to make the §3.4 digest
+        // R-count conflict-scoped AND torn-write-safe (same marker type, no distinct event).
+        let mut content = serde_json::Map::new();
+        content.insert("retires".to_string(), serde_json::Value::String(target_event_id.to_string()));
+        if let Some(pid) = source_proposal_id {
+            content.insert("via".to_string(), serde_json::Value::String("conflict".to_string()));
+            content.insert("proposal_id".to_string(), serde_json::Value::String(pid.to_string()));
+        }
         self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
             event_type: crate::graph::NOTE_RETIRED_EVENT_TYPE.to_string(),
-            content: serde_json::json!({ "retires": target_event_id }),
+            content: serde_json::Value::Object(content),
             model_meta: None,
             prev_hash: String::new(),
             hash: None,
@@ -5078,7 +5467,7 @@ impl EventLog {
     /// retired (validated before appending). Returns the `unretire` event's id.
     pub fn unretire(&self, retired_event_id: &str) -> Result<String, BossclawError> {
         self.assert_note_retired(retired_event_id)?;
-        self.append(Event {
+        let marker_id = self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
@@ -5089,7 +5478,13 @@ impl EventLog {
             hash: None,
             signed_by_did: self.signer_did(),
             signature: None,
-        })
+        })?;
+        // Rung-3 Phase-3 (§3.2): the note is current again but the cursor swept past it. Rewind (marker
+        // written first, so a torn write is benign). A note is one subject at within-seq id 0.
+        if let Some(seq) = self.seq_of_event(retired_event_id)? {
+            self.rewind_conflict_cursor(seq, 0)?;
+        }
+        Ok(marker_id)
     }
 
     /// Rung-3 §7.2: retire a SINGLE session passage (by `session_id` +
@@ -5110,6 +5505,7 @@ impl EventLog {
         &self,
         session_id: &str,
         passage_id: usize,
+        source_proposal_id: Option<&str>,
     ) -> Result<String, BossclawError> {
         let fold = fold_sessions(&self.session_events_ordered()?);
         let cs = fold
@@ -5132,12 +5528,23 @@ impl EventLog {
                 "cannot retire passage {passage_id} of {session_id}: already retired"
             )));
         }
+        // Base marker (byte-identical to today when `source_proposal_id` is None). The retire FOLD
+        // keys on `session_id`+`passage_id` only, so the additive `via`/`proposal_id` fields never
+        // disturb it — they exist ONLY to make the §3.4 digest R-count conflict-scoped AND
+        // torn-write-safe (same marker type, no distinct event).
+        let mut content = serde_json::Map::new();
+        content.insert("session_id".to_string(), serde_json::Value::String(session_id.to_string()));
+        content.insert("passage_id".to_string(), serde_json::json!(passage_id));
+        if let Some(pid) = source_proposal_id {
+            content.insert("via".to_string(), serde_json::Value::String("conflict".to_string()));
+            content.insert("proposal_id".to_string(), serde_json::Value::String(pid.to_string()));
+        }
         self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
             event_type: crate::graph::PASSAGE_RETIRED_EVENT_TYPE.to_string(),
-            content: serde_json::json!({ "session_id": session_id, "passage_id": passage_id }),
+            content: serde_json::Value::Object(content),
             model_meta: None,
             prev_hash: String::new(),
             hash: None,
@@ -5168,7 +5575,7 @@ impl EventLog {
                 "cannot unretire passage {passage_id} of {session_id}: not retired"
             )));
         }
-        self.append(Event {
+        let marker_id = self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
@@ -5179,7 +5586,16 @@ impl EventLog {
             hash: None,
             signed_by_did: self.signer_did(),
             signature: None,
-        })
+        })?;
+        // Rung-3 Phase-3 (§3.2): rewind to (current-head capture seq, passage_id). The fold from the
+        // pre-append validation is still current — an unretire marker never changes `fold.current` (it
+        // only mutates `retired_passages`, which the current-head projection never consults).
+        if let Some(cs) = fold.current.iter().find(|cs| cs.session_id == session_id) {
+            if let Some(seq) = self.seq_of_event(&cs.event_id)? {
+                self.rewind_conflict_cursor(seq, passage_id)?;
+            }
+        }
+        Ok(marker_id)
     }
 
     /// Validate `target_event_id` is a retirable CURRENT note — the same
@@ -6313,7 +6729,8 @@ impl EventLog {
         use crate::conflict::{
             bound_judge_text, confidence_band, decide_conflict_sweep, templated_why, winner_str,
             FinderInput, CANDIDATE_SIM_MIN, CONFLICT_JUDGE_PER_SWEEP, CONFLICT_OPEN_CEILING,
-            CONFLICT_SCAN_BOUND, CONFLICT_SEARCH_K, MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+            CONFLICT_PAIR_ERROR_BUDGET, CONFLICT_SCAN_BOUND, CONFLICT_SEARCH_K,
+            MAX_CANDIDATE_PAIRS_PER_SUBJECT,
         };
         use crate::index::ConflictRef;
         let mut report = ConflictDetectReport::default();
@@ -6364,6 +6781,13 @@ impl EventLog {
         let opens = self.open_conflict_proposals()?;
         let mut open_pairs: std::collections::HashSet<String> =
             opens.iter().map(|p| Self::conflict_pair_key(&p.a_ref, &p.b_ref)).collect();
+        // Rung-3 Phase-3 (§2.2 item 1, I9): a kept-both / live-dismissed pair must never be re-proposed.
+        // Union its `unordered_pair_key` into `open_pairs` (the SAME space the finder screens against) so the
+        // pure finder needs zero reshape. NOT the single-ref `resolution_excluded_refs` param, which feeds
+        // `decide_conflict_sweep`'s single-ref `excluded_refs` and would silently never match a pair key.
+        let resolution = self.resolution_exclusions()?;
+        open_pairs.extend(resolution.coexist_pairs);
+        open_pairs.extend(resolution.dismissed_pairs);
         let mut open_count = opens.len();
 
         // Text / lineage / ts / kind resolvers for a ref (notes from core; passages via the closure).
@@ -6448,9 +6872,16 @@ impl EventLog {
                 report.budget_hit = true;
                 break;
             }
-            let mut reasoner_failed = false;
+            let mut subject_blocked = false; // an outstanding SUB-budget pair error holds the cursor (I6)
             for (a, b) in pairs {
                 let (older, newer) = if ref_ts(&a) <= ref_ts(&b) { (a, b) } else { (b, a) };
+                let pk = Self::conflict_pair_key(&older, &newer);
+                // §3.3: a pair already at the budget is POISON — stop judging it entirely (consume no
+                // budget, count nothing, do not re-error). It no longer holds the cursor
+                // (`subject_blocked` stays false), so a deterministically-erroring pair can't stall the sweep.
+                if self.conflict_pair_error_count(&pk)? >= CONFLICT_PAIR_ERROR_BUDGET {
+                    continue;
+                }
                 let (Some(ot), Some(nt)) = (ref_text(&older), ref_text(&newer)) else {
                     report.dropped += 1;
                     continue;
@@ -6459,6 +6890,8 @@ impl EventLog {
                 budget_left -= 1;
                 match crate::conflict::judge_pair(reasoner, &ot, &nt) {
                     Ok(Some(v)) => {
+                        // Any successful judge (contradiction or not) clears the pair's error streak (§3.3).
+                        self.reset_conflict_pair_error(&pk)?;
                         // [I7 FIX — do NOT use the plan's `log::debug!("... {}", v.why)`. This runs as
                         // a daemon under launchd/systemd, which capture BOTH stdout and stderr to
                         // persistent log files, so neither `log::` nor `eprintln!` is ephemeral. The
@@ -6470,7 +6903,6 @@ impl EventLog {
                             winner_str(v.winner),
                             v.confidence
                         );
-                        let pk = Self::conflict_pair_key(&older, &newer);
                         if open_count >= CONFLICT_OPEN_CEILING {
                             report.ceiling_hit = true;
                             continue;
@@ -6506,15 +6938,29 @@ impl EventLog {
                         open_count += 1;
                         report.proposed += 1;
                     }
-                    Ok(None) => report.dropped += 1,
+                    Ok(None) => {
+                        // A successful judge that declined still clears the streak (§3.3).
+                        self.reset_conflict_pair_error(&pk)?;
+                        report.dropped += 1;
+                    }
                     Err(_) => {
+                        // Pair-granular (§3.3): skip ONLY this pair; keep judging the subject's other pairs so
+                        // a poison pair never hides a real sibling conflict. Persist the consecutive-error
+                        // count so a DETERMINISTIC poison pair is bounded across cycles/restarts.
                         report.reasoner_errors += 1;
-                        reasoner_failed = true;
-                        break;
+                        let n = self.bump_conflict_pair_error(&pk)?;
+                        if n >= CONFLICT_PAIR_ERROR_BUDGET {
+                            report.poison_skipped += 1; // give up on this pair; it no longer holds the cursor
+                        } else {
+                            subject_blocked = true; // sub-budget: retry this subject next cycle (I6)
+                        }
+                        continue;
                     }
                 }
             }
-            if reasoner_failed {
+            if subject_blocked {
+                // A transient outage → do NOT advance past this subject; next cycle re-judges it. Once every
+                // erroring pair reaches the budget (poison_skipped), `subject_blocked` stays false → advance.
                 break;
             }
             self.set_conflict_cursor(cs.seq, cs.within_seq_id + 1)?;
@@ -6634,6 +7080,131 @@ impl EventLog {
              ON CONFLICT(id) DO UPDATE SET last_seq = ?1, subject_offset = ?2",
             rusqlite::params![last_seq, subject_offset as i64],
         )?;
+        Ok(())
+    }
+
+    /// Read the digest window boundary (`0` if never set). §2.4.
+    pub fn conflict_digest_cursor(&self) -> Result<i64, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        Ok(store
+            .conn()
+            .query_row("SELECT last_seq FROM conflict_digest_cursor WHERE id = 0", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Advance the digest window boundary (idempotent single-row upsert). §2.4.
+    pub fn set_conflict_digest_cursor(&self, last_seq: i64) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO conflict_digest_cursor (id, last_seq) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET last_seq = ?1",
+            rusqlite::params![last_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Count conflict-resolution ACTIVITY strictly after `since_seq` (spec §2.4/§3.4). R = retire markers
+    /// with `via=="conflict"` (conflict-scoped — a manual App retire is tagless and NOT counted; AND
+    /// torn-write-safe — the tagged retire marker is written before `conflict_resolved`). D = `dismissed`,
+    /// K = `coexist_allowed`. Enumerates the four marker types by seq so the SEQ window boundary cannot
+    /// drop a retire marker on a torn write (Open-Q8). `max_seq` is the store's current max event seq.
+    pub fn conflict_digest_counts(&self, since_seq: i64) -> Result<ConflictDigest, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut d = ConflictDigest::default();
+        let mut stmt = conn.prepare(
+            "SELECT event_type, payload FROM events
+             WHERE event_type IN (?1, ?2, ?3, ?4) AND seq > ?5 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                crate::graph::NOTE_RETIRED_EVENT_TYPE,
+                crate::graph::PASSAGE_RETIRED_EVENT_TYPE,
+                crate::graph::DISMISSED_EVENT_TYPE,
+                crate::graph::COEXIST_ALLOWED_EVENT_TYPE,
+                since_seq,
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        for row in rows {
+            let (etype, payload) = row?;
+            let ev: Event = serde_json::from_str(&payload)?;
+            match etype.as_str() {
+                t if t == crate::graph::NOTE_RETIRED_EVENT_TYPE
+                    || t == crate::graph::PASSAGE_RETIRED_EVENT_TYPE =>
+                {
+                    if ev.content.get("via").and_then(|v| v.as_str()) == Some("conflict") {
+                        d.retired += 1;
+                    }
+                }
+                t if t == crate::graph::DISMISSED_EVENT_TYPE => d.dismissed += 1,
+                // coexist_allowed: keep-both
+                _ => d.kept += 1,
+            }
+        }
+        d.max_seq = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?;
+        Ok(d)
+    }
+
+    /// Read a pair's consecutive-error count (0 if absent). §3.3.
+    fn conflict_pair_error_count(&self, pair_key: &str) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n: Option<i64> = store
+            .conn()
+            .query_row(
+                "SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1",
+                [pair_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n.unwrap_or(0) as usize)
+    }
+
+    /// Increment a pair's consecutive-error count, returning the NEW value (§3.3).
+    fn bump_conflict_pair_error(&self, pair_key: &str) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO conflict_pair_errors (pair_key, consecutive_errors) VALUES (?1, 1)
+             ON CONFLICT(pair_key) DO UPDATE SET consecutive_errors = consecutive_errors + 1",
+            [pair_key],
+        )?;
+        let n: i64 = store.conn().query_row(
+            "SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1",
+            [pair_key],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Reset a pair's consecutive-error count to 0 (on any successful judge of that pair — §3.3).
+    fn reset_conflict_pair_error(&self, pair_key: &str) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "DELETE FROM conflict_pair_errors WHERE pair_key = ?1",
+            [pair_key],
+        )?;
+        Ok(())
+    }
+
+    /// Rewind the conflict cursor to the lexicographic `min` of its current position and `(seq, within)`
+    /// (§3.2). MONOTONE — only ever moves the cursor BACK (never advances), so a re-examination is
+    /// re-scheduled without ever skipping unrelated newer subjects. Idempotent upsert via
+    /// [`Self::set_conflict_cursor`], so it works on a brain that never ran detection (cursor defaults to
+    /// `(0, 0)`). Caller appends the unretire marker FIRST; a torn write here leaves the cursor un-rewound
+    /// (the memory is current but not re-examined until something else rewinds below it — a benign,
+    /// bounded loss; once the cursor is already past the memory there is no future natural sweep back to it).
+    ///
+    /// Accepted benign race: unretire runs OUTSIDE the daemon's `conflict_lock`, so a concurrently-running
+    /// sweep cycle's cursor advance can overwrite this rewind — the same benign-miss class as the torn write
+    /// above. The fix would be a guarded compare-and-set UPDATE (rewind only if the row still holds the value
+    /// we read); deliberately not done in Phase 3.
+    fn rewind_conflict_cursor(&self, seq: i64, within: usize) -> Result<(), BossclawError> {
+        let current = self.conflict_cursor()?;
+        let target = (seq, within);
+        if target < current {
+            self.set_conflict_cursor(seq, within)?;
+        }
         Ok(())
     }
 
@@ -8988,6 +9559,43 @@ struct OpenConflictProposal {
     detected_at: i64,
 }
 
+/// Which terminal action resolved a proposal (spec §2.1). Ordered so `conflict_resolved`'s `action`
+/// string maps here. Portable data type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionKind {
+    /// `conflict_resolved` with `action == "retire_older"` — a_ref retired.
+    RetireOlder,
+    /// `conflict_resolved` with `action == "retire_newer"` — b_ref retired.
+    RetireNewer,
+    /// `coexist_allowed` — keep both.
+    KeepBoth,
+    /// `dismissed` — snoozed.
+    Dismiss,
+}
+
+/// One proposal's terminal record (spec §2.1). `retired_event_id` is present only for the two retire
+/// kinds. Internal to the resolution fold.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields consumed by resolve_conflict's terminal-state guard (Task 6)
+struct ResolutionRecord {
+    kind: ResolutionKind,
+    retired_event_id: Option<String>,
+}
+
+/// The two PAIR-key exclusion sets derived from the terminal resolution markers (spec §2.2). Both keyed
+/// by [`crate::index::ConflictRef::unordered_pair_key`] — the SAME space as the finder's `open_pairs` and
+/// `conflict_pair_key`. ONE reader ([`EventLog::resolution_exclusions`]) produces both, so the finder
+/// union and the `pending_conflict_proposals` filter can never drift on `session_heads` liveness.
+#[cfg(unix)]
+#[derive(Debug, Default, Clone)]
+pub struct ResolutionExclusions {
+    /// `unordered_pair_key`s the owner chose KEEP-BOTH — never re-proposed, dropped from the read surface.
+    pub coexist_pairs: std::collections::HashSet<String>,
+    /// `unordered_pair_key`s DISMISSED and still LIVE (every referenced session head unchanged, §3.1).
+    pub dismissed_pairs: std::collections::HashSet<String>,
+}
+
 /// Pure session fold (SP3 §4b), mirroring [`crate::graph::fold_pages`]. Given
 /// `session_captured` + `session_deleted` + `supersede` + the Rung-3 retire
 /// markers (`note_retired` / `passage_retired` / `unretire`) in `seq ASC`
@@ -9221,6 +9829,285 @@ mod tests {
         assert_eq!(sources, vec!["n_old".to_string(), "cap_ev".to_string()]);
     }
 
+    /// Rung-3 Phase-3 (§2.3, §2.1 MAJOR-1): `conflict_proposal_by_id` recovers `(a_ref, b_ref)` for a
+    /// proposal by id REGARDLESS of open-ness. A successful retire withdraws the proposal from the OPEN
+    /// set (a non-current ref ⇒ `open_conflict_proposals` drops it), so the idempotency / roll-forward
+    /// path in `resolve_conflict` (Task 6) MUST recover the frozen refs from a by-id read that ignores
+    /// open-ness — reading over the open set alone would return "unknown id" for a legitimately-retried
+    /// retire. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn conflict_proposal_by_id_recovers_refs_even_after_a_ref_is_retired() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let n1 = log.remember(&emb, "branch is main").unwrap();
+        let n2 = log.remember(&emb, "branch is master").unwrap();
+        let (a, b) = (
+            ConflictRef::Note { event_id: n1.clone() },
+            ConflictRef::Note { event_id: n2.clone() },
+        );
+        let prop = log
+            .append_conflict_proposal(&a, &b, "newer", "high", "why", 7, &[n1.clone(), n2.clone()])
+            .unwrap();
+
+        // Before any retire: recovers both refs, and the proposal IS in the OPEN set.
+        let (ra, rb) = log.conflict_proposal_by_id(&prop).unwrap().expect("proposal exists");
+        assert_eq!(ra, a);
+        assert_eq!(rb, b);
+        assert!(
+            log.open_conflict_proposals().unwrap().iter().any(|p| p.id == prop),
+            "open before retire",
+        );
+
+        // Retire a_ref (withdraws the proposal from the OPEN set) — the by-id reader STILL recovers it.
+        log.retire_memory(&n1, Some(&prop)).unwrap();
+        assert!(
+            !log.open_conflict_proposals().unwrap().iter().any(|p| p.id == prop),
+            "withdrawn from the OPEN set once a_ref is non-current",
+        );
+        let (ra2, rb2) = log
+            .conflict_proposal_by_id(&prop)
+            .unwrap()
+            .expect("still readable by id after retire");
+        assert_eq!(ra2, a, "a_ref recovered by id regardless of open-ness (MAJOR-1)");
+        assert_eq!(rb2, b);
+
+        // Unknown / wrong-type id → None.
+        assert!(log.conflict_proposal_by_id("NOPE").unwrap().is_none());
+        assert!(
+            log.conflict_proposal_by_id(&n2).unwrap().is_none(),
+            "a memory id is not a proposal id",
+        );
+    }
+
+    /// Rung-3 Phase-3 (§2.2 / §3.1): the SINGLE `resolution_exclusions()` reader returns the coexist +
+    /// LIVE-dismissed pair keys. A `coexist_allowed` pair is permanent; a `dismissed` pair is live ONLY
+    /// while every referenced session's current head is unchanged (a re-capture advances the head → the
+    /// dismissal lapses), and a note↔note pair needs no head (an edit mints a new id → a new pair key
+    /// the stored key no longer matches). Seeded with LOCAL terminal-marker helpers (the natural producer
+    /// `resolve_conflict` lands in Task 6) whose content shape mirrors EXACTLY what it will write.
+    /// `#[cfg(unix)]` (the reader + `ResolutionExclusions` are part of the conflict subsystem).
+    #[cfg(unix)]
+    #[test]
+    fn resolution_exclusions_are_live_and_dismiss_lapses_on_session_head_change() {
+        use crate::index::ConflictRef;
+
+        /// Append a `coexist_allowed` terminal marker by hand (mirrors resolve_conflict's KeepBoth write).
+        fn append_coexist(log: &EventLog, pk: &str, a: &ConflictRef, b: &ConflictRef, prop: &str) {
+            log.append(crate::event::Event {
+                id: String::new(), ts: String::new(), valid_time: None,
+                event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+                content: serde_json::json!({ "proposal_id": prop, "pair_key": pk, "a_ref": a.to_json(), "b_ref": b.to_json() }),
+                model_meta: None, prev_hash: String::new(), hash: None,
+                signed_by_did: log.signer_did(), signature: None,
+            }).unwrap();
+        }
+        /// Append a `dismissed` marker whose `session_heads` records each passage member's session
+        /// CURRENT head event id AT SEED TIME (§3.1). A later re-capture mints a NEW head id, so
+        /// `resolution_exclusions` no longer matches → the dismissal lapses.
+        fn append_dismissed(
+            log: &EventLog, pk: &str, a: &ConflictRef, b: &ConflictRef, prop: &str,
+            session_heads: serde_json::Value,
+        ) {
+            log.append(crate::event::Event {
+                id: String::new(), ts: String::new(), valid_time: None,
+                event_type: crate::graph::DISMISSED_EVENT_TYPE.to_string(),
+                content: serde_json::json!({
+                    "proposal_id": prop, "pair_key": pk,
+                    "a_ref": a.to_json(), "b_ref": b.to_json(), "session_heads": session_heads,
+                }),
+                model_meta: None, prev_hash: String::new(), hash: None,
+                signed_by_did: log.signer_did(), signature: None,
+            }).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // Two notes → a note↔note coexist pair (KEEP-BOTH → a permanent exclusion).
+        let n1 = log.remember(&emb, "branch is main").unwrap();
+        let n2 = log.remember(&emb, "branch is master").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: n1.clone() }, ConflictRef::Note { event_id: n2.clone() });
+        let pk_notes = ConflictRef::unordered_pair_key(&a, &b);
+        append_coexist(&log, &pk_notes, &a, &b, "P1");
+
+        // A session-passage ↔ note pair → DISMISSED, with the session's CURRENT head recorded.
+        let head = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &head, &["deploy on vercel".to_string()]).unwrap();
+        let n3 = log.remember(&emb, "deploy on fly.io").unwrap();
+        let (pa, pb) = (
+            ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 },
+            ConflictRef::Note { event_id: n3.clone() },
+        );
+        let pk_pass = ConflictRef::unordered_pair_key(&pa, &pb);
+        append_dismissed(&log, &pk_pass, &pa, &pb, "P2", serde_json::json!({ "s1": head }));
+
+        let excl = log.resolution_exclusions().unwrap();
+        assert!(excl.coexist_pairs.contains(&pk_notes), "keep-both pair is a live coexist exclusion");
+        assert!(excl.dismissed_pairs.contains(&pk_pass), "dismissed pair is live while the head is unchanged");
+
+        // Re-capture the SAME session with a DIFFERENT body (advances its head) → the dismissal lapses (§3.1).
+        let head2 = log.capture_session(&emb, &session_meta("s1", "bb")).unwrap();
+        log.store_session_passages(&emb, &head2, &["deploy on vercel".to_string()]).unwrap();
+        assert_ne!(head, head2, "a re-capture with a new sha mints a new head event id");
+        let excl2 = log.resolution_exclusions().unwrap();
+        assert!(excl2.coexist_pairs.contains(&pk_notes), "coexist (note↔note) is unaffected by the re-capture");
+        assert!(!excl2.dismissed_pairs.contains(&pk_pass), "dismissal LAPSED after the session head advanced");
+    }
+
+    /// Rung-3 Phase-3 (§2.1 idempotency universe): `resolution_markers` folds ALL terminal markers
+    /// (`conflict_resolved` / `coexist_allowed` / `dismissed`) into `proposal_id -> ResolutionRecord`, over
+    /// the WHOLE log — NOT the open set (a retire withdraws the proposal from open, MAJOR-1, but its terminal
+    /// marker persists so the SAME-vs-DIFFERENT-action guard in `resolve_conflict` (Task 6) still fires). A
+    /// `conflict_resolved` marker captures the ACTION (`retire_older` → `RetireOlder`) and the retired event
+    /// id; a `coexist_allowed` folds to `KeepBoth`; an unresolved proposal is absent. Seeded with LOCAL
+    /// hand-built markers (the natural producer `resolve_conflict` lands in Task 6) whose content shape
+    /// mirrors EXACTLY what it will write. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn resolution_markers_key_by_proposal_and_map_each_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // Append a conflict_resolved (retire_older) for PROP1 and a coexist for PROP2.
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::CONFLICT_RESOLVED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "PROP1", "action": "retire_older", "retired_event_id": "E1" }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "PROP2", "pair_key": "PK", "a_ref": {"kind":"note","event_id":"a"}, "b_ref": {"kind":"note","event_id":"b"} }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+
+        let m = log.resolution_markers().unwrap();
+        let r1 = m.get("PROP1").expect("PROP1 resolved");
+        assert_eq!(r1.kind, ResolutionKind::RetireOlder);
+        assert_eq!(r1.retired_event_id.as_deref(), Some("E1"));
+        assert_eq!(m.get("PROP2").unwrap().kind, ResolutionKind::KeepBoth);
+        assert!(!m.contains_key("PROP_NONE")); // unresolved proposal folds to absent
+    }
+
+    /// Rung-3 Phase-3 (§2.1, §3.4, MAJOR-1/MAJOR-2): `resolve_conflict` settles a detected conflict.
+    /// The retire actions retire the FROZEN loser (`RetireOlder`=a_ref, `RetireNewer`=b_ref — NO ts
+    /// recompute) with conflict provenance, then append `conflict_resolved`. Idempotency is owned over the
+    /// ALL-proposals terminal fold (a retire withdraws the proposal from the OPEN set, so the guard must NOT
+    /// key off open membership): same-action repeat = clean `NoOp`, different action = reject, unknown id =
+    /// error. The torn-write / cross-source roll-forward gate is retired-SET membership (§3.4), NOT
+    /// tag-equality: if the frozen loser is already retired — by THIS proposal, a DIFFERENT one, or a manual
+    /// tagless App retire — `resolve_conflict` appends the missing `conflict_resolved` and returns `NoOp`,
+    /// never re-calling the fail-loud primitive. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_conflict_retires_frozen_loser_and_is_idempotent_and_rolls_forward() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // ── RetireOlder retires the FROZEN a_ref (no ts recompute) ──
+        let older = log.remember(&emb, "branch is main").unwrap();
+        let newer = log.remember(&emb, "branch is master").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: older.clone() }, ConflictRef::Note { event_id: newer.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "newer", "high", "why", 0, &[older.clone(), newer.clone()]).unwrap();
+
+        let out = log.resolve_conflict(&prop, ResolveAction::RetireOlder).unwrap();
+        assert!(matches!(out, ResolveOutcome::Applied(_)), "first resolution applies");
+        assert!(!log.current_notes().unwrap().iter().any(|c| c.event_id == older), "a_ref (older) retired");
+        assert!(log.current_notes().unwrap().iter().any(|c| c.event_id == newer), "b_ref (newer) survives");
+        // The conflict_resolved marker exists AND the retire marker carries the conflict provenance tag.
+        let resolved = log.resolution_markers_for_test(&prop); // helper: reads resolution_markers().get(prop).cloned()
+        assert!(resolved.is_some(), "conflict_resolved recorded");
+
+        // Idempotent repeat of the SAME action — EVEN THOUGH the retire withdrew the proposal from the open
+        // set — is a clean no-op success (no primitive Err bubbles up).
+        let again = log.resolve_conflict(&prop, ResolveAction::RetireOlder).unwrap();
+        assert!(matches!(again, ResolveOutcome::NoOp), "same-action repeat = no-op success");
+
+        // A DIFFERENT action on a resolved proposal is rejected (first resolution wins).
+        let diff = log.resolve_conflict(&prop, ResolveAction::KeepBoth);
+        assert!(matches!(diff, Err(BossclawError::InvalidInput(_))), "different action on resolved = reject");
+
+        // Unknown proposal id → error.
+        assert!(matches!(log.resolve_conflict("NOPE", ResolveAction::Dismiss), Err(BossclawError::InvalidInput(_))));
+
+        // ── KeepBoth + Dismiss append their markers ──
+        let k1 = log.remember(&emb, "x=1").unwrap();
+        let k2 = log.remember(&emb, "x=2").unwrap();
+        let kp = log.append_conflict_proposal(
+            &ConflictRef::Note { event_id: k1.clone() }, &ConflictRef::Note { event_id: k2.clone() },
+            "unclear", "med", "why", 0, &[k1.clone(), k2.clone()]).unwrap();
+        assert!(matches!(log.resolve_conflict(&kp, ResolveAction::KeepBoth).unwrap(), ResolveOutcome::Applied(_)));
+        assert_eq!(log.resolution_markers_for_test(&kp).unwrap(), ResolutionKind::KeepBoth);
+
+        // ── Torn-write roll-forward: loser retired, conflict_resolved MISSING → append it, no-op success ──
+        let o2 = log.remember(&emb, "y=old").unwrap();
+        let n2b = log.remember(&emb, "y=new").unwrap();
+        let (ra, rb) = (ConflictRef::Note { event_id: o2.clone() }, ConflictRef::Note { event_id: n2b.clone() });
+        let torn = log.append_conflict_proposal(&ra, &rb, "newer", "high", "why", 0, &[o2.clone(), n2b.clone()]).unwrap();
+        // Simulate the crash window: the tagged retire marker landed, the conflict_resolved did NOT.
+        log.retire_memory(&o2, Some(&torn)).unwrap();
+        assert!(log.resolution_markers_for_test(&torn).is_none(), "precondition: no conflict_resolved yet");
+        let rolled = log.resolve_conflict(&torn, ResolveAction::RetireOlder).unwrap();
+        assert!(matches!(rolled, ResolveOutcome::NoOp), "roll-forward returns no-op success (no primitive Err)");
+        assert_eq!(log.resolution_markers_for_test(&torn).unwrap(), ResolutionKind::RetireOlder, "missing marker appended");
+
+        // ── DISCRIMINATING roll-forward: the frozen loser is already retired by a DIFFERENT source (a MANUAL
+        // App retire, via=None), NOT by this proposal. The gate is retired-SET MEMBERSHIP (§3.4), NOT
+        // tag-equality — so a regression to a "was-this-proposal's-tag" gate would wrongly re-call the
+        // fail-loud primitive here and bubble an Err. resolve_conflict must still roll forward to a clean NoOp.
+        let o3 = log.remember(&emb, "z=old").unwrap();
+        let n3c = log.remember(&emb, "z=new").unwrap();
+        let (za, zb) = (ConflictRef::Note { event_id: o3.clone() }, ConflictRef::Note { event_id: n3c.clone() });
+        let cross = log.append_conflict_proposal(&za, &zb, "newer", "high", "why", 0, &[o3.clone(), n3c.clone()]).unwrap();
+        log.retire_memory(&o3, None).unwrap(); // MANUAL retire of the frozen loser — a DIFFERENT source, no tag
+        assert!(log.resolution_markers_for_test(&cross).is_none(), "precondition: proposal not yet resolved");
+        let crossed = log.resolve_conflict(&cross, ResolveAction::RetireOlder)
+            .expect("must NOT bubble a fail-loud `already retired` Err — the gate is retired-set membership");
+        assert!(matches!(crossed, ResolveOutcome::NoOp), "roll-forward on a differently-retired loser = no-op");
+        assert_eq!(log.resolution_markers_for_test(&cross).unwrap(), ResolutionKind::RetireOlder, "missing marker appended");
+    }
+
+    #[cfg(unix)]
+    impl EventLog {
+        fn resolution_markers_for_test(&self, prop: &str) -> Option<ResolutionKind> {
+            self.resolution_markers().unwrap().get(prop).map(|r| r.kind)
+        }
+    }
+
+    /// Rung-3 Phase-3 (§2.1, point-3 "frozen loser"): the loser is chosen by the ACTION→FROZEN-REF mapping
+    /// (`RetireNewer`=b_ref), NOT by any ts recompute at resolve time. Detection fixes older→a_ref /
+    /// newer→b_ref once; resolve time must retire exactly that frozen side. This deterministically pins the
+    /// `RetireNewer` retire path (the sibling of the main test's `RetireOlder`) with NO wall-clock/ts
+    /// dependence — a ts-flip discriminator would hinge on events landing in distinct seconds (flaky), which
+    /// this crate intentionally avoids; the impl is structurally ts-free, so the mapping is what matters.
+    /// `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_conflict_retire_newer_retires_frozen_b_ref() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        let older = log.remember(&emb, "port is 8080").unwrap();
+        let newer = log.remember(&emb, "port is 9090").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: older.clone() }, ConflictRef::Note { event_id: newer.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "older", "high", "why", 0, &[older.clone(), newer.clone()]).unwrap();
+
+        let out = log.resolve_conflict(&prop, ResolveAction::RetireNewer).unwrap();
+        assert!(matches!(out, ResolveOutcome::Applied(_)), "first resolution applies");
+        // RetireNewer retires the FROZEN b_ref (newer); the frozen a_ref (older) survives.
+        assert!(!log.current_notes().unwrap().iter().any(|c| c.event_id == newer), "b_ref (newer) retired");
+        assert!(log.current_notes().unwrap().iter().any(|c| c.event_id == older), "a_ref (older) survives");
+        assert_eq!(log.resolution_markers_for_test(&prop).unwrap(), ResolutionKind::RetireNewer);
+    }
+
     /// Rung-3 Phase-2 (§3.5, I9): a proposal for an unordered typed pair suppresses a duplicate for
     /// the SAME pair (either order) but not a different pair — covering both a note↔note pair and a
     /// cross-kind note↔passage pair (whose `pair_key`s have different shapes, so the sort bites).
@@ -9282,7 +10169,7 @@ mod tests {
         assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "one open proposal");
 
         // Retire one referenced note → the proposal is GC-withdrawn and the pair is re-proposable.
-        log.retire_memory(&n1).unwrap();
+        log.retire_memory(&n1, None).unwrap();
         assert!(log.pending_conflict_proposals().unwrap().is_empty(), "withdrawn on retire");
         assert!(!log.is_conflict_proposal_suppressed(&a, &b).unwrap(), "pair freed to re-propose");
 
@@ -9351,6 +10238,42 @@ mod tests {
             log.is_conflict_proposal_suppressed(&note_ref, &p0).unwrap(),
             "the surviving-ordinal pair (ordinal 0) is STILL suppressed — not over-withdrawn"
         );
+    }
+
+    /// Rung-3 Phase-3 (§2.2 item 2, I9): the READER complement to Task 7's finder suppression.
+    /// KeepBoth/Dismiss retire NOTHING, so both refs stay current and the proposal stays in the OPEN
+    /// set — without a filter the pending count / `ListConflicts` would nag every session forever.
+    /// `pending_conflict_proposals` drops any open proposal whose `unordered_pair_key` is in the SAME
+    /// live `resolution_exclusions()` set the finder consumes (single source → no drift): a KeepBoth'd
+    /// note↔note pair AND a Dismissed passage↔note pair both disappear from the read surface, and the
+    /// pending count drops with them. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn keep_both_and_dismiss_drop_the_proposal_from_the_read_surface() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        let n1 = log.remember(&emb, "x=1").unwrap();
+        let n2 = log.remember(&emb, "x=2").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: n1.clone() }, ConflictRef::Note { event_id: n2.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "unclear", "med", "why", 0, &[n1.clone(), n2.clone()]).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "open before resolution");
+
+        // KeepBoth retires nothing — both refs stay current — but the reader must drop it (I9).
+        log.resolve_conflict(&prop, ResolveAction::KeepBoth).unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "kept-both drops from the read surface");
+
+        // A dismissed passage pair drops while live; re-appears if the head advances (covered in Task 3).
+        let cev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cev, &["deploy vercel".to_string()]).unwrap();
+        let n3 = log.remember(&emb, "deploy fly").unwrap();
+        let pa = ConflictRef::Passage { session_id: "s1".into(), passage_id: 0 };
+        let pb = ConflictRef::Note { event_id: n3.clone() };
+        let prop2 = log.append_conflict_proposal(&pa, &pb, "unclear", "med", "why", 0, &[cev.clone(), n3.clone()]).unwrap();
+        assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1);
+        log.resolve_conflict(&prop2, ResolveAction::Dismiss).unwrap();
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "dismissed drops while the head is unchanged");
     }
 
     #[test]
@@ -9490,6 +10413,44 @@ mod tests {
         );
     }
 
+    /// Rung-3 Phase-3 (§3.2, Open-Q5): un-retiring makes a memory current again, but the conflict
+    /// cursor already swept past it. Both `unretire` and `unretire_passage` rewind the 2-D
+    /// `(last_seq, subject_offset)` cursor to the lexicographic MIN of its position and the memory's
+    /// coordinate — re-scheduling a re-examination — and the rewind is MONOTONE (never advances).
+    #[test]
+    fn unretire_rewinds_the_conflict_cursor_to_re_examine_the_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A note, retired, then the cursor advanced well past it (as detection would).
+        let note = log.remember(&emb, "branch is main").unwrap();
+        let note_seq = log.seq_of_event(&note).unwrap().expect("note has a seq");
+        let m = log.retire_memory(&note, None).unwrap();
+        log.set_conflict_cursor(note_seq + 100, 5).unwrap();
+
+        // Unretire rewinds to (note_seq, 0) — the lexicographic min — never advances.
+        log.unretire(&note).unwrap();
+        assert_eq!(log.conflict_cursor().unwrap(), (note_seq, 0), "cursor rewound to the un-retired note");
+
+        // A rewind never ADVANCES: unretire when the cursor is already behind the note is a no-op on the cursor.
+        let _ = m; // (marker id unused)
+        log.set_conflict_cursor(0, 0).unwrap();
+        // re-retire + unretire again; cursor stays at/below the note position (min semantics).
+        log.retire_memory(&note, None).unwrap();
+        log.unretire(&note).unwrap();
+        assert_eq!(log.conflict_cursor().unwrap(), (0, 0), "rewind is monotone: never advances past current");
+
+        // Passage rewind: unretire_passage rewinds to (capture_seq, passage_id).
+        let cev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cev, &["p0".to_string(), "p1".to_string()]).unwrap();
+        let cap_seq = log.seq_of_event(&cev).unwrap().unwrap();
+        log.retire_passage("s1", 1, None).unwrap();
+        log.set_conflict_cursor(cap_seq + 50, 0).unwrap();
+        log.unretire_passage("s1", 1).unwrap();
+        assert_eq!(log.conflict_cursor().unwrap(), (cap_seq, 1), "passage unretire rewinds to (capture_seq, passage_id)");
+    }
+
     /// Rung-3 Phase-2 (§3.3): the enumeration's exclusion GATES — the whole point of the fold — are
     /// each a live subject that must NOT appear. Pins all three negative paths (a positive-only test
     /// would still pass if a gate were deleted): a superseded note's old head is dropped (its live
@@ -9508,11 +10469,11 @@ mod tests {
         let note_new = log.supersede_note(&emb, &note_old, "the branch is trunk").unwrap();
         // (2) A note that gets RETIRED via the distinct note_retired marker — must drop.
         let note_retired = log.remember(&emb, "db is postgres").unwrap();
-        log.retire_memory(&note_retired).unwrap();
+        log.retire_memory(&note_retired, None).unwrap();
         // (3) A capture whose passage 0 is RETIRED — passage 0 drops, passage 1 stays.
         let cap_s2 = log.capture_session(&emb, &session_meta("s2", "cc")).unwrap();
         log.store_session_passages(&emb, &cap_s2, &["p0".to_string(), "p1".to_string()]).unwrap();
-        log.retire_passage("s2", 0).unwrap();
+        log.retire_passage("s2", 0, None).unwrap();
         // (4) A capture SUPERSEDED by a newer capture of the SAME session_id (different sha) — the
         // OLD capture event must contribute zero passage subjects; only the new head's do.
         let cap_s1_old = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
@@ -9662,7 +10623,7 @@ mod tests {
         let chunks = vec!["Vercel".to_string(), "Postgres".to_string()];
         log.store_session_passages(&emb, &ev, &chunks).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
-        log.retire_passage("s1", 0).unwrap();
+        log.retire_passage("s1", 0, None).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
         let hit = |q: &str| {
             log.conflict_search(&emb.embed(&[q.into()]).unwrap()[0], 8)
@@ -9679,15 +10640,15 @@ mod tests {
         // Reject branches, asserted WHILE passage 0 is still retired (all three are
         // read-only rejects that append nothing, so they never disturb the flow below).
         assert!(
-            matches!(log.retire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
+            matches!(log.retire_passage("s1", 0, None), Err(BossclawError::InvalidInput(_))),
             "double-retire of a still-retired passage is rejected (I6)"
         );
         assert!(
-            matches!(log.retire_passage("s1", 9), Err(BossclawError::InvalidInput(_))),
+            matches!(log.retire_passage("s1", 9, None), Err(BossclawError::InvalidInput(_))),
             "out-of-range passage_id (≥ N=2) is rejected"
         );
         assert!(
-            matches!(log.retire_passage("ghost", 0), Err(BossclawError::InvalidInput(_))),
+            matches!(log.retire_passage("ghost", 0, None), Err(BossclawError::InvalidInput(_))),
             "retire against a non-current session is rejected"
         );
         // SWEEP durability: same-sha re-capture is a no-op (returns the same id); marker persists across rebuild.
@@ -9701,6 +10662,115 @@ mod tests {
             matches!(log.unretire_passage("s1", 0), Err(BossclawError::InvalidInput(_))),
             "unretiring a no-longer-retired passage is rejected (I6)"
         );
+    }
+
+    /// Rung-3 §2.1 (MAJOR-2) / §3.4: the optional `source_proposal_id` provenance stamp. When
+    /// `Some`, the SAME `note_retired`/`passage_retired` marker gains `{"via":"conflict",
+    /// "proposal_id":id}` (additive, so the retire fold — keyed on `retires` / `session_id`+
+    /// `passage_id`, no `deny_unknown_fields` — is UNTOUCHED and still retires). When `None`
+    /// (the manual App path) the marker is byte-identical to today, carrying NO provenance tag.
+    #[test]
+    fn retire_stamps_conflict_provenance_but_fold_and_app_path_are_untouched() {
+        use crate::graph::{NOTE_RETIRED_EVENT_TYPE, PASSAGE_RETIRED_EVENT_TYPE};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // (a) App path (None) — the marker is byte-identical to today: {"retires": id}, no `via`.
+        let n_app = log.remember(&emb, "app-retired note").unwrap();
+        let m_app = log.retire_memory(&n_app, None).unwrap();
+        let ev = log.event_by_id(&m_app).unwrap().unwrap();
+        assert_eq!(ev.event_type, NOTE_RETIRED_EVENT_TYPE);
+        assert_eq!(ev.content.get("retires").and_then(|v| v.as_str()), Some(n_app.as_str()));
+        assert!(ev.content.get("via").is_none(), "App retire carries NO provenance tag");
+
+        // (b) Conflict path (Some) — same marker TYPE, plus the provenance tag; the fold still retires it.
+        let n_conf = log.remember(&emb, "conflict-retired note").unwrap();
+        let m_conf = log.retire_memory(&n_conf, Some("PROP1")).unwrap();
+        let ev = log.event_by_id(&m_conf).unwrap().unwrap();
+        assert_eq!(ev.event_type, NOTE_RETIRED_EVENT_TYPE, "SAME marker type as the App path");
+        assert_eq!(ev.content.get("retires").and_then(|v| v.as_str()), Some(n_conf.as_str()));
+        assert_eq!(ev.content.get("via").and_then(|v| v.as_str()), Some("conflict"));
+        assert_eq!(ev.content.get("proposal_id").and_then(|v| v.as_str()), Some("PROP1"));
+        // The retire fold is untouched: the note is no longer current (recall/list drop it).
+        assert!(!log.current_notes().unwrap().iter().any(|c| c.event_id == n_conf), "tagged retire still retires");
+
+        // (c) Passage retire carries the tag too, same shape.
+        let cev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cev, &["p0".to_string(), "p1".to_string()]).unwrap();
+        let pm = log.retire_passage("s1", 0, Some("PROP2")).unwrap();
+        let ev = log.event_by_id(&pm).unwrap().unwrap();
+        assert_eq!(ev.event_type, PASSAGE_RETIRED_EVENT_TYPE);
+        assert_eq!(ev.content.get("session_id").and_then(|v| v.as_str()), Some("s1"));
+        assert_eq!(ev.content.get("passage_id").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(ev.content.get("via").and_then(|v| v.as_str()), Some("conflict"));
+        assert_eq!(ev.content.get("proposal_id").and_then(|v| v.as_str()), Some("PROP2"));
+    }
+
+    #[test]
+    fn conflict_digest_counts_scope_to_via_conflict_and_advance_by_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        assert_eq!(log.conflict_digest_cursor().unwrap(), 0, "digest cursor defaults to 0");
+
+        // A MANUAL App retire (via=None) must NOT be counted.
+        let manual = log.remember(&emb, "manually retired").unwrap();
+        log.retire_memory(&manual, None).unwrap();
+        // A CONFLICT retire (via="conflict") IS counted.
+        let conf = log.remember(&emb, "conflict retired").unwrap();
+        log.retire_memory(&conf, Some("PROP")).unwrap();
+
+        let d = log.conflict_digest_counts(0).unwrap();
+        assert_eq!(d.retired, 1, "only the via=conflict retire is counted (manual App retire excluded)");
+        assert!(d.max_seq > 0);
+
+        // Advance the cursor to max_seq → the next window sees nothing until new markers appear.
+        log.set_conflict_digest_cursor(d.max_seq).unwrap();
+        let d2 = log.conflict_digest_counts(log.conflict_digest_cursor().unwrap()).unwrap();
+        assert_eq!(d2.retired, 0, "no new conflict retires since the cursor");
+
+        // A dismissed + a coexist marker after the cursor count as D and K.
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::DISMISSED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "P", "pair_key": "K", "a_ref": {"kind":"note","event_id":"a"}, "b_ref": {"kind":"note","event_id":"b"} }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "P2", "pair_key": "K2", "a_ref": {"kind":"note","event_id":"c"}, "b_ref": {"kind":"note","event_id":"d"} }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+        let d3 = log.conflict_digest_counts(log.conflict_digest_cursor().unwrap()).unwrap();
+        assert_eq!((d3.dismissed, d3.kept), (1, 1), "dismissed + coexist counted since the cursor");
+    }
+
+    /// Open-Q9: the accepted both-sides torn-write edge is DIGEST-VISIBLE, which is what makes it
+    /// acceptable. A torn `RetireOlder` (tagged retire landed, `conflict_resolved` lost) is rolled
+    /// forward by a deliberate `RetireNewer` that retires the newer side too — both retires carry
+    /// `via=="conflict"`, so the digest counts BOTH.
+    #[cfg(unix)]
+    #[test]
+    fn both_sides_torn_write_edge_is_digest_visible() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        let older = log.remember(&emb, "the default deploy target is vercel").unwrap();
+        let newer = log.remember(&emb, "the default deploy target is fly").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: older.clone() }, ConflictRef::Note { event_id: newer.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "newer", "high", "why", 0, &[older.clone(), newer.clone()]).unwrap();
+
+        // Torn RetireOlder: the tagged retire marker for a_ref landed, but conflict_resolved was lost (crash).
+        log.retire_memory(&older, Some(&prop)).unwrap();
+        // A deliberate RetireNewer then proceeds (b_ref is not yet retired) and retires the newer side too — the
+        // accepted both-sides edge. Both retires carry via=="conflict", so the digest counts BOTH.
+        log.resolve_conflict(&prop, ResolveAction::RetireNewer).unwrap();
+        let d = log.conflict_digest_counts(0).unwrap();
+        assert_eq!(d.retired, 2, "both conflict-driven retires are digest-visible (Open-Q9 acceptability)");
     }
 
     /// Rung-3 §9/§13 recall-NEUTRALITY (by construction + measured): building the SEPARATE
@@ -9749,7 +10819,7 @@ mod tests {
         let chunks = vec!["we deploy on vercel".to_string(), "db is postgres".to_string()];
         log.store_session_passages(&emb, &ev, &chunks).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
-        log.retire_passage("s1", 0).unwrap();
+        log.retire_passage("s1", 0, None).unwrap();
         log.rebuild_conflict_index(&emb).unwrap();
 
         // Byte-identity: same ordered hit ids, same recall-index element count. The conflict index
@@ -10100,11 +11170,11 @@ mod tests {
         let ev = log.remember(&emb, "we deploy on Vercel").unwrap();
         log.rebuild_indexes(&emb).unwrap();
         assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev));
-        log.retire_memory(&ev).unwrap();
+        log.retire_memory(&ev, None).unwrap();
         assert!(!log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "retired note excluded from recall");
         assert!(!log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "retired note excluded from the Library list");
         // (a) retiring an already-retired note rejects (guard path).
-        assert!(matches!(log.retire_memory(&ev), Err(BossclawError::InvalidInput(_))), "cannot retire an already-retired note");
+        assert!(matches!(log.retire_memory(&ev, None), Err(BossclawError::InvalidInput(_))), "cannot retire an already-retired note");
         assert!(matches!(log.unretire("not-a-retired-id"), Err(BossclawError::InvalidInput(_))), "unretire refuses a non-retired id");
         log.unretire(&ev).unwrap();
         assert!(log.recall(&emb, "Vercel", 10, &RecallOptions::default()).unwrap().iter().any(|h| h.event_id == ev), "unretire restores recall");
@@ -10112,7 +11182,7 @@ mod tests {
         assert!(log.current_notes().unwrap().iter().any(|n| n.event_id == ev), "unretire restores the Library list");
         // (b) double unretire rejects: it is no longer in `retired_notes`.
         assert!(matches!(log.unretire(&ev), Err(BossclawError::InvalidInput(_))), "cannot unretire a note that is not retired");
-        assert!(matches!(log.retire_memory("nope"), Err(BossclawError::InvalidInput(_))));
+        assert!(matches!(log.retire_memory("nope", None), Err(BossclawError::InvalidInput(_))));
     }
 
     #[test]
@@ -10667,6 +11737,63 @@ mod tests {
         assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1, "still exactly one (idempotent)");
     }
 
+    /// Rung-3 Phase-3 (§2.2 item 1, I9 — the FINDER half of stop-nagging): a `coexist_allowed` marker
+    /// for a pair with NO open `conflict_proposal` must still suppress re-proposal. The finder unions
+    /// `resolution_exclusions().{coexist_pairs ∪ dismissed_pairs}` into `open_pairs` (the SAME
+    /// `unordered_pair_key` space it already screens against). The coexist-marker-WITHOUT-open-proposal
+    /// construction isolates this union from open-set membership: a still-open proposal would suppress
+    /// on its own, so without the union the judge fires and mints a proposal (`proposed == 1`) — the RED
+    /// failure; with it, the pair is screened out BEFORE judging (`proposed == 0`).
+    #[cfg(unix)]
+    #[test]
+    fn finder_union_suppresses_a_coexist_pair_with_no_open_proposal() {
+        // REAL test-double API (verified `reason.rs:56-112`, Phase-2 ref `log.rs:10620-10668`).
+        use crate::index::ConflictRef;
+        use crate::conflict::{build_conflict_prompt, CONFLICT_SYSTEM};
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // MUST be 64: at dim=8 these near-dups fall below CANDIDATE_SIM_MIN → zero candidate pairs → the test
+        // would trivially pass for the wrong reason.
+        let emb = MockEmbedder::new(64);
+
+        // Proven near-duplicate texts (one token apart) that clear the similarity floor. n1 is remembered
+        // first, so ref_ts makes it the OLDER side; register BOTH orderings so the pair surfaces from either
+        // endpoint the finder judges first.
+        let t1 = "the default deploy target is vercel";
+        let t2 = "the default deploy target is fly";
+        let n1 = log.remember(&emb, t1).unwrap();
+        let n2 = log.remember(&emb, t2).unwrap();
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // The judge WOULD rule this pair a conflict (verdict keyed on SHA of (CONFLICT_SYSTEM, prompt)).
+        let verdict = serde_json::json!({
+            "contradicts": true, "winner": "newer", "confidence": 92, "why": "conflicting deploy targets"
+        });
+        let reasoner = ScriptedReasoner::new("test")
+            .with_response(CONFLICT_SYSTEM, &build_conflict_prompt(t1, t2), verdict.clone())
+            .with_response(CONFLICT_SYSTEM, &build_conflict_prompt(t2, t1), verdict);
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        // A `coexist_allowed` marker exists for this exact pair, but NO open `conflict_proposal` does. This
+        // ISOLATES the finder union from open-set membership: without the Task-7 union, `open_pairs` is empty,
+        // the judge returns a conflict, and a proposal is minted (`proposed == 1`) — the RED failure. With the
+        // union, `coexist_pairs` holds this pk → the finder screens it out BEFORE judging → `proposed == 0`.
+        let (a, b) = (ConflictRef::Note { event_id: n1.clone() }, ConflictRef::Note { event_id: n2.clone() });
+        let pk = ConflictRef::unordered_pair_key(&a, &b);
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "P", "pair_key": pk, "a_ref": a.to_json(), "b_ref": b.to_json() }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+
+        let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 100).unwrap();
+        assert_eq!(r.proposed, 0, "the coexist pair is never (re-)proposed by the finder (open_pairs union, I9)");
+        assert!(log.pending_conflict_proposals().unwrap().is_empty(), "no proposal materializes for a coexist pair");
+    }
+
     /// Rung-3 Phase-2 (§3.3, I4 — the multi-passage NO-STALL fix): a single capture whose near-
     /// duplicate passages produce MORE candidate pairs (up to C(5,2)=10) than one cycle's budget (8)
     /// must NOT defer the whole seq-group. Detection advances SUBJECT-BY-SUBJECT across cycles, emits
@@ -10844,6 +11971,55 @@ mod tests {
         let r_ok = log.detect_conflicts_once(&emb, &good, &no_passages, &empty, 2).unwrap();
         assert_eq!(r_ok.proposed, 1, "the once-failed pair proposes on a later working cycle");
         assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1);
+    }
+
+    /// Rung-3 Phase-3 (§3.3, Open-Q3): a DETERMINISTICALLY-erroring pair must not stall the sweep
+    /// forever. A per-pair persistent consecutive-error counter retries below the budget (cursor held,
+    /// I6) and, at `CONFLICT_PAIR_ERROR_BUDGET`, marks the pair `poison_skipped` — it stops holding the
+    /// cursor AND stops being judged. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn poison_pair_is_skipped_after_budget_and_frees_the_cursor() {
+        // REAL test-double API. An ERRORING pair is created by simply NOT registering its
+        // (CONFLICT_SYSTEM, build_conflict_prompt(a, b)) response — an unregistered prompt returns
+        // `Err(Reasoner(..))` naturally (reason.rs:106-111). NO `err_on` builder exists.
+        use crate::conflict::CONFLICT_PAIR_ERROR_BUDGET;
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64); // 64 — a lower dim drops the pair below CANDIDATE_SIM_MIN
+
+        // EXACTLY ONE candidate pair: two near-duplicate notes (one token apart). A 2-note graph guarantees a
+        // single pair — the architect traced that a 3-note {anchor, good, bad} graph produces STAGGERED poison
+        // pairs (`bad` neighbours both), so `poison_skipped` on a fixed cycle count can be 0. Keep it to one pair.
+        log.remember(&emb, "the default deploy target is vercel").unwrap();
+        log.remember(&emb, "the default deploy target is fly").unwrap();
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // NO responses registered → every judge of this pair returns Err → a DETERMINISTIC poison pair.
+        let reasoner = ScriptedReasoner::new("test");
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        // Sub-budget cycles: the pair keeps erroring and the cursor does NOT advance past the subject (I6 — a
+        // transient reasoner outage must retry next cycle, not be dropped). Assert the INVARIANTS each cycle,
+        // not "on the Nth call".
+        let mut r = None;
+        for _ in 0..CONFLICT_PAIR_ERROR_BUDGET {
+            r = Some(log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 100).unwrap());
+            assert!(r.as_ref().unwrap().reasoner_errors >= 1, "the poison pair errored this cycle");
+        }
+        // On the budget-th consecutive error the pair is poison_skipped, stops holding the cursor, and the
+        // sweep advances — a permanent stall becomes a bounded dropped-counter on ONE pair.
+        assert!(r.unwrap().poison_skipped >= 1, "poison pair skipped once it reaches CONFLICT_PAIR_ERROR_BUDGET");
+        let (cseq, _off) = log.conflict_cursor().unwrap();
+        assert!(cseq > 0, "cursor advanced past the poisoned subject (sweep no longer stalls)");
+
+        // It is truly STOPPED being judged (the top-of-loop poison check, not merely re-erroring): rewind the
+        // cursor to re-scan the same subject and confirm NO fresh reasoner error is attributed to the pair.
+        log.set_conflict_cursor(0, 0).unwrap();
+        let after = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 100).unwrap();
+        assert_eq!(after.reasoner_errors, 0, "a fully-poisoned pair is skipped BEFORE the judge, not re-judged");
     }
 
     /// Rung-3 Phase-2 (§3.5, I9): the open-proposal ceiling caps the pending set. A note cluster whose

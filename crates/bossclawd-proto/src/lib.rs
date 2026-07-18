@@ -31,10 +31,11 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::types::{
-    ApplyResultWire, EngineStatusWire, EvolveReportMirror, EvolveStatusMirror, EvolveTelemetryWire,
-    FileRecordMirror, GrantMirror, HitMirror, IngestReportMirror, MandateSummaryWire,
-    MandateWriteSummaryWire, ModelStatusWire, NoteWire, PreviewDataWire, ProposalSummaryWire,
-    ReasonerConfigWire, RecallStatsWire, SessionDetailWire, SessionSummaryWire,
+    ApplyResultWire, ConflictProposalWire, EngineStatusWire, EvolveReportMirror, EvolveStatusMirror,
+    EvolveTelemetryWire, FileRecordMirror, GrantMirror, HitMirror, IngestReportMirror,
+    MandateSummaryWire, MandateWriteSummaryWire, ModelStatusWire, NoteWire, PreviewDataWire,
+    ProposalSummaryWire, ReasonerConfigWire, RecallStatsWire, ResolveActionWire, SessionDetailWire,
+    SessionSummaryWire,
 };
 
 /// The wire-protocol version. Bumped on any breaking change to [`Request`],
@@ -56,15 +57,17 @@ pub enum Role {
     /// Full access to every wire op (the default; the desktop app).
     #[default]
     App,
-    /// A scoped coding-agent client: may invoke ONLY `Recall` + `Remember` + the SP3 session-capture
-    /// pokes (`CaptureNotify` + `Snapshot`) — never the destructive/listing/telemetry ops.
+    /// A scoped coding-agent client: may invoke ONLY `Recall` + `Remember`, the SP3 session-capture
+    /// pokes (`CaptureNotify` + `Snapshot`), and the Rung-3 Phase-3 resolution ops (`ListConflicts` +
+    /// `ResolveConflict`, the I8 relaxation) — never the destructive/listing/telemetry ops.
     MemoryClient,
 }
 
 impl Role {
     /// Fail-closed per-op allowlist. `App` may invoke every op. `MemoryClient` may invoke ONLY
-    /// [`Request::Recall`], [`Request::Remember`], [`Request::CaptureNotify`], and
-    /// [`Request::Snapshot`] (the read+write loop plus the SP3 session-capture pokes); **every other
+    /// [`Request::Recall`], [`Request::Remember`], [`Request::CaptureNotify`], [`Request::Snapshot`]
+    /// (the read+write loop plus the SP3 session-capture pokes), and the Rung-3 Phase-3 resolution ops
+    /// [`Request::ListConflicts`] + [`Request::ResolveConflict`] (the I8 relaxation); **every other
     /// variant — present or future — is refused by default** (the `matches!` denies anything not
     /// explicitly listed). A new `Request` variant is therefore refused for `MemoryClient` until
     /// someone deliberately adds it here.
@@ -77,6 +80,12 @@ impl Role {
                     | Request::Remember { .. }
                     | Request::CaptureNotify { .. }
                     | Request::Snapshot { .. }
+                    // I8 RELAXATION (owner decision 2026-07-17, design §0/§4): for a locally-installed
+                    // AIR Agent, local Claude Code IS the owner. The resolve ops are guest-reachable;
+                    // safety rests on reversible retire + the visibility digest + the signed log, NOT a
+                    // rate cap (the per-connection limiter is a no-op vs a reconnecting MCP client).
+                    | Request::ListConflicts { .. }
+                    | Request::ResolveConflict { .. }
             ),
         }
     }
@@ -242,6 +251,12 @@ pub enum Request {
     /// SP3 capture-toggle query: whether ongoing session capture is enabled. App-only. Mirrors
     /// `MandatesEnabled`.
     CaptureEnabled { onboarded: bool },
+    /// Rung-3 Phase-3: list the pending conflict proposals (already excludes coexist/dismissed). Reachable
+    /// from `MemoryClient` (the I8 relaxation) so Claude Code can review conflicts. Sanitized daemon-side.
+    ListConflicts { onboarded: bool },
+    /// Rung-3 Phase-3: resolve one conflict proposal with a deterministic action. Reachable from
+    /// `MemoryClient` (the I8 relaxation). No LLM, no egress; the retire actions are reversible.
+    ResolveConflict { onboarded: bool, proposal_id: String, action: ResolveActionWire },
 }
 
 /// The subject of a [`Request::RetireMemory`]: either a whole `remember` note (by its event id) or a
@@ -335,6 +350,11 @@ pub enum Response {
     Superseded(String),
     /// `RetireMemory` / `Unretire` result — the id of the newly appended retire/unretire marker event.
     Retired(String),
+    /// `ListConflicts` result — the pending (coexist/dismissed-filtered), daemon-sanitized proposals.
+    ListConflicts(Vec<ConflictProposalWire>),
+    /// `ResolveConflict` result — whether a terminal marker was newly applied, and its id when it was.
+    /// `applied == false` is the idempotent no-op / roll-forward success (never an error to the agent).
+    ResolveConflict { applied: bool, marker_event_id: Option<String> },
     /// `RecallStats` result — recall hit/miss telemetry for the tuning UI.
     RecallStats(RecallStatsWire),
     /// `CaptureEnabled` result — the sticky capture-enabled flag.
@@ -800,7 +820,7 @@ mod protocol_tests {
     }
 
     /// Spot-checks that a representative set of pre-SP3 destructive/egress/read ops stay refused for
-    /// `MemoryClient` (SP3's `memory_client_allows_exactly_four_ops` covers the new SP3 ops). The true
+    /// `MemoryClient` (`memory_client_allows_exactly_six_ops` covers the new SP3/Phase-3 ops). The true
     /// fail-closed guarantee is structural: `Role::allows`'s positive `matches!` allowlist denies every
     /// non-listed variant, present or future; this test guards against a regression that admits one of
     /// these specific ops.
@@ -836,18 +856,21 @@ mod protocol_tests {
         }
     }
 
-    /// `MemoryClient` allows EXACTLY the four guest ops — recall/remember plus the SP3 capture and
-    /// snapshot pokes — and REFUSES every other new SP3 op (listing, get, delete, notes, supersede,
-    /// stats, capture toggle/query). Enumerates all new variants so a future variant wrongly admitted
-    /// to the guest role fails here (the fail-closed allowlist's positive guarantee, pinned per-op).
+    /// `MemoryClient` allows EXACTLY the six guest ops — recall/remember, the SP3 capture and snapshot
+    /// pokes, and the two Rung-3 Phase-3 resolution ops (`ListConflicts` + `ResolveConflict`, the I8
+    /// relaxation) — and REFUSES every other new SP3 op (listing, get, delete, notes, supersede, stats,
+    /// capture toggle/query, retire/unretire). Enumerates all new variants so a future variant wrongly
+    /// admitted to the guest role fails here (the fail-closed allowlist's positive guarantee, pinned per-op).
     #[test]
-    fn memory_client_allows_exactly_four_ops() {
+    fn memory_client_allows_exactly_six_ops() {
         use Request::*;
         let yes = [
             Recall { onboarded: true, query: "q".into(), k: 1 },
             Remember { onboarded: true, text: "t".into() },
             CaptureNotify { onboarded: true, session_id: "s".into(), transcript_path: "/p.jsonl".into() },
             Snapshot { onboarded: true, project: "/repo".into(), source: "startup".into(), session_id: None, transcript_path: None },
+            ListConflicts { onboarded: true },
+            ResolveConflict { onboarded: true, proposal_id: "P".into(), action: crate::types::ResolveActionWire::KeepBoth },
         ];
         for r in yes { assert!(Role::MemoryClient.allows(&r), "{r:?}"); }
         let no = [
@@ -863,6 +886,28 @@ mod protocol_tests {
             Unretire { onboarded: true, retired_event_id: "r".into() },
         ];
         for r in no { assert!(!Role::MemoryClient.allows(&r), "{r:?}"); }
+    }
+
+    #[test]
+    fn memory_client_allows_the_two_resolution_ops() {
+        use Request::*;
+        // I8 RELAXATION (owner decision 2026-07-17): the resolve ops are guest-reachable.
+        assert!(Role::MemoryClient.allows(&ListConflicts { onboarded: true }));
+        assert!(Role::MemoryClient.allows(&ResolveConflict {
+            onboarded: true, proposal_id: "P".into(), action: crate::types::ResolveActionWire::KeepBoth,
+        }));
+    }
+
+    #[test]
+    fn resolution_ops_round_trip_serde() {
+        let req = Request::ResolveConflict {
+            onboarded: true, proposal_id: "P1".into(), action: crate::types::ResolveActionWire::RetireOlder,
+        };
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+        let req = Request::ListConflicts { onboarded: true };
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
     }
 
     /// The SP3 `Snapshot` request round-trips through JSON with its `Option` fields populated — the

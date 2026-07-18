@@ -29,6 +29,9 @@ pub struct ConflictSweepReport {
     pub budget_hit: bool,
     /// The open-proposal ceiling was hit.
     pub ceiling_hit: bool,
+    /// Pairs abandoned this run after `CONFLICT_PAIR_ERROR_BUDGET` consecutive reasoner errors (§3.3) —
+    /// surfaced so a poison-skip is never a silent drop.
+    pub poison_skipped: usize,
 }
 
 /// Run ONE conflict-detection sweep: gate → delegate → map the core report. `now` is the
@@ -50,6 +53,7 @@ pub async fn run_conflict_sweep_once(
             dropped: r.dropped,
             budget_hit: r.budget_hit,
             ceiling_hit: r.ceiling_hit,
+            poison_skipped: r.poison_skipped,
             ..Default::default()
         },
         // Busy / reasoner-not-ready / transient open failure → a safe no-op this cycle (I6).
@@ -72,10 +76,20 @@ pub fn spawn(engine: Arc<EngineHandle>, data_dir: PathBuf) {
             let now = crate::capture::sweeper::system_time_to_epoch(Some(SystemTime::now()));
             let report = run_conflict_sweep_once(&engine, &data_dir, now).await;
             // Surface only real work (mirrors the capture sweeper's quiet-on-noop discipline).
-            if report.proposed > 0 || report.dropped > 0 || report.budget_hit || report.ceiling_hit {
+            if report.proposed > 0
+                || report.dropped > 0
+                || report.budget_hit
+                || report.ceiling_hit
+                || report.poison_skipped > 0
+            {
                 eprintln!(
-                    "conflict-sweep: proposed {} / judged {} (dropped {}, budget-hit {}, ceiling-hit {})",
-                    report.proposed, report.judged, report.dropped, report.budget_hit, report.ceiling_hit
+                    "conflict-sweep: proposed {} / judged {} (dropped {}, budget-hit {}, ceiling-hit {}, poison-skipped {})",
+                    report.proposed,
+                    report.judged,
+                    report.dropped,
+                    report.budget_hit,
+                    report.ceiling_hit,
+                    report.poison_skipped
                 );
             }
         }

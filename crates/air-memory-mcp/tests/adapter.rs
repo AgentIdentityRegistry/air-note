@@ -161,7 +161,10 @@ async fn tools_list_advertises_recall_and_remember() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, vec!["recall".to_string(), "remember".to_string()]);
+    // recall + remember lead the surface (the Rung-3 resolution tools are appended after them;
+    // the four-tool surface is pinned by `mcp`'s own unit test).
+    assert_eq!(names[0], "recall");
+    assert_eq!(names[1], "remember");
     // Each tool carries an object inputSchema with the required fields.
     let recall = &resp["result"]["tools"][0];
     assert_eq!(recall["inputSchema"]["required"][0], "query");
