@@ -25,10 +25,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bossclawd_proto::types::{
-    ApplyResultWire, CloudProviderWire, EngineStateWire, EngineStatusWire, EvolveStatusMirror,
-    EvolveTelemetryWire, MandateSummaryWire, MandateWriteSummaryWire, ModelStateWire,
-    ModelStatusWire, NoteWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire,
-    ReasonerModeWire, RecallStatsWire, ReindexProgressWire, SessionDetailWire, SessionSummaryWire,
+    ApplyResultWire, CloudProviderWire, ConflictProposalWire, EngineStateWire, EngineStatusWire,
+    EvolveStatusMirror, EvolveTelemetryWire, MandateSummaryWire, MandateWriteSummaryWire,
+    ModelStateWire, ModelStatusWire, NoteWire, PreviewDataWire, ProposalSummaryWire,
+    ReasonerConfigWire, ReasonerModeWire, RecallStatsWire, ReindexProgressWire, SessionDetailWire,
+    SessionSummaryWire,
 };
 use bossclawd_proto::{
     read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response,
@@ -221,6 +222,13 @@ fn override_onboarding_for_guest(req: Request, onboarded: bool) -> Option<Reques
         }
         Request::Snapshot { project, source, session_id, transcript_path, .. } => {
             Some(Request::Snapshot { onboarded, project, source, session_id, transcript_path })
+        }
+        // Rung-3 Phase-3 (I8 relaxation): the two resolve ops are guest ops (`Role::allows` admits them), so
+        // they need explicit passthrough arms — a missing arm → None → refused. Rewrite `onboarded` to the
+        // daemon's OWN truth like every other guest op.
+        Request::ListConflicts { .. } => Some(Request::ListConflicts { onboarded }),
+        Request::ResolveConflict { proposal_id, action, .. } => {
+            Some(Request::ResolveConflict { onboarded, proposal_id, action })
         }
         _ => None,
     }
@@ -461,6 +469,25 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
         },
         Request::Unretire { retired_event_id, .. } => {
             op_result(engine.unretire(retired_event_id).await, Response::Retired)
+        }
+        // ── Rung 3 §Phase-3: conflict resolution (guest-reachable — the I8 relaxation). ──
+        Request::ListConflicts { onboarded } => {
+            op_result(engine.list_conflicts(onboarded).await, |rows| {
+                // Sanitize DAEMON-SIDE (MINOR-1: air-memory-mcp has bossclawd only as a dev-dep and cannot
+                // call `sanitize_injected` in prod). Belt-and-suspenders even though the fields are ids +
+                // the content-free `templated_why` today: a future change that puts model text in `why`
+                // can never regress into an unfenced injection.
+                Response::ListConflicts(rows.into_iter().map(sanitize_conflict_row).collect())
+            })
+        }
+        Request::ResolveConflict { onboarded, proposal_id, action } => {
+            op_result(engine.resolve_conflict(onboarded, proposal_id, action.into()).await, |outcome| {
+                let (applied, marker_event_id) = match outcome {
+                    bossclaw_core::ResolveOutcome::Applied(id) => (true, Some(id)),
+                    bossclaw_core::ResolveOutcome::NoOp => (false, None),
+                };
+                Response::ResolveConflict { applied, marker_event_id }
+            })
         }
         Request::SetCaptureEnabled { onboarded, enabled, backfill } => {
             // `at` is the ONLY clock read on the dispatch core — the daemon boundary supplies it so
@@ -810,6 +837,25 @@ fn note_wire(n: bossclaw_core::log::CurrentNote) -> NoteWire {
     }
 }
 
+/// Build a sanitized [`ConflictProposalWire`] from a core row (MINOR-1). The refs are ids
+/// (structurally safe → the plain `From<ConflictRef>` conversion); the free-ish string fields are
+/// passed through `sanitize_injected` (single-line, ≤ `SNAPSHOT_FIELD_MAX`) so no memory-derived
+/// text can ever cross the wire un-neutralized. This deliberately does NOT use proto's whole-row
+/// `From<ConflictProposalRow>` (which passes the strings through verbatim): the daemon owns the
+/// neutralization because the MCP adapter cannot call `sanitize_injected` in prod.
+fn sanitize_conflict_row(row: bossclaw_core::ConflictProposalRow) -> ConflictProposalWire {
+    use crate::capture::snapshot::sanitize_injected;
+    ConflictProposalWire {
+        id: row.id,
+        a_ref: row.a_ref.into(),
+        b_ref: row.b_ref.into(),
+        winner_hint: sanitize_injected(&row.winner_hint),
+        confidence_band: sanitize_injected(&row.confidence_band),
+        why: sanitize_injected(&row.why),
+        detected_at: row.detected_at,
+    }
+}
+
 fn telemetry_wire(t: EvolveTelemetry) -> EvolveTelemetryWire {
     EvolveTelemetryWire {
         last_tick_ms: t.last_tick_ms,
@@ -1149,5 +1195,35 @@ mod tests {
             .is_none(),
             "Unretire is App-only and must fail closed (None) for a guest"
         );
+    }
+
+    #[test]
+    fn resolution_ops_are_not_rate_limited() {
+        // Per §0 the per-connection limiter cannot bound a reconnecting MCP client, so the resolve ops are
+        // deliberately NOT rate-limited — reversibility + the visibility digest are the controls.
+        assert!(!is_rate_limited_op(&Request::ListConflicts { onboarded: true }));
+        assert!(!is_rate_limited_op(&Request::ResolveConflict {
+            onboarded: true, proposal_id: "P".into(), action: bossclawd_proto::types::ResolveActionWire::KeepBoth,
+        }));
+    }
+
+    #[test]
+    fn guest_onboarding_override_passes_through_the_two_resolution_ops() {
+        // I8 relaxation: the two resolve ops are guest ops, so they MUST get an explicit passthrough arm
+        // (a missing arm → None → refused). The client's `onboarded` is overwritten with the daemon's truth.
+        match override_onboarding_for_guest(Request::ListConflicts { onboarded: false }, true) {
+            Some(Request::ListConflicts { onboarded }) => assert!(onboarded),
+            other => panic!("expected Some(ListConflicts), got {other:?}"),
+        }
+        match override_onboarding_for_guest(
+            Request::ResolveConflict { onboarded: false, proposal_id: "P".into(), action: bossclawd_proto::types::ResolveActionWire::Dismiss },
+            true,
+        ) {
+            Some(Request::ResolveConflict { onboarded, proposal_id, .. }) => {
+                assert!(onboarded, "daemon truth overwrites the client flag");
+                assert_eq!(proposal_id, "P");
+            }
+            other => panic!("expected Some(ResolveConflict), got {other:?}"),
+        }
     }
 }

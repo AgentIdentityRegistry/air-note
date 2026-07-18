@@ -1140,6 +1140,45 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    /// Rung-3 Phase-3: the pending conflict proposals (already coexist/dismissed-filtered by core).
+    /// Onboarding is the daemon's OWN verdict passed in by the dispatch layer (guest-reachable — the
+    /// I8 relaxation — but the daemon computes onboarding, never the client). Read-only: NO embedder,
+    /// NO reasoner, NO egress. Mirrors [`Self::deleted_session_ids`]'s pure-read idiom (`Core` on any
+    /// core failure).
+    pub async fn list_conflicts(
+        &self,
+        onboarded: bool,
+    ) -> Result<Vec<bossclaw_core::ConflictProposalRow>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.pending_conflict_proposals().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-3 Phase-3: resolve one conflict proposal. Deterministic, no LLM, no egress. An unknown or
+    /// already-resolved-by-a-different-action proposal folds to the typed `Rejected` (core reports
+    /// `InvalidInput`); any other core failure folds to `Core`. Onboarding is the daemon's OWN verdict
+    /// passed in by the dispatch layer. Mirrors [`Self::retire_memory`]'s marker-append idiom (same
+    /// `InvalidInput` → `Rejected` mapping).
+    pub async fn resolve_conflict(
+        &self,
+        onboarded: bool,
+        proposal_id: String,
+        action: bossclaw_core::ResolveAction,
+    ) -> Result<bossclaw_core::ResolveOutcome, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.resolve_conflict(&proposal_id, action).map_err(|e| match e {
+                bossclaw_core::BossclawError::InvalidInput(m) => EngineOpError::Rejected(m),
+                other => EngineOpError::Core(other.to_string()),
+            })
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
     /// default read the scheduler loop uses each tick (a `0` makes the tick a no-op, the safe
     /// default — never run a tick we can't size).
