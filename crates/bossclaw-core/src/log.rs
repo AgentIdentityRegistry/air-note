@@ -1161,6 +1161,17 @@ impl EventLog {
         Ok(payload.map(|p| serde_json::from_str(&p)).transpose()?)
     }
 
+    /// The append `seq` of the event with `event_id`, or `None` if no such event. A thin indexed lookup
+    /// (`events.id` is unique); used by the Rung-3 conflict-cursor rewind (§3.2) to map an un-retired
+    /// memory's event id back to its cursor coordinate.
+    pub fn seq_of_event(&self, event_id: &str) -> Result<Option<i64>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        Ok(store
+            .conn()
+            .query_row("SELECT seq FROM events WHERE id = ?1", [event_id], |r| r.get::<_, i64>(0))
+            .optional()?)
+    }
+
     /// Number of events in the log.
     pub fn count(&self) -> Result<i64, BossclawError> {
         let store = self.inner.lock().expect(POISON);
@@ -5419,7 +5430,7 @@ impl EventLog {
     /// retired (validated before appending). Returns the `unretire` event's id.
     pub fn unretire(&self, retired_event_id: &str) -> Result<String, BossclawError> {
         self.assert_note_retired(retired_event_id)?;
-        self.append(Event {
+        let marker_id = self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
@@ -5430,7 +5441,13 @@ impl EventLog {
             hash: None,
             signed_by_did: self.signer_did(),
             signature: None,
-        })
+        })?;
+        // Rung-3 Phase-3 (§3.2): the note is current again but the cursor swept past it. Rewind (marker
+        // written first, so a torn write is benign). A note is one subject at within-seq id 0.
+        if let Some(seq) = self.seq_of_event(retired_event_id)? {
+            self.rewind_conflict_cursor(seq, 0)?;
+        }
+        Ok(marker_id)
     }
 
     /// Rung-3 §7.2: retire a SINGLE session passage (by `session_id` +
@@ -5521,7 +5538,7 @@ impl EventLog {
                 "cannot unretire passage {passage_id} of {session_id}: not retired"
             )));
         }
-        self.append(Event {
+        let marker_id = self.append(Event {
             id: String::new(),
             ts: String::new(),
             valid_time: None,
@@ -5532,7 +5549,16 @@ impl EventLog {
             hash: None,
             signed_by_did: self.signer_did(),
             signature: None,
-        })
+        })?;
+        // Rung-3 Phase-3 (§3.2): rewind to (current-head capture seq, passage_id). Resolve the head via
+        // the post-append fold so the un-retired passage is included.
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        if let Some(cs) = fold.current.iter().find(|cs| cs.session_id == session_id) {
+            if let Some(seq) = self.seq_of_event(&cs.event_id)? {
+                self.rewind_conflict_cursor(seq, passage_id)?;
+            }
+        }
+        Ok(marker_id)
     }
 
     /// Validate `target_event_id` is a retirable CURRENT note — the same
@@ -6994,6 +7020,21 @@ impl EventLog {
              ON CONFLICT(id) DO UPDATE SET last_seq = ?1, subject_offset = ?2",
             rusqlite::params![last_seq, subject_offset as i64],
         )?;
+        Ok(())
+    }
+
+    /// Rewind the conflict cursor to the lexicographic `min` of its current position and `(seq, within)`
+    /// (§3.2). MONOTONE — only ever moves the cursor BACK (never advances), so a re-examination is
+    /// re-scheduled without ever skipping unrelated newer subjects. Idempotent upsert via
+    /// [`Self::set_conflict_cursor`], so it works on a brain that never ran detection (cursor defaults to
+    /// `(0, 0)`). Caller appends the unretire marker FIRST; a torn write here leaves the cursor un-rewound
+    /// (a benign delay — the memory is current but re-examined only at the next natural sweep past it).
+    fn rewind_conflict_cursor(&self, seq: i64, within: usize) -> Result<(), BossclawError> {
+        let current = self.conflict_cursor()?;
+        let target = (seq, within);
+        if target < current {
+            self.set_conflict_cursor(seq, within)?;
+        }
         Ok(())
     }
 
@@ -10200,6 +10241,44 @@ mod tests {
             log.unprocessed_conflict_subjects_since(cseq, coff, 64).unwrap().is_empty(),
             "nothing new after restart"
         );
+    }
+
+    /// Rung-3 Phase-3 (§3.2, Open-Q5): un-retiring makes a memory current again, but the conflict
+    /// cursor already swept past it. Both `unretire` and `unretire_passage` rewind the 2-D
+    /// `(last_seq, subject_offset)` cursor to the lexicographic MIN of its position and the memory's
+    /// coordinate — re-scheduling a re-examination — and the rewind is MONOTONE (never advances).
+    #[test]
+    fn unretire_rewinds_the_conflict_cursor_to_re_examine_the_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        // A note, retired, then the cursor advanced well past it (as detection would).
+        let note = log.remember(&emb, "branch is main").unwrap();
+        let note_seq = log.seq_of_event(&note).unwrap().expect("note has a seq");
+        let m = log.retire_memory(&note, None).unwrap();
+        log.set_conflict_cursor(note_seq + 100, 5).unwrap();
+
+        // Unretire rewinds to (note_seq, 0) — the lexicographic min — never advances.
+        log.unretire(&note).unwrap();
+        assert_eq!(log.conflict_cursor().unwrap(), (note_seq, 0), "cursor rewound to the un-retired note");
+
+        // A rewind never ADVANCES: unretire when the cursor is already behind the note is a no-op on the cursor.
+        let _ = m; // (marker id unused)
+        log.set_conflict_cursor(0, 0).unwrap();
+        // re-retire + unretire again; cursor stays at/below the note position (min semantics).
+        log.retire_memory(&note, None).unwrap();
+        log.unretire(&note).unwrap();
+        assert_eq!(log.conflict_cursor().unwrap(), (0, 0), "rewind is monotone: never advances past current");
+
+        // Passage rewind: unretire_passage rewinds to (capture_seq, passage_id).
+        let cev = log.capture_session(&emb, &session_meta("s1", "aa")).unwrap();
+        log.store_session_passages(&emb, &cev, &["p0".to_string(), "p1".to_string()]).unwrap();
+        let cap_seq = log.seq_of_event(&cev).unwrap().unwrap();
+        log.retire_passage("s1", 1, None).unwrap();
+        log.set_conflict_cursor(cap_seq + 50, 0).unwrap();
+        log.unretire_passage("s1", 1).unwrap();
+        assert_eq!(log.conflict_cursor().unwrap(), (cap_seq, 1), "passage unretire rewinds to (capture_seq, passage_id)");
     }
 
     /// Rung-3 Phase-2 (§3.3): the enumeration's exclusion GATES — the whole point of the fold — are
