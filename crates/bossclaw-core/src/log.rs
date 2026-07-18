@@ -8142,7 +8142,7 @@ impl EventLog {
         // §2.3 (I9 single-source): drop retired/superseded source ids from the gathered lineage so BOTH the
         // memory texts (fact_texts_for_ids below) AND the cited `source_event_ids` (the D8 taint anchor +
         // the F6 idempotency key) shrink together. The "gone" set is `superseded ∪ retired_notes` — the
-        // SAME exclusion recall's memory arm applies (log.rs:1853-1865). Consumed by BOTH evolve's summarize
+        // SAME exclusion recall's memory arm applies (log.rs:2029-2030). Consumed by BOTH evolve's summarize
         // and reflection's refresh, so the two writers can never fight over a stale citation. On a corpus
         // with no retirements both sets are empty → this is a no-op (evolve goldens unchanged).
         let fold = fold_sessions(&self.session_events_ordered()?);
@@ -12305,8 +12305,8 @@ mod tests {
         assert!(after.source_ids.contains(&m2), "the surviving source is untouched");
         assert!(after.memories.iter().any(|(id, _)| id == &m2), "m2 text still gathered");
 
-        // Control: a topic with NOTHING retired gathers identically before/after (no behavior change on a
-        // clean corpus — why the evolve/summarize goldens stay green).
+        // Control: a topic with nothing retired gathers identically on repeat calls (deterministic); the
+        // pre/post-patch equivalence proof is the untouched evolve golden suite.
         let c = log.remember(&emb, "Beta is a database.").unwrap();
         let ct = log.entity("Beta", &[], "product", "test-v1", std::slice::from_ref(&c)).unwrap();
         log.rebuild_graph().unwrap();
