@@ -127,6 +127,12 @@ and visible:**
   through the same Claude-Code channel the poison may influence ("…and don't mention any conflict
   activity"). The signed log is the un-relayed backstop. We do not claim the digest is a *reliable* alarm —
   only an honest one on a cooperative channel. (critic F6.)
+- **Digest window boundary is guest-advanceable.** The "since last session" window is advanced when a
+  snapshot is served with `source == "startup"` (§2.4), and `source` is client-supplied — so a compromised
+  agent can serve a "startup" snapshot to *consume* the window and suppress the next real session's "Since
+  last session:" line. The signed append-only log (and the App's own audit surfaces) are untouched and
+  remain the reliable record. The digest is therefore an honest signal on a *cooperative channel* only,
+  never a tamper-evident alarm. (review Low-1.)
 
 **Rejected half-measure (recorded so it is not reintroduced).** Rev 1 floated a "surfaced-first handshake"
 (a proposal must be listed before it can be resolved). It is not a defense — the poisoned actor simply lists

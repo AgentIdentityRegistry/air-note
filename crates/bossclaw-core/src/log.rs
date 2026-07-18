@@ -3045,7 +3045,6 @@ impl EventLog {
     /// re-propose). Notes need no head: an edit mints a new event id → a new `unordered_pair_key` the
     /// stored key no longer matches, so the stale key becomes inert. Restart-safe (pure fold, no cursor).
     #[cfg(unix)]
-    #[allow(dead_code)] // consumed by the finder's open_pairs union (Task 7) + pending_conflict_proposals (Task 8)
     fn resolution_exclusions(&self) -> Result<ResolutionExclusions, BossclawError> {
         let fold = fold_sessions(&self.session_events_ordered()?);
         let head_of: std::collections::HashMap<String, String> =
@@ -3128,7 +3127,9 @@ impl EventLog {
     /// recompute here, since a passage's ts tracks its session head, which a re-capture can flip). A
     /// torn-write retry (loser already in the retired set, no `conflict_resolved`) rolls forward: append
     /// the missing marker, return `NoOp` — never re-call the fail-loud primitive (`Err("already retired")`,
-    /// `log.rs:5214`/`:5130`). `#[cfg(unix)]`.
+    /// `log.rs:5214`/`:5130`). Callers must SERIALIZE concurrent resolves per brain (the daemon's engine
+    /// wrapper holds `resolve_lock`); unserialized concurrent callers risk a spurious fail-loud `Err` to
+    /// one caller, never corruption. `#[cfg(unix)]`.
     #[cfg(unix)]
     pub fn resolve_conflict(
         &self,

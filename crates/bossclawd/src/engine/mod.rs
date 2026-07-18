@@ -282,6 +282,16 @@ pub struct EngineHandle {
     /// Serializes manual + scheduled conflict-detection cycles (`try_lock` → `Busy("conflict")`).
     /// Mirrors `evolve_lock`.
     conflict_lock: Mutex<()>,
+    /// Serializes `resolve_conflict` wrapper calls against EACH OTHER, per daemon. A double-submit of
+    /// the SAME proposal (realistic when a reconnecting MCP client re-fires the op) becomes a
+    /// deterministic first-wins outcome: one caller does the real work (`Applied`), the serialized
+    /// second observes the terminal marker and returns a clean `NoOp` — never a spurious fail-loud
+    /// `Rejected("already retired"/"already resolved")`. DEDICATED, NOT reused `conflict_lock`: a sweep
+    /// cycle can hold `conflict_lock` for a long time (LLM judges) and must never block a user's
+    /// resolve. resolve-vs-sweep and resolve-vs-App-manual-retire stay UNSERIALIZED by design — core's
+    /// retired-set roll-forward gate + fail-loud primitives make those interleavings benign (design
+    /// Open-Q9).
+    resolve_lock: Mutex<()>,
     /// `true` once the in-memory recall index reflects persisted vectors this session.
     /// Set ONLY after a successful rebuild (a failure stays retryable). See `ensure_indexed`.
     indexed: Mutex<bool>,
@@ -326,6 +336,7 @@ impl EngineHandle {
             ingest_lock: Mutex::new(()),
             evolve_lock: Mutex::new(()),
             conflict_lock: Mutex::new(()),
+            resolve_lock: Mutex::new(()),
             indexed: Mutex::new(false),
             evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
             conflict_tel: std::sync::Mutex::new(ConflictTelemetry::default()),
@@ -1162,12 +1173,25 @@ impl EngineHandle {
     /// `InvalidInput`); any other core failure folds to `Core`. Onboarding is the daemon's OWN verdict
     /// passed in by the dispatch layer. Mirrors [`Self::retire_memory`]'s marker-append idiom (same
     /// `InvalidInput` → `Rejected` mapping).
+    ///
+    /// Holds `resolve_lock` across the WHOLE body (acquired before `get_or_open`, released after the
+    /// `spawn_blocking` completes) so concurrent resolves serialize against EACH OTHER per daemon: a
+    /// double-submit of one proposal (realistic when a reconnecting MCP client re-fires the op) is a
+    /// deterministic first-wins `Applied` + serialized `NoOp`, never a spurious fail-loud `Rejected`.
+    /// resolve-vs-sweep and resolve-vs-App-manual-retire stay unserialized by design — core's
+    /// retired-set roll-forward gate + fail-loud primitives make those interleavings benign (Open-Q9).
     pub async fn resolve_conflict(
         &self,
         onboarded: bool,
         proposal_id: String,
         action: bossclaw_core::ResolveAction,
     ) -> Result<bossclaw_core::ResolveOutcome, EngineOpError> {
+        // Serialize resolves against each other (see the doc + the `resolve_lock` field): held across
+        // the whole op — acquired before `get_or_open`, dropped at function return after the
+        // `spawn_blocking` await — so a double-submit is first-wins Applied + NoOp, never a raced
+        // fail-loud Err. `.lock().await` WAITS (does not `Busy`-reject like `conflict_lock`): the
+        // second submit must observe the first's terminal marker, which is what yields the clean NoOp.
+        let _resolve_guard = self.resolve_lock.lock().await;
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
             log.resolve_conflict(&proposal_id, action).map_err(|e| match e {
@@ -1192,6 +1216,9 @@ impl EngineHandle {
     /// session:" activity before the real next start ever shows it; `clear` and unknown sources
     /// likewise deliberately do not advance — only a true fresh startup consumes the window.
     /// Non-startup serves still RENDER the (unconsumed) lines — honest, just not window-advancing.
+    /// `source` is CLIENT-supplied, so the advance is reachable by any guest snapshot claiming
+    /// `"startup"` — accepted: the digest is a cooperative-channel signal, not a tamper-evident alarm,
+    /// and the signed append-only log is the backstop (design §0).
     pub async fn serve_conflict_digest_lines(&self, source: &str) -> Vec<String> {
         let onboarded = self.is_onboarded_local();
         let Ok(log) = self.get_or_open(onboarded).await else {
