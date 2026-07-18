@@ -1,8 +1,10 @@
 # Rung 4 — Reflection (sleep-time consolidation, miss-driven) — Design
 
-**Status:** Rev 2 — Rev 1 owner-approved conversationally 2026-07-19; independently reviewed same day
-(architect SOUND-WITH-CHANGES + critic APPROVE-WITH-CHANGES); ALL findings folded below (changelog §9).
-Awaiting reviewer re-verification + file-level owner review before planning.
+**Status:** Rev 3 — Rev 1 owner-approved conversationally 2026-07-19; independently reviewed
+(architect SOUND-WITH-CHANGES + critic APPROVE-WITH-CHANGES → Rev 2 folded all findings); re-verified same
+day (architect SOUND; critic APPROVE-WITH-CHANGES with ONE new Blocker in Rev 2's own harness-scoring fix +
+convergent minors) → Rev 3 folds the re-verification round (changelog §9). Awaiting final reviewer
+confirmation + file-level owner review before planning.
 **North Star anchor:** `air/memory-strategy-2026-07-03-beat-the-stack` Phase 4 — "M3 reflection,
 dossier-centric. Continuous sleep-time consolidation; evolve page dossiers as the primary answer substrate.
 (Dreaming-style +15pp is NOT yet neutrally verified — open question; build instrumented.)" Beat-the-stack
@@ -70,12 +72,18 @@ Follows the proven three-sibling shape (`engine/scheduler.rs` pure decide fn + 3
   measured to matter).
 - **Starvation floor (arch M5 / critic M3):** if the durable backlog (§2.2) holds unrepaired, unparked
   misses AND more than `REFLECT_STALENESS_FLOOR_SECS` (provisional: 6h) have passed since the last completed
-  reflect run, run ONE budgeted tick even if not quiet. A perpetually-slightly-active brain still reflects;
-  the floor is bounded to one tick per floor interval.
+  reflect run, run ONE budgeted tick. **Precedence (re-verify convergence, arch residual = critic
+  New-Minor-2): the floor overrides BOTH the quiet gate AND the evolve-backlog defer** — a wedged evolve
+  queue (e.g. reasoner down, poisoned retry) can never starve reflection indefinitely; a floor-fired tick on
+  an incomplete graph just yields more honest `no_material` (bounded harm, no minting). The floor fires at
+  most once per interval, tracked by a last-floor-fire timestamp (not per-300s re-fires). Stated honestly:
+  a floor tick deliberately runs bounded, consent-gated reasoner work during WAKE time — a small, accepted
+  dilution of "sleep-time" in exchange for bounded staleness.
 - **Evolve-backlog rule:** when Evolve is ENABLED and its unprocessed queue is non-empty, reflection defers
-  (the daytime helper goes first — its extraction feeds the entity graph reflection anchors on). When Evolve
-  is DISABLED, reflection still runs against whatever graph exists; misses that resolve to no known entity
-  are `no_material` (reflection never does evolve's extraction job — no minting, §2.2).
+  (the daytime helper goes first — its extraction feeds the entity graph reflection anchors on), EXCEPT when
+  the starvation floor fires (above). When Evolve is DISABLED, reflection still runs against whatever graph
+  exists; misses that resolve to no known entity are `no_material` (reflection never does evolve's
+  extraction job — no minting, §2.2).
 - **Serialization:** dedicated `reflect_lock.try_lock()` → `Busy` (the Rung-3 dedicated-lock lesson).
 - **Budget:** small fixed per-tick caps (provisional, harness-tunable, single consts block): misses
   attempted ≤ 4, dossiers refreshed ≤ 4. Priority: misses first, refresh with the remainder.
@@ -106,6 +114,11 @@ harness).
 3. **Refresh the resolved topics' dossiers additively** through the existing citation-floored machinery
    (`gather_fact_set` → compose → `citation_floor` → `emit_page` atomic supersede), with the §2.3 lineage
    exclusion applied. Emit machine links only on already-resolved entity ids. No new write primitives.
+   Reach, stated plainly (arch re-verify observation): because step 3 recomposes the resolved entity's OWN
+   lineage (never injecting the miss's candidate material into a prompt as new facts), a true repair occurs
+   only where a known topic's dossier was under-composed or stale — a deliberately narrow surface that
+   overlaps §2.3. The operational repair rate will be LOW BY DESIGN; §5.3(d) measures the actual reach, with
+   a pre-registered success threshold agreed at plan review BEFORE the live dogfood (§5.5).
 4. **Replay the original query** against recall. Hit → state `candidate_repaired` — an OPERATIONAL counter,
    not evidence (renamed from Rev 1's `repaired` per B1: a query-derived page ranking for its own query is
    near-tautological; the citation floor guards fabrication, not answer quality — §5.3 carries the evidence
@@ -134,6 +147,16 @@ the two writers' cited sets diverge and fight). This changes evolve's own dossie
 stale-lineage topics (a healing, not a regression — dossiers stop citing retired memories); the §5.3 harness
 gate guards the blast radius.
 
+**Thin-set residual (arch re-verify, accepted + surfaced):** a topic whose lineage is ENTIRELY
+retired/superseded and which has no current edges falls below `PAGE_MIN_FACTS` (`summarize.rs:26`; the
+summarize path skips thin emits at `log.rs:8131`) — so its stale page cannot legally be re-emitted, and
+reflection never retires pages (I1). "The next night heals it" is therefore NOT universal: such pages stay
+stale-but-provenance-true until new current facts arrive. Surfaced as a distinct scoreboard outcome
+(`unhealable_thin`) rather than silently retried; the per-tick budget stops it wasting nights. Plan-level
+correctness note: the exclusion must shrink BOTH the gathered memory texts AND the cited `source_event_ids`
+set (the idempotency key at `log.rs:8162` and the D8 taint anchor) — excluding only the texts would leave
+the cited set unchanged and the heal would still no-op.
+
 **Writer-coordination / stability note (critic gap):** evolve's summarize and reflection's refresh converge
 by construction — both route through the same gather (same exclusion) and the same set-diff idempotent
 `emit_page`; for a fixed corpus state they compute the same cited set, so alternation cannot oscillate.
@@ -149,11 +172,12 @@ cap instead).
 ### §2.4 Scoreboard (operational telemetry — NOT the evidence instrument)
 
 `ReflectReport` per tick: `attempted / candidate_repaired / repaired_by_time / no_material / parked /
-dossiers_refreshed / merge_proposed (0 until R4-B) / gated_off / reasoner_errors` + cumulative counters in
-the telemetry family. Snapshot digest line (Rung-3 never-truncated preamble, integer-only): default-include
-"`N` memory gaps addressed, `M` unknown-topic gaps since last session" — `M` (= no_material) is the most
-actionable output for the owner ("your memory never knew this; consider telling it"), per critic's open
-question. Disclosure copy for the miss store updates in the same PR (critic m4): it is no longer a passive
+dossiers_refreshed / unhealable_thin / merge_proposed (0 until R4-B) / gated_off / reasoner_errors` +
+cumulative counters in the telemetry family. Snapshot digest line (Rung-3 never-truncated preamble,
+integer-only), in deliberately NEUTRAL copy (critic New-Minor-1 — the digest must not present an operational
+counter as proven benefit): default-include "`N` dossiers refreshed for recently-missed topics, `M`
+unknown-topic gaps since last session" — `M` (= no_material) is the most actionable output for the owner
+("your memory never knew this; consider telling it"), per critic's open question. Disclosure copy for the miss store updates in the same PR (critic m4): it is no longer a passive
 read-only signal; it actively drives reflection work (and, with cloud consent ON, gathered material may
 egress under the existing consent).
 
@@ -191,7 +215,7 @@ Rung-3 dogfood needs.
 | --- | --- | --- |
 | I1 never-destroy | Reflection writes are append-only dossier REVISIONS (supersede = replace-in-recall; prior revision recoverable from the log — a good revision can be displaced until re-superseded, accepted and inherited from evolve's existing posture) + machine links; merge is marker-based and reversible; originals never mutated or deleted; reflection NEVER mints entities or retires anything. | §2.2/§2.3/§3 |
 | I2 no silent egress | Reasoner phases behind `cloud_consent_ok`; local default; cloud fail-closed. Miss QUERIES drive only local search; gathered MATERIAL reaches a reasoner only inside the consent envelope. | §2.1/§2.2 |
-| I3 dormant | `ConfigFlag::Reflect` default-closed + `prime_switches` force-off; merging R4-A changes no runtime behavior (loop gated off; enable requires the explicit App-only op §2.5). The fresh-brain config-event trip-wire moves **5 → 6** in ALL THREE sites (`bossclawd/tests/roundtrip.rs:173`, `engine/mod.rs:2237`, desktop `engine/client.rs:973`) as one conscious, documented act. | §2.1/§2.5 |
+| I3 dormant (scoped honestly) | `ConfigFlag::Reflect` default-closed + `prime_switches` force-off; the REFLECTION loop does nothing until the explicit App-only enable (§2.5). ONE deliberate Reflect-independent change ships with R4-A (critic New-Major-1): the shared gather-path exclusion (§2.3) means an EVOLVE-enabled brain with retired/superseded lineage emits healed dossier revisions on its next evolve tick even with Reflect OFF — a bounded, gate-guarded healing (dossiers stop citing retired memories), named here rather than hidden under "dormant". Fresh-brain trip-wire moves **5 → 6** in ALL THREE sites (`bossclawd/tests/roundtrip.rs:173`, `engine/mod.rs:2237`, desktop `engine/client.rs:973`) as one conscious, documented act. | §2.1/§2.3/§2.5 |
 | I5 append-only | All durable state via signed events; `reflect_miss_backlog` is re-derivable progress state, not history. | §2.2 |
 | I6 fail-safe | Per-miss attempt budget → parked; per-tick caps; starvation floor bounded to one tick per interval; `Busy` on overlap; torn ticks re-try idempotently (set-diff emit). | §2.1/§2.2 |
 | I7 hostile-output | Dossier content citation-floored (subtract-only); no raw model text logged; merge/activity listings sanitized daemon-side; digest lines integer-only. | §2.2/§2.4/§3 |
@@ -211,20 +235,36 @@ Two instruments with different jobs — the scoreboard OPERATES, the harness EVI
    existing mechanism"):**
    (a) a run-to-quiescence reflection driver over the frozen corpus + a frozen synthetic miss set;
    (b) a PAGE ARM: `PageResolver` today is fail-loud on any non-file hit (the Phase-0 no-evolve invariant,
-   `arms.rs:76,106`) — extend it so a dossier hit scores as the UNION of its cited source pages (a dossier
-   that cites gold sources earns the gold; one that cites none earns nothing);
-   (c) the reflected pass RUNS EVOLVE TOO (quiescence = both loops drained) so evolve↔reflect page
-   interaction is inside the gate, not invisible to it;
+   `arms.rs:76,106`) — extend it so reflected-brain runs do not abort on dossier hits. **Gate scoring rule
+   (critic re-verify New-Blocker-1 — Rev 2's union-credit rule is REJECTED):** in the §5.2 SHIP gate, the
+   gold page scores ONLY as itself; a dossier hit NEVER substitutes for the gold it cites. A dossier that
+   crowds the gold page out of top-k therefore registers as the regression it is — the exact harm the gate
+   exists to catch — and the gate stays free of the unproven dossier-primacy assumption (which belongs to
+   (e), not the gate). Union-style "dossier covers gold at rank r" is computed as a SEPARATE, REPORTED
+   coverage metric only, never gated (this also keeps the harness's single-page-id hit/dedup/rank model
+   intact — `arms.rs:13,19,24`);
+   (c) the reflected pass RUNS EVOLVE TOO (quiescence = both loops drained) AND SEEDS retired/superseded
+   lineage into the frozen corpus (a scripted Rung-3 `resolve_conflict` retire) — the fresh-ingested Phase-0
+   corpus contains no retirements, so without seeding the §2.3 gather-exclusion path would never execute
+   under the gate (critic New-Major-1);
    (d) **held-out generalization probe (B1 fix):** reflect on miss set A, then measure success@k on a
    DISJOINT paraphrase/query set B over the same topics — repair must generalize past the verbatim query;
    (e) **dossier-vs-source answer A/B (B1/M5 fix — the primacy evidence-generator):** blind position-swapped
    judging of answers composed from the dossier page vs from its raw cited memories, on the open-case set.
+   The judge must clear the Phase-0 trust contract (agreement ≥85% / κ ≥0.6 vs the audit ladder) or (e)'s
+   lift numbers are reported as UNINTERPRETABLE rather than as evidence.
    Outputs (d)+(e) are REPORTED, not SHIP-gated in R4-A (the SHIP bar is non-regression; the lift data
-   informs the future dossier-primacy decision honestly).
+   informs the future dossier-primacy decision honestly — including the future question of whether a
+   dossier judged equal-or-better by (e) may legitimately substitute for its gold, which stays OUT of the
+   R4-A gate by construction).
 4. **Dormancy proof:** trip-wire `==5 → ==6` updated in all THREE sites in the same task that adds the flag.
 5. **Live evidence (Peter-gated, post-merge, via §2.5):** enable Reflect on the real brain; the field
    metrics are the miss-counter trend + the digest counts over ≥1 week of nights. Field churn (evolve
-   re-superseding reflected pages) is measured, not hidden (§2.3).
+   re-superseding reflected pages) is measured, not hidden (§2.3). Stated plainly (critic re-verify): this
+   first live run happens BEFORE R4-B's read-only review surface exists — accepted because it is the
+   owner's own brain, enable is App-only and owner-gated, and the signed log + Library remain the
+   inspection backstops (I-vis). The §5.3(d) pre-registered success threshold is agreed at plan review
+   before this run, so the week's verdict is read against a bar set in advance.
 
 ## §6 Boundary — explicitly OUT of Rung 4
 
@@ -291,3 +331,22 @@ anchors drift — re-grep at plan/build time.
   note, §5.3(c), §2.3 growth bound, §2.1 floor, §2.2 backlog, §5.3(d,e).
 - Critic open Qs: no_material surfaced in the digest (§2.4); evolve-supersede churn = accepted + measured
   (§2.3); harness runs evolve (§5.3(c)).
+
+**Rev 3 (re-verification round — architect SOUND with residuals; critic APPROVE-WITH-CHANGES, 1 new Blocker
+in Rev 2's own fix; convergent floor/defer minor):**
+- Critic New-Blocker-1 (union-credit defeats the gate + presupposes primacy + breaks the single-page-id hit
+  model): §5.3(b) — gate scores gold ONLY as itself; dossier never substitutes; crowding-out = regression by
+  design; union-coverage demoted to a separate reported metric.
+- Critic New-Major-1 (gather exclusion is Reflect-independent + untested on a fresh corpus): I3 reworded to
+  name the evolve-visible healing honestly; §5.3(c) seeds retired/superseded lineage into the reflected pass
+  so the exclusion path executes under the gate.
+- Arch residual 1 (thin-set unhealable): §2.3 residual paragraph + `unhealable_thin` scoreboard outcome +
+  the texts-AND-cited-ids exclusion correctness note.
+- Arch residual 3 = critic New-Minor-2 (floor vs defer precedence, CONVERGED): §2.1 — floor overrides both
+  gates; wedged evolve queue cannot starve reflection; last-floor-fire timestamp; honest wake-time-work
+  sentence.
+- Critic New-Minor-1 (digest copy leaked benefit framing): §2.4 neutral copy ("dossiers refreshed for
+  recently-missed topics").
+- Arch residual 2 (narrow repair surface): §2.2 step 3 reach paragraph + pre-registered (d) threshold
+  before the dogfood; §5.5 names the review-surface-absent first live run; §5.3(e) gains the Phase-0
+  judge-trust contract (≥85% / κ≥0.6, else lift reported uninterpretable).
