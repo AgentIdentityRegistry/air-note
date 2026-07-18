@@ -1325,3 +1325,57 @@ fn injection_in_a_memory_cannot_plant_an_uncited_claim_or_emit_config() {
     assert_ne!(meta.model_id, "manual", "the page is machine-origin, never manual");
     log.verify_chain().unwrap();
 }
+
+#[test]
+fn summarize_re_emits_a_healed_page_after_a_cited_source_is_retired() {
+    // §2.3: retiring a cited source shrinks the gathered cited set, so the F6 idempotency guard now
+    // DIFFERS → the dossier re-emits WITHOUT the retired citation (dossiers stop citing retired memories).
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let embedder = MockEmbedder::new(MID_DIM);
+    // Seed a topic whose lineage has TWO source memories so a retire still leaves it summary-worthy.
+    let m1 = seed_memory(&log, &embedder, "Kenny works at Acme.");
+    let m2 = seed_memory(&log, &embedder, "Kenny lives in Denver.");
+    let lineage = vec![m1.clone(), m2.clone()];
+    let topic = log.entity("Kenny", &[], "person", "scripted-evolve-v1", &lineage).unwrap();
+    let acme = log.entity("Acme", &[], "org", "scripted-evolve-v1", &lineage).unwrap();
+    log.link_machine(&topic, "works_at", &acme, 0.9, "scripted-evolve-v1", &lineage).unwrap();
+    log.rebuild_graph().unwrap();
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+
+    // Tick 1: emit the first page, cites BOTH memories.
+    let facts1 = log.gather_fact_set(&entity).unwrap();
+    let r1 = scripted_both_passes("scripted-evolve-v1", "Kenny works at Acme.", &[], &[], empty_pass_a())
+        .with_response(SUMMARIZE_SYSTEM, &build_compose_prompt(&facts1), json!({
+            "title": "Kenny",
+            "claims": [
+                { "text": "Kenny works at Acme.", "cites": [m1.clone()] },
+                { "text": "Kenny lives in Denver.", "cites": [m2.clone()] }
+            ]}));
+    assert_eq!(log.evolve_once(&embedder, &r1).unwrap().pages_emitted, 1);
+
+    // Retire m1, then re-dirty the topic (a fresh link past the summarize cursor).
+    log.retire_memory(&m1, None).unwrap();
+    let beta = log.entity("Beta", &[], "org", "scripted-evolve-v1", std::slice::from_ref(&m2)).unwrap();
+    log.link_machine(&topic, "advises", &beta, 0.9, "scripted-evolve-v1", std::slice::from_ref(&m2)).unwrap();
+    log.rebuild_graph().unwrap();
+
+    // Tick 2: gather the POST-exclusion facts (m1 gone) and script a compose citing only m2. The cited
+    // set shrank vs the current page → the F6 guard fires an emit + supersede (the heal).
+    let entity2 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts2 = log.gather_fact_set(&entity2).unwrap();
+    assert!(!facts2.source_ids.contains(&m1), "the retired source is excluded from the refreshed gather");
+    let r2 = scripted_both_passes("scripted-evolve-v1", "Kenny works at Acme.", &[], &[], empty_pass_a())
+        .with_response(SUMMARIZE_SYSTEM, &build_compose_prompt(&facts2), json!({
+            "title": "Kenny", "claims": [{ "text": "Kenny lives in Denver.", "cites": [m2.clone()] }]}));
+    let report2 = log.evolve_once(&embedder, &r2).unwrap();
+    assert_eq!(report2.pages_superseded, 1, "the stale page is superseded by a healed revision");
+
+    // The current page no longer cites the retired memory.
+    let page = log.current_pages().unwrap().into_iter().find(|p| p.topic_id == topic).unwrap();
+    let page_ev = log.stream_all().unwrap().into_iter().find(|e| e.id == page.page_event_id).unwrap();
+    let cited = page_ev.model_meta.unwrap().source_event_ids;
+    assert!(!cited.contains(&m1), "healed page no longer cites the retired memory");
+    assert!(cited.contains(&m2), "healed page still cites the surviving memory");
+    log.verify_chain().unwrap();
+}

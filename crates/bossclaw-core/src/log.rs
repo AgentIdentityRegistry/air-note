@@ -8139,6 +8139,16 @@ impl EventLog {
         }
         lineage.sort();
         lineage.dedup();
+        // §2.3 (I9 single-source): drop retired/superseded source ids from the gathered lineage so BOTH the
+        // memory texts (fact_texts_for_ids below) AND the cited `source_event_ids` (the D8 taint anchor +
+        // the F6 idempotency key) shrink together. The "gone" set is `superseded ∪ retired_notes` — the
+        // SAME exclusion recall's memory arm applies (log.rs:1853-1865). Consumed by BOTH evolve's summarize
+        // and reflection's refresh, so the two writers can never fight over a stale citation. On a corpus
+        // with no retirements both sets are empty → this is a no-op (evolve goldens unchanged).
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        if !fold.superseded.is_empty() || !fold.retired_notes.is_empty() {
+            lineage.retain(|id| !fold.superseded.contains(id) && !fold.retired_notes.contains(id));
+        }
         let memories = self.fact_texts_for_ids(&lineage)?;
         Ok(crate::summarize::FactSet { entity: entity.clone(), edges, memories, source_ids: lineage })
     }
@@ -12260,5 +12270,49 @@ mod tests {
         let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 1).unwrap();
         assert!(r.judged <= CONFLICT_JUDGE_PER_SWEEP, "day-one judging is budget-bounded ({})", r.judged);
         assert!(r.proposed <= CONFLICT_JUDGE_PER_SWEEP, "day-one proposals are a trickle ({})", r.proposed);
+    }
+
+    /// §2.3 (arch M2) + §4 I3: the gather path drops retired/superseded lineage from BOTH the
+    /// gathered memory texts AND the cited `source_event_ids` (the D8 anchor + the F6 idempotency
+    /// key). The exclusion set is `fold.superseded ∪ fold.retired_notes` — the same "gone" set
+    /// recall's memory arm already uses. On a corpus with nothing retired, gather is byte-stable
+    /// (the control) — which is why the evolve/summarize goldens stay green.
+    #[test]
+    fn gather_fact_set_excludes_retired_and_superseded_lineage_from_texts_and_cited_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        // Two source notes fold into one topic's lineage; a link ties the entity to a second endpoint.
+        let m1 = log.remember(&emb, "Kenny joined Acme in 2019.").unwrap();
+        let m2 = log.remember(&emb, "Kenny leads the platform team.").unwrap();
+        let lineage = vec![m1.clone(), m2.clone()];
+        let topic = log.entity("Kenny", &[], "person", "test-v1", &lineage).unwrap();
+        let acme = log.entity("Acme", &[], "org", "test-v1", &lineage).unwrap();
+        log.link_machine(&topic, "works_at", &acme, 0.9, "test-v1", &lineage).unwrap();
+        log.rebuild_graph().unwrap();
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+
+        // Before any retire: both source ids are gathered (texts + cited set).
+        let before = log.gather_fact_set(&entity).unwrap();
+        assert!(before.source_ids.contains(&m1) && before.source_ids.contains(&m2), "both cited");
+        assert!(before.memories.iter().any(|(id, _)| id == &m1), "m1 text gathered");
+
+        // Retire m1 (App path). The gather path must now drop it from BOTH the memory texts AND source_ids.
+        log.retire_memory(&m1, None).unwrap();
+        let after = log.gather_fact_set(&entity).unwrap();
+        assert!(!after.source_ids.contains(&m1), "retired m1 dropped from the cited source_event_ids (D8 anchor)");
+        assert!(!after.memories.iter().any(|(id, _)| id == &m1), "retired m1 dropped from the gathered texts");
+        assert!(after.source_ids.contains(&m2), "the surviving source is untouched");
+        assert!(after.memories.iter().any(|(id, _)| id == &m2), "m2 text still gathered");
+
+        // Control: a topic with NOTHING retired gathers identically before/after (no behavior change on a
+        // clean corpus — why the evolve/summarize goldens stay green).
+        let c = log.remember(&emb, "Beta is a database.").unwrap();
+        let ct = log.entity("Beta", &[], "product", "test-v1", std::slice::from_ref(&c)).unwrap();
+        log.rebuild_graph().unwrap();
+        let ce = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == ct).unwrap();
+        let g1 = log.gather_fact_set(&ce).unwrap();
+        let g2 = log.gather_fact_set(&ce).unwrap();
+        assert_eq!(g1.source_ids, g2.source_ids, "no retirement → gather is stable (control)");
     }
 }
