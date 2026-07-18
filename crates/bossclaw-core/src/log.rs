@@ -7551,6 +7551,63 @@ impl EventLog {
         Ok(MissAttempt { outcome, dossiers_emitted })
     }
 
+    /// Refresh dossiers whose cited sources went stale (spec §2.3). A page is STALE when its per-claim
+    /// CITES UNION — the same set `current_page_for_topic` reads and the F6 emit idempotency compares —
+    /// intersects `superseded ∪ retired_notes` (the aftermath of a Rung-3 retire). (The page-level D8
+    /// `model_meta.source_event_ids` provenance anchor shrinks too, via the same T3 gather filter, but it
+    /// is a DISTINCT set and not the staleness read here — ARCH minor-c.) For each stale topic (≤ `cap`
+    /// total ATTEMPTS — reasoner AND transient errors count toward the cap, critic m2), call
+    /// [`EventLog::refresh_topic_page`] and tally: `Emitted` → healed, `SkippedUnchanged` → unchanged,
+    /// `SkippedThin` → `unhealable_thin` (the §2.3 residual — an all-retired lineage cannot re-emit;
+    /// counted, never retried within this pass), `ReasonerError` → reasoner_errors, `TransientError` →
+    /// transient_errors (both isolated per-item). The pass-level `fold_sessions` here is the STALENESS
+    /// read; `refresh_topic_page`'s own gather re-folds per call — accepted: each such call precedes an
+    /// LLM compose that dwarfs it, bounded by `cap` (the T3-review cost note). Reflection NEVER retires a
+    /// page (I1). PORTABLE.
+    pub fn refresh_stale_pages(
+        &self,
+        reasoner: &dyn crate::reason::Reasoner,
+        cap: usize,
+    ) -> Result<crate::reflect::StaleRefreshReport, BossclawError> {
+        use crate::reflect::{StaleRefreshReport, TopicRefreshOutcome};
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        // Nothing gone → nothing stale (the fresh-corpus fast path).
+        if fold.superseded.is_empty() && fold.retired_notes.is_empty() {
+            return Ok(StaleRefreshReport::default());
+        }
+        let entities = self.all_entities()?;
+        let mut report = StaleRefreshReport::default();
+        let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for page in self.current_pages()? {
+            // Per-tick budget over total ATTEMPTS (critic m2 + T4-split): errors of BOTH kinds consume
+            // budget too, so a failing reasoner or a write hiccup cannot turn the cap into an unbounded
+            // retry sweep. [CONTROLLER OVERRIDE: + transient_errors in the sum]
+            if report.healed + report.unchanged + report.unhealable_thin
+                + report.reasoner_errors + report.transient_errors >= cap {
+                break;
+            }
+            if !attempted.insert(page.topic_id.clone()) {
+                continue; // one refresh per topic per pass
+            }
+            // Read the page's cited set; stale iff it intersects the gone set.
+            let Some((_pid, cites)) = self.current_page_for_topic(&page.topic_id)? else { continue };
+            let stale = cites.iter().any(|id| fold.superseded.contains(id) || fold.retired_notes.contains(id));
+            if !stale {
+                continue;
+            }
+            let Some(entity) = entities.iter().find(|e| e.entity_id == page.topic_id) else { continue };
+            match self.refresh_topic_page(reasoner, entity)? {
+                TopicRefreshOutcome::Emitted { .. } => report.healed += 1,
+                TopicRefreshOutcome::SkippedUnchanged => report.unchanged += 1,
+                TopicRefreshOutcome::SkippedThin => report.unhealable_thin += 1,
+                TopicRefreshOutcome::ReasonerError => report.reasoner_errors += 1,
+                // CONTROLLER OVERRIDE (T4 split): engine-I/O hiccups are transient, never "unhealable".
+                TopicRefreshOutcome::TransientError => report.transient_errors += 1,
+            }
+        }
+        Ok(report)
+    }
+
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
@@ -12803,6 +12860,87 @@ mod tests {
         let thin_entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == te).unwrap();
         // fact_count = 0 edges + 1 memory = 1 < PAGE_MIN_FACTS(2) → thin.
         assert_eq!(log.refresh_topic_page(&reasoner, &thin_entity).unwrap(), TopicRefreshOutcome::SkippedThin);
+    }
+
+    /// R4-A (spec §2.3): the ONE autonomous tidy job heals a page whose cited lineage went stale. A
+    /// topic with two cited sources + an edge is paged, then ONE source is retired: the page's claim-cites
+    /// union now intersects `retired_notes` (stale), and its post-exclusion fact-set still clears
+    /// `PAGE_MIN_FACTS` (m2 + one edge), so the refresh emits a healed revision → `healed == 1`.
+    #[test]
+    fn refresh_stale_pages_heals_a_stale_dossier() {
+        use crate::reflect::TopicRefreshOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        // A topic with TWO cited sources + an edge → a page. Retire ONE source → the page is stale but still
+        // summary-worthy → healed. A SECOND topic with ONE cited source → retire it → below PAGE_MIN_FACTS →
+        // unhealable_thin.
+        let m1 = log.remember(&emb, "Kenny works at Acme.").unwrap();
+        let m2 = log.remember(&emb, "Kenny lives in Denver.").unwrap();
+        let heal_lineage = vec![m1.clone(), m2.clone()];
+        let kenny = log.entity("Kenny", &[], "person", "test-v1", &heal_lineage).unwrap();
+        let acme = log.entity("Acme", &[], "org", "test-v1", &heal_lineage).unwrap();
+        log.link_machine(&kenny, "works_at", &acme, 0.9, "test-v1", &heal_lineage).unwrap();
+        log.rebuild_graph().unwrap();
+        let ke = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == kenny).unwrap();
+        let f = log.gather_fact_set(&ke).unwrap();
+        let r_heal = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny works at Acme.", "cites": [m1.clone(), m2.clone()] }]}));
+        assert_eq!(log.refresh_topic_page(&r_heal, &ke).unwrap(), TopicRefreshOutcome::Emitted { superseded: false });
+        log.rebuild_graph().unwrap();
+
+        // Retire m1 → the Kenny page's cited set now intersects retired → stale → healed on refresh (its
+        // post-exclusion facts still clear PAGE_MIN_FACTS: one memory m2 + one edge). Script the healed compose.
+        log.retire_memory(&m1, None).unwrap();
+        let ke2 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == kenny).unwrap();
+        let f2 = log.gather_fact_set(&ke2).unwrap();
+        let r_healed = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f2),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny lives in Denver.", "cites": [m2.clone()] }]}));
+        let report = log.refresh_stale_pages(&r_healed, 8).unwrap();
+        assert_eq!(report.healed, 1, "the stale Kenny page healed");
+        assert_eq!(report.unhealable_thin, 0);
+    }
+
+    /// R4-A (spec §2.3 thin-set residual): a page whose ENTIRE lineage is retired cannot legally re-emit —
+    /// its post-exclusion fact-set falls below `PAGE_MIN_FACTS`, so `refresh_topic_page` returns
+    /// `SkippedThin` BEFORE any reasoner turn. This pass counts it `unhealable_thin` (a distinct outcome,
+    /// not an error), never retries it, and — per I1 — leaves the stale page CURRENT (provenance-true).
+    #[test]
+    fn refresh_stale_pages_counts_unhealable_thin_when_all_sources_retired() {
+        use crate::reflect::TopicRefreshOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        // A SINGLE-source topic: one memory + one edge → fact_count 2 == PAGE_MIN_FACTS → page-worthy.
+        let m = log.remember(&emb, "Gamma ships crates.").unwrap();
+        let gamma = log.entity("Gamma", &[], "product", "test-v1", std::slice::from_ref(&m)).unwrap();
+        let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m)).unwrap();
+        log.link_machine(&gamma, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m)).unwrap();
+        log.rebuild_graph().unwrap();
+        let ge = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == gamma).unwrap();
+        let f = log.gather_fact_set(&ge).unwrap();
+        let seed_reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f),
+            serde_json::json!({ "title": "Gamma",
+                "claims": [{ "text": "Gamma ships crates.", "cites": [m.clone()] }]}));
+        assert_eq!(log.refresh_topic_page(&seed_reasoner, &ge).unwrap(),
+            TopicRefreshOutcome::Emitted { superseded: false });
+        log.rebuild_graph().unwrap();
+
+        // Retire the ONLY source: the page's claim-cites union intersects `retired_notes` (stale), but the
+        // post-exclusion fact-set is 1 edge + 0 memories < PAGE_MIN_FACTS(2) → it cannot legally re-emit
+        // (§2.3 residual). An EMPTY ScriptedReasoner proves no compose call happens (SkippedThin fires
+        // BEFORE any reasoner turn — a scripted reasoner with no canned response errors if consulted).
+        log.retire_memory(&m, None).unwrap();
+        let report = log.refresh_stale_pages(&crate::reason::ScriptedReasoner::new("test-v1"), 8).unwrap();
+        assert_eq!(report.unhealable_thin, 1, "the all-retired-lineage page is counted, not retried as an error");
+        assert_eq!(report.healed, 0);
+        assert_eq!(report.reasoner_errors, 0, "no reasoner call for a thin topic");
+        // I1: reflection never retires a page — the stale page STAYS current (provenance-true) until new
+        // current facts arrive.
+        assert_eq!(log.current_pages().unwrap().len(), 1, "the stale page remains current");
     }
 
     /// R4-A (spec §2.2 step 2, arch B1): the read-only query→topic bridge resolves a missed query to
