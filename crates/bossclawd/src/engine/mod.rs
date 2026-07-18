@@ -591,6 +591,13 @@ impl EngineHandle {
         if !log.explicitly_set(ConfigFlag::ConflictDetect)? {
             log.set_conflict_detect_enabled(false)?;
         }
+        // Rung-4 R4-A (§2.1, I3): reflection is default-CLOSED — its getter already returns false when
+        // unset — so, like capture/conflict above, persist an EXPLICIT OFF the first time it was never set
+        // (a tamper-evident "this brain has reflection off" record). Idempotent: `explicitly_set` is true
+        // afterward, so a re-open writes nothing. This is the SIXTH sticky config event on a fresh brain.
+        if !log.explicitly_set(ConfigFlag::Reflect)? {
+            log.set_reflect_enabled(false)?;
+        }
         Ok(())
     }
 
@@ -1054,6 +1061,18 @@ impl EngineHandle {
             return false;
         };
         spawn_blocking(move || log.conflict_detect_enabled().unwrap_or(false))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// The reflection off-switch verdict, defaulting to `false` (OFF) on ANY error (not onboarded, open
+    /// failure, …). The gate the reflect sweep reads each cycle — it must never propagate an error (a
+    /// transient read failure must not trip reflection ON). Mirrors [`Self::conflict_detect_enabled_or_false`].
+    pub async fn reflect_enabled_or_false(&self, onboarded: bool) -> bool {
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return false;
+        };
+        spawn_blocking(move || log.reflect_enabled().unwrap_or(false))
             .await
             .unwrap_or(false)
     }
@@ -2231,11 +2250,13 @@ mod tests {
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
         // First open primes the autonomy switches OFF (SP3 `prime_switches`): the three original
-        // flags (evolve/proposals/mandates), the SP3 capture force-off, and the Rung-3 Phase-2
-        // conflict-detect force-off — so a fresh brain holds exactly those 5 sticky `config` events,
-        // not zero.
-        assert_eq!(st.event_count, 5);
+        // flags (evolve/proposals/mandates), the SP3 capture force-off, the Rung-3 Phase-2
+        // conflict-detect force-off, and the Rung-4 R4-A reflect force-off (design §4 I3) — so a fresh
+        // brain holds exactly those 6 sticky `config` events, not zero.
+        assert_eq!(st.event_count, 6, "prime_switches wrote the 6 sticky config events");
         assert!(st.chain_ok);
+        // I3 dormancy: a fresh brain has reflect forced explicitly OFF, so the sweeper gate is closed.
+        assert!(!h.reflect_enabled_or_false(true).await, "fresh brain: reflect is forced off");
         // Second call reuses the same instance (Arc ptr identical).
         let a = h.get_or_open(true).await.unwrap();
         let b = h.get_or_open(true).await.unwrap();
