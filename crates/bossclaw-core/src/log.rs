@@ -1046,6 +1046,37 @@ impl EventLog {
                 last_seq INTEGER NOT NULL
             )",
         )?;
+        // Rung-4 R4-A (§2.2): the durable miss backlog, re-derivable from the SP3 miss ring (I5). PK =
+        // trimmed-casefold sha256 so near-duplicate queries converge; `query_text` kept for the digest/UI.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS reflect_miss_backlog (
+                normalized_query_key TEXT PRIMARY KEY,
+                query_text           TEXT NOT NULL,
+                first_seen           INTEGER NOT NULL,
+                attempts             INTEGER NOT NULL DEFAULT 0,
+                state                TEXT NOT NULL DEFAULT 'open',
+                updated_at           INTEGER NOT NULL
+            )",
+        )?;
+        // Rung-4 R4-A (§2.4): cumulative operational counters (single row id=0).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS reflect_counters (
+                id                INTEGER PRIMARY KEY CHECK (id = 0),
+                refreshed_total   INTEGER NOT NULL DEFAULT 0,
+                no_material_total INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
+        // Rung-4 R4-A (§2.1/§2.4): progress cursor (single row id=0) — digest last-served totals + the
+        // daemon-supplied floor timing markers.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS reflect_cursor (
+                id                    INTEGER PRIMARY KEY CHECK (id = 0),
+                last_served_refreshed INTEGER NOT NULL DEFAULT 0,
+                last_served_no_material INTEGER NOT NULL DEFAULT 0,
+                last_completed_run_at INTEGER NOT NULL DEFAULT 0,
+                last_floor_fire_at    INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
         // spill to the filesystem. This is a connection-level setting; it must be
         // re-applied on every open.
@@ -7217,6 +7248,189 @@ impl EventLog {
         Ok(())
     }
 
+    // ── Rung-4 R4-A reflection progress state (re-derivable, spec §2.2/§2.4). PORTABLE. ──
+
+    /// Seed a miss into the backlog, upsert-IF-NEW (spec §2.2): a new key lands `open`; an existing key
+    /// (any state, incl. parked/no_material) is left UNTOUCHED so ring churn can never reset progress.
+    pub fn seed_miss(&self, key: &str, query: &str, now: i64) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO reflect_miss_backlog
+                 (normalized_query_key, query_text, first_seen, attempts, state, updated_at)
+             VALUES (?1, ?2, ?3, 0, 'open', ?3)
+             ON CONFLICT(normalized_query_key) DO NOTHING",
+            rusqlite::params![key, query, now],
+        )?;
+        Ok(())
+    }
+
+    /// The `(key, query_text, attempts)` of open misses, oldest `first_seen` first, capped at `limit`.
+    /// The `normalized_query_key` tiebreak makes the order total (stable across ties).
+    pub fn open_misses(&self, limit: usize) -> Result<Vec<(String, String, u32)>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT normalized_query_key, query_text, attempts FROM reflect_miss_backlog
+             WHERE state = 'open' ORDER BY first_seen ASC, normalized_query_key ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Count OPEN (unparked) misses (spec §2.1 floor input). `parked`/`no_material`/repaired states are
+    /// excluded by construction (only `state = 'open'` counts).
+    pub fn open_miss_count(&self) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM reflect_miss_backlog WHERE state = 'open'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Move a miss to a terminal or intermediate state (spec §2.2).
+    pub fn set_miss_state(
+        &self,
+        key: &str,
+        state: crate::reflect::MissState,
+        now: i64,
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "UPDATE reflect_miss_backlog SET state = ?2, updated_at = ?3
+             WHERE normalized_query_key = ?1",
+            rusqlite::params![key, state.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Age out TERMINAL-repaired backlog rows older than
+    /// [`crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS`] (spec §7.3, critic m1): `repaired_by_time` /
+    /// `candidate_repaired` are pruned (no forward information); `parked` / `no_material` PERSIST. Keeps
+    /// the table bounded. Returns the pruned row count. Called at the end of each `reflect_once` tick.
+    pub fn prune_reflect_backlog(&self, now: i64) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n = store.conn().execute(
+            "DELETE FROM reflect_miss_backlog
+             WHERE state IN ('repaired_by_time','candidate_repaired') AND updated_at < ?1",
+            rusqlite::params![now - crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS],
+        )?;
+        Ok(n)
+    }
+
+    /// Increment a miss's attempt count, returning the NEW count (spec §2.2).
+    pub fn bump_miss_attempt(&self, key: &str, now: i64) -> Result<u32, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        conn.execute(
+            "UPDATE reflect_miss_backlog SET attempts = attempts + 1, updated_at = ?2
+             WHERE normalized_query_key = ?1",
+            rusqlite::params![key, now],
+        )?;
+        Ok(conn.query_row(
+            "SELECT attempts FROM reflect_miss_backlog WHERE normalized_query_key = ?1",
+            rusqlite::params![key],
+            |r| r.get::<_, i64>(0),
+        )? as u32)
+    }
+
+    /// Add to the cumulative operational counters (spec §2.4). Upsert of the single row.
+    pub fn add_reflect_counters(
+        &self,
+        refreshed: i64,
+        no_material: i64,
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO reflect_counters (id, refreshed_total, no_material_total)
+             VALUES (0, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET refreshed_total = refreshed_total + ?1,
+                                           no_material_total = no_material_total + ?2",
+            rusqlite::params![refreshed, no_material],
+        )?;
+        Ok(())
+    }
+
+    /// Read the cumulative `(refreshed_total, no_material_total)` (spec §2.4). `(0,0)` if never written.
+    pub fn reflect_counters(&self) -> Result<(u64, u64), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let row: Option<(i64, i64)> = store
+            .conn()
+            .query_row(
+                "SELECT refreshed_total, no_material_total FROM reflect_counters WHERE id = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (a, b) = row.unwrap_or((0, 0));
+        Ok((a as u64, b as u64))
+    }
+
+    /// Read the reflect progress cursor (spec §2.1/§2.4). Default row if never written.
+    pub fn reflect_cursor(&self) -> Result<crate::reflect::ReflectCursor, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let row: Option<(i64, i64, i64, i64)> = store
+            .conn()
+            .query_row(
+                "SELECT last_served_refreshed, last_served_no_material,
+                        last_completed_run_at, last_floor_fire_at
+                 FROM reflect_cursor WHERE id = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (a, b, c, d) = row.unwrap_or((0, 0, 0, 0));
+        Ok(crate::reflect::ReflectCursor {
+            last_served_refreshed: a,
+            last_served_no_material: b,
+            last_completed_run_at: c,
+            last_floor_fire_at: d,
+        })
+    }
+
+    /// Advance the digest last-served totals (spec §2.4; T13 advances only on `source == "startup"`).
+    pub fn set_reflect_last_served(
+        &self,
+        refreshed: i64,
+        no_material: i64,
+    ) -> Result<(), BossclawError> {
+        self.upsert_reflect_cursor(
+            "last_served_refreshed = ?1, last_served_no_material = ?2",
+            rusqlite::params![refreshed, no_material],
+        )
+    }
+
+    /// Record the wall-clock of the last COMPLETED reflect run (daemon-supplied; §2.1 floor).
+    pub fn set_reflect_last_completed_run(&self, at: i64) -> Result<(), BossclawError> {
+        self.upsert_reflect_cursor("last_completed_run_at = ?1", rusqlite::params![at])
+    }
+
+    /// Record the wall-clock of the last floor fire (daemon-supplied; §2.1 floor re-fire guard).
+    pub fn set_reflect_last_floor_fire(&self, at: i64) -> Result<(), BossclawError> {
+        self.upsert_reflect_cursor("last_floor_fire_at = ?1", rusqlite::params![at])
+    }
+
+    /// Shared single-row upsert for `reflect_cursor` (the row is created with defaults if absent). The
+    /// `set_clause` is ALWAYS a compile-time literal from the three setters above (never user input), so
+    /// the `format!` is injection-impossible by construction; the mutated VALUES ride as bound `params`.
+    fn upsert_reflect_cursor(
+        &self,
+        set_clause: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        conn.execute("INSERT OR IGNORE INTO reflect_cursor (id) VALUES (0)", [])?;
+        conn.execute(
+            &format!("UPDATE reflect_cursor SET {set_clause} WHERE id = 0"),
+            params,
+        )?;
+        Ok(())
+    }
+
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
@@ -10828,6 +11042,65 @@ mod tests {
         }).unwrap();
         let d3 = log.conflict_digest_counts(log.conflict_digest_cursor().unwrap()).unwrap();
         assert_eq!((d3.dismissed, d3.kept), (1, 1), "dismissed + coexist counted since the cursor");
+    }
+
+    /// Rung-4 R4-A (§2.2/§2.4/§7.3): the miss backlog is upsert-if-new (ring churn never resets
+    /// progress), a terminal transition drops a row from `open` while `parked`/`no_material` persist,
+    /// TERMINAL-repaired rows age out after the TTL, and the counters + cursor round-trip.
+    #[test]
+    fn reflect_backlog_seeds_upsert_only_transitions_and_counters_roundtrip() {
+        use crate::reflect::{normalized_query_key, MissState};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let k1 = normalized_query_key("where is kenny?");
+        let k2 = normalized_query_key("what is beta?");
+
+        // Seed twice: upsert-if-new keeps the FIRST first_seen/state (no reset of progress).
+        log.seed_miss(&k1, "where is kenny?", 100).unwrap();
+        log.seed_miss(&k1, "where is kenny?", 200).unwrap(); // ignored (already present)
+        log.seed_miss(&k2, "what is beta?", 150).unwrap();
+        let open = log.open_misses(10).unwrap();
+        assert_eq!(open.len(), 2, "two open misses");
+        assert_eq!(open[0].0, k1, "oldest first_seen first"); // k1 seeded at 100 < k2 at 150
+
+        // A terminal transition removes it from `open`; parked/no_material persist (spec §7.3).
+        log.set_miss_state(&k1, MissState::NoMaterial, 300).unwrap();
+        assert_eq!(log.open_misses(10).unwrap().len(), 1, "no_material is no longer open");
+
+        // Attempt bump returns the new count; at budget the caller parks (see T7).
+        let a = log.bump_miss_attempt(&k2, 400).unwrap();
+        assert_eq!(a, 1, "first attempt");
+
+        // §7.3 age-out (critic m1): TERMINAL-repaired rows prune after the TTL; parked/no_material persist.
+        log.set_miss_state(&k2, MissState::CandidateRepaired, 500).unwrap();
+        let horizon = 500 + crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS + 1;
+        assert_eq!(
+            log.prune_reflect_backlog(horizon).unwrap(),
+            1,
+            "aged-out candidate_repaired row pruned"
+        );
+        assert_eq!(
+            log.prune_reflect_backlog(horizon).unwrap(),
+            0,
+            "no_material (k1) persists — it carries information (spec §7.3)"
+        );
+
+        // Counters accumulate; cursor holds the last-served totals + the daemon-supplied timing markers.
+        log.add_reflect_counters(3, 2).unwrap();
+        log.add_reflect_counters(1, 0).unwrap();
+        assert_eq!(log.reflect_counters().unwrap(), (4, 2), "refreshed_total, no_material_total");
+        let c0 = log.reflect_cursor().unwrap();
+        assert_eq!(
+            (c0.last_served_refreshed, c0.last_served_no_material),
+            (0, 0),
+            "nothing served yet"
+        );
+        log.set_reflect_last_served(4, 2).unwrap();
+        log.set_reflect_last_completed_run(999).unwrap();
+        log.set_reflect_last_floor_fire(888).unwrap();
+        let c = log.reflect_cursor().unwrap();
+        assert_eq!((c.last_served_refreshed, c.last_served_no_material), (4, 2));
+        assert_eq!((c.last_completed_run_at, c.last_floor_fire_at), (999, 888));
     }
 
     /// Open-Q9: the accepted both-sides torn-write edge is DIGEST-VISIBLE, which is what makes it
