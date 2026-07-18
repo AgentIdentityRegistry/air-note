@@ -39,6 +39,7 @@ pub mod ollama;
 pub mod reason;
 pub mod recall;
 pub mod reconcile;
+pub mod reflect;
 pub mod sign;
 pub mod summarize;
 pub mod store;

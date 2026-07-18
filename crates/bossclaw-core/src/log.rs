@@ -8181,83 +8181,19 @@ impl EventLog {
                 // with a seq PAST the advanced cursor, re-dirtying the topic
                 // for the next tick. Nothing is silently dropped forever.
             };
-            let facts = match self.gather_fact_set(&entity) {
-                Ok(f) if f.fact_count() >= crate::summarize::PAGE_MIN_FACTS => f,
-                _ => continue, // too thin, or a gather error → skip this topic (F4)
-            };
-            let raw = match reasoner.complete_json(
-                crate::summarize::SUMMARIZE_SYSTEM,
-                &crate::summarize::build_compose_prompt(&facts),
-                &crate::summarize::compose_schema(),
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!("summarize: compose failed for {topic_id}, skipping: {e}");
-                    continue;
-                }
-            };
-            let draft = match crate::summarize::parse_draft(&raw) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::warn!("summarize: malformed draft for {topic_id}, skipping: {e}");
-                    continue;
-                }
-            };
-            let floored = crate::summarize::citation_floor(&draft, &facts);
-            // F4: the empty-floor path NEVER reaches emit_page/append (an empty
-            // source set would hit the Tier-B reject and is not an emit anyway).
-            let rendered = match crate::summarize::assemble(&floored) {
-                Some(r) => r,
-                None => continue,
-            };
-            // Idempotency (F6): compare the cited-source SET against the current
-            // page; an unchanged grounding set emits nothing (no supersede churn).
-            let prior = self.current_page_for_topic(topic_id)?;
-            if let Some((_pid, prior_cites)) = &prior {
-                if prior_cites == &rendered.cites {
-                    continue;
-                }
-            }
-            // Canonicalize each claim's own `cites` for F7 signed content. This
-            // is NOT removable and NOT a duplicate of assemble(): assemble() sorts
-            // the cites UNION to produce `source_event_ids` (the page-level set),
-            // while this block sorts each INDIVIDUAL claim's `cites` array (the
-            // per-claim attribution stored in `content.claims[].cites`). Removing
-            // this leaves per-claim cites in raw model order → JCS-canonical
-            // signing becomes non-deterministic. The cap precedes signing.
-            let claims_json: Vec<serde_json::Value> = floored
-                .claims
-                .iter()
-                .map(|c| {
-                    let mut cites = c.cites.clone();
-                    cites.sort();
-                    cites.dedup();
-                    serde_json::json!({ "text": c.text, "cites": cites })
-                })
-                .collect();
-            let claims_capped =
-                &claims_json[..claims_json.len().min(crate::summarize::MAX_CLAIMS_PER_PAGE)];
-            let prior_id = prior.as_ref().map(|(id, _)| id.as_str());
-            match self.emit_page(
-                topic_id,
-                &rendered.title,
-                &rendered.text,
-                claims_capped,
-                &[],
-                reasoner.model_id(),
-                &facts.source_ids, // D8: engine gather lineage (taint anchor), not model cites
-                prior_id,
-            ) {
-                Ok((_pid, superseded)) => {
+            // Per-topic body extracted to `refresh_topic_page` (I9 single-source with
+            // reflection). The outcome maps to this batch's counters; every Skipped/error
+            // variant is a no-op `continue` (behavior-preserving vs the old inline body).
+            match self.refresh_topic_page(reasoner, &entity)? {
+                crate::reflect::TopicRefreshOutcome::Emitted { superseded } => {
                     report.pages_emitted += 1;
                     if superseded {
                         report.pages_superseded += 1;
                     }
                 }
-                Err(e) => {
-                    log::warn!("summarize: emit_page failed for {topic_id}, skipping: {e}");
-                    continue;
-                }
+                crate::reflect::TopicRefreshOutcome::SkippedUnchanged
+                | crate::reflect::TopicRefreshOutcome::SkippedThin
+                | crate::reflect::TopicRefreshOutcome::ReasonerError => {}
             }
         }
         // Refresh the projection only if the phase changed the page set.
@@ -8269,6 +8205,90 @@ impl EventLog {
             self.set_summarize_cursor(max_seq)?;
         }
         Ok(())
+    }
+
+    /// Refresh ONE topic's dossier through the citation-floored machinery (spec §2.2 step 3): gather →
+    /// (thin? → SkippedThin) → compose → citation floor → assemble → F6 cited-set idempotency → emit_page
+    /// (atomic supersede). PORTABLE, reasoner-only (no embedder: pages embed lazily via `append` and become
+    /// recall-visible at the caller's post-tick `rebuild_indexes`). Per-topic errors fold to `SkippedThin`
+    /// (F4: a topic failure must never propagate). Extracted from `summarize_topics` so evolve's batch AND
+    /// reflection share ONE composer (I9 single-source) — the §2.3 gather exclusion applies to both by
+    /// construction (it lives in `gather_fact_set`).
+    fn refresh_topic_page(
+        &self,
+        reasoner: &dyn crate::reason::Reasoner,
+        entity: &crate::graph::Entity,
+    ) -> Result<crate::reflect::TopicRefreshOutcome, BossclawError> {
+        use crate::reflect::TopicRefreshOutcome;
+        let facts = match self.gather_fact_set(entity) {
+            Ok(f) if f.fact_count() >= crate::summarize::PAGE_MIN_FACTS => f,
+            _ => return Ok(TopicRefreshOutcome::SkippedThin), // too thin, or a gather error (F4)
+        };
+        let raw = match reasoner.complete_json(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            &crate::summarize::compose_schema(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("refresh: compose failed for {}, skipping: {e}", entity.entity_id);
+                return Ok(TopicRefreshOutcome::ReasonerError);
+            }
+        };
+        let draft = match crate::summarize::parse_draft(&raw) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("refresh: malformed draft for {}, skipping: {e}", entity.entity_id);
+                return Ok(TopicRefreshOutcome::SkippedThin);
+            }
+        };
+        let floored = crate::summarize::citation_floor(&draft, &facts);
+        // F4: the empty-floor path NEVER reaches emit_page/append (an empty source
+        // set would hit the Tier-B reject and is not an emit anyway).
+        let rendered = match crate::summarize::assemble(&floored) {
+            Some(r) => r,
+            None => return Ok(TopicRefreshOutcome::SkippedThin), // empty floor (F4)
+        };
+        // Idempotency (F6): an unchanged cited-source SET emits nothing (no supersede churn).
+        let prior = self.current_page_for_topic(&entity.entity_id)?;
+        if let Some((_pid, prior_cites)) = &prior {
+            if prior_cites == &rendered.cites {
+                return Ok(TopicRefreshOutcome::SkippedUnchanged);
+            }
+        }
+        // Canonicalize each claim's own `cites` for F7 signed content (identical to
+        // summarize_topics's old inline block): assemble() sorts the cites UNION into
+        // `source_event_ids` (page-level), while this sorts each INDIVIDUAL claim's
+        // `cites` array (per-claim attribution). The cap precedes signing.
+        let claims_json: Vec<serde_json::Value> = floored
+            .claims
+            .iter()
+            .map(|c| {
+                let mut cites = c.cites.clone();
+                cites.sort();
+                cites.dedup();
+                serde_json::json!({ "text": c.text, "cites": cites })
+            })
+            .collect();
+        let claims_capped =
+            &claims_json[..claims_json.len().min(crate::summarize::MAX_CLAIMS_PER_PAGE)];
+        let prior_id = prior.as_ref().map(|(id, _)| id.as_str());
+        match self.emit_page(
+            &entity.entity_id,
+            &rendered.title,
+            &rendered.text,
+            claims_capped,
+            &[],
+            reasoner.model_id(),
+            &facts.source_ids, // D8: engine gather lineage (taint anchor), post-exclusion
+            prior_id,
+        ) {
+            Ok((_pid, superseded)) => Ok(TopicRefreshOutcome::Emitted { superseded }),
+            Err(e) => {
+                log::warn!("refresh: emit_page failed for {}, skipping: {e}", entity.entity_id);
+                Ok(TopicRefreshOutcome::SkippedThin)
+            }
+        }
     }
 
     /// Map a proposed mention to its resolved `entity:<ulid>` if known, else pass
@@ -12314,5 +12334,50 @@ mod tests {
         let g1 = log.gather_fact_set(&ce).unwrap();
         let g2 = log.gather_fact_set(&ce).unwrap();
         assert_eq!(g1.source_ids, g2.source_ids, "no retirement → gather is stable (control)");
+    }
+
+    /// R4-A (spec §2.2 step 3): the extracted `refresh_topic_page` maps ONE topic to its outcome
+    /// directly — `Emitted{superseded}` on a fresh emit, `SkippedUnchanged` when the cited set matches
+    /// the current page (F6 idempotency), `SkippedThin` below `PAGE_MIN_FACTS`. This drives the
+    /// behavior-preserving extraction out of `summarize_topics`; the untouched evolve/summarize
+    /// goldens are the proof the batch loop's behavior is unchanged.
+    #[test]
+    fn refresh_topic_page_returns_emitted_unchanged_or_thin() {
+        use crate::reflect::TopicRefreshOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        // Summary-worthy topic (>= PAGE_MIN_FACTS): one memory + one edge.
+        let m1 = log.remember(&emb, "Kenny works at Acme.").unwrap();
+        let topic = log.entity("Kenny", &[], "person", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        let acme = log.entity("Acme", &[], "org", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.link_machine(&topic, "works_at", &acme, 0.9, "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.rebuild_graph().unwrap();
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny works at Acme.", "cites": [m1] }]}),
+        );
+        // First refresh → Emitted (no prior page → not superseded).
+        assert_eq!(log.refresh_topic_page(&reasoner, &entity).unwrap(),
+            TopicRefreshOutcome::Emitted { superseded: false });
+        log.rebuild_graph().unwrap();
+        // Second refresh, identical grounding → SkippedUnchanged (F6 cited-set idempotency).
+        let entity2 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts2 = log.gather_fact_set(&entity2).unwrap();
+        let reasoner2 = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&facts2),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny works at Acme.", "cites": [
+                facts2.memories[0].0.clone()] }]}),
+        );
+        assert_eq!(log.refresh_topic_page(&reasoner2, &entity2).unwrap(), TopicRefreshOutcome::SkippedUnchanged);
+        // A topic below PAGE_MIN_FACTS → SkippedThin (no reasoner call needed).
+        let thin = log.remember(&emb, "lonely note").unwrap();
+        let te = log.entity("Lonely", &[], "misc", "test-v1", std::slice::from_ref(&thin)).unwrap();
+        log.rebuild_graph().unwrap();
+        let thin_entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == te).unwrap();
+        // fact_count = 0 edges + 1 memory = 1 < PAGE_MIN_FACTS(2) → thin.
+        assert_eq!(log.refresh_topic_page(&reasoner, &thin_entity).unwrap(), TopicRefreshOutcome::SkippedThin);
     }
 }
