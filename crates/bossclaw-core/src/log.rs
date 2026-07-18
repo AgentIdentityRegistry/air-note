@@ -7473,9 +7473,9 @@ impl EventLog {
         query: &str,
         now: i64,
     ) -> Result<crate::reflect::MissAttempt, BossclawError> {
-        use crate::reflect::TopicRefreshOutcome;
         use crate::reflect::{
-            MissAttempt, MissOutcome, MissState, REFLECT_MISS_ATTEMPT_BUDGET, REFLECT_RECALL_K,
+            MissAttempt, MissOutcome, MissState, TopicRefreshOutcome, REFLECT_MISS_ATTEMPT_BUDGET,
+            REFLECT_RECALL_K,
         };
         let opts = crate::recall::RecallOptions::default();
         // 1. Re-run recall. Hit → repaired_by_time (no reasoner call, no emit).
@@ -7539,6 +7539,8 @@ impl EventLog {
         }
         // CONTROLLER OVERRIDE: error precedence reasoner > transient > still-missing (both error kinds
         // consumed the attempt, same as the plan's ReasonerError semantics — bounded by the same budget).
+        // (Parked already returned above: a budget-exhausted attempt parks regardless of error kind —
+        // I6 bounded loss.)
         let outcome = if reasoner_errored {
             MissOutcome::ReasonerError
         } else if transient_errored {
@@ -12919,13 +12921,13 @@ mod tests {
         let a1 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 20).unwrap();
         assert_eq!(a1.outcome, MissOutcome::StillMissing, "refresh fired but the replay still misses");
         assert_eq!(a1.dossiers_emitted, 1, "attempt 1 emitted a real dossier revision");
-        log.rebuild_graph().unwrap(); // the tick-boundary projection refresh the daemon wrapper performs
+        // (No external rebuild needed between attempts: attempt 1's visibility block already projected
+        // the page; the F6 check reads that projection.)
 
         // Attempt 2: identical grounding → F6 skips the emit; the attempt still accrues.
         let a2 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 30).unwrap();
         assert_eq!(a2.outcome, MissOutcome::StillMissing);
         assert_eq!(a2.dossiers_emitted, 0, "F6 cited-set idempotency: no re-emit on an unchanged topic");
-        log.rebuild_graph().unwrap();
 
         // Attempt 3 = REFLECT_MISS_ATTEMPT_BUDGET → parked (bounded loss, I6/I9).
         let a3 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 40).unwrap();
@@ -12948,8 +12950,9 @@ mod tests {
         log.rederive_entity_vectors_pending(&emb).unwrap(); // MAJOR-1
         log.rebuild_entity_index(&emb).unwrap();
 
-        // The scripted claim text NAMES the topic, so the emitted page keyword-matches the replay query
-        // (the FTS side is live on append — the within-tick visibility note above).
+        // The scripted claim text NAMES the topic, so the emitted page keyword-matches the replay query.
+        // The visibility block's keyword_add indexes the fresh page into the FTS arm, and its
+        // rebuild_graph keeps it past the F2 gate — so the replay's keyword arm hits it.
         let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
         let facts = log.gather_fact_set(&entity).unwrap();
         let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
