@@ -2,6 +2,13 @@
 
 > For agentic workers: REQUIRED SUB-SKILL: superpowers:subagent-driven-development
 
+**Status:** Rev 2 (2026-07-19) — folded the dual plan review (critic APPROVE-WITH-CHANGES + architect REVISE,
+all mechanical). See "Rev 2 changelog" at the bottom for the item→edit map. Key folds: the
+`rederive_entity_vectors_pending` derive-before-index fix (ARCH MAJOR-1), all THREE trip-wires flip in T2
+(ARCH MAJOR-2), zero-elision test code (CRITIC M1), digest counts REAL dossier emits only (CRITIC M2/OQ4),
+`REFLECT_TOPIC_FLOOR = 0.92` (CRITIC M3/OQ1), `HarnessDaemon::engine()` control surface (OQ2), and all five
+open questions LOCKED.
+
 **Goal.** Give the daemon a fourth background loop — a **night cleaner** — that, when the room is quiet,
 (1) repairs the specific recall gaps the owner actually hit (consuming the SP3 recall-miss telemetry that today
 has no *acting* consumer) and (2) refreshes dossiers whose cited sources went stale (the aftermath of a Rung-3
@@ -32,8 +39,8 @@ one deliberate, named, Reflect-independent behavior change (I3, below).
   capture-style pure decide fn); `reflect_enabled_or_false`; the `prime_switches` force-off; the
   `SetReflectEnabled`/`ReflectEnabled` dispatch arms; and the never-truncated snapshot digest line.
 - **`air_agent_desktop` (the settings surface).** One toggle in a dedicated Reflect settings block (command +
-  registration + `Engine`/`EngineClient` methods + TS invoke + React panel + tests), and the desktop half of
-  the `5 → 6` fresh-brain trip-wire.
+  registration + `Engine`/`EngineClient` methods + TS invoke + React panel + tests) plus the LibraryPanel
+  miss-strip disclosure copy fix. (The desktop `5 → 6` trip-wire flips in T2, with the other two sites.)
 - **`memharness` (dev-only, never ships).** The reflection non-regression **gate** (page-hit resolution so a
   reflected brain's dossier hits do not abort the run; a run-to-quiescence driver; `recall_regressed` as the
   SHIP gate; union-coverage as a separate REPORTED metric) plus the two REPORTED evidence probes (held-out
@@ -86,6 +93,7 @@ these are the CURRENT branch values). Re-grep before editing if the file has dri
 | `entity_search` → `Vec<(entity_id, cosine_dist∈[0,2])>` (index keyed by `entity_id` at `:6429`) | `bossclaw-core/log.rs` | `:6576` |
 | `resolve_mention` (`1.0 - dist`; `resolve_decision`) / `RESOLVE_HIGH`=0.92 / `RESOLVE_LOW`=0.75 / `GRAPH_CONTEXT_K`=8 | `log.rs` / `extract.rs` | `:6979` / `:19` / `:24` / `:57` |
 | `all_entities` → `Vec<Entity>` / `Entity{entity_id,label,aliases,entity_type}` / `rebuild_entity_index` | `log.rs` / `graph.rs` / `log.rs` | `:2669` / `:277` / `:6425` |
+| `rederive_entity_vectors_pending(&emb)→usize` (derives vectors for entities missing one; `log.entity` `:2628` mints NO vector — derive happens ONLY at evolve-mint `derive_entity_vector` `:9152` or here) / `stream_all`(pub) | `bossclaw-core/log.rs` | `:2449` / `:9152` / `:1423` |
 | `recall` / `RecallOptions` / `Hit{event_id,score,sources,kind}` | `log.rs` / `recall.rs` / `recall.rs` | `:1790` / `:76` / `:35` |
 | `SessionFold{superseded:9531, retired_notes:9539}` / `fold_sessions` / `session_events_ordered` | `bossclaw-core/log.rs` | `:9519` / `:9607` / `:5725` |
 | `MEMORY_EVENT_TYPE`"memory" / `PAGE_EVENT_TYPE`"page" / `SESSION_CAPTURED_EVENT_TYPE`"session_captured" | `bossclaw-core/graph.rs` | `:23` / `:30` / `:35` |
@@ -99,7 +107,7 @@ these are the CURRENT branch values). Re-grep before editing if the file has dri
 | engine lock fields (`evolve_lock:281`,`conflict_lock:284`,`resolve_lock:294`) + `new()` init | `bossclawd/engine/mod.rs` | `:279-303` / `:336-342` |
 | `EvolveTelemetry` / `ConflictTelemetry`(template) / `record_tick` / `record_tick_into` | `bossclawd/engine/mod.rs` | `:244` / `:258` / `:1010` / `:1849` |
 | `evolve_once` wrapper (lock→consent→ensure_indexed→spawn_blocking{rebuild_entity_index; core; rebuild_indexes; rebuild_graph}→record) | `bossclawd/engine/mod.rs` | `:956` |
-| `cloud_consent_ok` / `evolve_enabled_or_false` / `conflict_detect_enabled_or_false`(T2 template) / `capture_enabled` / `set_evolve_enabled` / `is_onboarded_local` | `bossclawd/engine/mod.rs` | `:1692` / `:1040` / `:1052` / `:512` / `:1274` / `:407` |
+| `cloud_consent_ok` / `evolve_enabled_or_false` / `conflict_detect_enabled_or_false`(T2 template) / `capture_enabled` / `set_evolve_enabled` / `is_onboarded_local` / `queue_depth_or_zero` / `get_or_open`(pub) | `bossclawd/engine/mod.rs` | `:1692` / `:1040` / `:1052` / `:512` / `:1274` / `:407` / `:1266` / `:372` |
 | `serve_conflict_digest_lines` / `build_digest_lines`(pure) / byte-exact test | `bossclawd/engine/mod.rs` | `:1222` / `:1249` / `:2129` |
 | `prime_switches` (5 force-offs) / fresh-brain trip-wire `assert_eq!(st.event_count, 5)` | `bossclawd/engine/mod.rs` | `:564` / `:2237` |
 | `dispatch` / `SetCaptureEnabled` arm(`unit_result`→`Response::Ok`) / `CaptureEnabled` arm / `override_onboarding_for_guest`(`_ => None :233`) / `now_unix_secs` | `bossclawd/server.rs` | `:251` / `:492` / `:497` / `:211` / `:568` |
@@ -108,7 +116,7 @@ these are the CURRENT branch values). Re-grep before editing if the file has dri
 | proto `PROTO_VERSION`=1 / `Role::allows`(App=true) / `SetCaptureEnabled`(App-only) / `CaptureEnabled` / `Response::Ok` / `Response::CaptureEnabled(bool)` / six-ops test(`no` set) / `proto_version_still_one` | `bossclawd-proto/lib.rs` | `:44` / `:74` / `:250` / `:253` / `:298` / `:361` / `:865` / `:944` |
 | `HitWire{hit,text}` / `HitMirror.kind` / `RecallMissWire{query,at}` / `RecallStatsWire` | `proto/lib.rs`,`proto/types.rs` | `:423` / `:337` / `:804` / `:812` |
 | daemon-side trip-wire `assert_eq!(s.event_count, 5, ...)` | `bossclawd/tests/roundtrip.rs` | `:173` |
-| desktop trip-wire `assert_eq!(st.event_count, 5, ...)` / `set_capture_enabled` / `capture_enabled` / round-trip test | `apps/desktop/src-tauri/src/engine/client.rs` | `:973` / `:436` / `:447` / `:1272` |
+| desktop trip-wire `assert_eq!(st.event_count, 5, ...)` in `status_shape_parity_over_socket` (`:964`; stale "5, not 4" comment `:967-969` updates with it) / `set_capture_enabled` / `capture_enabled` / round-trip test | `apps/desktop/src-tauri/src/engine/client.rs` | `:973` / `:436` / `:447` / `:1272` |
 | desktop `Engine::set_capture_enabled`/`capture_enabled` / command `integrations_set_capture_enabled`(`:103`)+`integrations_capture_enabled`(`:121`) / registration | `desktop engine/mod.rs`,`commands/integrations.rs`,`main.rs` | `:502` / `:103` / `:246-249` |
 | desktop TS `setCaptureEnabled`/`captureEnabled` + test / React `IntegrationsPanel`(state`:34`,handler`:87`,JSX`:135`) + test / mount `AirSettings.tsx:22` | `apps/desktop/src/...` | `api/integrations.ts:47,54` / `api/integrations.test.ts:37` / `settings/IntegrationsPanel.tsx` / `IntegrationsPanel.test.tsx:81` |
 | memharness `RetrievedHit{page_id,snippet}` / `gold_rank` / `dedup_by_page` / `map_hits`(loud call `:106`) | `memharness/arms.rs` | `:12` / `:18` / `:24` / `:98` |
@@ -117,7 +125,9 @@ these are the CURRENT branch values). Re-grep before editing if the file has dri
 | memharness `recall_regressed` / `SegmentComparison` / `REGRESSION_ALPHA`=0.05 / `compare_runs` | `memharness/compare.rs` | `:136` / `:13` / `:123` / `:59` |
 | memharness `prepare_corpus` / `manifest_sha` / `CorpusManifest` / `STRIP_FRONTMATTER` / `save_cases`/`load_cases` | `memharness/corpus.rs`,`cases.rs` | `:87` / `:42` / `:31` / `:19` / `:35`/`:53` |
 | memharness judge ladder: `TRUST_AGREEMENT_MIN`=0.85 / `TRUST_KAPPA_MIN`=0.6 / `trust_verdict` / `judge_pair_blind` / `PairJudge` / `assign_blind` / `AUDIT_FLOOR`=30 | `memharness/judge.rs` | `:67` / `:68` / `:89` / `:241` / `:135` / `:213` / `:263` |
-| memharness `HarnessDaemon::spawn_real`/`spawn_with_provider` / `WireClient`(`connect`,`add_grant`,`run_ingest`,`list_files`,`recall`) / `Command` enum | `memharness/daemon.rs`,`client.rs`,`main.rs` | `:61`/`:74` / `:29,63,72,82,91` / `:25` |
+| memharness `HarnessDaemon::spawn_real`/`spawn_with_provider` / `start_runtime` `bound_tx` sync-channel handshake (engine built via `bossclawd::server::test_engine*` at `:126-129`, sent-ok at `:130-131` — the T14 `engine()` insertion point) / `WireClient`(`connect`,`add_grant`,`run_ingest`,`list_files`,`recall`) / `Command` enum | `memharness/daemon.rs`,`client.rs`,`main.rs` | `:61`/`:74` / `:90-131` / `:29,63,72,82,91` / `:25` |
+| bossclawd authz socket harness: `RoleClient`/`connect`/`call(req)→Response` / `spawn_onboarded_daemon()→(TempDir,PathBuf)` / `is_not_permitted` (`OpErrorKindWire::NotPermitted`) | `bossclawd/tests/authz.rs` | `:19`/`:24`/`:34` / `:43` / `:63` |
+| desktop LibraryPanel miss-strip: stale "read-only" framing comments (the §2.4 disclosure copy, T12b) | `apps/desktop/src/memory/LibraryPanel.tsx` | `:40` / `:253` |
 
 ---
 
@@ -137,14 +147,16 @@ these are the CURRENT branch values). Re-grep before editing if the file has dri
 | `crates/bossclawd/src/telemetry.rs` | Modify | `take_recent_misses` drain accessor; disclosure doc-header update (T10). |
 | `crates/bossclawd/src/capture/snapshot.rs` | Modify | `build` prepends `serve_reflect_digest_line(source)` into the preamble (T13). |
 | `crates/bossclawd/tests/roundtrip.rs` | Modify | Trip-wire `5 → 6` (T2). |
-| `crates/bossclawd/tests/reflect_e2e.rs` | **Create** | End-to-end enable→seed→tick→digest daemon test + guest-refused test (T16). |
-| `apps/desktop/src-tauri/src/engine/client.rs` | Modify | `set_reflect_enabled`/`reflect_enabled` client methods; trip-wire `5 → 6` (T12b). |
+| `crates/bossclawd/tests/authz.rs` | Modify | Over-the-socket reflect App-only test (App enable/read round-trip + guest `NotPermitted`), reusing the file's own `RoleClient`/`spawn_onboarded_daemon`/`is_not_permitted` helpers (T16). |
+| `apps/desktop/src-tauri/src/engine/client.rs` | Modify | Trip-wire `5 → 6` in `status_shape_parity_over_socket` (T2); `set_reflect_enabled`/`reflect_enabled` client methods + round-trip test (T12b). |
 | `apps/desktop/src-tauri/src/engine/mod.rs` | Modify | `Engine::set_reflect_enabled`/`reflect_enabled` (T12b). |
 | `apps/desktop/src-tauri/src/commands/integrations.rs` | Modify | `integrations_set_reflect_enabled`/`integrations_reflect_enabled` commands + tests (T12b). |
 | `apps/desktop/src-tauri/src/main.rs` | Modify | Register the two commands (T12b). |
 | `apps/desktop/src/api/integrations.ts`(+`.test.ts`) | Modify | `setReflectEnabled`/`reflectEnabled` invoke wrappers + tests (T12b). |
 | `apps/desktop/src/settings/ReflectPanel.tsx`(+`.test.tsx`) | **Create** | The Reflect toggle panel + component test (T12b). |
 | `apps/desktop/src/settings/AirSettings.tsx` | Modify | Mount `<ReflectPanel/>` (T12b). |
+| `apps/desktop/src/memory/LibraryPanel.tsx` | Modify | Miss-strip §2.4 disclosure copy: "read-only" framing → active-drive wording (T12b). |
+| `crates/memharness/src/daemon.rs` | Modify | `HarnessDaemon.engine` field + `engine()` accessor — the `bound_tx` handshake carries the `Arc<EngineHandle>` out (T14, OQ2 lock). |
 | `crates/memharness/src/resolve.rs`,`arms.rs` | Modify | `PageResolver` resolves page-kind hits as synthetic non-gold occupants (T14). |
 | `crates/memharness/src/reflect_pass.rs` | **Create** | Run-to-quiescence reflected-pass driver + union-coverage metric (T14). |
 | `crates/memharness/src/probes.rs` | **Create** | Held-out generalization (d) + dossier-vs-source A/B (e) runners (T15). |
@@ -191,12 +203,18 @@ pub const REFLECT_RECALL_K: usize = 5;
 
 /// Minimum cosine SIMILARITY (= `1.0 - entity_search` cosine distance, which lies in `[0,2]`; the
 /// conversion mirrors `resolve_mention`, log.rs:6987) for a missed query to resolve to a KNOWN topic
-/// (spec §2.2 step 2 / §7.2). Anchored to `extract::RESOLVE_LOW` (0.75) — the similarity BELOW which
-/// evolve's own `resolve_decision` treats a mention as a brand-new entity (Mint) — so reflection never
-/// claims to "know" a topic evolve itself would have minted fresh. Conservative per §7.2 (a too-high
-/// floor merely yields more honest `no_material`); §5.3(d) tunes it upward toward `RESOLVE_HIGH` (0.92,
-/// evolve's auto-merge bar) if precision demands. Compared as `1.0 - dist >= REFLECT_TOPIC_FLOOR`.
-pub const REFLECT_TOPIC_FLOOR: f32 = 0.75;
+/// (spec §2.2 step 2 / §7.2; plan-review OQ1 LOCK). Anchored to `extract::RESOLVE_HIGH` (0.92,
+/// extract.rs:19/:146) — evolve's OWN autonomous-action bar: in the `[RESOLVE_LOW, RESOLVE_HIGH)` band
+/// evolve refuses to self-act and asks a model to adjudicate, so an AUTONOMOUS reflection refresh must
+/// not be bolder than the awake loop's auto-merge. Conservative-first per §7.2 (a too-high floor merely
+/// yields more honest `no_material`); §5.3(d) tunes DOWNWARD toward `RESOLVE_LOW` (0.75) only if the
+/// held-out probe shows precision allows it. Compared as `1.0 - dist >= REFLECT_TOPIC_FLOOR`.
+pub const REFLECT_TOPIC_FLOOR: f32 = 0.92;
+
+/// Age-out horizon for TERMINAL-repaired backlog rows (spec §7.3): `repaired_by_time` /
+/// `candidate_repaired` rows older than this are pruned (they carry no forward information);
+/// `parked` / `no_material` PERSIST (they do — "we tried and could not" / "we never knew this").
+pub const REFLECT_BACKLOG_TERMINAL_TTL_SECS: i64 = 30 * 86_400;
 ```
 
 ---
@@ -314,19 +332,22 @@ const REFLECT_ENABLED_KEY: &str = "reflect_enabled";
 
 ---
 
-## Task 2 — `prime_switches` force-off + `reflect_enabled_or_false` + the TWO daemon trip-wires 5→6 (daemon)
+## Task 2 — `prime_switches` force-off + `reflect_enabled_or_false` + ALL THREE trip-wires 5→6 (daemon + desktop)
 
 Spec §2.1 / §4 I3 / §5.4. Adds the sixth `prime_switches` write (unconditional-persist-OFF like
 `ConflictDetect`), the fail-closed engine gate the sweeper reads each tick (mirroring
 `conflict_detect_enabled_or_false` `:1052`), and moves the fresh-brain config-event-count trip-wire from `5` to
-`6` at the TWO **daemon-side** sites. (The desktop third site `client.rs:973` is T12b's.) `engine/mod.rs` is a
-`#[cfg(unix)]` module → no per-fn gates.
+`6` at **ALL THREE sites in this ONE task** (ARCH MAJOR-2: the desktop parity test asserts the same fresh-brain
+count over the socket, so bumping only the daemon sites would leave `air_agent_desktop` red from T2 until T12b
+— no crate is ever left failing between tasks). `engine/mod.rs` is a `#[cfg(unix)]` module → no per-fn gates.
 
 **Files**
 - Modify: `crates/bossclawd/src/engine/mod.rs` — `prime_switches` (`:564`, after the ConflictDetect force-off
   `:591-593`); `reflect_enabled_or_false` (beside `conflict_detect_enabled_or_false` `:1052`); the fresh-brain
   test assertion `:2237`.
 - Modify: `crates/bossclawd/tests/roundtrip.rs` — the trip-wire assertion `:173`.
+- Modify: `apps/desktop/src-tauri/src/engine/client.rs` — the trip-wire assertion `:973` inside
+  `status_shape_parity_over_socket` (`:964`), including its stale "5, not 4" history comment (`:967-969`).
 - Test: `crates/bossclawd/src/engine/mod.rs` `mod tests` (the existing fresh-brain test, updated).
 
 **Steps**
@@ -353,8 +374,21 @@ Spec §2.1 / §4 I3 / §5.4. Adds the sixth `prime_switches` write (unconditiona
         assert_eq!(s.event_count, 6, "prime_switches wrote the 6 sticky config events");
 ```
 
-2. Run → FAIL: `cargo test -p bossclawd --lib engine::` and `cargo test -p bossclawd --test roundtrip`
-   Expected: the count assertions fail (`5 != 6`) and `no method named reflect_enabled_or_false`.
+   In `apps/desktop/src-tauri/src/engine/client.rs` (`status_shape_parity_over_socket`, `:964`): update the
+   history comment at `:967-969` and the assertion at `:973`:
+
+```rust
+        // Onboarded → fresh brain opens Ready with exactly the 6 primed config events + intact chain,
+        // IDENTICAL to `EngineHandle::status` (see `mod.rs::onboarded_opens_fresh_brain_and_memoizes`).
+        // (SP3 A8 → 4; Rung-3 Phase-2 conflict-detect force-off → 5; Rung-4 R4-A reflect force-off → 6.)
+        let st = bounded(client.status(true)).await;
+        assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
+        assert_eq!(st.event_count, 6, "prime_switches wrote the 6 sticky config events");
+```
+
+2. Run → FAIL: `cargo test -p bossclawd --lib engine::`, `cargo test -p bossclawd --test roundtrip`, and
+   `cargo test -p air_agent_desktop status_shape_parity_over_socket`
+   Expected: all three count assertions fail (`5 != 6`) and `no method named reflect_enabled_or_false`.
 
 3. Implement.
    (a) `prime_switches` (after the `ConflictDetect` block ending `:593`):
@@ -385,10 +419,11 @@ Spec §2.1 / §4 I3 / §5.4. Adds the sixth `prime_switches` write (unconditiona
     }
 ```
 
-4. Run → PASS: `cargo test -p bossclawd --lib engine::` and `cargo test -p bossclawd --test roundtrip`
+4. Run → PASS: `cargo test -p bossclawd --lib engine::`, `cargo test -p bossclawd --test roundtrip`, and
+   `cargo test -p air_agent_desktop status_shape_parity_over_socket`
    Regression: `cargo test -p bossclawd --lib prime_switches`
 
-5. Commit: `feat(rung4-a): prime_switches force-off Reflect + reflect_enabled_or_false + daemon trip-wire 5→6`
+5. Commit: `feat(rung4-a): prime_switches force-off Reflect + reflect_enabled_or_false + trip-wire 5→6 at all three sites`
 
 ---
 
@@ -402,9 +437,14 @@ BOTH evolve's summarize and reflection's refresh — the I9 single-source lesson
 
 **Verified single-seam placement.** `fact_texts_for_ids` has EXACTLY ONE caller — `gather_fact_set:8098` (grep
 confirmed). `gather_fact_set` builds `lineage` (`:8087-8097`) then derives BOTH `memories =
-fact_texts_for_ids(&lineage)` AND `source_ids: lineage` (`:8098-8099`). So filtering `lineage` in
-`gather_fact_set` shrinks BOTH the gathered memory texts AND the cited `source_event_ids` — precisely the
-"texts-AND-cited-ids" correctness note (§2.3). The exclusion set is `fold.superseded ∪ fold.retired_notes`,
+fact_texts_for_ids(&lineage)` AND `source_ids: lineage` (`:8098-8099`). So the ONE lineage filter shrinks both
+cited sets at once (ARCH minor-c precision): (a) the **emit-idempotency key** — the per-claim CITES UNION that
+`current_page_for_topic` reads (`log.rs:8051-8064`) and the emit compares (`:8161-8166`) — shrinks because
+`citation_floor` drops any claim citing outside the filtered fact-set, so the model can no longer cite the
+excluded ids; and (b) the **page-level D8 `source_event_ids` provenance anchor** (`facts.source_ids`) shrinks
+directly. These are two DISTINCT sets (the key is claim-derived; the anchor is engine-gathered) healed by the
+same filter — the §2.3 "texts-AND-cited-ids" correctness note, stated precisely. The exclusion set is
+`fold.superseded ∪ fold.retired_notes`,
 the SAME "gone" set recall's memory arm already uses (`log.rs:1853-1865`). This is the ONLY behavior change:
 for a fresh corpus with no retirements the fold sets are empty → gather is byte-identical (why the existing
 evolve/summarize goldens stay green). Portable (ungated).
@@ -823,6 +863,13 @@ fn reflect_backlog_seeds_upsert_only_transitions_and_counters_roundtrip() {
     let a = log.bump_miss_attempt(&k2, 400).unwrap();
     assert_eq!(a, 1, "first attempt");
 
+    // §7.3 age-out (critic m1): TERMINAL-repaired rows prune after the TTL; parked/no_material persist.
+    log.set_miss_state(&k2, MissState::CandidateRepaired, 500).unwrap();
+    let horizon = 500 + crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS + 1;
+    assert_eq!(log.prune_reflect_backlog(horizon).unwrap(), 1, "aged-out candidate_repaired row pruned");
+    assert_eq!(log.prune_reflect_backlog(horizon).unwrap(), 0,
+        "no_material (k1) persists — it carries information (spec §7.3)");
+
     // Counters accumulate; cursor holds the last-served totals + the daemon-supplied timing markers.
     log.add_reflect_counters(3, 2).unwrap();
     log.add_reflect_counters(1, 0).unwrap();
@@ -876,8 +923,18 @@ impl MissState {
     }
 }
 
-/// The result of ONE `attempt_miss` (spec §2.2). Consumed by `reflect_once` to tally the report + persist
-/// the state. PORTABLE.
+/// The result of ONE `attempt_miss` (spec §2.2): the classification PLUS the number of REAL dossier
+/// revisions the attempt emitted (critic M2/OQ4: the digest's "refreshed" unit counts only true
+/// `TopicRefreshOutcome::Emitted`s — `candidate_repaired` alone never feeds it). PORTABLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissAttempt {
+    /// The classification this attempt reached.
+    pub outcome: MissOutcome,
+    /// How many topics' dossiers this attempt ACTUALLY re-emitted (step 3 `Emitted` count).
+    pub dossiers_emitted: usize,
+}
+
+/// The classification of ONE `attempt_miss` (spec §2.2). Carried inside [`MissAttempt`]. PORTABLE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissOutcome {
     /// Recall now hits without any refresh (step 1).
@@ -917,6 +974,8 @@ pub struct ReflectReport {
     pub repaired_by_time: usize,
     pub no_material: usize,
     pub parked: usize,
+    /// REAL dossier revisions emitted this tick = miss-pipeline `Emitted`s + stale-refresh heals — the
+    /// digest's honest "refreshed" unit (critic M2/OQ4). NEVER counts `candidate_repaired` by itself.
     pub dossiers_refreshed: usize,
     pub unhealable_thin: usize,
     pub merge_proposed: usize,
@@ -1029,6 +1088,20 @@ pub struct ReflectCursor {
         Ok(())
     }
 
+    /// Age out TERMINAL-repaired backlog rows older than
+    /// [`crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS`] (spec §7.3, critic m1): `repaired_by_time` /
+    /// `candidate_repaired` are pruned (no forward information); `parked` / `no_material` PERSIST. Keeps
+    /// the table bounded. Returns the pruned row count. Called at the end of each `reflect_once` tick.
+    pub fn prune_reflect_backlog(&self, now: i64) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n = store.conn().execute(
+            "DELETE FROM reflect_miss_backlog
+             WHERE state IN ('repaired_by_time','candidate_repaired') AND updated_at < ?1",
+            rusqlite::params![now - crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS],
+        )?;
+        Ok(n)
+    }
+
     /// Increment a miss's attempt count, returning the NEW count (spec §2.2).
     pub fn bump_miss_attempt(&self, key: &str, now: i64) -> Result<u32, BossclawError> {
         let store = self.inner.lock().expect(POISON);
@@ -1110,7 +1183,7 @@ pub struct ReflectCursor {
 4. Run → PASS: `cargo test -p bossclaw-core normalized_query_key_is_trim_casefold_stable reflect_backlog_seeds_upsert_only_transitions_and_counters_roundtrip`
    Regression: `cargo test -p bossclaw-core --lib` (schema init still opens clean).
 
-5. Commit: `feat(rung4-a): reflect module types + backlog/counters/cursor tables + normalized_query_key`
+5. Commit: `feat(rung4-a): reflect module types + backlog/counters/cursor tables + 30d terminal age-out + normalized_query_key`
 
 ---
 
@@ -1137,6 +1210,10 @@ fn reflect_topics_for_query_resolves_known_topics_and_empties_on_garbage() {
     let m = log.remember(&emb, "seed").unwrap();
     let kenny = log.entity("Kenny Ortega", &[], "person", "test-v1", std::slice::from_ref(&m)).unwrap();
     let _acme = log.entity("Acme Corporation", &[], "org", "test-v1", std::slice::from_ref(&m)).unwrap();
+    // ARCH MAJOR-1: `log.entity()` mints NO vector (derive happens only at evolve-mint, log.rs:9152, or
+    // via this backfill, :2449) — rebuild_entity_index only READS `entity_vectors`, so without this the
+    // index is empty and every search below returns nothing.
+    log.rederive_entity_vectors_pending(&emb).unwrap();
     log.rebuild_entity_index(&emb).unwrap(); // entity_search precondition
 
     // A query naming a known topic resolves to it (MockEmbedder is deterministic; the exact label
@@ -1191,10 +1268,13 @@ budget → `Parked`). State transitions persisted via T5. PORTABLE. Deterministi
 `ScriptedReasoner`/`MockEmbedder`.
 
 **Within-tick visibility note (documented, accepted).** The step-4 replay recall runs BEFORE the wrapper's
-post-tick `rebuild_indexes`, so a just-emitted dossier surfaces via the KEYWORD arm only (the vector arm folds
-it at the wrapper post-tick — `recall` lifecycle note, `log.rs:1783-1789`). This is sufficient for
-`CandidateRepaired`, which is explicitly OPERATIONAL ("the mechanism fired"), not evidence (§5.1); the harness
-gate (T14) — not this counter — carries the SHIP burden.
+post-tick `rebuild_indexes`, so a just-emitted dossier surfaces via the KEYWORD arm only — which IS live on
+append (the FTS side-table is maintained at write time; `recall`'s lifecycle note `log.rs:1783-1789` says
+fresh appends "surface via the keyword arm until rebuild_indexes"). The vector arm folds the dossier at the
+wrapper's post-tick rebuild. This is sufficient for `CandidateRepaired` — explicitly OPERATIONAL ("the
+mechanism fired"), not evidence (§5.1); the harness gate (T14), not this counter, carries the SHIP burden —
+and it makes the candidate path hermetically testable below (a scripted dossier containing the query's tokens
+keyword-matches in the replay).
 
 **Files**
 - Modify: `crates/bossclaw-core/src/log.rs` — `attempt_miss` (in the reflection section from T5). Uses
@@ -1204,12 +1284,36 @@ gate (T14) — not this counter — carries the SHIP burden.
 
 **Steps**
 
-1. Write the failing test (each outcome path incl. 3-attempt parking; assert states + outcomes, not internals):
+1. Write the failing tests (all four outcome paths, ZERO elision — critic M1). First the tiny state-read
+   helper the assertions use (a `#[cfg(test)]` impl beside the tests, the P3 `resolution_markers_for_test`
+   idiom):
+
+```rust
+#[cfg(test)]
+impl EventLog {
+    /// Test-only backlog state read (the accessors expose only the OPEN set; parked/terminal assertions
+    /// need the raw row state).
+    fn miss_state_for_test(&self, key: &str) -> Option<String> {
+        let store = self.inner.lock().expect(POISON);
+        store
+            .conn()
+            .query_row(
+                "SELECT state FROM reflect_miss_backlog WHERE normalized_query_key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+}
+```
+
+   Test 1 — the two no-reasoner classifications:
 
 ```rust
 #[test]
-fn attempt_miss_covers_repaired_by_time_no_material_candidate_and_parking() {
-    use crate::reflect::{normalized_query_key, MissOutcome, MissState};
+fn attempt_miss_classifies_repaired_by_time_and_no_material() {
+    use crate::reflect::{normalized_query_key, MissOutcome};
     let dir = tempfile::tempdir().unwrap();
     let log = open_log(dir.path());
     let emb = MockEmbedder::new(64);
@@ -1220,7 +1324,9 @@ fn attempt_miss_covers_repaired_by_time_no_material_candidate_and_parking() {
     log.seed_miss(&qk, "who is nobody?", 10).unwrap();
     let empty_reasoner = crate::reason::ScriptedReasoner::new("test-v1");
     let out = log.attempt_miss(&emb, &empty_reasoner, &qk, "who is nobody?", 20).unwrap();
-    assert_eq!(out, MissOutcome::NoMaterial);
+    assert_eq!(out.outcome, MissOutcome::NoMaterial);
+    assert_eq!(out.dossiers_emitted, 0, "no topic → no refresh → no emit");
+    assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("no_material"));
 
     // ── repaired_by_time: a query that recall now answers (a matching memory exists). ──
     let mem = log.remember(&emb, "The capital of France is Paris.").unwrap();
@@ -1228,25 +1334,111 @@ fn attempt_miss_covers_repaired_by_time_no_material_candidate_and_parking() {
     let rk = normalized_query_key("The capital of France is Paris.");
     log.seed_miss(&rk, "The capital of France is Paris.", 10).unwrap();
     let out = log.attempt_miss(&emb, &empty_reasoner, &rk, "The capital of France is Paris.", 20).unwrap();
-    assert_eq!(out, MissOutcome::RepairedByTime);
+    assert_eq!(out.outcome, MissOutcome::RepairedByTime);
+    assert_eq!(out.dossiers_emitted, 0, "a time-repaired miss consumes no reasoner and emits nothing");
+    assert_eq!(log.miss_state_for_test(&rk).as_deref(), Some("repaired_by_time"));
     let _ = mem;
-
-    // ── parking: a query that resolves to a known topic but the refresh never makes recall hit. After
-    //    REFLECT_MISS_ATTEMPT_BUDGET(3) failed attempts the caller-side transition parks it. ──
-    // (Build a topic whose dossier text does NOT contain the miss query's keywords, so the replay stays a
-    //  miss; script the compose so refresh_topic_page emits.) Assert the third attempt returns Parked.
-    // [full seeding mirrors T4's seed_topic_directly-style setup; the load-bearing assertion:]
-    // let out3 = log.attempt_miss(&emb, &reasoner, &pk, "unrelated phrasing", 40).unwrap();
-    // assert_eq!(out3, MissOutcome::Parked);
-    // assert_eq!(open_state(&log, &pk), MissState::Parked.as_str());
 }
 ```
 
-   (The parking sub-case's full topic seeding follows the T4 idiom; the executor completes it so the third
-   `attempt_miss` returns `Parked` and the backlog row reads `parked`.)
+   Test 2 — the FULL 3-attempt parking path (fresh log; the vector index is deliberately NEVER built, so
+   recall runs on the always-live keyword arm only, and every text avoids the query's tokens):
 
-2. Run → FAIL: `cargo test -p bossclaw-core attempt_miss_covers_repaired_by_time_no_material_candidate_and_parking`
-   Expected: `no method named attempt_miss`.
+```rust
+#[test]
+fn attempt_miss_parks_after_three_failed_attempts() {
+    use crate::reflect::{normalized_query_key, MissOutcome, REFLECT_MISS_ATTEMPT_BUDGET};
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let emb = MockEmbedder::new(64);
+    // A known topic whose LABEL equals the missed query exactly (MockEmbedder: identical text →
+    // identical vector → similarity 1.0 ≥ REFLECT_TOPIC_FLOOR), while the memory texts share NO token
+    // with the query — the keyword arm can never match, and with no `rebuild_indexes` call the vector
+    // arm stays unbuilt (recall degrades keyword-only per resolve_arms), so the replay stays a miss.
+    let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+    let m2 = log.remember(&emb, "He joined in 2019.").unwrap();
+    let lineage = vec![m1.clone(), m2.clone()];
+    let topic = log.entity("Kenny Ortega", &[], "person", "test-v1", &lineage).unwrap();
+    let beta = log.entity("Beta", &[], "org", "test-v1", &lineage).unwrap();
+    log.link_machine(&topic, "works_at", &beta, 0.9, "test-v1", &lineage).unwrap();
+    log.rebuild_graph().unwrap();
+    // ARCH MAJOR-1: log.entity() mints NO vector — derive the pending ones BEFORE building the index.
+    log.rederive_entity_vectors_pending(&emb).unwrap();
+    log.rebuild_entity_index(&emb).unwrap();
+
+    // The scripted dossier ALSO avoids the query tokens (title + claim), so the emitted page cannot
+    // keyword-match "Kenny Ortega" either.
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts = log.gather_fact_set(&entity).unwrap();
+    let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+        crate::summarize::SUMMARIZE_SYSTEM,
+        &crate::summarize::build_compose_prompt(&facts),
+        serde_json::json!({ "title": "Team lead dossier",
+            "claims": [{ "text": "He runs the platform group.", "cites": [m1.clone()] }] }),
+    );
+    let qk = normalized_query_key("Kenny Ortega");
+    log.seed_miss(&qk, "Kenny Ortega", 10).unwrap();
+
+    // Attempt 1: the bridge resolves the topic, the refresh EMITS a dossier, the replay still misses.
+    let a1 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 20).unwrap();
+    assert_eq!(a1.outcome, MissOutcome::StillMissing, "refresh fired but the replay still misses");
+    assert_eq!(a1.dossiers_emitted, 1, "attempt 1 emitted a real dossier revision");
+    log.rebuild_graph().unwrap(); // the tick-boundary projection refresh the daemon wrapper performs
+
+    // Attempt 2: identical grounding → F6 skips the emit; the attempt still accrues.
+    let a2 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 30).unwrap();
+    assert_eq!(a2.outcome, MissOutcome::StillMissing);
+    assert_eq!(a2.dossiers_emitted, 0, "F6 cited-set idempotency: no re-emit on an unchanged topic");
+    log.rebuild_graph().unwrap();
+
+    // Attempt 3 = REFLECT_MISS_ATTEMPT_BUDGET → parked (bounded loss, I6/I9).
+    let a3 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 40).unwrap();
+    assert_eq!(a3.outcome, MissOutcome::Parked, "attempt {REFLECT_MISS_ATTEMPT_BUDGET} parks the miss");
+    assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("parked"), "backlog row is parked");
+    assert!(log.open_misses(10).unwrap().is_empty(), "a parked miss is never re-attempted (I9)");
+}
+```
+
+   Test 3 — the candidate_repaired path (the emitted dossier's text CONTAINS the query tokens, so the
+   within-tick keyword arm finds it on replay):
+
+```rust
+#[test]
+fn attempt_miss_candidate_repaired_when_the_refreshed_dossier_answers_the_replay() {
+    use crate::reflect::{normalized_query_key, MissOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let emb = MockEmbedder::new(64);
+    let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+    let topic = log.entity("Nova Signal", &[], "product", "test-v1", std::slice::from_ref(&m1)).unwrap();
+    let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m1)).unwrap();
+    log.link_machine(&topic, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m1)).unwrap();
+    log.rebuild_graph().unwrap();
+    log.rederive_entity_vectors_pending(&emb).unwrap(); // MAJOR-1
+    log.rebuild_entity_index(&emb).unwrap();
+
+    // The scripted claim text NAMES the topic, so the emitted page keyword-matches the replay query
+    // (the FTS side is live on append — the within-tick visibility note above).
+    let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+    let facts = log.gather_fact_set(&entity).unwrap();
+    let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+        crate::summarize::SUMMARIZE_SYSTEM,
+        &crate::summarize::build_compose_prompt(&facts),
+        serde_json::json!({ "title": "Nova Signal",
+            "claims": [{ "text": "Nova Signal runs the platform group.", "cites": [m1.clone()] }] }),
+    );
+    let qk = normalized_query_key("Nova Signal");
+    log.seed_miss(&qk, "Nova Signal", 10).unwrap();
+    let out = log.attempt_miss(&emb, &reasoner, &qk, "Nova Signal", 20).unwrap();
+    assert_eq!(out.outcome, MissOutcome::CandidateRepaired, "the replay now hits the fresh dossier");
+    assert_eq!(out.dossiers_emitted, 1, "exactly one real dossier emit fed the repair");
+    assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("candidate_repaired"));
+}
+```
+
+2. Run → FAIL:
+   `cargo test -p bossclaw-core attempt_miss_classifies_repaired_by_time_and_no_material attempt_miss_parks_after_three_failed_attempts attempt_miss_candidate_repaired_when_the_refreshed_dossier_answers_the_replay`
+   Expected: `no method named attempt_miss` (and `miss_state_for_test`).
 
 3. Implement (in the reflection section):
 
@@ -1263,48 +1455,56 @@ fn attempt_miss_covers_repaired_by_time_no_material_candidate_and_parking() {
         key: &str,
         query: &str,
         now: i64,
-    ) -> Result<crate::reflect::MissOutcome, BossclawError> {
-        use crate::reflect::{MissOutcome, MissState, TopicRefreshOutcome, REFLECT_MISS_ATTEMPT_BUDGET, REFLECT_RECALL_K};
+    ) -> Result<crate::reflect::MissAttempt, BossclawError> {
+        use crate::reflect::{MissAttempt, MissOutcome, MissState, TopicRefreshOutcome,
+            REFLECT_MISS_ATTEMPT_BUDGET, REFLECT_RECALL_K};
         let opts = crate::recall::RecallOptions::default();
-        // 1. Re-run recall. Hit → repaired_by_time (no reasoner call).
+        // 1. Re-run recall. Hit → repaired_by_time (no reasoner call, no emit).
         if !self.recall(embedder, query, REFLECT_RECALL_K, &opts)?.is_empty() {
             self.set_miss_state(key, MissState::RepairedByTime, now)?;
-            return Ok(MissOutcome::RepairedByTime);
+            return Ok(MissAttempt { outcome: MissOutcome::RepairedByTime, dossiers_emitted: 0 });
         }
         // 2. Resolve query → known topics. Empty → no_material.
         let topics = self.reflect_topics_for_query(embedder, query)?;
         if topics.is_empty() {
             self.set_miss_state(key, MissState::NoMaterial, now)?;
-            return Ok(MissOutcome::NoMaterial);
+            return Ok(MissAttempt { outcome: MissOutcome::NoMaterial, dossiers_emitted: 0 });
         }
-        // 3. Refresh each resolved topic's dossier (per-item error isolation).
+        // 3. Refresh each resolved topic's dossier (per-item error isolation). Count REAL `Emitted`s —
+        //    the digest's honest "refreshed" unit (critic M2/OQ4); a skip emits nothing and counts nothing.
         let entities = self.all_entities()?;
+        let mut dossiers_emitted = 0usize;
         let mut reasoner_errored = false;
         for tid in &topics {
             if let Some(entity) = entities.iter().find(|e| &e.entity_id == tid) {
-                if self.refresh_topic_page(reasoner, entity)? == TopicRefreshOutcome::ReasonerError {
-                    reasoner_errored = true;
+                match self.refresh_topic_page(reasoner, entity)? {
+                    TopicRefreshOutcome::Emitted { .. } => dossiers_emitted += 1,
+                    TopicRefreshOutcome::ReasonerError => reasoner_errored = true,
+                    TopicRefreshOutcome::SkippedUnchanged | TopicRefreshOutcome::SkippedThin => {}
                 }
             }
         }
-        // 4. Replay recall. Hit → candidate_repaired.
+        // 4. Replay recall. Hit → candidate_repaired (operational, §5.1 — the emit count above is what
+        //    feeds the digest, never this classification by itself).
         if !self.recall(embedder, query, REFLECT_RECALL_K, &opts)?.is_empty() {
             self.set_miss_state(key, MissState::CandidateRepaired, now)?;
-            return Ok(MissOutcome::CandidateRepaired);
+            return Ok(MissAttempt { outcome: MissOutcome::CandidateRepaired, dossiers_emitted });
         }
         // Still missing: bump the attempt; at budget → parked (bounded loss, I6).
         let attempts = self.bump_miss_attempt(key, now)?;
         if attempts >= REFLECT_MISS_ATTEMPT_BUDGET {
             self.set_miss_state(key, MissState::Parked, now)?;
-            return Ok(MissOutcome::Parked);
+            return Ok(MissAttempt { outcome: MissOutcome::Parked, dossiers_emitted });
         }
-        Ok(if reasoner_errored { MissOutcome::ReasonerError } else { MissOutcome::StillMissing })
+        let outcome = if reasoner_errored { MissOutcome::ReasonerError } else { MissOutcome::StillMissing };
+        Ok(MissAttempt { outcome, dossiers_emitted })
     }
 ```
 
-4. Run → PASS: `cargo test -p bossclaw-core attempt_miss_covers_repaired_by_time_no_material_candidate_and_parking`
+4. Run → PASS:
+   `cargo test -p bossclaw-core attempt_miss_classifies_repaired_by_time_and_no_material attempt_miss_parks_after_three_failed_attempts attempt_miss_candidate_repaired_when_the_refreshed_dossier_answers_the_replay`
 
-5. Commit: `feat(rung4-a): attempt_miss pipeline (recall → bridge → refresh → replay; budget → parked)`
+5. Commit: `feat(rung4-a): attempt_miss pipeline (recall → bridge → refresh → replay; budget → parked; real-emit tally)`
 
 ---
 
@@ -1327,11 +1527,11 @@ per-tick budget keep it from wasting nights (§2.3).
 
 **Steps**
 
-1. Write the failing test:
+1. Write the failing tests (ZERO elision — critic M1). Test 1 — the healed path:
 
 ```rust
 #[test]
-fn refresh_stale_pages_heals_and_counts_unhealable_thin() {
+fn refresh_stale_pages_heals_a_stale_dossier() {
     use crate::reflect::TopicRefreshOutcome;
     let dir = tempfile::tempdir().unwrap();
     let log = open_log(dir.path());
@@ -1365,30 +1565,66 @@ fn refresh_stale_pages_heals_and_counts_unhealable_thin() {
     let report = log.refresh_stale_pages(&r_healed, 8).unwrap();
     assert_eq!(report.healed, 1, "the stale Kenny page healed");
     assert_eq!(report.unhealable_thin, 0);
-
-    // Thin case: a topic with ONE cited source; retire it → its whole lineage is retired → below
-    // PAGE_MIN_FACTS → unhealable_thin (page unchanged, not an error).
-    // [seed a single-source topic + page, retire its only source, then:]
-    // let thin_report = log.refresh_stale_pages(&any_reasoner, 8).unwrap();
-    // assert_eq!(thin_report.unhealable_thin, 1, "an all-retired-lineage page is unhealable_thin");
-    // assert_eq!(thin_report.healed, 0);
 }
 ```
 
-   (The executor completes the thin sub-case with a single-source topic whose only source is retired.)
+   Test 2 — the FULL §2.3 thin-set residual (a single-source topic whose ONLY source is retired):
 
-2. Run → FAIL: `cargo test -p bossclaw-core refresh_stale_pages_heals_and_counts_unhealable_thin`
+```rust
+#[test]
+fn refresh_stale_pages_counts_unhealable_thin_when_all_sources_retired() {
+    use crate::reflect::TopicRefreshOutcome;
+    let dir = tempfile::tempdir().unwrap();
+    let log = open_log(dir.path());
+    let emb = MockEmbedder::new(64);
+    // A SINGLE-source topic: one memory + one edge → fact_count 2 == PAGE_MIN_FACTS → page-worthy.
+    let m = log.remember(&emb, "Gamma ships crates.").unwrap();
+    let gamma = log.entity("Gamma", &[], "product", "test-v1", std::slice::from_ref(&m)).unwrap();
+    let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m)).unwrap();
+    log.link_machine(&gamma, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m)).unwrap();
+    log.rebuild_graph().unwrap();
+    let ge = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == gamma).unwrap();
+    let f = log.gather_fact_set(&ge).unwrap();
+    let seed_reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+        crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f),
+        serde_json::json!({ "title": "Gamma",
+            "claims": [{ "text": "Gamma ships crates.", "cites": [m.clone()] }]}));
+    assert_eq!(log.refresh_topic_page(&seed_reasoner, &ge).unwrap(),
+        TopicRefreshOutcome::Emitted { superseded: false });
+    log.rebuild_graph().unwrap();
+
+    // Retire the ONLY source: the page's claim-cites union intersects `retired_notes` (stale), but the
+    // post-exclusion fact-set is 1 edge + 0 memories < PAGE_MIN_FACTS(2) → it cannot legally re-emit
+    // (§2.3 residual). An EMPTY ScriptedReasoner proves no compose call happens (SkippedThin fires
+    // BEFORE any reasoner turn — a scripted reasoner with no canned response errors if consulted).
+    log.retire_memory(&m, None).unwrap();
+    let report = log.refresh_stale_pages(&crate::reason::ScriptedReasoner::new("test-v1"), 8).unwrap();
+    assert_eq!(report.unhealable_thin, 1, "the all-retired-lineage page is counted, not retried as an error");
+    assert_eq!(report.healed, 0);
+    assert_eq!(report.reasoner_errors, 0, "no reasoner call for a thin topic");
+    // I1: reflection never retires a page — the stale page STAYS current (provenance-true) until new
+    // current facts arrive.
+    assert_eq!(log.current_pages().unwrap().len(), 1, "the stale page remains current");
+}
+```
+
+2. Run → FAIL:
+   `cargo test -p bossclaw-core refresh_stale_pages_heals_a_stale_dossier refresh_stale_pages_counts_unhealable_thin_when_all_sources_retired`
    Expected: `no method named refresh_stale_pages`.
 
 3. Implement (reflection section):
 
 ```rust
-    /// Refresh dossiers whose cited sources went stale (spec §2.3). A page is STALE when its cited
-    /// `source_event_ids` intersect `superseded ∪ retired_notes` (the aftermath of a Rung-3 retire).
-    /// For each stale topic (≤ `cap`), call [`EventLog::refresh_topic_page`] and tally the outcome:
-    /// `Emitted` → healed, `SkippedUnchanged` → unchanged, `SkippedThin` → `unhealable_thin` (the §2.3
-    /// residual — an all-retired lineage cannot re-emit; counted, never retried within this pass),
-    /// `ReasonerError` → reasoner_errors (isolated). Reflection NEVER retires a page (I1). PORTABLE.
+    /// Refresh dossiers whose cited sources went stale (spec §2.3). A page is STALE when its per-claim
+    /// CITES UNION — the same set `current_page_for_topic` reads (log.rs:8051-8064) and the F6 emit
+    /// idempotency compares — intersects `superseded ∪ retired_notes` (the aftermath of a Rung-3 retire).
+    /// (The page-level D8 `model_meta.source_event_ids` provenance anchor shrinks too, via the same T3
+    /// gather filter, but it is a DISTINCT set and not the staleness read here — ARCH minor-c.) For each
+    /// stale topic (≤ `cap` total ATTEMPTS — reasoner errors count toward the cap, critic m2), call
+    /// [`EventLog::refresh_topic_page`] and tally: `Emitted` → healed, `SkippedUnchanged` → unchanged,
+    /// `SkippedThin` → `unhealable_thin` (the §2.3 residual — an all-retired lineage cannot re-emit;
+    /// counted, never retried within this pass), `ReasonerError` → reasoner_errors (isolated).
+    /// Reflection NEVER retires a page (I1). PORTABLE.
     pub fn refresh_stale_pages(
         &self,
         reasoner: &dyn crate::reason::Reasoner,
@@ -1404,8 +1640,10 @@ fn refresh_stale_pages_heals_and_counts_unhealable_thin() {
         let mut report = StaleRefreshReport::default();
         let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
         for page in self.current_pages()? {
-            if report.healed + report.unchanged + report.unhealable_thin >= cap {
-                break; // per-tick budget
+            // Per-tick budget over total ATTEMPTS (critic m2): reasoner errors consume budget too, so a
+            // failing reasoner cannot turn the cap into an unbounded retry sweep.
+            if report.healed + report.unchanged + report.unhealable_thin + report.reasoner_errors >= cap {
+                break;
             }
             if !attempted.insert(page.topic_id.clone()) {
                 continue; // one refresh per topic per pass
@@ -1428,9 +1666,10 @@ fn refresh_stale_pages_heals_and_counts_unhealable_thin() {
     }
 ```
 
-4. Run → PASS: `cargo test -p bossclaw-core refresh_stale_pages_heals_and_counts_unhealable_thin`
+4. Run → PASS:
+   `cargo test -p bossclaw-core refresh_stale_pages_heals_a_stale_dossier refresh_stale_pages_counts_unhealable_thin_when_all_sources_retired`
 
-5. Commit: `feat(rung4-a): refresh_stale_pages tidy job (heal / unchanged / unhealable_thin residual)`
+5. Commit: `feat(rung4-a): refresh_stale_pages tidy job (heal / unchanged / unhealable_thin residual; error-bounded cap)`
 
 ---
 
@@ -1511,10 +1750,14 @@ fn reflect_once_is_off_by_default_then_reports_when_enabled() {
         for q in new_misses {
             self.seed_miss(&normalized_query_key(q), q, now)?;
         }
-        // Attempt the oldest open misses (misses first, spec §2.1 priority).
+        // Attempt the oldest open misses (misses first, spec §2.1 priority). `miss_emits` counts the
+        // pipeline's REAL dossier emits (`TopicRefreshOutcome::Emitted`s inside attempt_miss step 3).
+        let mut miss_emits = 0usize;
         for (key, query, _attempts) in self.open_misses(REFLECT_MISSES_PER_TICK)? {
             report.attempted += 1;
-            match self.attempt_miss(embedder, reasoner, &key, &query, now)? {
+            let attempt = self.attempt_miss(embedder, reasoner, &key, &query, now)?;
+            miss_emits += attempt.dossiers_emitted;
+            match attempt.outcome {
                 MissOutcome::RepairedByTime => report.repaired_by_time += 1,
                 MissOutcome::NoMaterial => report.no_material += 1,
                 MissOutcome::CandidateRepaired => report.candidate_repaired += 1,
@@ -1525,13 +1768,16 @@ fn reflect_once_is_off_by_default_then_reports_when_enabled() {
         }
         // Then the stale-dossier tidy with the remaining budget.
         let stale = self.refresh_stale_pages(reasoner, REFLECT_REFRESH_PER_TICK)?;
-        report.dossiers_refreshed = stale.healed;
+        // The digest's honest unit (critic M2 / OQ4 LOCK): `dossiers_refreshed` = REAL dossier emits only —
+        // miss-pipeline `Emitted`s + tidy heals. `candidate_repaired` (a replay-recall classification) NEVER
+        // feeds the digest: a replay can hit without any emit this tick (e.g. a prior night's page finally
+        // matching), and an emit can happen without a replay hit.
+        report.dossiers_refreshed = miss_emits + stale.healed;
         report.unhealable_thin = stale.unhealable_thin;
         report.reasoner_errors += stale.reasoner_errors;
-        // Cumulative counters (spec §2.4): dossiers refreshed = miss-driven candidate_repaired's refreshes
-        // + tidy heals; no_material is the owner's most actionable signal.
-        self.add_reflect_counters((report.dossiers_refreshed + report.candidate_repaired) as i64,
-                                  report.no_material as i64)?;
+        self.add_reflect_counters(report.dossiers_refreshed as i64, report.no_material as i64)?;
+        // §7.3 hygiene (critic m1): age out TERMINAL-repaired rows; parked/no_material persist.
+        self.prune_reflect_backlog(now)?;
         Ok(report)
     }
 ```
@@ -1584,7 +1830,12 @@ doc-header still updates (the store now actively drives reflection).
             Arc::new(reason::MockReasonerProvider::from_reasoner(
                 Arc::new(bossclaw_core::ScriptedReasoner::new("test")))));
         let onboarded = true;
-        engine.set_reflect_enabled(onboarded, true).await.unwrap();
+        // ARCH minor-a: enable via the CORE setter (T1) through get_or_open — the ENGINE setter method is
+        // T12's product surface and does not exist yet at this task; the test must compile+pass here.
+        {
+            let log = engine.get_or_open(onboarded).await.unwrap();
+            tokio::task::spawn_blocking(move || log.set_reflect_enabled(true)).await.unwrap().unwrap();
+        }
         // A fresh brain with no misses/pages → an empty-but-successful tick (not skipped_disabled).
         let report = engine.reflect_once(onboarded, 1000).await.expect("reflect tick runs");
         assert!(!report.skipped_disabled, "enabled → runs");
@@ -1593,8 +1844,8 @@ doc-header still updates (the store now actively drives reflection).
 ```
 
 2. Run → FAIL: `cargo test -p bossclawd --lib engine_reflect_once_runs_when_enabled_and_records_telemetry`
-   Expected: `no method named reflect_once` / `no method named set_reflect_enabled` (set_reflect_enabled lands
-   in T12; land T10's wrapper first and this test after T12, or add a temporary in-test enable via the log).
+   Expected: `no method named reflect_once` (the enable path above already compiles — it uses only T1's core
+   setter, so this task is self-contained before T12 lands).
 
 3. Implement.
    (a) `ReflectTelemetry` (beside `ConflictTelemetry` `:258`):
@@ -1839,6 +2090,32 @@ mod tests {
         // to the ordinary gate, which here is NotQuiet).
         let recent = ReflectDecisionInput { last_floor_fire_at: 1_000_000 - 10, ..wedged };
         assert_eq!(decide_reflect(&recent), ReflectDecision::NotQuiet);
+    }
+
+    #[test]
+    fn floor_needs_open_misses_and_evolve_defer_needs_a_nonempty_queue() {
+        // Conjunct guard 1 (critic m3): BOTH floor timers stale but ZERO open unparked misses → the floor
+        // must NOT fire (`open_unparked_misses > 0` is a required conjunct); the ordinary gate applies
+        // (here: NotQuiet). Guards a regression that drops the misses conjunct and turns the floor into a
+        // periodic wake-time timer.
+        let stale_timers_no_misses = ReflectDecisionInput {
+            newest_activity_at: Some(1_000_000 - 1), // not quiet
+            evolve_enabled: true,
+            evolve_queue_depth: 5,
+            open_unparked_misses: 0,
+            last_completed_run_at: 1_000_000 - REFLECT_STALENESS_FLOOR_SECS - 1,
+            last_floor_fire_at: 1_000_000 - REFLECT_STALENESS_FLOOR_SECS - 1,
+            ..base()
+        };
+        assert_eq!(decide_reflect(&stale_timers_no_misses), ReflectDecision::NotQuiet,
+            "no open misses → no floor fire, ever");
+
+        // Conjunct guard 2 (critic m3): evolve ENABLED but its queue EMPTY → NO defer; a quiet tick runs.
+        // Guards a regression that defers on `evolve_enabled` alone (which would silence reflection on
+        // every evolve-enabled brain regardless of backlog).
+        let evolve_on_but_idle = ReflectDecisionInput { evolve_enabled: true, evolve_queue_depth: 0, ..base() };
+        assert_eq!(decide_reflect(&evolve_on_but_idle), ReflectDecision::Run { floor_fired: false },
+            "an idle evolve queue defers nothing");
     }
 }
 ```
@@ -2086,7 +2363,15 @@ pub struct ReflectGateInputs {
         // `reflect_enabled` flag), so merging ships reflection dormant.
         bossclawd::reflect::sweeper::spawn(engine.clone(), data_dir.clone());
 ```
-   (Update the stale `// (6) ... two background loops` comment `:154` to "four background loops".)
+   Also fix the stale spawn-count comment (verified: `main.rs:154` reads `// (6) Spawn the two background
+   loops as siblings, ...` yet THREE spawns already follow — the conflict sweeper was added without updating
+   it). With the reflect spawn it becomes four; rewrite the opening line to:
+
+```rust
+        // (6) Spawn the four background loops as siblings, each OFF by default with every gate
+        // re-read per wake: the evolve scheduler, the capture sweeper (SP3 A9), the Rung-3
+        // conflict-detection sweep, and the Rung-4 reflection sweep.
+```
 
 4. Run → PASS:
    `cargo test -p bossclaw-core newest_memory_activity_at_tracks_memory_and_session_appends`
@@ -2228,14 +2513,17 @@ T14 lesson — test the real format fn).
         // Nothing new since last session → no line (an all-quiet reflect brain adds nothing).
         assert_eq!(EngineHandle::build_reflect_digest_line(0, 0), None);
         // Neutral copy, integer-only, pluralized with a bare `(s)` (matches the conflict-line style).
+        // Critic M2 lock: NO topic-attribution clause — `n` counts real dossier emits from BOTH the miss
+        // pipeline AND the stale-refresh tidy, so "for recently-missed topics" would be false for the
+        // tidy's share. Every unit is now true under its label.
         assert_eq!(
             EngineHandle::build_reflect_digest_line(2, 3),
-            Some("2 dossier(s) refreshed for recently-missed topics, 3 unknown-topic gap(s) since last session.".to_string()),
+            Some("2 dossier(s) refreshed, 3 unknown-topic gap(s) since last session.".to_string()),
         );
         // Either non-zero alone still renders (both counts always shown for honesty).
         assert_eq!(
             EngineHandle::build_reflect_digest_line(0, 1),
-            Some("0 dossier(s) refreshed for recently-missed topics, 1 unknown-topic gap(s) since last session.".to_string()),
+            Some("0 dossier(s) refreshed, 1 unknown-topic gap(s) since last session.".to_string()),
         );
     }
 ```
@@ -2249,15 +2537,16 @@ T14 lesson — test the real format fn).
 ```rust
     /// The PURE reflect digest line (spec §2.4). Renders ONLY when `n + m > 0` (an all-quiet reflect brain
     /// adds nothing). Deliberately NEUTRAL copy — the digest must not present an operational counter as
-    /// proven benefit (critic New-Minor-1): "refreshed for recently-missed topics" / "unknown-topic gaps".
-    /// `m` (no_material) is the owner's most actionable signal ("your memory never knew this"). Integer-only.
+    /// proven benefit (critic New-Minor-1), and every unit must be TRUE under its label (critic M2/OQ4):
+    /// `n` = REAL dossier emits (miss-pipeline `Emitted`s + stale-refresh heals — the `refreshed_total`
+    /// counter; never `candidate_repaired`), so the copy carries no topic-attribution clause (the tidy's
+    /// share is not miss-driven). `m` (no_material) is the owner's most actionable signal ("your memory
+    /// never knew this"). Integer-only.
     fn build_reflect_digest_line(n: u64, m: u64) -> Option<String> {
         if n + m == 0 {
             return None;
         }
-        Some(format!(
-            "{n} dossier(s) refreshed for recently-missed topics, {m} unknown-topic gap(s) since last session."
-        ))
+        Some(format!("{n} dossier(s) refreshed, {m} unknown-topic gap(s) since last session."))
     }
 
     /// SERVE the reflect digest line for the SessionStart snapshot preamble (§2.4). INFALLIBLE — empty Vec
@@ -2306,16 +2595,18 @@ T14 lesson — test the real format fn).
 
 ## Task 12b — Desktop Reflect toggle (desktop)
 
-Spec §2.5. The single toggle in a DEDICATED Reflect settings block (the capture toggle is nested behind the
-Claude-Code-connected gate with history-import copy; reflection is unrelated to Claude Code connection state, so
-it gets its own panel — the desktop investigation's recommendation). Pure mirroring of the `SetCaptureEnabled`
-wiring (command + registration + `Engine`/`EngineClient` + TS invoke + React + tests), minus `backfill`, plus
-the desktop half of the `5 → 6` trip-wire. Split from T12 because it is ~120-190 lines across 6-8 files with a
-hard dependency on T12's wire ops. Commands are `#[cfg(unix)]` like the capture commands.
+Spec §2.5 + §2.4 (the second disclosure surface — critic ambiguity fix). The single toggle in a DEDICATED
+Reflect settings block (the capture toggle is nested behind the Claude-Code-connected gate with history-import
+copy; reflection is unrelated to Claude Code connection state, so it gets its own panel — the desktop
+investigation's recommendation). Pure mirroring of the `SetCaptureEnabled` wiring (command + registration +
+`Engine`/`EngineClient` + TS invoke + React + tests), minus `backfill`, PLUS the LibraryPanel miss-strip
+disclosure copy fix (the miss store's framing must stop saying "read-only" once reflection actively consumes
+it). Split from T12 because it is ~120-190 lines across 6-8 files with a hard dependency on T12's wire ops.
+Commands are `#[cfg(unix)]` like the capture commands. (The desktop trip-wire already flipped in T2.)
 
 **Files**
 - Modify: `apps/desktop/src-tauri/src/engine/client.rs` — `set_reflect_enabled`/`reflect_enabled` (after
-  `capture_enabled` `:452`); trip-wire `:973` (`5 → 6`); a round-trip test (beside `:1272`).
+  `capture_enabled` `:452`); a round-trip test (beside `:1272`).
 - Modify: `apps/desktop/src-tauri/src/engine/mod.rs` — `Engine::set_reflect_enabled`/`reflect_enabled` (after
   `:514`).
 - Modify: `apps/desktop/src-tauri/src/commands/integrations.rs` — `integrations_set_reflect_enabled` +
@@ -2324,6 +2615,7 @@ hard dependency on T12's wire ops. Commands are `#[cfg(unix)]` like the capture 
 - Modify: `apps/desktop/src/api/integrations.ts`(+`.test.ts`) — `setReflectEnabled`/`reflectEnabled` (after
   `:55`) + invoke-contract tests (after `:47`).
 - Create: `apps/desktop/src/settings/ReflectPanel.tsx`(+`.test.tsx`); Modify `AirSettings.tsx` (mount at `:22`).
+- Modify: `apps/desktop/src/memory/LibraryPanel.tsx` — the miss-strip framing comments (`:40`, `:253`).
 
 **Steps**
 
@@ -2339,10 +2631,6 @@ hard dependency on T12's wire ops. Commands are `#[cfg(unix)]` like the capture 
         bounded(client.set_reflect_enabled(true, true)).await.unwrap();
         assert!(bounded(client.reflect_enabled(true)).await.unwrap(), "reads back enabled");
     }
-```
-   And bump the trip-wire (`client.rs:973`):
-```rust
-        assert_eq!(st.event_count, 6, "prime_switches wrote the 6 sticky config events");
 ```
    (b) TS invoke contract (`api/integrations.test.ts`, mirroring `:37`):
 ```ts
@@ -2389,11 +2677,16 @@ hard dependency on T12's wire ops. Commands are `#[cfg(unix)]` like the capture 
         }
     }
 ```
-   (b) `engine/mod.rs` (after `:514`) — thin passthroughs mirroring `set_capture_enabled`/`capture_enabled`
-   (drop `backfill`); `commands/integrations.rs` (after `:125`) — the two `#[tauri::command]`s mirroring
-   `integrations_set_capture_enabled`/`integrations_capture_enabled` (no `toggle_capture_wiring`; call
-   `engine.set_reflect_enabled(onboarded, enabled)` directly; the read fails closed to `false`); `main.rs`
-   (`:249`) — two `#[cfg(unix)]` registrations.
+   (b) `engine/mod.rs` (after `:514`) + `commands/integrations.rs` (after `:125`) + `main.rs` (`:249`) — the
+   Rust plumbing is a byte-level mirror of the capture pair with `backfill` dropped: copy
+   `Engine::set_capture_enabled`/`capture_enabled` (`engine/mod.rs:502-514`) and
+   `integrations_set_capture_enabled`/`integrations_capture_enabled` (`integrations.rs:103-125`) VERBATIM —
+   same state extraction, same onboarded read, same error mapping, same `#[cfg(unix)]` — changing ONLY:
+   the fn names (`…_reflect_…`), the client calls (`set_reflect_enabled(onboarded, enabled)` /
+   `reflect_enabled(onboarded)`), the dropped `backfill` param, and NO `toggle_capture_wiring` side call
+   (reflection has no sweeper wiring to poke; the daemon sweeper self-gates). The read command fails closed
+   to `false` exactly as `integrations_capture_enabled` does. Register both in the `generate_handler!` list
+   (`main.rs:246-249`, beside the capture pair, `#[cfg(unix)]`).
    (c) `api/integrations.ts` (after `:55`):
 ```ts
 export const setReflectEnabled = (enabled: boolean): Promise<void> =>
@@ -2401,16 +2694,84 @@ export const setReflectEnabled = (enabled: boolean): Promise<void> =>
 export const reflectEnabled = (): Promise<boolean> =>
   invoke<boolean>("integrations_reflect_enabled");
 ```
-   (d) `ReflectPanel.tsx` — a standalone panel (state + mount read + toggle handler, mirroring the capture
-   toggle's `useState`/`refreshCapture`/`onToggleCapture` idiom at `IntegrationsPanel.tsx:34,49,87`) with the
-   label "Reflect on recently-missed topics" + neutral sub-copy ("When your machine is idle, AIR quietly
-   refreshes dossiers for topics you recently searched and couldn't find."); mount `<ReflectPanel/>` in
-   `AirSettings.tsx:22`.
+   (d) `ReflectPanel.tsx` — the full standalone panel (state + mount read + toggle handler, the
+   `IntegrationsPanel.tsx:34,49,87` idiom; styles via the app's CSS tokens, no hardcoded colors):
+
+```tsx
+import { useCallback, useEffect, useState } from "react";
+import { reflectEnabled, setReflectEnabled } from "../api/integrations";
+
+/** Rung-4 R4-A (§2.5): the single reflection toggle. Deliberately NOT inside the Claude-Code-connected
+ * gate — reflection is a brain-local loop, unrelated to connection state. Fails closed: any read/write
+ * error renders the toggle OFF (the daemon's flag is the sole truth; the sweeper self-gates). */
+export default function ReflectPanel() {
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      setEnabled(await reflectEnabled());
+    } catch {
+      setEnabled(false); // fail-closed display: an unreadable flag shows OFF
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const onToggle = useCallback(async () => {
+    const next = !enabled;
+    setBusy(true);
+    try {
+      await setReflectEnabled(next);
+      setEnabled(next);
+    } catch {
+      await refresh(); // write failed → re-read the daemon's truth, never assume
+    } finally {
+      setBusy(false);
+    }
+  }, [enabled, refresh]);
+
+  return (
+    <section aria-label="Reflection">
+      <h3 style={{ margin: "0 0 4px" }}>Reflection</h3>
+      <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input
+          type="checkbox"
+          role="checkbox"
+          aria-label="Reflect on recently-missed topics"
+          checked={enabled}
+          disabled={busy}
+          onChange={() => void onToggle()}
+        />
+        <span>Reflect on recently-missed topics</span>
+      </label>
+      <p style={{ color: "var(--text-tertiary)", fontSize: 12, margin: "4px 0 0" }}>
+        When your machine is idle, AIR quietly refreshes dossiers for topics you recently searched and
+        couldn’t find. Uses your configured reasoner; with a cloud reasoner enabled, gathered material may
+        be sent under your existing cloud consent.
+      </p>
+    </section>
+  );
+}
+```
+   Mount `<ReflectPanel />` in `AirSettings.tsx:22`, beside the existing panels.
+   (e) `LibraryPanel.tsx` — the §2.4 second disclosure surface (critic ambiguity fix): the miss-strip's
+   "read-only" framing predates reflection and is now false once R4-A ships. Update BOTH comments:
+   - `:40`: `// C6: recall telemetry (queries-only miss log — spec §8). A read-only status strip; ...` →
+     `// C6: recall telemetry (queries-only miss log — spec §8). Since Rung-4 R4-A these miss queries also
+     ACTIVELY drive the reflect loop's dossier refreshes (design §2.4) — no longer a passive display; ...`
+     (keep the trailing stats-hiccup clause unchanged).
+   - `:253`: `{/* C6: recall-miss stats strip — a compact, read-only status line. Only past search QUERIES
+     that ... */}` → `{/* C6: recall-miss stats strip. Since R4-A these queries actively drive reflection
+     (dossier refreshes for missed topics — design §2.4). Still only past search QUERIES that found nothing
+     are shown (never result text — spec §8; the daemon guarantees queries-only). */}`
 
 4. Run → PASS: the three test commands above.
    Full desktop gate: `cargo test -p air_agent_desktop` and `cd apps/desktop && npx vitest run && npx tsc --noEmit && npx eslint src --max-warnings 0`.
 
-5. Commit: `feat(rung4-a): desktop Reflect settings toggle + client methods + trip-wire 5→6`
+5. Commit: `feat(rung4-a): desktop Reflect settings toggle + client methods + miss-strip active-drive disclosure`
 
 ---
 
@@ -2429,12 +2790,34 @@ gate exists to catch). `memharness` is dev-only, never ships.
 kind-branch belongs in `map_hits` (`arms.rs:98`), which already holds each `HitWire` (its `hit.kind` is the
 event type — `proto/types.rs:337`). The single-page-id hit/dedup/rank model (`arms.rs:12,18,24`) stays intact.
 
+**Control surface (OQ2 LOCK — option (i), zero new wire ops; design §1's two-op surface holds).** The daemon
+is IN-PROCESS (`daemon.rs:90-131`): `start_runtime` builds the `Arc<EngineHandle>` via
+`bossclawd::server::test_engine*` (`:126-129`) and signals readiness over the `bound_tx` sync-channel
+(`:130-131`). Widen that channel from `anyhow::Result<()>` to `anyhow::Result<Arc<EngineHandle>>` (send
+`Ok(engine.clone())` at the same point), store it on `HarnessDaemon`, and expose:
+
+```rust
+    /// The in-process daemon's engine handle (dev-harness only — the production daemon exposes no such
+    /// thing; this is why the harness needs ZERO new wire ops for enables/ticks/reads, OQ2).
+    pub fn engine(&self) -> Arc<bossclawd::engine::EngineHandle> {
+        self.engine.clone()
+    }
+```
+
+Everything T14/T15 needs flows through it: enables (`engine.set_evolve_enabled(true, true)` /
+`engine.set_reflect_enabled(true, true)` — T12's engine methods), ticks (`engine.evolve_once(true)` /
+`engine.reflect_once(true, now)`), queue reads (`engine.queue_depth_or_zero(true)` /
+`engine.reflect_gate_inputs(true)`), and the union-coverage cites read (`engine.get_or_open(true)` — pub,
+`engine/mod.rs:372` — then `log.stream_all()`, pub, `log.rs:1423`).
+
 **Files**
 - Modify: `crates/memharness/src/arms.rs` — `map_hits` (`:98`) branches on `hit.kind == "page"`.
+- Modify: `crates/memharness/src/daemon.rs` — the `bound_tx` channel type + `engine` field + `engine()`
+  accessor (insertion points `:100`, `:126-131`, struct at `:85`-family).
 - Create: `crates/memharness/src/reflect_pass.rs` — the quiescence driver + `union_coverage` metric.
 - Modify: `crates/memharness/src/lib.rs` — `pub mod reflect_pass;`; `main.rs` — a `reflect-gate` subcommand +
   the Peter-gated runbook doc.
-- Test: `crates/memharness/src/arms.rs mod tests` (hand-built HitWires) + `reflect_pass.rs mod tests` (doubles).
+- Test: `crates/memharness/src/arms.rs mod tests` (hand-built HitWires) + `reflect_pass.rs mod tests` (pure).
 
 **Steps**
 
@@ -2503,6 +2886,10 @@ pub fn map_hits(
 //! `recall_regressed`. Union-coverage is REPORTED only, never gated (critic New-Blocker-1). Dev-only.
 
 /// A hard cap on evolve+reflect drive cycles; non-convergence is a FAIL-LOUD error, never a silent cap.
+/// Headroom assumption (OQ5 lock): each cycle attempts ≤ REFLECT_MISSES_PER_TICK(4) misses +
+/// REFLECT_REFRESH_PER_TICK(4) refreshes, so 64 cycles ≈ 256 miss-attempts against a frozen synthetic
+/// miss set of ≤ 20 (each miss terminal within ≤ REFLECT_MISS_ATTEMPT_BUDGET(3) attempts) — an order of
+/// magnitude of slack; hitting the cap therefore indicates a REAL non-convergence bug, not a tight bound.
 pub const MAX_QUIESCENCE_CYCLES: usize = 64;
 
 /// Drive evolve + reflect to quiescence (both queues drained) on an ALREADY-INGESTED, evolve+reflect-ENABLED
@@ -2526,29 +2913,108 @@ pub fn drive_to_quiescence(
     )
 }
 
-/// Union-coverage (REPORTED, never gated): for each known-item case whose gold FILE page is NOT in the top-k,
-/// does a dossier hit whose CITED sources include the gold file appear, and at what rank? Reported alongside
-/// s@k so the future dossier-primacy decision has honest data, but it NEVER feeds `recall_regressed`.
-/// BLOCKED ON OPEN QUESTION #2 (below): computing this needs each dossier hit's cited `source_event_ids`,
-/// which the recall wire `Hit` does NOT carry — settle the read mechanism (a `GetPage`-style op vs an
-/// in-process page-event read) at plan review, THEN implement this signature over `(cases, per-case dossier
-/// hits with their resolved cited file page_ids, gold)`. Not part of T14's runnable-gate red→green.
+/// One case's union-coverage inputs, precomputed by the driver (OQ2 unblocked this: the recall wire `Hit`
+/// carries no cites, so the driver reads each top-k dossier hit's page event via
+/// `daemon.engine().get_or_open(true)` → `log.stream_all()` → `model_meta.source_event_ids`, maps every
+/// cited FILE id through the SAME `PageResolver` (non-file cites are skipped), and records whether any
+/// resolved cite equals this case's `gold_page_id`).
+pub struct UnionCase {
+    /// Whether the gold FILE page itself made top-k (from the deduped hits, the gate's own read).
+    pub gold_in_topk: bool,
+    /// The best (lowest) rank of a top-k dossier hit whose cites resolve to this case's gold, if any.
+    pub best_citing_dossier_rank: Option<usize>,
+}
+
+/// Union-coverage (REPORTED, never gated — the §5.3(b) demotion): among cases whose gold FILE page is NOT
+/// in top-k, how many have a top-k dossier hit CITING the gold, and at what ranks. Informs the future
+/// dossier-primacy decision honestly; NEVER feeds `recall_regressed`. PURE over driver-precomputed inputs.
+pub struct UnionCoverageReport {
+    pub gold_missing_topk: usize,
+    pub covered_by_citing_dossier: usize,
+    pub covering_ranks: Vec<usize>,
+}
+
+pub fn union_coverage(cases: &[UnionCase]) -> UnionCoverageReport {
+    let mut r = UnionCoverageReport {
+        gold_missing_topk: 0,
+        covered_by_citing_dossier: 0,
+        covering_ranks: Vec::new(),
+    };
+    for c in cases {
+        if c.gold_in_topk {
+            continue; // the gate already credits gold-as-itself; union-coverage reports only the gap cases
+        }
+        r.gold_missing_topk += 1;
+        if let Some(rank) = c.best_citing_dossier_rank {
+            r.covered_by_citing_dossier += 1;
+            r.covering_ranks.push(rank);
+        }
+    }
+    r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn union_coverage_counts_only_gap_cases_and_their_citing_dossiers() {
+        let cases = [
+            UnionCase { gold_in_topk: true, best_citing_dossier_rank: Some(1) }, // gate case — ignored here
+            UnionCase { gold_in_topk: false, best_citing_dossier_rank: Some(3) }, // covered gap
+            UnionCase { gold_in_topk: false, best_citing_dossier_rank: None },    // uncovered gap
+        ];
+        let r = union_coverage(&cases);
+        assert_eq!(r.gold_missing_topk, 2, "only gold-missing cases enter the metric");
+        assert_eq!(r.covered_by_citing_dossier, 1);
+        assert_eq!(r.covering_ranks, vec![3]);
+    }
+
+    #[test]
+    fn drive_to_quiescence_converges_and_fails_loud_on_a_spinner() {
+        // Converges: evolve drains in 2 cycles, misses in 3 → quiescent at cycle 3.
+        let (mut e, mut m) = (2usize, 3usize);
+        let cycles = drive_to_quiescence(
+            || { e = e.saturating_sub(1); Ok(e) },
+            || { m = m.saturating_sub(1); Ok(m) },
+        )
+        .unwrap();
+        assert_eq!(cycles, 3);
+        // A non-converging pass (queue never drains) fails LOUD at the cap, never silently scores.
+        let err = drive_to_quiescence(|| Ok(1), || Ok(0)).unwrap_err();
+        assert!(err.to_string().contains("did not reach quiescence"), "loud non-convergence: {err}");
+    }
+}
 ```
 
-   The `reflect-gate` subcommand orchestration (main.rs): ingest the frozen corpus (the existing
-   `prepare_corpus` → wire `run_ingest` path), enable evolve + reflect, SEED a scripted retire (§5.3(c);
-   simplest per the brief = a direct `retire_memory` on a seeded `remember` note folded into an entity's
-   lineage — see the deviation note), load a FROZEN synthetic miss-set file, `drive_to_quiescence`, then
-   `run_queries` for the reflected arm and a baseline arm, write both reports, and `compare_runs` +
-   `recall_regressed` as the SHIP gate. Hermetic tests use `AirDouble`/`GbrainDouble`/doubles (the
-   `tests/hermetic_run_e2e.rs` fixtures) to exercise `drive_to_quiescence` + `map_hits` + the gate WITHOUT a
-   live model; the live frozen-corpus run is Peter-gated (document the runbook: `cargo run -p memharness --
-   reflect-gate --corpus ~/brain --miss-set <frozen.jsonl> --reports-dir <outside-repo>`).
+   The `reflect-gate` subcommand orchestration (main.rs), all through `daemon.engine()` (OQ2 lock):
+   1. Ingest the frozen corpus (the existing `prepare_corpus` → wire `run_ingest` path) and run the
+      BASELINE arm's `run_queries` first (unreflected).
+   2. `let engine = daemon.engine();` → enable both loops: `engine.set_evolve_enabled(true, true).await` +
+      `engine.set_reflect_enabled(true, true).await` (T12's engine methods).
+   3. SEED the §5.3(c) retire (OQ3 lock: a direct `retire_memory(note, None)` on a seeded `remember` note
+      folded into an entity's lineage — see the deviation note) and load the FROZEN synthetic miss-set file,
+      seeding each query via the core `seed_miss` (through `engine.get_or_open(true)` + `spawn_blocking`).
+      NOTE (ARCH MAJOR-1): any fixture that seeds entities directly via `log.entity(...)` MUST call
+      `log.rederive_entity_vectors_pending(&emb)` before any index build — `log.entity` mints no vector.
+      (The live corpus path needs no such call: evolve's own mints derive vectors inline, log.rs:9152.)
+   4. Drive to quiescence — the live async twin of the pure fn, same bound + same loud failure:
+      loop ≤ `MAX_QUIESCENCE_CYCLES` { `engine.evolve_once(true).await?` then
+      `engine.reflect_once(true, now).await?`; read `engine.queue_depth_or_zero(true).await` and
+      `engine.reflect_gate_inputs(true).await` (`open_unparked_misses`); break when both are 0 }, else
+      bail with the same "did not reach quiescence" message.
+   5. `run_queries` for the REFLECTED arm → `compare_runs` + `recall_regressed` = the SHIP gate; then build
+      the per-case `UnionCase` inputs (top-k dossier hits' cites via `get_or_open` + `stream_all`, mapped
+      through the SAME `PageResolver`) and print `union_coverage` as the REPORTED-only metric.
+   Hermetic tests exercise `drive_to_quiescence` + `union_coverage` + `map_hits` pure (above) WITHOUT a live
+   model; the live frozen-corpus run is Peter-gated (runbook: `cargo run -p memharness -- reflect-gate
+   --corpus ~/brain --miss-set <frozen.jsonl> --reports-dir <outside-repo>`).
 
-4. Run → PASS: `cargo test -p memharness page_hits_resolve_as_synthetic_non_gold_occupants_and_file_hits_stay_loud`
-   + the hermetic driver tests. The live gate run is Peter-gated (NOT in CI).
+4. Run → PASS:
+   `cargo test -p memharness page_hits_resolve_as_synthetic_non_gold_occupants_and_file_hits_stay_loud union_coverage_counts_only_gap_cases_and_their_citing_dossiers drive_to_quiescence_converges_and_fails_loud_on_a_spinner`
+   The live gate run is Peter-gated (NOT in CI).
 
-5. Commit: `feat(rung4-a): memharness reflection non-regression gate (page arm + quiescence driver + recall_regressed)`
+5. Commit: `feat(rung4-a): memharness reflection non-regression gate (page arm + engine() handle + quiescence driver + union-coverage reported)`
 
 ---
 
@@ -2573,28 +3039,230 @@ reuses `judge_pair_blind` + `trust_verdict` exactly as `run_queries` does for op
 - Modify: `crates/memharness/src/lib.rs` (`pub mod probes;`); `main.rs` (surface both as REPORTED lines).
 - Test: `crates/memharness/src/probes.rs mod tests` (doubles for both runners).
 
+**Design note (pure-scored).** Both probes are PURE over driver-precomputed inputs — the DRIVER (the live,
+Peter-gated path) does retrieval/answer-composition through `daemon.engine()` + `WireClient` exactly as
+`run_queries` does; the probes only score. That is what makes them hermetically testable with hand-built
+hits and the in-file judge-double idiom (`GoodJudge`/`MumbleJudge`, `judge.rs:380/:392`). Verified trait
+shape: `PairJudge::pick(&self, query, answer_a, answer_b) -> anyhow::Result<Option<PosPick>>` (`judge.rs:135`);
+`judge_pair_blind(judge, blind, query, air_answer, gbrain_answer) -> anyhow::Result<Verdict>` (`:241`).
+
 **Steps**
 
-1. Write the failing tests (hermetic doubles): (d) an A→B held-out run reports a success@k on B with a REPORTED
-   kill-criterion constant `HELD_OUT_LIFT_KILL: f64` (documented, not asserted as a gate); (e) a dossier-vs-source
-   run over `GoodJudge`/`ContrarianAuditor` doubles produces a `TrustVerdict` and, when `trusted == false`,
-   prints the lift as UNINTERPRETABLE rather than as evidence. (Assert the machinery: the (e) runner returns a
-   `TrustVerdict` and an `Option<f64>` lift that is `None`/flagged when untrusted.)
+1. Write the failing tests (ZERO elision — critic M1; in `probes.rs mod tests`):
 
-2. Run → FAIL: `cargo test -p memharness probes` (missing module).
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arms::RetrievedHit;
+    use crate::judge::{PairJudge, PosPick};
+
+    #[test]
+    fn held_out_scoring_and_verdict_bands() {
+        let hit = |gold: &str| {
+            (gold.to_string(), vec![RetrievedHit { page_id: gold.to_string(), snippet: String::new() }])
+        };
+        let miss = |gold: &str| {
+            (gold.to_string(), vec![RetrievedHit { page_id: "other/page".into(), snippet: String::new() }])
+        };
+        // Pure success@k over deduped hits: 1/2 then 2/2.
+        assert_eq!(score_success_at_k(&[hit("g1"), miss("g2")], 5), 0.5);
+        assert_eq!(score_success_at_k(&[hit("g1"), hit("g2")], 5), 1.0);
+        // The pre-registered bands (OQ5 lock): ≥ +5pp promising, ≤ 0pp kill, else inconclusive. REPORTED,
+        // never a CI assert on live numbers — these asserts pin the BAND ARITHMETIC, not any real result.
+        assert_eq!(held_out_report(0.50, 0.56).verdict, "promising");
+        assert_eq!(held_out_report(0.50, 0.50).verdict, "kill");
+        assert_eq!(held_out_report(0.50, 0.53).verdict, "inconclusive");
+    }
+
+    /// Content-based judge double (the `GoodJudge` idiom, judge.rs:380): prefers the answer containing
+    /// "DOSSIER" — it judges CONTENT, not position, so it survives blinding + swapping.
+    struct DossierLover;
+    impl PairJudge for DossierLover {
+        fn pick(&self, _q: &str, a: &str, b: &str) -> anyhow::Result<Option<PosPick>> {
+            Ok(match (a.contains("DOSSIER"), b.contains("DOSSIER")) {
+                (true, false) => Some(PosPick::A),
+                (false, true) => Some(PosPick::B),
+                _ => Some(PosPick::Tie),
+            })
+        }
+    }
+    /// Ambiguity double (the `MumbleJudge` idiom, judge.rs:392): always None → every pair `Uncertain`.
+    struct Mumble;
+    impl PairJudge for Mumble {
+        fn pick(&self, _q: &str, _a: &str, _b: &str) -> anyhow::Result<Option<PosPick>> {
+            Ok(None)
+        }
+    }
+
+    /// 3 dossier-better + 1 source-better items → MIXED verdict categories, so Cohen's κ over the
+    /// perfectly-agreeing audit is well-defined (an all-one-category audit makes κ degenerate).
+    fn mixed_items() -> Vec<AbItem> {
+        let mut v: Vec<AbItem> = (0..3)
+            .map(|i| AbItem {
+                query: format!("q{i}"),
+                dossier_answer: "DOSSIER grounded answer".into(),
+                source_answer: "raw source answer".into(),
+            })
+            .collect();
+        v.push(AbItem {
+            query: "q3".into(),
+            dossier_answer: "thin dossier answer".into(),
+            source_answer: "DOSSIER-quality raw source answer".into(),
+        });
+        v
+    }
+
+    #[test]
+    fn ab_lift_is_reported_only_under_a_trusted_judge() {
+        // Agreeing judge + auditor over mixed outcomes → agreement 1.0, κ = 1.0 → trusted → Some(lift).
+        let out = dossier_vs_source_ab(&mixed_items(), &DossierLover, Some(&DossierLover), 7).unwrap();
+        assert!(out.verdict.trusted, "identical local/cloud verdicts clear ≥85% / κ≥0.6");
+        assert_eq!((out.dossier_wins, out.source_wins, out.ties, out.uncertain), (3, 1, 0, 0));
+        assert_eq!(out.lift_pp, Some(50.0), "(3-1)/4 → +50pp; reported as evidence ONLY because trusted");
+        assert!(out.verdict.audit_n_too_small, "4 < AUDIT_FLOOR(30) → indicative-only flag carried");
+
+        // NO auditor → audit_incomplete → UNTRUSTED → the lift is WITHHELD (printed UNINTERPRETABLE).
+        let out = dossier_vs_source_ab(&mixed_items(), &DossierLover, None, 7).unwrap();
+        assert!(!out.verdict.trusted);
+        assert!(out.verdict.audit_incomplete, "no cloud audit → verdict UNAVAILABLE, never fabricated");
+        assert_eq!(out.lift_pp, None, "untrusted judge → no lift claim (spec §5.3(e))");
+
+        // A mumbling judge → all Uncertain → zero agreement with the auditor → untrusted, lift withheld.
+        let out = dossier_vs_source_ab(&mixed_items(), &Mumble, Some(&DossierLover), 7).unwrap();
+        assert_eq!(out.uncertain, 4);
+        assert!(!out.verdict.trusted);
+        assert_eq!(out.lift_pp, None);
+    }
+}
+```
+
+2. Run → FAIL: `cargo test -p memharness probes` (missing module / missing symbols).
 
 3. Implement `probes.rs`:
-   - `pub const HELD_OUT_LIFT_KILL: f64 = <pre-registered at plan review>;` — a REPORTED kill-criterion, with
-     a doc comment stating it is agreed BEFORE the live dogfood (spec §5.5) and is NOT a CI gate.
-   - `pub fn held_out_probe(reflect_set: &[QueryCase], eval_set: &[QueryCase], air: &mut dyn AirRetriever,
-     cfg: &RunConfig) -> HeldOutReport` — reflect (drive) on `reflect_set`'s topics, then score success@k on the
-     DISJOINT `eval_set` (paraphrases), reusing `dedup_by_page` + `gold_rank` + `success_at_k`.
-   - `pub fn dossier_vs_source_ab(open_cases: &[QueryCase], /* dossier ctx + source ctx per case */,
-     answerer: &dyn Answerer, judge: &dyn PairJudge, auditor: Option<&dyn PairJudge>, seed: u64)
-     -> (TrustVerdict, Option<f64>)` — for each open case, compose an answer from the DOSSIER context and one
-     from its RAW CITED memories, `judge_pair_blind` (dossier-vs-source, blind + position-swapped), audit via
-     `select_audit_indices` + `trust_verdict`; return the trust verdict + the lift, where the lift is
-     `Some(_)` only when `trusted`, else `None` (printed UNINTERPRETABLE).
+
+```rust
+//! §5.3(d)+(e) evidence probes — REPORTED, never SHIP-gated in R4-A. PURE scoring over
+//! driver-precomputed inputs; the live driver (Peter-gated) retrieves/composes via `daemon.engine()`.
+
+use crate::arms::{dedup_by_page, gold_rank, RetrievedHit};
+use crate::judge::{assign_blind, judge_pair_blind, trust_verdict, PairJudge, TrustVerdict, Verdict,
+    AUDIT_FLOOR};
+use rand::SeedableRng;
+
+/// §5.3(d) pre-registered bands (OQ5 LOCK, recorded 2026-07-19 at plan review, per §5.5): the reflected
+/// arm's success@k lift over baseline on the DISJOINT paraphrase set B. `≥ +5pp` = promising; `≤ 0pp` =
+/// kill. REPORTED kill-criterion — NOT a CI gate and NOT a tuning knob (critic guard): the agreed
+/// value + date live here and at the §5.5 pre-registration; LOWERING the kill bar after a failed dogfood
+/// requires a written rationale in the design changelog. A kill bar you can quietly lower is not a kill bar.
+pub const HELD_OUT_LIFT_PROMISING_PP: f64 = 5.0;
+pub const HELD_OUT_LIFT_KILL_PP: f64 = 0.0;
+
+/// Success@k over per-case `(gold_page_id, retrieved hits)` — dedup-by-page then rank, the run.rs scoring
+/// path's exact semantics. PURE.
+pub fn score_success_at_k(cases: &[(String, Vec<RetrievedHit>)], k: usize) -> f64 {
+    if cases.is_empty() {
+        return 0.0;
+    }
+    let hits = cases
+        .iter()
+        .filter(|(gold, hs)| gold_rank(&dedup_by_page(hs.clone()), gold).is_some_and(|r| r < k))
+        .count();
+    hits as f64 / cases.len() as f64
+}
+
+/// The (d) report: baseline vs reflected success@k on set B + the band verdict (REPORTED only).
+pub struct HeldOutReport {
+    pub baseline: f64,
+    pub reflected: f64,
+    pub lift_pp: f64,
+    pub verdict: &'static str,
+}
+
+pub fn held_out_report(baseline: f64, reflected: f64) -> HeldOutReport {
+    let lift_pp = (reflected - baseline) * 100.0;
+    let verdict = if lift_pp >= HELD_OUT_LIFT_PROMISING_PP {
+        "promising"
+    } else if lift_pp <= HELD_OUT_LIFT_KILL_PP {
+        "kill"
+    } else {
+        "inconclusive"
+    };
+    HeldOutReport { baseline, reflected, lift_pp, verdict }
+}
+
+/// One (e) A/B item: the SAME question answered twice — once composed from the topic's DOSSIER page,
+/// once from its RAW CITED memories (the driver composes both through the same answerer).
+pub struct AbItem {
+    pub query: String,
+    pub dossier_answer: String,
+    pub source_answer: String,
+}
+
+/// The (e) outcome. `lift_pp` is `Some` ONLY when the judge cleared the Phase-0 trust ladder
+/// (`TRUST_AGREEMENT_MIN`/`TRUST_KAPPA_MIN`, judge.rs:67-68) — otherwise `None` and the report prints
+/// the lift as UNINTERPRETABLE (the honest tokens are `verdict.audit_incomplete` / `!verdict.trusted`).
+pub struct AbOutcome {
+    pub verdict: TrustVerdict,
+    pub dossier_wins: usize,
+    pub source_wins: usize,
+    pub ties: usize,
+    pub uncertain: usize,
+    pub lift_pp: Option<f64>,
+}
+
+/// §5.3(e): blind position-swapped dossier-vs-source judging, reusing `judge_pair_blind` VERBATIM — the
+/// "air" slot carries the DOSSIER answer and the "gbrain" slot the SOURCE answer (a slot reuse of the
+/// arm-named machinery: `Verdict::AirWins` reads "dossier wins" here). AUDIT: the auditor re-judges the
+/// FULL item set — the open-case pool sits at/below `AUDIT_FLOOR`, where the ladder audits in full and
+/// flags `audit_n_too_small` (indicative-only), so no sampler dependency — then `trust_verdict` computes
+/// agreement + κ. No auditor → `audit_incomplete` → untrusted → the lift is withheld, never fabricated.
+pub fn dossier_vs_source_ab(
+    items: &[AbItem],
+    judge: &dyn PairJudge,
+    auditor: Option<&dyn PairJudge>,
+    seed: u64,
+) -> anyhow::Result<AbOutcome> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut locals = Vec::with_capacity(items.len());
+    for it in items {
+        let blind = assign_blind(&mut rng);
+        locals.push(judge_pair_blind(judge, blind, &it.query, &it.dossier_answer, &it.source_answer)?);
+    }
+    let verdict = match auditor {
+        None => trust_verdict(&[], &[], false, true, false),
+        Some(aud) => {
+            let mut rng2 = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5eed);
+            let mut clouds = Vec::with_capacity(items.len());
+            for it in items {
+                let blind = assign_blind(&mut rng2);
+                clouds.push(judge_pair_blind(aud, blind, &it.query, &it.dossier_answer, &it.source_answer)?);
+            }
+            trust_verdict(&locals, &clouds, false, false, items.len() < AUDIT_FLOOR)
+        }
+    };
+    let (mut dossier_wins, mut source_wins, mut ties, mut uncertain) = (0usize, 0usize, 0usize, 0usize);
+    for v in &locals {
+        match v {
+            Verdict::AirWins => dossier_wins += 1,
+            Verdict::GbrainWins => source_wins += 1,
+            Verdict::Tie => ties += 1,
+            Verdict::Uncertain => uncertain += 1,
+        }
+    }
+    let lift_pp = if verdict.trusted && !items.is_empty() {
+        Some((dossier_wins as f64 - source_wins as f64) / items.len() as f64 * 100.0)
+    } else {
+        None // UNINTERPRETABLE — the report prints the verdict tokens, not a lift number
+    };
+    Ok(AbOutcome { verdict, dossier_wins, source_wins, ties, uncertain, lift_pp })
+}
+```
+
+   `main.rs` surfaces both as REPORTED lines in the reflect-gate output (`held-out: baseline X / reflected
+   Y / lift Z pp → <band>`; `dossier-vs-source: +N pp (trusted)` or `dossier-vs-source: UNINTERPRETABLE
+   (judge failed the trust ladder — agreement A, κ K, audit_incomplete=…)`). The (d) DISJOINT paraphrase
+   set B ships as a frozen file beside the miss-set file (the `cases.rs` save/load shapes).
 
 4. Run → PASS: `cargo test -p memharness probes`.
 
@@ -2609,46 +3277,102 @@ in-process engine and asserts the counters + the digest line + guest refusal; th
 with the `== 6` trip-wire green at ALL THREE sites.
 
 **Files**
-- Create: `crates/bossclawd/tests/reflect_e2e.rs` — the end-to-end enable→seed→tick→digest test + guest-refused.
-- No change: the three trip-wire sites (`roundtrip.rs:173`, `engine/mod.rs:2237` — T2; `client.rs:973` — T12b)
-  now read `6`; this task only verifies them green.
+- Modify: `crates/bossclawd/src/engine/mod.rs` `mod tests` — the end-to-end tick+digest test (the engine-level
+  home lets the test reach the core log for seeding; a separate integration-test crate could not script it).
+- Modify: `crates/bossclawd/tests/authz.rs` — the over-the-socket App-only test, INSIDE the file that owns the
+  private `RoleClient`/`spawn_onboarded_daemon`/`is_not_permitted` helpers (critic m4: integration-test files
+  are separate crates — a new `reflect_e2e.rs` could not import them).
+- No change: the three trip-wire sites (`roundtrip.rs:173`, `engine/mod.rs:2237`, `client.rs:973` — ALL
+  flipped in T2) now read `6`; this task only verifies them green.
 
 **Steps**
 
-1. Write the failing integration test (`crates/bossclawd/tests/reflect_e2e.rs`, mirroring the conflict-sweep
-   engine e2e `conflict/sweeper.rs:112`):
+1. Write the failing tests.
+   (a) The end-to-end tick+digest test (in `engine/mod.rs mod tests`, the T10 fixture idiom — ZERO elision):
+
+```rust
+    #[tokio::test]
+    async fn reflect_tick_classifies_misses_and_the_digest_line_appears() {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("identity.json"), serde_json::json!({
+            "did": "did:wba:example.com:tester", "name": "Tester",
+            "created_at": "2026-07-11T00:00:00+00:00" }).to_string()).unwrap();
+        let engine = EngineHandle::new(
+            crate::server::shared_test_vault(), dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(reason::MockReasonerProvider::from_reasoner(
+                Arc::new(bossclaw_core::ScriptedReasoner::new("test")))));
+        let onboarded = true;
+        // T12's engine setter (landed by this task) — the product enable path, end to end.
+        engine.set_reflect_enabled(onboarded, true).await.unwrap();
+
+        // Seed through the SAME log the engine serves: one memory the brain can answer, one KNOWN entity
+        // (ARCH MAJOR-1: log.entity mints no vector — rederive before any index build), and two backlog
+        // misses — one answerable (→ repaired_by_time), one unknowable (→ no_material).
+        let log = engine.get_or_open(onboarded).await.unwrap();
+        let emb = engine.ensure_indexed(&log).await.unwrap(); // the engine's OWN embedder (model ids match)
+        {
+            let log = log.clone();
+            tokio::task::spawn_blocking(move || {
+                let m = log.remember(&*emb, "The capital of France is Paris.").unwrap();
+                let _e = log.entity("Paris", &[], "place", "test", std::slice::from_ref(&m)).unwrap();
+                log.rederive_entity_vectors_pending(&*emb).unwrap(); // MAJOR-1
+                log.rebuild_indexes(&*emb).unwrap();
+                log.seed_miss(
+                    &bossclaw_core::reflect::normalized_query_key("The capital of France is Paris."),
+                    "The capital of France is Paris.", 10).unwrap();
+                log.seed_miss(
+                    &bossclaw_core::reflect::normalized_query_key("zzz unknowable gibberish 9182"),
+                    "zzz unknowable gibberish 9182", 11).unwrap();
+            }).await.unwrap();
+        }
+
+        let report = engine.reflect_once(onboarded, 1_000).await.expect("tick runs");
+        assert!(!report.skipped_disabled);
+        assert_eq!(report.attempted, 2, "both seeded misses attempted");
+        assert_eq!(report.repaired_by_time, 1, "the answerable miss self-heals via recall");
+        assert_eq!(report.no_material, 1, "the unknowable miss is an honest gap");
+
+        // The NEUTRAL digest line renders byte-exactly on a startup serve, then the window is consumed.
+        let lines = engine.serve_reflect_digest_line("startup").await;
+        assert_eq!(lines,
+            vec!["0 dossier(s) refreshed, 1 unknown-topic gap(s) since last session.".to_string()]);
+        assert!(engine.serve_reflect_digest_line("startup").await.is_empty(),
+            "startup consumed the since-last-session window (T13 rule)");
+    }
+```
+
+   (b) The over-the-socket App-only test (appended to `crates/bossclawd/tests/authz.rs`, using ITS verified
+   helpers — `spawn_onboarded_daemon` `:43`, `RoleClient::connect` `:24`, `call` `:34`, `is_not_permitted`
+   `:63`):
 
 ```rust
 #[tokio::test]
-async fn reflect_tick_heals_a_stale_dossier_and_the_digest_line_appears() {
-    // Real in-process engine (dim-64 mock embedder + a scripted reasoner), identity on disk so `is_onboarded`
-    // passes. Enable reflect + evolve, seed a topic+page whose source is then retired (a stale dossier), and a
-    // synthetic miss; drive a reflect tick and assert the report counters > 0 + the startup digest line.
-    crate::common::... // reuse the crate's engine test harness
-    engine.set_reflect_enabled(true, true).await.unwrap();
-    // ... seed: remember two sources → evolve to a page → retire one source (stale lineage). ...
-    let report = engine.reflect_once(true, 1000).await.unwrap();
-    assert!(report.dossiers_refreshed >= 1 || report.no_material >= 1 || report.repaired_by_time >= 1,
-        "the tick did real work (healed a stale dossier and/or classified the seeded miss)");
-    // The digest line appears in a fresh startup snapshot preamble.
-    let lines = engine.serve_reflect_digest_line("startup").await;
-    assert!(lines.iter().any(|l| l.contains("since last session")), "the neutral digest line renders");
-}
-
-#[tokio::test]
-async fn guest_cannot_enable_reflection_over_the_socket() {
-    // I8 unchanged: SetReflectEnabled is App-only. A MemoryClient connection is refused (NotPermitted).
-    let daemon = TestDaemon::spawn().await;
-    let resp = daemon.roundtrip(Role::MemoryClient, Request::SetReflectEnabled { onboarded: true, enabled: true }).await;
-    assert!(matches!(resp, Response::Err { kind: OpErrorKindWire::NotPermitted, .. }),
-        "guest cannot enable reflection (App-only)");
+async fn reflect_enable_is_app_only_over_the_socket() {
+    let (_tmp, sock) = spawn_onboarded_daemon().await;
+    // Guest: refused at the role boundary (never reaches the engine) — Role::allows is UNCHANGED (I8).
+    let mut guest = RoleClient::connect(&sock, Role::MemoryClient).await;
+    let resp = guest.call(Request::SetReflectEnabled { onboarded: true, enabled: true }).await;
+    assert!(is_not_permitted(&resp), "guest cannot enable reflection: {resp:?}");
+    let resp = guest.call(Request::ReflectEnabled { onboarded: true }).await;
+    assert!(is_not_permitted(&resp), "guest cannot read the reflect flag: {resp:?}");
+    // App: full round-trip — default CLOSED, enable acks Ok, reads back true.
+    let mut app = RoleClient::connect(&sock, Role::App).await;
+    let resp = app.call(Request::ReflectEnabled { onboarded: true }).await;
+    assert!(matches!(resp, Response::ReflectEnabled(false)), "default CLOSED, got {resp:?}");
+    let resp = app.call(Request::SetReflectEnabled { onboarded: true, enabled: true }).await;
+    assert!(matches!(resp, Response::Ok), "App enable acks Ok, got {resp:?}");
+    let resp = app.call(Request::ReflectEnabled { onboarded: true }).await;
+    assert!(matches!(resp, Response::ReflectEnabled(true)), "reads back enabled, got {resp:?}");
 }
 ```
 
-2. Run → FAIL (until the harness seams compile): `cargo test -p bossclawd --test reflect_e2e`
+2. Run → FAIL (both compile against the T1-T13 surface; red only until any missed wiring lands):
+   `cargo test -p bossclawd --lib reflect_tick_classifies_misses_and_the_digest_line_appears`
+   `cargo test -p bossclawd --test authz reflect_enable_is_app_only_over_the_socket`
 
-3. Implement: nothing new in product code — this exercises the T1-T13 surface end-to-end. Adapt to the crate's
-   real engine test harness (mirror `engine/mod.rs mod tests` seeding + the `authz`/`roundtrip` socket helper).
+3. Implement: nothing new in product code — these exercise the T1-T13 surface end-to-end.
 
 4. Run → PASS, then the FULL-WORKSPACE EXIT GATE (all foreground, all must be green):
 
@@ -2671,7 +3395,7 @@ cd apps/desktop && npx vitest run && npx tsc --noEmit && npx eslint src --max-wa
    - **Reflect-independent heal + fresh-corpus exclusion path (§5.3(c), New-Major-1):** T3 + T14's seeded retire.
    - **Scoreboard vs evidence separation (§5):** T13 (operational digest) vs T15 (reported probes).
 
-5. Commit: `test(rung4-a): reflect end-to-end (heal + digest + guest-refused) + full-workspace exit gate green`
+5. Commit: `test(rung4-a): reflect end-to-end (tick + byte-exact digest + App-only socket) + full-workspace exit gate green`
 
 ---
 
@@ -2712,39 +3436,77 @@ cd apps/desktop && npx vitest run && npx tsc --noEmit && npx eslint src --max-wa
    core, keeping core clock-free. The daemon reads them via `reflect_gate_inputs` and writes them via
    `set_reflect_last_completed_run` / `set_reflect_last_floor_fire`.
 
-## Open questions for plan review (do NOT let the executor guess these silently)
+## Open questions — ALL RESOLVED at plan review (Rev 2 locks; kept for the audit trail)
 
-1. **`REFLECT_TOPIC_FLOOR = 0.75` (RESOLVE_LOW) vs a tighter 0.92 (RESOLVE_HIGH).** I anchored the floor to
-   `extract::RESOLVE_LOW` (the bar below which evolve mints a fresh entity) with the harness (§5.3(d)) tuning it
-   upward. §7.2 says "start conservative (high floor)". A reviewer may prefer starting at `RESOLVE_HIGH` (0.92,
-   evolve's auto-merge bar) — accepting near-total `no_material` initially — and letting §5.3(d) lower it. Both
-   are defensible; the const is the single-line dial. **Decide the starting value at plan review.**
-2. **The memharness reflected-pass CONTROL SURFACE (T14).** Driving evolve+reflect to quiescence requires the
-   harness to (a) ENABLE evolve+reflect on `HarnessDaemon`, (b) TICK `evolve_once`/`reflect_once` repeatedly, and
-   (c) for union-coverage, READ a dossier's cited `source_event_ids`. The verified `HarnessDaemon` API
-   (`spawn_real`/`spawn_with_provider`/`home`/`socket_path`) + `WireClient`
-   (`connect`/`add_grant`/`run_ingest`/`list_files`/`recall`) exposes NONE of these. **Which control surface?**
-   Options: (i) expose the in-process `EngineHandle` on `HarnessDaemon` (simplest for an in-process dev harness);
-   (ii) add wire ops (`EvolveNow`/`ReflectNow`/`GetPage`) — heavier, App-only. I recommend (i) for evolve/reflect
-   ticks + enables, and flag that union-coverage's "read a dossier's cites" needs either a `GetPage`-style read
-   or an in-process page-event read. This is the single biggest unresolved seam and must be settled before T14
-   is built.
-3. **The §5.3(c) retirement seed mechanism.** I chose the simplest that exercises the T3 gather-exclusion: a
-   direct `retire_memory(note, None)` on a seeded `remember` note folded into an entity's lineage (deterministic
-   under a scripted reasoner). The brief allows "resolve_conflict on a seeded proposal OR direct retire_memory".
-   `resolve_conflict` would additionally require seeding a `conflict_proposal` (the `#[cfg(unix)]` Phase-2/3
-   machinery) — heavier and orthogonal to what the gate tests. **Confirm `retire_memory` is an acceptable seed**
-   (it is App-reachable and portable; the exclusion set is `retired_notes ∪ superseded`, so an App retire
-   populates `retired_notes` identically to a conflict retire).
-4. **`reflect_once` cumulative "dossiers refreshed" counter definition.** I count
-   `dossiers_refreshed (tidy heals) + candidate_repaired (miss-driven refreshes that made recall hit)` into the
-   `refreshed_total` counter feeding the digest's `n`. A reviewer may prefer `refreshed_total` to count ONLY
-   tidy heals (excluding miss-driven candidate_repaired) so the digest's "dossiers refreshed" is unambiguous.
-   **Confirm the digest `n` composition.**
-5. **Held-out probe (d) pre-registered threshold + `MAX_QUIESCENCE_CYCLES`.** `HELD_OUT_LIFT_KILL` (§5.3(d)) is a
-   REPORTED kill-criterion "agreed at plan review before the live dogfood" (§5.5) — its VALUE is deliberately a
-   plan-review decision, not a source-derived constant. `MAX_QUIESCENCE_CYCLES = 64` is a provisional bound;
-   confirm it is comfortably above the realistic evolve+reflect convergence depth for the frozen corpus.
+1. **`REFLECT_TOPIC_FLOOR` — LOCKED at `0.92` (`RESOLVE_HIGH`), critic M3 + architect converged.** Rationale
+   (in the const's doc): 0.92 is evolve's OWN autonomous-action bar (`extract.rs:19/:146` — the
+   `[RESOLVE_LOW, RESOLVE_HIGH)` band is model-adjudicated, where evolve refuses to self-act); an autonomous
+   reflection refresh must not be bolder than the awake loop. §5.3(d) tunes DOWN only if precision allows.
+   (Exact-label test seeds embed at distance 0 → similarity 1.0, so every hermetic test passes unchanged.)
+2. **T14 control surface — LOCKED: option (i), `HarnessDaemon::engine()`.** The `bound_tx` handshake
+   (`daemon.rs:100`/`:126-131`) carries the `Arc<EngineHandle>` out; enables + ticks + the union-coverage
+   cited-ids read (`get_or_open` `:372` + `stream_all` `:1423`) all flow through it. ZERO new wire ops —
+   design §1's two-op surface holds. Union-coverage is UNBLOCKED and specified in T14.
+3. **§5.3(c) retirement seed — CONFIRMED: direct `retire_memory(note, None)`.** An App retire populates
+   `retired_notes` identically to a conflict retire (the T3 exclusion set is `retired_notes ∪ superseded`).
+   Executor sanity note: `assert_retirable_note` accepts a plain `remember` memory — the
+   `retire_memory_note_excludes_from_recall_and_list_and_unretire_round_trips` precedent (`log.rs:11166`)
+   retires exactly such a note.
+4. **Digest `n` composition — LOCKED (with critic M2): REAL DOSSIER EMITS ONLY.** `refreshed_total` =
+   miss-pipeline `Emitted`s (the `MissAttempt.dossiers_emitted` tally) + stale-refresh heals;
+   `candidate_repaired` NEVER feeds the digest (a replay classification is not an emit). Copy drops the
+   topic-attribution clause: `"{n} dossier(s) refreshed, {m} unknown-topic gap(s) since last session."` —
+   every unit true under its label. (This supersedes the spec §2.4 draft copy; recorded here rather than
+   re-opening the spec, whose §2.4 semantic content — neutral, integer-only, no_material surfaced — is upheld.)
+5. **(d) threshold + quiescence bound — LOCKED.** `HELD_OUT_LIFT_PROMISING_PP = +5.0` / `HELD_OUT_LIFT_KILL_PP
+   = 0.0` as the pre-registered REPORTED kill-criterion (recorded 2026-07-19; the anti-lowering guard lives in
+   the const's doc — lowering after a failed dogfood requires a written design-changelog rationale).
+   `MAX_QUIESCENCE_CYCLES = 64` stands, with the headroom arithmetic documented at the const (≈256 attempts of
+   budget vs a ≤20-query frozen miss set × ≤3 attempts each — order-of-magnitude slack).
+
+## Rev 2 changelog (dual plan-review fold, 2026-07-19 — critic APPROVE-WITH-CHANGES + architect REVISE)
+
+1. **ARCH MAJOR-1 (build-blocking):** `log.rederive_entity_vectors_pending(&emb)` inserted BEFORE every
+   `rebuild_entity_index` in tests that seed entities via `log.entity(...)` and expect
+   `entity_search`/`reflect_topics_for_query` to resolve them — T6, T7 (parking + candidate tests), T14
+   (driver note, step 3), T16 (e2e). Evidence row added to the anchor table (`:2449`/`:9152`).
+2. **ARCH MAJOR-2:** the desktop trip-wire (`client.rs:973`, in `status_shape_parity_over_socket`) moved from
+   T12b INTO T2 — all THREE sites flip in one task; no crate is left red between tasks. T2 gains the desktop
+   test edit + `cargo test -p air_agent_desktop status_shape_parity_over_socket` in both gates. T11 also fixes
+   the stale `main.rs:154` "two background loops" comment (verified: three spawns already follow) → "four".
+3. **CRITIC M1 (zero elision):** the six elided blocks are now FULL code — T7's 3-attempt parking test +
+   `miss_state_for_test` helper, T7's new candidate_repaired test, T8's all-sources-retired
+   `unhealable_thin` test, T14's `union_coverage` (+ its test, unblocked by OQ2), T15's both probe test
+   suites, T16's engine-level e2e + authz socket test. No comments-as-assertions remain.
+4. **CRITIC M2 + OQ4:** digest unit = REAL dossier emits only. `attempt_miss` returns
+   `MissAttempt{outcome, dossiers_emitted}`; `reflect_once` sets `dossiers_refreshed = miss emits + heals`
+   and feeds ONLY that into `refreshed_total`; `candidate_repaired` never feeds the digest. Copy:
+   `"{n} dossier(s) refreshed, {m} unknown-topic gap(s) since last session."` (T7/T9/T13 + byte-exact tests).
+5. **CRITIC M3 + OQ1:** `REFLECT_TOPIC_FLOOR = 0.92` (`RESOLVE_HIGH`) with the architect's
+   not-bolder-than-the-awake-loop rationale in the doc comment; §5.3(d) tunes DOWN only.
+6. **OQ2:** T14 control surface = `HarnessDaemon::engine()` via the `bound_tx` handshake; zero new wire ops;
+   union-coverage specified + runbook rewritten against it.
+7. **OQ3:** retirement seed = direct `retire_memory(note, None)` CONFIRMED (+ the `:11166` executor note).
+8. **OQ5:** `HELD_OUT_LIFT_PROMISING_PP = +5.0` / `HELD_OUT_LIFT_KILL_PP = 0.0` placeholder pre-registration
+   with the anti-lowering guard; `MAX_QUIESCENCE_CYCLES = 64` + the ≈256-vs-≤60 headroom arithmetic.
+9. **CRITIC m1:** spec §7.3 implemented, not deferred — `REFLECT_BACKLOG_TERMINAL_TTL_SECS` (30d) +
+   `prune_reflect_backlog` (T5, one statement + test assertions) + the end-of-tick call (T9).
+10. **CRITIC m2:** `refresh_stale_pages`' cap counts `reasoner_errors` (total attempts bounded).
+11. **CRITIC m3:** `decide_reflect` truth table gains the two conjunct guards (zero-misses ⇒ no floor;
+    evolve-enabled-but-idle ⇒ no defer).
+12. **CRITIC m4:** the T16 socket test lives IN `tests/authz.rs` using its real private harness
+    (`spawn_onboarded_daemon` `:43` / `RoleClient::connect` `:24` / `call` `:34` / `is_not_permitted` `:63`,
+    `OpErrorKindWire::NotPermitted`) — a separate integration-test crate could not import them.
+13. **ARCH minor-a:** T10's test enables via the CORE setter through `get_or_open` (compiles pre-T12; T12's
+    engine method remains the product path — order kept, no reorder).
+14. **ARCH minor-c:** both docs now distinguish the emit-idempotency key (the per-claim CITES UNION,
+    `current_page_for_topic` `log.rs:8051-8064`) from the page-level D8 `source_event_ids` provenance anchor
+    — T3's placement note, T8's staleness doc, and the spec §2.3 correctness note (same commit).
+15. **ARCH minor-d:** `queue_depth_or_zero` (`engine/mod.rs:1266`) added to the anchor table (with
+    `get_or_open :372`).
+16. **CRITIC ambiguity (disclosure = BOTH surfaces):** T10(e) keeps the `telemetry.rs` doc-header update AND
+    T12b(e) fixes the desktop LibraryPanel miss-strip "read-only" framing (`:40`, `:253`) to active-drive
+    wording.
 
 ## Appendix — invariant → task cross-reference (design §4)
 
@@ -2752,7 +3514,7 @@ cd apps/desktop && npx vitest run && npx tsc --noEmit && npx eslint src --max-wa
 | --- | --- |
 | **I1** (append-only dossier REVISIONS; supersede-in-recall, prior recoverable; NEVER mints entities or retires anything) | T3/T4 (`refresh_topic_page` → `emit_page` supersede), T8 (`refresh_stale_pages` never retires; `unhealable_thin` residual), T9 (`reflect_once` mints nothing) |
 | **I2** (no silent egress; reasoner behind `cloud_consent_ok`; miss QUERIES drive local search; MATERIAL reaches a reasoner only inside consent) | T10 (`cloud_consent_ok` before the reasoner is built; local default), T11 (`reflect_reasoner_ready` — cloud never falls back local) |
-| **I3** (dormant; `ConfigFlag::Reflect` default-closed + `prime_switches` force-off; ONE named Reflect-independent change = the §2.3 gather heal; trip-wire `5 → 6` at all THREE sites) | T1 (default-closed flag), T2 (force-off + 2 daemon trip-wires), T3 (the named Reflect-independent heal), T12b (desktop trip-wire), T16 (dormancy assertion) |
+| **I3** (dormant; `ConfigFlag::Reflect` default-closed + `prime_switches` force-off; ONE named Reflect-independent change = the §2.3 gather heal; trip-wire `5 → 6` at all THREE sites) | T1 (default-closed flag), T2 (force-off + ALL THREE trip-wires — Rev 2 / ARCH MAJOR-2), T3 (the named Reflect-independent heal), T16 (dormancy assertion) |
 | **I5** (append-only durable state; `reflect_miss_backlog`/counters/cursor are re-derivable progress state, not history) | T5 (re-derivable tables; upsert-if-new; losing them re-learns from the ring) |
 | **I6** (fail-safe; per-miss attempt budget → parked; per-tick caps; floor ≤ once/interval; `Busy` on overlap; torn ticks idempotent) | T7 (attempt budget → parked), T9 (per-tick caps), T10 (`reflect_lock` → `Busy`; set-diff emit is idempotent), T11 (floor re-fire guard) |
 | **I7** (hostile-output; dossiers citation-floored subtract-only; no raw model text logged; digest lines integer-only) | T4 (`citation_floor` via `refresh_topic_page`), T13 (integer-only neutral digest line) |

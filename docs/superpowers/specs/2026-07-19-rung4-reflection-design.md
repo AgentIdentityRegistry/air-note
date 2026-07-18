@@ -153,9 +153,10 @@ summarize path skips thin emits at `log.rs:8131`) — so its stale page cannot l
 reflection never retires pages (I1). "The next night heals it" is therefore NOT universal: such pages stay
 stale-but-provenance-true until new current facts arrive. Surfaced as a distinct scoreboard outcome
 (`unhealable_thin`) rather than silently retried; the per-tick budget stops it wasting nights. Plan-level
-correctness note: the exclusion must shrink BOTH the gathered memory texts AND the cited `source_event_ids`
-set (the idempotency key at `log.rs:8162` and the D8 taint anchor) — excluding only the texts would leave
-the cited set unchanged and the heal would still no-op.
+correctness note: the exclusion must shrink BOTH the gathered memory texts AND the cited sets — the
+per-claim CITES UNION that is the emit-idempotency key (`current_page_for_topic`, `log.rs:8051-8064`,
+compared at `log.rs:8162`) and the DISTINCT page-level D8 `source_event_ids` provenance anchor — excluding
+only the texts would leave both unchanged and the heal would still no-op.
 
 **Writer-coordination / stability note (critic gap):** evolve's summarize and reflection's refresh converge
 by construction — both route through the same gather (same exclusion) and the same set-diff idempotent
