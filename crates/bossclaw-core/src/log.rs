@@ -6629,6 +6629,25 @@ impl EventLog {
         }
     }
 
+    /// Resolve a missed query to ≤ [`crate::reflect::REFLECT_TOPIC_N`] KNOWN topic entity ids (spec §2.2
+    /// step 2, the read-only bridge). Uses [`EventLog::entity_search`] over the entity-resolution index and
+    /// keeps only candidates at/above [`crate::reflect::REFLECT_TOPIC_FLOOR`] cosine SIMILARITY
+    /// (`1.0 - dist`, mirroring `resolve_mention`). NEVER mints (minting is a write, evolve's job): an empty
+    /// result IS the `no_material` signal. Requires the entity index built (the reflect wrapper rebuilds it
+    /// pre-tick, like evolve); a fresh brain with zero entities returns an empty index → empty result.
+    pub fn reflect_topics_for_query(
+        &self,
+        embedder: &dyn Embedder,
+        query: &str,
+    ) -> Result<Vec<String>, BossclawError> {
+        Ok(self
+            .entity_search(embedder, query, crate::reflect::REFLECT_TOPIC_N)?
+            .into_iter()
+            .filter(|(_, dist)| 1.0 - dist >= crate::reflect::REFLECT_TOPIC_FLOOR)
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// Rebuild the SEPARATE conflict index (Rung-3 §7.1) from the
     /// `session_passage_vectors` table: one vector per CURRENT session's live
     /// passage, keyed by `(session_id, passage_ix)`. Mirrors
@@ -12693,5 +12712,37 @@ mod tests {
         let thin_entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == te).unwrap();
         // fact_count = 0 edges + 1 memory = 1 < PAGE_MIN_FACTS(2) → thin.
         assert_eq!(log.refresh_topic_page(&reasoner, &thin_entity).unwrap(), TopicRefreshOutcome::SkippedThin);
+    }
+
+    /// R4-A (spec §2.2 step 2, arch B1): the read-only query→topic bridge resolves a missed query to
+    /// ≤ REFLECT_TOPIC_N KNOWN topics via the real `entity_search`, keeping only candidates at/above
+    /// REFLECT_TOPIC_FLOOR cosine similarity (`1.0 - dist`, mirroring `resolve_mention`). Reflection
+    /// NEVER mints — a query resolving to no known topic IS the `no_material` path (empty result).
+    #[test]
+    fn reflect_topics_for_query_resolves_known_topics_and_empties_on_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64); // higher dim → distinct vectors for distinct labels
+        let m = log.remember(&emb, "seed").unwrap();
+        let kenny = log.entity("Kenny Ortega", &[], "person", "test-v1", std::slice::from_ref(&m)).unwrap();
+        let _acme = log.entity("Acme Corporation", &[], "org", "test-v1", std::slice::from_ref(&m)).unwrap();
+        // `entity()` only APPENDS the entity event; the `entities` projection that the backfill reads
+        // (`SELECT ... FROM entities`) is materialized by rebuild_graph (mirrors the sibling reflect test).
+        log.rebuild_graph().unwrap();
+        // ARCH MAJOR-1: `log.entity()` mints NO vector (derive happens only at evolve-mint, log.rs:9152, or
+        // via this backfill, :2449) — rebuild_entity_index only READS `entity_vectors`, so without this the
+        // index is empty and every search below returns nothing.
+        log.rederive_entity_vectors_pending(&emb).unwrap();
+        log.rebuild_entity_index(&emb).unwrap(); // entity_search precondition
+
+        // A query naming a known topic resolves to it (MockEmbedder is deterministic; the exact label
+        // embeds to distance 0 → similarity 1.0, well above the floor).
+        let topics = log.reflect_topics_for_query(&emb, "Kenny Ortega").unwrap();
+        assert!(topics.contains(&kenny), "an above-floor query resolves to the known topic");
+        assert!(topics.len() <= crate::reflect::REFLECT_TOPIC_N, "capped at N");
+
+        // A garbage query far from every label → empty → the no_material path.
+        let none = log.reflect_topics_for_query(&emb, "zzzz qqqq unrelated gibberish 9182").unwrap();
+        assert!(none.is_empty(), "no known topic above the floor → empty (no_material)");
     }
 }
