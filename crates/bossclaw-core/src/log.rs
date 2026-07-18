@@ -8193,7 +8193,8 @@ impl EventLog {
                 }
                 crate::reflect::TopicRefreshOutcome::SkippedUnchanged
                 | crate::reflect::TopicRefreshOutcome::SkippedThin
-                | crate::reflect::TopicRefreshOutcome::ReasonerError => {}
+                | crate::reflect::TopicRefreshOutcome::ReasonerError
+                | crate::reflect::TopicRefreshOutcome::TransientError => {}
             }
         }
         // Refresh the projection only if the phase changed the page set.
@@ -8210,10 +8211,12 @@ impl EventLog {
     /// Refresh ONE topic's dossier through the citation-floored machinery (spec §2.2 step 3): gather →
     /// (thin? → SkippedThin) → compose → citation floor → assemble → F6 cited-set idempotency → emit_page
     /// (atomic supersede). PORTABLE, reasoner-only (no embedder: pages embed lazily via `append` and become
-    /// recall-visible at the caller's post-tick `rebuild_indexes`). Per-topic errors fold to `SkippedThin`
-    /// (F4: a topic failure must never propagate). Extracted from `summarize_topics` so evolve's batch AND
-    /// reflection share ONE composer (I9 single-source) — the §2.3 gather exclusion applies to both by
-    /// construction (it lives in `gather_fact_set`).
+    /// recall-visible at the caller's post-tick `rebuild_indexes`). Most per-topic failures fold to a
+    /// Skipped/error outcome (F4: one topic's failure must never poison the batch); the ONE exception is
+    /// the idempotency read (`current_page_for_topic`), whose error propagates — same as the
+    /// pre-extraction code. Extracted from `summarize_topics` so evolve's batch AND reflection share ONE
+    /// composer (I9 single-source) — the §2.3 gather exclusion applies to both by construction (it lives
+    /// in `gather_fact_set`).
     fn refresh_topic_page(
         &self,
         reasoner: &dyn crate::reason::Reasoner,
@@ -8222,7 +8225,10 @@ impl EventLog {
         use crate::reflect::TopicRefreshOutcome;
         let facts = match self.gather_fact_set(entity) {
             Ok(f) if f.fact_count() >= crate::summarize::PAGE_MIN_FACTS => f,
-            _ => return Ok(TopicRefreshOutcome::SkippedThin), // too thin, or a gather error (F4)
+            // Below PAGE_MIN_FACTS → STRUCTURALLY thin (F4; T8 counts it unhealable_thin).
+            Ok(_) => return Ok(TopicRefreshOutcome::SkippedThin),
+            // A gather read error is engine I/O — retry-fixable, NOT thinness (F4).
+            Err(_) => return Ok(TopicRefreshOutcome::TransientError),
         };
         let raw = match reasoner.complete_json(
             crate::summarize::SUMMARIZE_SYSTEM,
@@ -8239,7 +8245,8 @@ impl EventLog {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("refresh: malformed draft for {}, skipping: {e}", entity.entity_id);
-                return Ok(TopicRefreshOutcome::SkippedThin);
+                // Malformed model JSON is a reasoner-QUALITY failure (retry-fixable), not thinness.
+                return Ok(TopicRefreshOutcome::ReasonerError);
             }
         };
         let floored = crate::summarize::citation_floor(&draft, &facts);
@@ -8247,7 +8254,7 @@ impl EventLog {
         // set would hit the Tier-B reject and is not an emit anyway).
         let rendered = match crate::summarize::assemble(&floored) {
             Some(r) => r,
-            None => return Ok(TopicRefreshOutcome::SkippedThin), // empty floor (F4)
+            None => return Ok(TopicRefreshOutcome::SkippedThin), // empty floor → structurally thin (F4)
         };
         // Idempotency (F6): an unchanged cited-source SET emits nothing (no supersede churn).
         let prior = self.current_page_for_topic(&entity.entity_id)?;
@@ -8286,7 +8293,8 @@ impl EventLog {
             Ok((_pid, superseded)) => Ok(TopicRefreshOutcome::Emitted { superseded }),
             Err(e) => {
                 log::warn!("refresh: emit_page failed for {}, skipping: {e}", entity.entity_id);
-                Ok(TopicRefreshOutcome::SkippedThin)
+                // A write failure is engine I/O (retry-fixable) — never "unhealable" thinness.
+                Ok(TopicRefreshOutcome::TransientError)
             }
         }
     }
@@ -12372,6 +12380,28 @@ mod tests {
                 facts2.memories[0].0.clone()] }]}),
         );
         assert_eq!(log.refresh_topic_page(&reasoner2, &entity2).unwrap(), TopicRefreshOutcome::SkippedUnchanged);
+        // A compose failure (no canned response for this prompt) on a summary-worthy topic →
+        // ReasonerError (the model bucket) — NOT SkippedThin: the topic is not structurally thin.
+        let empty_reasoner = crate::reason::ScriptedReasoner::new("test-v1");
+        assert_eq!(log.refresh_topic_page(&empty_reasoner, &entity2).unwrap(),
+            TopicRefreshOutcome::ReasonerError);
+        // Grow the grounding (a new memory + edge) so the cited set differs from the current
+        // page's → the refresh replaces that page atomically: Emitted { superseded: true } (F5).
+        let m2 = log.remember(&emb, "Kenny mentors the platform team.").unwrap();
+        let team = log.entity("Platform", &[], "team", "test-v1", std::slice::from_ref(&m2)).unwrap();
+        log.link_machine(&topic, "mentors", &team, 0.8, "test-v1", std::slice::from_ref(&m2)).unwrap();
+        log.rebuild_graph().unwrap();
+        let entity3 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts3 = log.gather_fact_set(&entity3).unwrap();
+        let reasoner3 = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&facts3),
+            serde_json::json!({ "title": "Kenny", "claims": [
+                { "text": "Kenny works at Acme.", "cites": [m1] },
+                { "text": "Kenny mentors the platform team.", "cites": [m2] },
+            ]}),
+        );
+        assert_eq!(log.refresh_topic_page(&reasoner3, &entity3).unwrap(),
+            TopicRefreshOutcome::Emitted { superseded: true });
         // A topic below PAGE_MIN_FACTS → SkippedThin (no reasoner call needed).
         let thin = log.remember(&emb, "lonely note").unwrap();
         let te = log.entity("Lonely", &[], "misc", "test-v1", std::slice::from_ref(&thin)).unwrap();
