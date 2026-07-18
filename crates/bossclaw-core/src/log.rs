@@ -541,6 +541,9 @@ pub struct ConflictDetectReport {
     pub budget_hit: bool,
     /// The open-proposal ceiling was hit (stop proposing; surface one quiet count).
     pub ceiling_hit: bool,
+    /// Pairs abandoned this run after `CONFLICT_PAIR_ERROR_BUDGET` consecutive reasoner errors (§3.3) — a
+    /// bounded dropped counter on ONE pair, never a frozen sweep, never a hidden sibling conflict.
+    pub poison_skipped: usize,
 }
 
 /// The serialized, signed event log.
@@ -1000,6 +1003,14 @@ impl EventLog {
                 id             INTEGER PRIMARY KEY CHECK (id = 0),
                 last_seq       INTEGER NOT NULL,
                 subject_offset INTEGER NOT NULL
+            )",
+        )?;
+        // Rung-3 Phase-3 (§3.3): per-pair CONSECUTIVE reasoner-error counter. Re-derivable progress state
+        // (NOT a Tier-A fold): losing it only re-tries a poison pair. Keyed by `unordered_pair_key`.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS conflict_pair_errors (
+                pair_key           TEXT PRIMARY KEY,
+                consecutive_errors INTEGER NOT NULL
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -6692,7 +6703,8 @@ impl EventLog {
         use crate::conflict::{
             bound_judge_text, confidence_band, decide_conflict_sweep, templated_why, winner_str,
             FinderInput, CANDIDATE_SIM_MIN, CONFLICT_JUDGE_PER_SWEEP, CONFLICT_OPEN_CEILING,
-            CONFLICT_SCAN_BOUND, CONFLICT_SEARCH_K, MAX_CANDIDATE_PAIRS_PER_SUBJECT,
+            CONFLICT_PAIR_ERROR_BUDGET, CONFLICT_SCAN_BOUND, CONFLICT_SEARCH_K,
+            MAX_CANDIDATE_PAIRS_PER_SUBJECT,
         };
         use crate::index::ConflictRef;
         let mut report = ConflictDetectReport::default();
@@ -6834,9 +6846,16 @@ impl EventLog {
                 report.budget_hit = true;
                 break;
             }
-            let mut reasoner_failed = false;
+            let mut subject_blocked = false; // an outstanding SUB-budget pair error holds the cursor (I6)
             for (a, b) in pairs {
                 let (older, newer) = if ref_ts(&a) <= ref_ts(&b) { (a, b) } else { (b, a) };
+                let pk = Self::conflict_pair_key(&older, &newer);
+                // §3.3: a pair already at the budget is POISON — stop judging it entirely (consume no
+                // budget, count nothing, do not re-error). It no longer holds the cursor
+                // (`subject_blocked` stays false), so a deterministically-erroring pair can't stall the sweep.
+                if self.conflict_pair_error_count(&pk)? >= CONFLICT_PAIR_ERROR_BUDGET {
+                    continue;
+                }
                 let (Some(ot), Some(nt)) = (ref_text(&older), ref_text(&newer)) else {
                     report.dropped += 1;
                     continue;
@@ -6845,6 +6864,8 @@ impl EventLog {
                 budget_left -= 1;
                 match crate::conflict::judge_pair(reasoner, &ot, &nt) {
                     Ok(Some(v)) => {
+                        // Any successful judge (contradiction or not) clears the pair's error streak (§3.3).
+                        self.reset_conflict_pair_error(&pk)?;
                         // [I7 FIX — do NOT use the plan's `log::debug!("... {}", v.why)`. This runs as
                         // a daemon under launchd/systemd, which capture BOTH stdout and stderr to
                         // persistent log files, so neither `log::` nor `eprintln!` is ephemeral. The
@@ -6856,7 +6877,6 @@ impl EventLog {
                             winner_str(v.winner),
                             v.confidence
                         );
-                        let pk = Self::conflict_pair_key(&older, &newer);
                         if open_count >= CONFLICT_OPEN_CEILING {
                             report.ceiling_hit = true;
                             continue;
@@ -6892,15 +6912,29 @@ impl EventLog {
                         open_count += 1;
                         report.proposed += 1;
                     }
-                    Ok(None) => report.dropped += 1,
+                    Ok(None) => {
+                        // A successful judge that declined still clears the streak (§3.3).
+                        self.reset_conflict_pair_error(&pk)?;
+                        report.dropped += 1;
+                    }
                     Err(_) => {
+                        // Pair-granular (§3.3): skip ONLY this pair; keep judging the subject's other pairs so
+                        // a poison pair never hides a real sibling conflict. Persist the consecutive-error
+                        // count so a DETERMINISTIC poison pair is bounded across cycles/restarts.
                         report.reasoner_errors += 1;
-                        reasoner_failed = true;
-                        break;
+                        let n = self.bump_conflict_pair_error(&pk)?;
+                        if n >= CONFLICT_PAIR_ERROR_BUDGET {
+                            report.poison_skipped += 1; // give up on this pair; it no longer holds the cursor
+                        } else {
+                            subject_blocked = true; // sub-budget: retry this subject next cycle (I6)
+                        }
+                        continue;
                     }
                 }
             }
-            if reasoner_failed {
+            if subject_blocked {
+                // A transient outage → do NOT advance past this subject; next cycle re-judges it. Once every
+                // erroring pair reaches the budget (poison_skipped), `subject_blocked` stays false → advance.
                 break;
             }
             self.set_conflict_cursor(cs.seq, cs.within_seq_id + 1)?;
@@ -7020,6 +7054,37 @@ impl EventLog {
              ON CONFLICT(id) DO UPDATE SET last_seq = ?1, subject_offset = ?2",
             rusqlite::params![last_seq, subject_offset as i64],
         )?;
+        Ok(())
+    }
+
+    /// Read a pair's consecutive-error count (0 if absent). §3.3.
+    fn conflict_pair_error_count(&self, pair_key: &str) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n: Option<i64> = store
+            .conn()
+            .query_row("SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1", [pair_key], |r| r.get(0))
+            .optional()?;
+        Ok(n.unwrap_or(0) as usize)
+    }
+
+    /// Increment a pair's consecutive-error count, returning the NEW value (§3.3).
+    fn bump_conflict_pair_error(&self, pair_key: &str) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO conflict_pair_errors (pair_key, consecutive_errors) VALUES (?1, 1)
+             ON CONFLICT(pair_key) DO UPDATE SET consecutive_errors = consecutive_errors + 1",
+            [pair_key],
+        )?;
+        let n: i64 = store.conn().query_row(
+            "SELECT consecutive_errors FROM conflict_pair_errors WHERE pair_key = ?1", [pair_key], |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Reset a pair's consecutive-error count to 0 (on any successful judge of that pair — §3.3).
+    fn reset_conflict_pair_error(&self, pair_key: &str) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute("DELETE FROM conflict_pair_errors WHERE pair_key = ?1", [pair_key])?;
         Ok(())
     }
 
@@ -11735,6 +11800,55 @@ mod tests {
         let r_ok = log.detect_conflicts_once(&emb, &good, &no_passages, &empty, 2).unwrap();
         assert_eq!(r_ok.proposed, 1, "the once-failed pair proposes on a later working cycle");
         assert_eq!(log.pending_conflict_proposals().unwrap().len(), 1);
+    }
+
+    /// Rung-3 Phase-3 (§3.3, Open-Q3): a DETERMINISTICALLY-erroring pair must not stall the sweep
+    /// forever. A per-pair persistent consecutive-error counter retries below the budget (cursor held,
+    /// I6) and, at `CONFLICT_PAIR_ERROR_BUDGET`, marks the pair `poison_skipped` — it stops holding the
+    /// cursor AND stops being judged. `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn poison_pair_is_skipped_after_budget_and_frees_the_cursor() {
+        // REAL test-double API. An ERRORING pair is created by simply NOT registering its
+        // (CONFLICT_SYSTEM, build_conflict_prompt(a, b)) response — an unregistered prompt returns
+        // `Err(Reasoner(..))` naturally (reason.rs:106-111). NO `err_on` builder exists.
+        use crate::conflict::CONFLICT_PAIR_ERROR_BUDGET;
+        use crate::reason::ScriptedReasoner;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64); // 64 — a lower dim drops the pair below CANDIDATE_SIM_MIN
+
+        // EXACTLY ONE candidate pair: two near-duplicate notes (one token apart). A 2-note graph guarantees a
+        // single pair — the architect traced that a 3-note {anchor, good, bad} graph produces STAGGERED poison
+        // pairs (`bad` neighbours both), so `poison_skipped` on a fixed cycle count can be 0. Keep it to one pair.
+        log.remember(&emb, "the default deploy target is vercel").unwrap();
+        log.remember(&emb, "the default deploy target is fly").unwrap();
+        log.set_conflict_detect_enabled(true).unwrap();
+
+        // NO responses registered → every judge of this pair returns Err → a DETERMINISTIC poison pair.
+        let reasoner = ScriptedReasoner::new("test");
+        let no_passages = |_sid: &str, _pid: usize| -> Option<String> { None };
+        let empty = std::collections::HashSet::new();
+
+        // Sub-budget cycles: the pair keeps erroring and the cursor does NOT advance past the subject (I6 — a
+        // transient reasoner outage must retry next cycle, not be dropped). Assert the INVARIANTS each cycle,
+        // not "on the Nth call".
+        let mut r = None;
+        for _ in 0..CONFLICT_PAIR_ERROR_BUDGET {
+            r = Some(log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 100).unwrap());
+            assert!(r.as_ref().unwrap().reasoner_errors >= 1, "the poison pair errored this cycle");
+        }
+        // On the budget-th consecutive error the pair is poison_skipped, stops holding the cursor, and the
+        // sweep advances — a permanent stall becomes a bounded dropped-counter on ONE pair.
+        assert!(r.unwrap().poison_skipped >= 1, "poison pair skipped once it reaches CONFLICT_PAIR_ERROR_BUDGET");
+        let (cseq, _off) = log.conflict_cursor().unwrap();
+        assert!(cseq > 0, "cursor advanced past the poisoned subject (sweep no longer stalls)");
+
+        // It is truly STOPPED being judged (the top-of-loop poison check, not merely re-erroring): rewind the
+        // cursor to re-scan the same subject and confirm NO fresh reasoner error is attributed to the pair.
+        log.set_conflict_cursor(0, 0).unwrap();
+        let after = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 100).unwrap();
+        assert_eq!(after.reasoner_errors, 0, "a fully-poisoned pair is skipped BEFORE the judge, not re-judged");
     }
 
     /// Rung-3 Phase-2 (§3.5, I9): the open-proposal ceiling caps the pending set. A note cluster whose
