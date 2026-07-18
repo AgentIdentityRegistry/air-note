@@ -179,3 +179,45 @@ async fn memory_client_cannot_force_onboarding() {
         "guest remember on a not-onboarded brain → NotOnboarded (no mint)"
     );
 }
+
+/// Rung-3 Phase-3 (I8 relaxation): the SAME `MemoryClient` guest connection MAY drive conflict
+/// *resolution* (`ListConflicts` + `ResolveConflict` — confirm-on-a-trusted-surface) yet is STILL
+/// refused raw memory *retirement* (`RetireMemory`, App-only). End-to-end allowlist proof over the
+/// real socket: the resolve ops reach the engine (permitted), the raw retire is refused at the
+/// boundary (NotPermitted, never reaching the engine). Resolution is not a backdoor to direct retire.
+#[tokio::test]
+async fn memory_client_can_resolve_conflicts_but_still_cannot_retire_directly() {
+    let (_dir, sock) = spawn_onboarded_daemon().await;
+    let mut c = RoleClient::connect(&sock, Role::MemoryClient).await;
+
+    // ListConflicts is PERMITTED for the guest — an empty list on a fresh brain, crucially NOT a
+    // NotPermitted refusal (the op dispatched into the engine).
+    let resp = c.call(Request::ListConflicts { onboarded: true }).await;
+    assert!(!is_not_permitted(&resp), "guest may ListConflicts, got {resp:?}");
+    assert!(matches!(resp, Response::ListConflicts(_)), "guest ListConflicts dispatches, got {resp:?}");
+
+    // ResolveConflict on an unknown id is a clean, TYPED Rejected (permitted op, bad arg): it reached
+    // the engine — proving the op is allowed — and the core folded the unknown id to InvalidInput →
+    // Rejected. Distinctly NOT NotPermitted and NOT a transport error.
+    let resp = c
+        .call(Request::ResolveConflict {
+            onboarded: true,
+            proposal_id: "NOPE".into(),
+            action: bossclawd_proto::types::ResolveActionWire::Dismiss,
+        })
+        .await;
+    assert!(
+        matches!(resp, Response::Err { kind: OpErrorKindWire::Rejected, .. }),
+        "guest may call resolve; an unknown id folds to the typed Rejected, got {resp:?}"
+    );
+
+    // But raw retirement stays App-only: the SAME guest is refused at the boundary (never reaches the
+    // engine). This is the negative half of the allowlist.
+    let resp = c
+        .call(Request::RetireMemory {
+            onboarded: true,
+            target: RetireTarget::Note { event_id: "e".into() },
+        })
+        .await;
+    assert!(is_not_permitted(&resp), "guest still cannot RetireMemory directly, got {resp:?}");
+}
