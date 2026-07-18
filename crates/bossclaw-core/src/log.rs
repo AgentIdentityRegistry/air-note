@@ -494,6 +494,21 @@ pub enum ResolveOutcome {
     NoOp,
 }
 
+/// The visibility-digest counts since the last session boundary (spec §2.4). `max_seq` is the store's
+/// current max event seq — the daemon advances `conflict_digest_cursor` to it after serving a snapshot,
+/// so the next session's window starts fresh. Portable data type.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConflictDigest {
+    /// `note_retired`/`passage_retired` markers with `via=="conflict"` since the cursor (torn-write-safe).
+    pub retired: usize,
+    /// `dismissed` markers since the cursor.
+    pub dismissed: usize,
+    /// `coexist_allowed` (keep-both) markers since the cursor.
+    pub kept: usize,
+    /// The store's current max event seq (the new cursor position).
+    pub max_seq: i64,
+}
+
 /// Map a `ResolveAction` to its terminal `ResolutionKind` (the two retire actions map to the two retire
 /// kinds; KeepBoth/Dismiss map to their own).
 fn action_kind(a: ResolveAction) -> ResolutionKind {
@@ -1011,6 +1026,14 @@ impl EventLog {
             "CREATE TABLE IF NOT EXISTS conflict_pair_errors (
                 pair_key           TEXT PRIMARY KEY,
                 consecutive_errors INTEGER NOT NULL
+            )",
+        )?;
+        // Rung-3 Phase-3 (§2.4): the "since last session" digest window boundary (a SEQ, Open-Q8). Single
+        // row (id = 0). Advanced when a snapshot is served (Task 14). Re-derivable progress state.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS conflict_digest_cursor (
+                id       INTEGER PRIMARY KEY CHECK (id = 0),
+                last_seq INTEGER NOT NULL
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -7057,6 +7080,69 @@ impl EventLog {
         Ok(())
     }
 
+    /// Read the digest window boundary (`0` if never set). §2.4.
+    pub fn conflict_digest_cursor(&self) -> Result<i64, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        Ok(store
+            .conn()
+            .query_row("SELECT last_seq FROM conflict_digest_cursor WHERE id = 0", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Advance the digest window boundary (idempotent single-row upsert). §2.4.
+    pub fn set_conflict_digest_cursor(&self, last_seq: i64) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO conflict_digest_cursor (id, last_seq) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET last_seq = ?1",
+            rusqlite::params![last_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Count conflict-resolution ACTIVITY strictly after `since_seq` (spec §2.4/§3.4). R = retire markers
+    /// with `via=="conflict"` (conflict-scoped — a manual App retire is tagless and NOT counted; AND
+    /// torn-write-safe — the tagged retire marker is written before `conflict_resolved`). D = `dismissed`,
+    /// K = `coexist_allowed`. Enumerates the four marker types by seq so the SEQ window boundary cannot
+    /// drop a retire marker on a torn write (Open-Q8). `max_seq` is the store's current max event seq.
+    pub fn conflict_digest_counts(&self, since_seq: i64) -> Result<ConflictDigest, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut d = ConflictDigest::default();
+        let mut stmt = conn.prepare(
+            "SELECT event_type, payload FROM events
+             WHERE event_type IN (?1, ?2, ?3, ?4) AND seq > ?5 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                crate::graph::NOTE_RETIRED_EVENT_TYPE,
+                crate::graph::PASSAGE_RETIRED_EVENT_TYPE,
+                crate::graph::DISMISSED_EVENT_TYPE,
+                crate::graph::COEXIST_ALLOWED_EVENT_TYPE,
+                since_seq,
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        for row in rows {
+            let (etype, payload) = row?;
+            let ev: Event = serde_json::from_str(&payload)?;
+            match etype.as_str() {
+                t if t == crate::graph::NOTE_RETIRED_EVENT_TYPE
+                    || t == crate::graph::PASSAGE_RETIRED_EVENT_TYPE =>
+                {
+                    if ev.content.get("via").and_then(|v| v.as_str()) == Some("conflict") {
+                        d.retired += 1;
+                    }
+                }
+                t if t == crate::graph::DISMISSED_EVENT_TYPE => d.dismissed += 1,
+                _ => d.kept += 1,
+            }
+        }
+        d.max_seq = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?;
+        Ok(d)
+    }
+
     /// Read a pair's consecutive-error count (0 if absent). §3.3.
     fn conflict_pair_error_count(&self, pair_key: &str) -> Result<usize, BossclawError> {
         let store = self.inner.lock().expect(POISON);
@@ -10600,6 +10686,72 @@ mod tests {
         assert_eq!(ev.content.get("passage_id").and_then(|v| v.as_u64()), Some(0));
         assert_eq!(ev.content.get("via").and_then(|v| v.as_str()), Some("conflict"));
         assert_eq!(ev.content.get("proposal_id").and_then(|v| v.as_str()), Some("PROP2"));
+    }
+
+    #[test]
+    fn conflict_digest_counts_scope_to_via_conflict_and_advance_by_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+
+        assert_eq!(log.conflict_digest_cursor().unwrap(), 0, "digest cursor defaults to 0");
+
+        // A MANUAL App retire (via=None) must NOT be counted.
+        let manual = log.remember(&emb, "manually retired").unwrap();
+        log.retire_memory(&manual, None).unwrap();
+        // A CONFLICT retire (via="conflict") IS counted.
+        let conf = log.remember(&emb, "conflict retired").unwrap();
+        log.retire_memory(&conf, Some("PROP")).unwrap();
+
+        let d = log.conflict_digest_counts(0).unwrap();
+        assert_eq!(d.retired, 1, "only the via=conflict retire is counted (manual App retire excluded)");
+        assert!(d.max_seq > 0);
+
+        // Advance the cursor to max_seq → the next window sees nothing until new markers appear.
+        log.set_conflict_digest_cursor(d.max_seq).unwrap();
+        let d2 = log.conflict_digest_counts(log.conflict_digest_cursor().unwrap()).unwrap();
+        assert_eq!(d2.retired, 0, "no new conflict retires since the cursor");
+
+        // A dismissed + a coexist marker after the cursor count as D and K.
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::DISMISSED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "P", "pair_key": "K", "a_ref": {"kind":"note","event_id":"a"}, "b_ref": {"kind":"note","event_id":"b"} }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+        log.append(crate::event::Event {
+            id: String::new(), ts: String::new(), valid_time: None,
+            event_type: crate::graph::COEXIST_ALLOWED_EVENT_TYPE.to_string(),
+            content: serde_json::json!({ "proposal_id": "P2", "pair_key": "K2", "a_ref": {"kind":"note","event_id":"c"}, "b_ref": {"kind":"note","event_id":"d"} }),
+            model_meta: None, prev_hash: String::new(), hash: None, signed_by_did: log.signer_did(), signature: None,
+        }).unwrap();
+        let d3 = log.conflict_digest_counts(log.conflict_digest_cursor().unwrap()).unwrap();
+        assert_eq!((d3.dismissed, d3.kept), (1, 1), "dismissed + coexist counted since the cursor");
+    }
+
+    /// Open-Q9: the accepted both-sides torn-write edge is DIGEST-VISIBLE, which is what makes it
+    /// acceptable. A torn `RetireOlder` (tagged retire landed, `conflict_resolved` lost) is rolled
+    /// forward by a deliberate `RetireNewer` that retires the newer side too — both retires carry
+    /// `via=="conflict"`, so the digest counts BOTH.
+    #[cfg(unix)]
+    #[test]
+    fn both_sides_torn_write_edge_is_digest_visible() {
+        use crate::index::ConflictRef;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        let older = log.remember(&emb, "the default deploy target is vercel").unwrap();
+        let newer = log.remember(&emb, "the default deploy target is fly").unwrap();
+        let (a, b) = (ConflictRef::Note { event_id: older.clone() }, ConflictRef::Note { event_id: newer.clone() });
+        let prop = log.append_conflict_proposal(&a, &b, "newer", "high", "why", 0, &[older.clone(), newer.clone()]).unwrap();
+
+        // Torn RetireOlder: the tagged retire marker for a_ref landed, but conflict_resolved was lost (crash).
+        log.retire_memory(&older, Some(&prop)).unwrap();
+        // A deliberate RetireNewer then proceeds (b_ref is not yet retired) and retires the newer side too — the
+        // accepted both-sides edge. Both retires carry via=="conflict", so the digest counts BOTH.
+        log.resolve_conflict(&prop, ResolveAction::RetireNewer).unwrap();
+        let d = log.conflict_digest_counts(0).unwrap();
+        assert_eq!(d.retired, 2, "both conflict-driven retires are digest-visible (Open-Q9 acceptability)");
     }
 
     /// Rung-3 §9/§13 recall-NEUTRALITY (by construction + measured): building the SEPARATE
