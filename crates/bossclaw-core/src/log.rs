@@ -7460,6 +7460,95 @@ impl EventLog {
         Ok(())
     }
 
+    /// Attempt to repair ONE open miss (spec §2.2 steps 1-4). Persists the resulting state via the backlog
+    /// accessors and returns the [`crate::reflect::MissAttempt`] for the tick tally. PORTABLE. The refresh
+    /// (step 3) recomposes the resolved entities' OWN lineage through the shared, §2.3-excluded gather — it
+    /// injects NO new material and mints nothing (I1), so a true repair occurs only where a known topic's
+    /// dossier was under-composed or stale (reach is LOW BY DESIGN; §5.3(d) measures it).
+    pub fn attempt_miss(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+        key: &str,
+        query: &str,
+        now: i64,
+    ) -> Result<crate::reflect::MissAttempt, BossclawError> {
+        use crate::reflect::TopicRefreshOutcome;
+        use crate::reflect::{
+            MissAttempt, MissOutcome, MissState, REFLECT_MISS_ATTEMPT_BUDGET, REFLECT_RECALL_K,
+        };
+        let opts = crate::recall::RecallOptions::default();
+        // 1. Re-run recall. Hit → repaired_by_time (no reasoner call, no emit).
+        if !self.recall(embedder, query, REFLECT_RECALL_K, &opts)?.is_empty() {
+            self.set_miss_state(key, MissState::RepairedByTime, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::RepairedByTime, dossiers_emitted: 0 });
+        }
+        // 2. Resolve query → known topics. Empty → no_material.
+        let topics = self.reflect_topics_for_query(embedder, query)?;
+        if topics.is_empty() {
+            self.set_miss_state(key, MissState::NoMaterial, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::NoMaterial, dossiers_emitted: 0 });
+        }
+        // 3. Refresh each resolved topic's dossier (per-item error isolation). Count REAL `Emitted`s —
+        //    the digest's honest "refreshed" unit (critic M2/OQ4); a skip emits nothing and counts nothing.
+        let entities = self.all_entities()?;
+        let mut dossiers_emitted = 0usize;
+        let mut reasoner_errored = false;
+        let mut transient_errored = false; // CONTROLLER OVERRIDE: the T4 taxonomy split
+        for tid in &topics {
+            if let Some(entity) = entities.iter().find(|e| &e.entity_id == tid) {
+                match self.refresh_topic_page(reasoner, entity)? {
+                    TopicRefreshOutcome::Emitted { .. } => dossiers_emitted += 1,
+                    TopicRefreshOutcome::ReasonerError => reasoner_errored = true,
+                    TopicRefreshOutcome::TransientError => transient_errored = true,
+                    TopicRefreshOutcome::SkippedUnchanged | TopicRefreshOutcome::SkippedThin => {}
+                }
+            }
+        }
+        // CONTROLLER OVERRIDE (verified against real seams): make any dossier JUST emitted this attempt
+        // recall-visible for the step-4 replay. The plan's within-tick note assumed the FTS keyword arm is
+        // "live on append"; it is NOT — `keyword_add` runs ONLY inside `rebuild_indexes` (log.rs:1646), so a
+        // freshly `emit_page`'d dossier is in neither recall arm, and recall's F2 gate (log.rs:2026) drops a
+        // page hit unless the page is a CURRENT page in the `rebuild_graph` projection. Gated on a real emit:
+        // (a) `rebuild_graph` materializes the page projection so the F2 gate keeps it (mirrors
+        // `summarize_topics`' post-emit rebuild_graph), and (b) `keyword_add` incrementally indexes each
+        // resolved topic's current page into the FTS arm ONLY — deliberately NOT `rebuild_indexes`, whose
+        // vector-arm rebuild would make floorless recall return nearest-neighbours for ANY query and mask
+        // true misses (the vector arm folds the dossier at the wrapper's post-tick rebuild, per §5.1). This
+        // keeps recall keyword-only within the tick, which is exactly what the within-tick note intends.
+        if dossiers_emitted > 0 {
+            self.rebuild_graph()?;
+            let pages = self.current_pages()?;
+            for tid in &topics {
+                if let Some(page) = pages.iter().find(|p| &p.topic_id == tid) {
+                    self.keyword_add(&page.page_event_id, &page.text)?;
+                }
+            }
+        }
+        // 4. Replay recall. Hit → candidate_repaired (operational, §5.1 — the emit count above is what
+        //    feeds the digest, never this classification by itself).
+        if !self.recall(embedder, query, REFLECT_RECALL_K, &opts)?.is_empty() {
+            self.set_miss_state(key, MissState::CandidateRepaired, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::CandidateRepaired, dossiers_emitted });
+        }
+        // Still missing: bump the attempt; at budget → parked (bounded loss, I6).
+        let attempts = self.bump_miss_attempt(key, now)?;
+        if attempts >= REFLECT_MISS_ATTEMPT_BUDGET {
+            self.set_miss_state(key, MissState::Parked, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::Parked, dossiers_emitted });
+        }
+        // CONTROLLER OVERRIDE: error precedence reasoner > transient > still-missing (both error kinds
+        // consumed the attempt, same as the plan's ReasonerError semantics — bounded by the same budget).
+        let outcome = if reasoner_errored {
+            MissOutcome::ReasonerError
+        } else if transient_errored {
+            MissOutcome::TransientError
+        } else {
+            MissOutcome::StillMissing
+        };
+        Ok(MissAttempt { outcome, dossiers_emitted })
+    }
+
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
@@ -12744,5 +12833,136 @@ mod tests {
         // A garbage query far from every label → empty → the no_material path.
         let none = log.reflect_topics_for_query(&emb, "zzzz qqqq unrelated gibberish 9182").unwrap();
         assert!(none.is_empty(), "no known topic above the floor → empty (no_material)");
+    }
+
+    impl EventLog {
+        /// Test-only backlog state read (the accessors expose only the OPEN set; parked/terminal assertions
+        /// need the raw row state).
+        fn miss_state_for_test(&self, key: &str) -> Option<String> {
+            let store = self.inner.lock().expect(POISON);
+            store
+                .conn()
+                .query_row(
+                    "SELECT state FROM reflect_miss_backlog WHERE normalized_query_key = ?1",
+                    rusqlite::params![key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn attempt_miss_classifies_repaired_by_time_and_no_material() {
+        use crate::reflect::{normalized_query_key, MissOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        log.rebuild_entity_index(&emb).unwrap(); // empty index is valid
+
+        // ── no_material: a query resolving to no known topic (fresh brain, no entities). ──
+        let qk = normalized_query_key("who is nobody?");
+        log.seed_miss(&qk, "who is nobody?", 10).unwrap();
+        let empty_reasoner = crate::reason::ScriptedReasoner::new("test-v1");
+        let out = log.attempt_miss(&emb, &empty_reasoner, &qk, "who is nobody?", 20).unwrap();
+        assert_eq!(out.outcome, MissOutcome::NoMaterial);
+        assert_eq!(out.dossiers_emitted, 0, "no topic → no refresh → no emit");
+        assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("no_material"));
+
+        // ── repaired_by_time: a query that recall now answers (a matching memory exists). ──
+        let mem = log.remember(&emb, "The capital of France is Paris.").unwrap();
+        log.rebuild_indexes(&emb).unwrap(); // make the memory recall-visible
+        let rk = normalized_query_key("The capital of France is Paris.");
+        log.seed_miss(&rk, "The capital of France is Paris.", 10).unwrap();
+        let out = log.attempt_miss(&emb, &empty_reasoner, &rk, "The capital of France is Paris.", 20).unwrap();
+        assert_eq!(out.outcome, MissOutcome::RepairedByTime);
+        assert_eq!(out.dossiers_emitted, 0, "a time-repaired miss consumes no reasoner and emits nothing");
+        assert_eq!(log.miss_state_for_test(&rk).as_deref(), Some("repaired_by_time"));
+        let _ = mem;
+    }
+
+    #[test]
+    fn attempt_miss_parks_after_three_failed_attempts() {
+        use crate::reflect::{normalized_query_key, MissOutcome, REFLECT_MISS_ATTEMPT_BUDGET};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        // A known topic whose LABEL equals the missed query exactly (MockEmbedder: identical text →
+        // identical vector → similarity 1.0 ≥ REFLECT_TOPIC_FLOOR), while the memory texts share NO token
+        // with the query — the keyword arm can never match, and with no `rebuild_indexes` call the vector
+        // arm stays unbuilt (recall degrades keyword-only per resolve_arms), so the replay stays a miss.
+        let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+        let m2 = log.remember(&emb, "He joined in 2019.").unwrap();
+        let lineage = vec![m1.clone(), m2.clone()];
+        let topic = log.entity("Kenny Ortega", &[], "person", "test-v1", &lineage).unwrap();
+        let beta = log.entity("Beta", &[], "org", "test-v1", &lineage).unwrap();
+        log.link_machine(&topic, "works_at", &beta, 0.9, "test-v1", &lineage).unwrap();
+        log.rebuild_graph().unwrap();
+        // ARCH MAJOR-1: log.entity() mints NO vector — derive the pending ones BEFORE building the index.
+        log.rederive_entity_vectors_pending(&emb).unwrap();
+        log.rebuild_entity_index(&emb).unwrap();
+
+        // The scripted dossier ALSO avoids the query tokens (title + claim), so the emitted page cannot
+        // keyword-match "Kenny Ortega" either.
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Team lead dossier",
+                "claims": [{ "text": "He runs the platform group.", "cites": [m1.clone()] }] }),
+        );
+        let qk = normalized_query_key("Kenny Ortega");
+        log.seed_miss(&qk, "Kenny Ortega", 10).unwrap();
+
+        // Attempt 1: the bridge resolves the topic, the refresh EMITS a dossier, the replay still misses.
+        let a1 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 20).unwrap();
+        assert_eq!(a1.outcome, MissOutcome::StillMissing, "refresh fired but the replay still misses");
+        assert_eq!(a1.dossiers_emitted, 1, "attempt 1 emitted a real dossier revision");
+        log.rebuild_graph().unwrap(); // the tick-boundary projection refresh the daemon wrapper performs
+
+        // Attempt 2: identical grounding → F6 skips the emit; the attempt still accrues.
+        let a2 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 30).unwrap();
+        assert_eq!(a2.outcome, MissOutcome::StillMissing);
+        assert_eq!(a2.dossiers_emitted, 0, "F6 cited-set idempotency: no re-emit on an unchanged topic");
+        log.rebuild_graph().unwrap();
+
+        // Attempt 3 = REFLECT_MISS_ATTEMPT_BUDGET → parked (bounded loss, I6/I9).
+        let a3 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 40).unwrap();
+        assert_eq!(a3.outcome, MissOutcome::Parked, "attempt {REFLECT_MISS_ATTEMPT_BUDGET} parks the miss");
+        assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("parked"), "backlog row is parked");
+        assert!(log.open_misses(10).unwrap().is_empty(), "a parked miss is never re-attempted (I9)");
+    }
+
+    #[test]
+    fn attempt_miss_candidate_repaired_when_the_refreshed_dossier_answers_the_replay() {
+        use crate::reflect::{normalized_query_key, MissOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+        let topic = log.entity("Nova Signal", &[], "product", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.link_machine(&topic, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.rebuild_graph().unwrap();
+        log.rederive_entity_vectors_pending(&emb).unwrap(); // MAJOR-1
+        log.rebuild_entity_index(&emb).unwrap();
+
+        // The scripted claim text NAMES the topic, so the emitted page keyword-matches the replay query
+        // (the FTS side is live on append — the within-tick visibility note above).
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Nova Signal",
+                "claims": [{ "text": "Nova Signal runs the platform group.", "cites": [m1.clone()] }] }),
+        );
+        let qk = normalized_query_key("Nova Signal");
+        log.seed_miss(&qk, "Nova Signal", 10).unwrap();
+        let out = log.attempt_miss(&emb, &reasoner, &qk, "Nova Signal", 20).unwrap();
+        assert_eq!(out.outcome, MissOutcome::CandidateRepaired, "the replay now hits the fresh dossier");
+        assert_eq!(out.dossiers_emitted, 1, "exactly one real dossier emit fed the repair");
+        assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("candidate_repaired"));
     }
 }
