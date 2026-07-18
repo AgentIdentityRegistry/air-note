@@ -1179,18 +1179,20 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
-    /// The two Rung-3 visibility-digest lines for the SessionStart snapshot preamble (§2.4). INFALLIBLE
-    /// — returns an empty Vec on ANY error (not onboarded, open failure, join/core failure) or when
-    /// there is no conflict activity, so the snapshot builder never breaks (I1). Integer counts only —
-    /// no memory content, so nothing here needs sanitizing. Onboarding is the daemon's OWN verdict
-    /// (mirrors [`Self::current_sessions`]); this read holds NO conflict-sweep lock (a pure read is safe
-    /// concurrent with a sweep). Advances `conflict_digest_cursor` to the store's current max seq ONLY
-    /// when `source == "startup"`, so the window is honestly "since the last SESSION START":
-    /// [`crate::capture::snapshot::build`] also runs for `source == "compact"` (and resume), and
-    /// advancing there would let a mid-session compact CONSUME the "Since last session:" activity before
-    /// the real next start ever shows it. Non-startup serves still RENDER the (unconsumed) lines —
-    /// honest, just not window-advancing.
-    pub async fn conflict_digest_lines(&self, source: &str) -> Vec<String> {
+    /// SERVE the two Rung-3 visibility-digest lines for the SessionStart snapshot preamble (§2.4) —
+    /// "serve" because this read has ONE deliberate side effect: it conditionally advances the digest
+    /// cursor. INFALLIBLE — returns an empty Vec on ANY error (not onboarded, open failure, join/core
+    /// failure) or when there is no conflict activity, so the snapshot builder never breaks (I1).
+    /// Integer counts only — no memory content, so nothing here needs sanitizing. Onboarding is the
+    /// daemon's OWN verdict (mirrors [`Self::current_sessions`]); this read holds NO conflict-sweep
+    /// lock (a pure read is safe concurrent with a sweep). Advances `conflict_digest_cursor` to the
+    /// store's current max seq ONLY when `source == "startup"`, so the window is honestly "since the
+    /// last SESSION START": [`crate::capture::snapshot::build`] also runs for `source == "compact"`
+    /// (and resume), and advancing there would let a mid-session compact CONSUME the "Since last
+    /// session:" activity before the real next start ever shows it; `clear` and unknown sources
+    /// likewise deliberately do not advance — only a true fresh startup consumes the window.
+    /// Non-startup serves still RENDER the (unconsumed) lines — honest, just not window-advancing.
+    pub async fn serve_conflict_digest_lines(&self, source: &str) -> Vec<String> {
         let onboarded = self.is_onboarded_local();
         let Ok(log) = self.get_or_open(onboarded).await else {
             return Vec::new();
@@ -1206,20 +1208,29 @@ impl EngineHandle {
             if advance {
                 let _ = log.set_conflict_digest_cursor(d.max_seq);
             }
-            let mut lines = Vec::new();
-            if pending > 0 {
-                lines.push(format!("{pending} memory conflict(s) pending — ask me to review."));
-            }
-            if d.retired + d.dismissed + d.kept > 0 {
-                lines.push(format!(
-                    "Since last session: {} retired, {} dismissed, {} kept-both via conflict resolution.",
-                    d.retired, d.dismissed, d.kept
-                ));
-            }
-            lines
+            Self::build_digest_lines(pending, &d)
         })
         .await
         .unwrap_or_default()
+    }
+
+    /// The PURE tail of [`Self::serve_conflict_digest_lines`]: render the two §2.4 digest lines from
+    /// the already-read counts. Split out so the exact `format!` bytes and the two non-zero gating
+    /// branches are unit-testable without a brain (the snapshot tests use hand-typed look-alike
+    /// strings; this is the real builder). A line is emitted only on a non-zero count: the pending
+    /// line when `pending > 0`, the activity line when any of retired/dismissed/kept is non-zero.
+    fn build_digest_lines(pending: usize, d: &bossclaw_core::ConflictDigest) -> Vec<String> {
+        let mut lines = Vec::new();
+        if pending > 0 {
+            lines.push(format!("{pending} memory conflict(s) pending — ask me to review."));
+        }
+        if d.retired + d.dismissed + d.kept > 0 {
+            lines.push(format!(
+                "Since last session: {} retired, {} dismissed, {} kept-both via conflict resolution.",
+                d.retired, d.dismissed, d.kept
+            ));
+        }
+        lines
     }
 
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
@@ -2082,6 +2093,47 @@ mod tests {
             Arc::new(embed::MockEmbedderProvider::new(8)),
             Arc::new(crate::engine::reason::MockReasonerProvider::new("m")),
         )
+    }
+
+    /// Task 14 review: the REAL digest line-builder's four gating-branch combinations, byte-exact.
+    /// The snapshot preamble tests exercise hand-typed look-alike strings; this pins the actual
+    /// `format!` output and both non-zero gates, so a format typo or a dropped branch cannot pass.
+    #[test]
+    fn build_digest_lines_four_branch_combinations_byte_exact() {
+        use bossclaw_core::ConflictDigest;
+        let zeros = ConflictDigest::default();
+        let activity = ConflictDigest { retired: 2, dismissed: 1, kept: 0, max_seq: 99 };
+
+        // (0, zeros) → no lines at all (an all-quiet brain adds nothing to the preamble).
+        assert!(EngineHandle::build_digest_lines(0, &zeros).is_empty());
+
+        // (n>0, zeros) → only the pending line, exact bytes.
+        assert_eq!(
+            EngineHandle::build_digest_lines(3, &zeros),
+            vec!["3 memory conflict(s) pending — ask me to review."]
+        );
+
+        // (0, nonzero) → only the activity line, exact bytes.
+        assert_eq!(
+            EngineHandle::build_digest_lines(0, &activity),
+            vec!["Since last session: 2 retired, 1 dismissed, 0 kept-both via conflict resolution."]
+        );
+
+        // (n>0, nonzero) → both lines, pending first, exact bytes.
+        assert_eq!(
+            EngineHandle::build_digest_lines(3, &activity),
+            vec![
+                "3 memory conflict(s) pending — ask me to review.",
+                "Since last session: 2 retired, 1 dismissed, 0 kept-both via conflict resolution.",
+            ]
+        );
+
+        // The activity gate is the SUM of the three counts — a kept-only window still emits.
+        let kept_only = ConflictDigest { retired: 0, dismissed: 0, kept: 4, max_seq: 1 };
+        assert_eq!(
+            EngineHandle::build_digest_lines(0, &kept_only),
+            vec!["Since last session: 0 retired, 0 dismissed, 4 kept-both via conflict resolution."]
+        );
     }
 
     #[test]

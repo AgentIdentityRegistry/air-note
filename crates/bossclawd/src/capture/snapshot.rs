@@ -224,8 +224,8 @@ pub async fn build(
     // Rung-3 §2.4: prepend the daemon-authored conflict-visibility digest (integer counts only, no
     // memory content → no sanitize) as the never-dropped fence preamble. INFALLIBLE — an empty Vec on
     // any error / detection-off, so the snapshot builder never breaks (I1). The digest window advances
-    // only on a fresh `startup` serve (decided inside `conflict_digest_lines` from `source`).
-    let preamble = engine.conflict_digest_lines(source).await;
+    // only on a fresh `startup` serve (decided inside `serve_conflict_digest_lines` from `source`).
+    let preamble = engine.serve_conflict_digest_lines(source).await;
     assemble_fence(&preamble, &entries)
 }
 
@@ -582,6 +582,7 @@ mod tests {
         assert!(text.contains("conflict(s) pending"), "pending digest line survives truncation");
         assert!(text.contains("Since last session"), "activity digest line survives truncation");
         assert!(text.contains(FENCE_CLOSE), "close marker survives");
+        assert!(text.contains("1. "), "entries were shed but not all — the first survived");
     }
 
     #[test]
