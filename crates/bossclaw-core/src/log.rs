@@ -271,6 +271,12 @@ const CAPTURE_ENABLED_AT_KEY: &str = "capture_enabled_at";
 /// never consented (invariant I3), exactly like [`CAPTURE_ENABLED_KEY`].
 const CONFLICT_DETECT_ENABLED_KEY: &str = "conflict_detect_enabled";
 
+/// The `content` key carrying the Rung-4 R4-A reflection on/off switch (spec §2.1). Single-sourced (one
+/// writer [`EventLog::set_reflect_enabled`], one reader [`EventLog::reflect_enabled`]). DEFAULT CLOSED —
+/// the reflect loop never runs for a user who never consented (invariant I3), exactly like
+/// [`CONFLICT_DETECT_ENABLED_KEY`].
+const REFLECT_ENABLED_KEY: &str = "reflect_enabled";
+
 /// A typed identifier for a control-`config` key, mapping to the private `*_KEY` consts. Used by
 /// `EventLog::explicitly_set` (and the capture getters) so callers (e.g. the desktop
 /// `prime_switches`) reference a compile-checked variant instead of a stringly-typed key that could
@@ -295,6 +301,8 @@ pub enum ConfigFlag {
     BackfillConsented,
     /// The Rung-3 Phase-2 conflict-detection on/off switch ([`CONFLICT_DETECT_ENABLED_KEY`]). Default CLOSED.
     ConflictDetect,
+    /// The Rung-4 R4-A reflection on/off switch ([`REFLECT_ENABLED_KEY`]). Default CLOSED.
+    Reflect,
 }
 
 impl ConfigFlag {
@@ -310,6 +318,7 @@ impl ConfigFlag {
             ConfigFlag::CaptureEnabled => CAPTURE_ENABLED_KEY,
             ConfigFlag::BackfillConsented => BACKFILL_CONSENTED_KEY,
             ConfigFlag::ConflictDetect => CONFLICT_DETECT_ENABLED_KEY,
+            ConfigFlag::Reflect => REFLECT_ENABLED_KEY,
         }
     }
 }
@@ -7669,6 +7678,41 @@ impl EventLog {
         Ok(())
     }
 
+    /// Whether Rung-4 reflection is enabled (spec §2.1). STICKY / fail-closed via
+    /// [`EventLog::latest_config_value`]'s newest-first scan; DEFAULT CLOSED (a never-set flag reads
+    /// `false`), so the reflect loop never runs for a user who never consented (I3). Mirrors
+    /// [`EventLog::conflict_detect_enabled`].
+    pub fn reflect_enabled(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(ConfigFlag::Reflect.key())?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// Flip the reflection switch by appending ONE signed + hash-chained control `config` event
+    /// `{ "reflect_enabled": <enabled> }`. The ONLY writer of the key (so the reader can never drift the
+    /// shape). Carries no model fields → never disturbs `active_model`. Mirrors
+    /// [`EventLog::set_conflict_detect_enabled`].
+    pub fn set_reflect_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(REFLECT_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
     /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
     ///
@@ -11341,6 +11385,26 @@ mod tests {
         assert!(log.explicitly_set(ConfigFlag::ConflictDetect).unwrap(), "now explicit");
         log.set_conflict_detect_enabled(false).unwrap();
         assert!(!log.conflict_detect_enabled().unwrap(), "sticky OFF");
+    }
+
+    #[test]
+    fn reflect_flag_is_default_closed_sticky_and_explicit_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // Default CLOSED, exactly like conflict-detect: a never-set flag reads false (I3).
+        assert!(!log.reflect_enabled().unwrap(), "reflect defaults CLOSED (never runs without consent)");
+        assert!(!log.explicitly_set(ConfigFlag::Reflect).unwrap(), "never set yet");
+        // Set true → sticky true; explicitly_set flips.
+        log.set_reflect_enabled(true).unwrap();
+        assert!(log.reflect_enabled().unwrap(), "explicit true wins");
+        assert!(log.explicitly_set(ConfigFlag::Reflect).unwrap(), "now explicit");
+        // A flagLESS later config event (e.g. a capture flip) must NOT re-close reflect (sticky newest-explicit).
+        log.set_capture_enabled(true, false, 0).unwrap();
+        assert!(log.reflect_enabled().unwrap(), "an unrelated config event does not disturb the reflect flag");
+        // Explicit false wins over the earlier true.
+        log.set_reflect_enabled(false).unwrap();
+        assert!(!log.reflect_enabled().unwrap(), "newest explicit false is sticky");
+        log.verify_chain().unwrap();
     }
 
     /// SP3 §6a: the Integrations-toggle path — enable ongoing capture WITHOUT backfill. Records the
