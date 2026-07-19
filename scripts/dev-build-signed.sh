@@ -78,7 +78,7 @@ echo "Staged sidecar: ${MEMORY_SIDECAR_PATH}"
 # `--config tauri.bundle.conf.json` (path relative to src-tauri, the tauri CLI's
 # cwd) merges externalBin at bundle time only, so Tauri bundles the sidecar into
 # Contents/MacOS/bossclawd. RELEASE CI must pass the same --config.
-npm run build --workspace @air-agent/desktop -- --debug --bundles app --config tauri.bundle.conf.json
+npm run build --workspace @air-agent/desktop -- --debug --bundles app --config src-tauri/tauri.bundle.conf.json
 
 APP="target/debug/bundle/macos/AIR Agent.app"
 
