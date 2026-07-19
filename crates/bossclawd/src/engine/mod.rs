@@ -291,6 +291,14 @@ pub struct ReflectTelemetry {
     pub transient_errors_total: usize,
 }
 
+/// The core reads the pure `decide_reflect` gate consumes (spec §2.1).
+pub struct ReflectGateInputs {
+    pub newest_activity_at: Option<i64>,
+    pub open_unparked_misses: usize,
+    pub last_completed_run_at: i64,
+    pub last_floor_fire_at: i64,
+}
+
 /// The single chokepoint for engine access. Holds one lazily-opened `Arc<EventLog>`
 /// behind an async mutex; `get_or_open` serializes first-open and gates on onboarding.
 pub struct EngineHandle {
@@ -1184,6 +1192,50 @@ impl EngineHandle {
         spawn_blocking(move || log.reflect_enabled().unwrap_or(false))
             .await
             .unwrap_or(false)
+    }
+
+    /// The core reads `decide_reflect` needs, in ONE spawn_blocking. `None` on an open failure (→ the
+    /// sweeper no-ops that cycle).
+    pub async fn reflect_gate_inputs(&self, onboarded: bool) -> Option<ReflectGateInputs> {
+        let log = self.get_or_open(onboarded).await.ok()?;
+        spawn_blocking(move || {
+            let cur = log.reflect_cursor().unwrap_or_default();
+            ReflectGateInputs {
+                newest_activity_at: log.newest_memory_activity_at().unwrap_or(None),
+                open_unparked_misses: log.open_miss_count().unwrap_or(0),
+                last_completed_run_at: cur.last_completed_run_at,
+                last_floor_fire_at: cur.last_floor_fire_at,
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// Reasoner readiness for reflection, mirroring the evolve scheduler's `select_ready` block
+    /// (scheduler.rs): cloud mode trusts signed-consent readiness, local mode the Ollama probe; cloud
+    /// NEVER silently falls back to local (spec §2.1 / §3.4).
+    pub async fn reflect_reasoner_ready(&self, onboarded: bool) -> bool {
+        let cfg = self.reasoner_config_or_default(onboarded).await;
+        let cloud_mode = matches!(cfg.mode, crate::engine::reason::ReasonerMode::Cloud);
+        let ollama_ready = if cloud_mode {
+            false
+        } else {
+            let oll = crate::engine::ollama_probe::probe(crate::engine::reason::REASONER_MODEL_ID).await;
+            oll.reachable && oll.model_present
+        };
+        let cloud_ready = if cloud_mode {
+            self.reasoner_ready_or_false(onboarded).await
+        } else {
+            false
+        };
+        crate::engine::scheduler::select_ready(cloud_mode, ollama_ready, cloud_ready)
+    }
+
+    /// Stamp the last-floor-fire marker (best-effort; the §2.1 re-fire guard).
+    pub async fn stamp_reflect_floor_fire(&self, onboarded: bool, now: i64) {
+        if let Ok(log) = self.get_or_open(onboarded).await {
+            let _ = spawn_blocking(move || log.set_reflect_last_floor_fire(now)).await;
+        }
     }
 
     /// Run ONE conflict-detection cycle (gated, serialized). Gate → `conflict_lock.try_lock()`

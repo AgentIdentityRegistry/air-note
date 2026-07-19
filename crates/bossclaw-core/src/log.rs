@@ -7317,6 +7317,27 @@ impl EventLog {
         Ok(n as usize)
     }
 
+    /// The epoch-seconds ts of the NEWEST memory-class event (`memory` ∪ `session_captured`), or `None`
+    /// if none exist (spec §2.1 quiet predicate; the daemon computes `now - this >= REFLECT_QUIET_SECS`).
+    /// Reads the newest by `seq DESC` and parses its RFC3339 `ts` to epoch (clock-free: a stored ts, not
+    /// the wall clock). A table scan is acceptable at the 300s cadence (spec §2.1 — same cost class as
+    /// `dirty_entities_since`; add a partial `event_type` index only if measured to matter).
+    pub fn newest_memory_activity_at(&self) -> Result<Option<i64>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let ts: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT ts FROM events WHERE event_type IN (?1, ?2) ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![
+                    crate::graph::MEMORY_EVENT_TYPE,
+                    crate::graph::SESSION_CAPTURED_EVENT_TYPE
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(ts.and_then(|t| DateTime::parse_from_rfc3339(&t).ok().map(|d| d.timestamp())))
+    }
+
     /// Move a miss to a terminal or intermediate state (spec §2.2). Transition contract: the expected
     /// flow is `open` → {`repaired_by_time` | `candidate_repaired` | `no_material` | `parked`};
     /// terminal→open resurrection is NOT expected in v1 (no runtime guard — this is re-derivable
@@ -11346,6 +11367,20 @@ mod tests {
         let c = log.reflect_cursor().unwrap();
         assert_eq!((c.last_served_refreshed, c.last_served_no_material), (4, 2));
         assert_eq!((c.last_completed_run_at, c.last_floor_fire_at), (999, 888));
+    }
+
+    /// Rung-4 R4-A (§2.1 quiet predicate): the newest memory-class append (memory ∪ session-capture)
+    /// registers activity as epoch seconds; a fresh log with no such event reads `None` (treated as
+    /// quiet). Backs the daemon's `now - this >= REFLECT_QUIET_SECS` idle gate.
+    #[test]
+    fn newest_memory_activity_at_tracks_memory_and_session_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        assert_eq!(log.newest_memory_activity_at().unwrap(), None, "no activity yet → None (treated as quiet)");
+        log.remember(&emb, "a note").unwrap();
+        let t = log.newest_memory_activity_at().unwrap().expect("a memory append registers activity");
+        assert!(t > 0, "epoch seconds of the newest memory-class event");
     }
 
     /// Open-Q9: the accepted both-sides torn-write edge is DIGEST-VISIBLE, which is what makes it
