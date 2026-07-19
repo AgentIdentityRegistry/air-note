@@ -70,7 +70,7 @@ pub enum EngineOpError {
     #[allow(dead_code)]
     Reasoner(String),
     /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve" |
-    /// "conflict").
+    /// "conflict" | "reflect").
     Busy(&'static str),
     /// The on-disk file changed since the proposal was drafted; the re-gate at confirm
     /// fails closed. Carries the reason. Nothing is written.
@@ -267,6 +267,30 @@ pub struct ConflictTelemetry {
     pub reasoner_errors_total: usize,
 }
 
+/// Session-scoped reflection telemetry (mirrors [`ConflictTelemetry`]; in-memory, cleared on restart — the
+/// durable operational totals live in the core `reflect_counters` table). Written by `record_reflect_tick`.
+#[derive(Debug, Default, Clone)]
+pub struct ReflectTelemetry {
+    /// Wall-clock duration of the most recent tick, ms.
+    pub last_tick_ms: Option<u128>,
+    /// Ticks that returned an engine error this session.
+    pub error_count: usize,
+    /// The most recent tick error (truncated ~512 bytes — it can embed paths/reasoner output).
+    pub last_error: Option<String>,
+    /// Cumulative session tallies from the per-tick `ReflectReport` (the scoreboard, §2.4).
+    pub dossiers_refreshed_total: usize,
+    /// Session total of honest "we never knew this" classifications.
+    pub no_material_total: usize,
+    /// Session total of misses parked at the attempt budget.
+    pub parked_total: usize,
+    /// Session total of structurally-unhealable stale pages (§2.3 residual).
+    pub unhealable_thin_total: usize,
+    /// Session total of per-item MODEL failures (see `ReflectReport::reasoner_errors` granularity note).
+    pub reasoner_errors_total: usize,
+    /// Session total of per-item ENGINE-I/O failures (kept apart — never blamed on the model).
+    pub transient_errors_total: usize,
+}
+
 /// The single chokepoint for engine access. Holds one lazily-opened `Arc<EventLog>`
 /// behind an async mutex; `get_or_open` serializes first-open and gates on onboarding.
 pub struct EngineHandle {
@@ -301,6 +325,12 @@ pub struct EngineHandle {
     /// Session conflict-detection telemetry (a `std::sync::Mutex`, poison-recovered on read).
     /// Written by `record_conflict_tick` + read by `conflict_telemetry`. Mirrors `evolve_tel`.
     conflict_tel: std::sync::Mutex<ConflictTelemetry>,
+    /// Serializes manual + scheduled reflect ticks (`try_lock` → `Busy("reflect")`). DEDICATED, NOT reused
+    /// `evolve_lock`: a long evolve tick must never block a reflect tick and vice-versa (the Rung-3
+    /// dedicated-lock lesson).
+    reflect_lock: Mutex<()>,
+    /// Session reflection telemetry (poison-recovered on read). Mirrors `conflict_tel`.
+    reflect_tel: std::sync::Mutex<ReflectTelemetry>,
     /// The shared reasoner-config cell the daemon's `ConfigReasonerProvider` closure reads on
     /// every evolve tick (attached by `main.rs` via [`Self::with_reasoner_cell`]; `None` in unit
     /// tests that don't care). Held HERE so BOTH config-writing ops (`set_reasoner_config`,
@@ -340,6 +370,8 @@ impl EngineHandle {
             indexed: Mutex::new(false),
             evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
             conflict_tel: std::sync::Mutex::new(ConflictTelemetry::default()),
+            reflect_lock: Mutex::new(()),
+            reflect_tel: std::sync::Mutex::new(ReflectTelemetry::default()),
             reasoner_cell: None,
             probe_reasoner_for_test: None,
         }
@@ -1010,6 +1042,82 @@ impl EngineHandle {
         let queue_depth = self.queue_depth_or_zero(onboarded).await;
         self.record_tick(t0.elapsed().as_millis(), &result, cloud_mode, queue_depth);
         result
+    }
+
+    /// Run ONE reflect tick (gated, serialized). `reflect_lock.try_lock()` (`Busy("reflect")` on
+    /// overlap) → `cloud_consent_ok` (BEFORE the reasoner is built, so a cloud-not-ready tick egresses
+    /// nothing, I2) → read the SP3 miss-ring queries (non-destructive) → `ensure_indexed` →
+    /// `spawn_blocking`: `rebuild_entity_index` (the query→topic bridge precondition) THEN core
+    /// `reflect_once` THEN `rebuild_indexes` + `rebuild_graph` (so a follow-up recall sees the refreshed
+    /// dossiers) → record telemetry → stamp the floor's last-completed marker. `now` is the
+    /// sweeper-boundary clock (mirrors `detect_conflicts_once(onboarded, now)`).
+    pub async fn reflect_once(
+        &self,
+        onboarded: bool,
+        now: i64,
+    ) -> Result<bossclaw_core::ReflectReport, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        // Serialize manual + scheduled ticks: a second overlapping tick is Busy, not queued. DEDICATED
+        // lock (never `evolve_lock`): a long evolve tick must never block a reflect tick and vice-versa.
+        let _guard = self.reflect_lock.try_lock().map_err(|_| EngineOpError::Busy("reflect"))?;
+        // Shared cloud-egress consent barrier (I2), placed BEFORE the reasoner is built (and any
+        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner and egresses
+        // nothing — the same chokepoint `evolve_once`/`detect_conflicts_once` use.
+        if !self.cloud_consent_ok(onboarded).await {
+            return Err(EngineOpError::Reasoner(
+                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
+            ));
+        }
+        // Non-destructive read of the SP3 miss ring (queries only). The durable backlog's `seed_miss`
+        // is upsert-if-new, so re-reading the same ≤20 queries every tick is idempotent (a terminal
+        // miss is never reset); a non-destructive read also PRESERVES the App's `RecallStats` "recent
+        // misses" view.
+        let new_misses: Vec<String> = self
+            .data_dir()
+            .and_then(|d| crate::telemetry::Telemetry::open(d).ok())
+            .and_then(|t| t.stats().ok())
+            .map(|s| s.recent_misses.into_iter().map(|m| m.query).collect())
+            .unwrap_or_default();
+        let embedder = self.ensure_indexed(&log).await?;
+        let reasoner = self.reasoner_provider.reasoner()?;
+        let t0 = std::time::Instant::now();
+        let result = spawn_blocking({
+            let log = log.clone();
+            let emb = embedder.clone();
+            move || -> Result<bossclaw_core::ReflectReport, EngineOpError> {
+                // Precondition: the miss→topic bridge resolves queries via the entity-resolution
+                // index (as `evolve_once` does), which `entity_search` requires be built. It is
+                // SEPARATE from the recall index (`ensure_indexed`) and NOT built by `open` — the
+                // FIRST tick on a freshly-opened log must build it here.
+                log.rebuild_entity_index(&*emb).map_err(|e| EngineOpError::Core(e.to_string()))?;
+                let report = log
+                    .reflect_once(&*emb, &*reasoner, &new_misses, now)
+                    .map_err(|e| EngineOpError::Core(e.to_string()))?;
+                // Fold the refreshed dossiers/vectors so a follow-up recall reflects this tick.
+                log.rebuild_indexes(&*emb).map_err(|e| EngineOpError::Core(e.to_string()))?;
+                log.rebuild_graph().map_err(|e| EngineOpError::Core(e.to_string()))?;
+                Ok(report)
+            }
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?;
+        self.record_reflect_tick(t0.elapsed().as_millis(), &result);
+        // On a completed tick, stamp the last-completed-run marker (best-effort; backs the §2.1
+        // starvation floor). ONLY on Ok — a failed tick must not advance the floor's clock.
+        if result.is_ok() {
+            let log2 = log.clone();
+            let _ = spawn_blocking(move || log2.set_reflect_last_completed_run(now)).await;
+        }
+        result
+    }
+
+    /// Record one reflect tick's telemetry (thin `&self` wrapper over the pure recorder).
+    fn record_reflect_tick(
+        &self,
+        ms: u128,
+        result: &Result<bossclaw_core::ReflectReport, EngineOpError>,
+    ) {
+        record_reflect_tick_into(&self.reflect_tel, ms, result);
     }
 
     /// Record one tick's telemetry. Thin wrapper over the pure [`record_tick_into`] so the
@@ -1897,6 +2005,35 @@ fn record_tick_into(
             );
         }
         Ok(_) => {}
+    }
+}
+
+/// Pure reflect-tick recorder. The lock is poison-RECOVERED (a panicked tick must not wedge the status
+/// read); `last_tick_ms` is always set; on `Err` `error_count` bumps and `last_error` is stored TRUNCATED
+/// to ~512 bytes; on `Ok` the report's counters fold into the session totals (the §2.4 scoreboard, incl.
+/// the transient/reasoner split kept APART so a write hiccup is never blamed on the model).
+fn record_reflect_tick_into(
+    tel: &std::sync::Mutex<ReflectTelemetry>,
+    ms: u128,
+    result: &Result<bossclaw_core::ReflectReport, EngineOpError>,
+) {
+    let mut tel = tel.lock().unwrap_or_else(|p| p.into_inner());
+    tel.last_tick_ms = Some(ms);
+    match result {
+        Err(e) => {
+            tel.error_count += 1;
+            let mut s = e.to_string();
+            truncate_on_char_boundary(&mut s, 512);
+            tel.last_error = Some(s);
+        }
+        Ok(r) => {
+            tel.dossiers_refreshed_total += r.dossiers_refreshed;
+            tel.no_material_total += r.no_material;
+            tel.parked_total += r.parked;
+            tel.unhealable_thin_total += r.unhealable_thin;
+            tel.reasoner_errors_total += r.reasoner_errors;
+            tel.transient_errors_total += r.transient_errors;
+        }
     }
 }
 
@@ -3291,6 +3428,37 @@ mod tests {
         // After release, a cycle runs again (flag default-off → clean skip, no judge call).
         let report = handle.detect_conflicts_once(true, 100).await.unwrap();
         assert!(report.skipped_disabled, "post-release cycle runs (flag off → skipped)");
+    }
+
+    /// Task 10: the engine `reflect_once` wrapper drives the full op pattern (get_or_open → serialize
+    /// on the DEDICATED `reflect_lock` → Local consent-ok → non-destructive miss-ring read →
+    /// ensure_indexed → build reasoner → spawn_blocking the pre-rebuild + core tick + post-rebuilds →
+    /// record telemetry → stamp the floor). A fresh brain with no misses/pages runs an empty-but-
+    /// successful tick (NOT `skipped_disabled`) once reflection is enabled. Mirrors the conflict-sweep
+    /// engine e2e's inline setup (`MockEmbedderProvider::new(64)` + a scripted reasoner).
+    #[tokio::test]
+    async fn engine_reflect_once_runs_when_enabled_and_records_telemetry() {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineHandle::new(
+            TestVault::new(),
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::from_reasoner(Arc::new(
+                bossclaw_core::ScriptedReasoner::new("test"),
+            ))),
+        );
+        let onboarded = true;
+        // ARCH minor-a: enable via the CORE setter (T1) through get_or_open — the ENGINE setter method
+        // is T12's product surface and does not exist yet at this task; the test must compile+pass here.
+        {
+            let log = engine.get_or_open(onboarded).await.unwrap();
+            tokio::task::spawn_blocking(move || log.set_reflect_enabled(true)).await.unwrap().unwrap();
+        }
+        // A fresh brain with no misses/pages → an empty-but-successful tick (not skipped_disabled).
+        let report = engine.reflect_once(onboarded, 1000).await.expect("reflect tick runs");
+        assert!(!report.skipped_disabled, "enabled → runs");
+        assert_eq!(report.attempted, 0, "no seeded misses yet");
     }
 
     #[tokio::test]
