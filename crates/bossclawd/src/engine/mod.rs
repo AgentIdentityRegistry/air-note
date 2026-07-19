@@ -1161,6 +1161,10 @@ impl EngineHandle {
     /// The evolve off-switch verdict, defaulting to `false` (OFF) on ANY error (not onboarded,
     /// open failure, …). A thin gate-and-default read the scheduler loop uses each tick — it
     /// must never propagate an error (a transient read failure must not trip the loop ON).
+    ///
+    /// Unlike the sister gates, this reads the composite [`Self::evolve_status`] (which also carries
+    /// queue depth + telemetry), NOT a bare flag getter — so it deliberately does NOT share
+    /// [`Self::flag_enabled_or_false`]; folding it in would change its read path.
     pub async fn evolve_enabled_or_false(&self, onboarded: bool) -> bool {
         match self.evolve_status(onboarded).await {
             Ok((status, _telemetry)) => status.enabled,
@@ -1168,30 +1172,39 @@ impl EngineHandle {
         }
     }
 
-    /// The conflict-detection off-switch verdict, defaulting to `false` (OFF) on ANY error (not
-    /// onboarded, open failure, …). The gate the conflict sweep reads each cycle — it must never
-    /// propagate an error (a transient read failure must not trip detection ON). Mirrors
-    /// [`Self::mandates_enabled_or_false`] (a direct getter read); semantically the same fail-closed
-    /// gate as [`Self::evolve_enabled_or_false`].
-    pub async fn conflict_detect_enabled_or_false(&self, onboarded: bool) -> bool {
+    /// Shared fail-closed flag read for the sister off-switches: open the log (→ `false` on any open
+    /// failure) and read one sticky bool getter inside `spawn_blocking`, defaulting to `false` (OFF)
+    /// on ANY error — a transient read failure must never trip a background loop ON. `read` is the
+    /// bare getter ([`EventLog::conflict_detect_enabled`] / [`EventLog::reflect_enabled`] /
+    /// [`EventLog::mandates_enabled`]). [`Self::evolve_enabled_or_false`] is deliberately NOT a
+    /// caller — it reads the composite `evolve_status`, not a bare flag.
+    async fn flag_enabled_or_false(
+        &self,
+        onboarded: bool,
+        read: fn(&EventLog) -> Result<bool, bossclaw_core::BossclawError>,
+    ) -> bool {
         let Ok(log) = self.get_or_open(onboarded).await else {
             return false;
         };
-        spawn_blocking(move || log.conflict_detect_enabled().unwrap_or(false))
+        spawn_blocking(move || read(&log).unwrap_or(false))
             .await
             .unwrap_or(false)
+    }
+
+    /// The conflict-detection off-switch verdict, defaulting to `false` (OFF) on ANY error (not
+    /// onboarded, open failure, …). The gate the conflict sweep reads each cycle — it must never
+    /// propagate an error (a transient read failure must not trip detection ON). A fail-closed bare
+    /// getter read via [`Self::flag_enabled_or_false`], like [`Self::mandates_enabled_or_false`] /
+    /// [`Self::reflect_enabled_or_false`].
+    pub async fn conflict_detect_enabled_or_false(&self, onboarded: bool) -> bool {
+        self.flag_enabled_or_false(onboarded, EventLog::conflict_detect_enabled).await
     }
 
     /// The reflection off-switch verdict, defaulting to `false` (OFF) on ANY error (not onboarded, open
     /// failure, …). The gate the reflect sweep reads each cycle — it must never propagate an error (a
     /// transient read failure must not trip reflection ON). Mirrors [`Self::conflict_detect_enabled_or_false`].
     pub async fn reflect_enabled_or_false(&self, onboarded: bool) -> bool {
-        let Ok(log) = self.get_or_open(onboarded).await else {
-            return false;
-        };
-        spawn_blocking(move || log.reflect_enabled().unwrap_or(false))
-            .await
-            .unwrap_or(false)
+        self.flag_enabled_or_false(onboarded, EventLog::reflect_enabled).await
     }
 
     /// Rung-4 R4-A: flip the sticky reflection off-switch (the toggle behind the settings panel). The
@@ -1859,15 +1872,9 @@ impl EngineHandle {
     }
 
     /// `mandates_enabled`, defaulting to false on any error (the sweep's per-item kill-switch read).
-    /// Mirrors `evolve_enabled_or_false`. Gated read; never panics the sweep.
+    /// A fail-closed bare getter read via [`Self::flag_enabled_or_false`]; never panics the sweep.
     pub async fn mandates_enabled_or_false(&self, onboarded: bool) -> bool {
-        let log = match self.get_or_open(onboarded).await {
-            Ok(l) => l,
-            Err(_) => return false,
-        };
-        spawn_blocking(move || log.mandates_enabled().unwrap_or(false))
-            .await
-            .unwrap_or(false)
+        self.flag_enabled_or_false(onboarded, EventLog::mandates_enabled).await
     }
 
     // ---- Cloud reasoner (Milestone D Phase 2a, spec R1/R5/R8) ----
