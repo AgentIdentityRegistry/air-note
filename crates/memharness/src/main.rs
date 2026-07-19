@@ -302,7 +302,10 @@ fn compare(args: CompareArgs) -> anyhow::Result<()> {
 // ── Rung-4 R4-A reflection non-regression gate (spec §5.2/§5.3). LIVE + Peter-gated (NOT in CI).
 //    The hermetic halves are unit-tested (`arms::map_hits`, `reflect_pass::{drive_to_quiescence,
 //    union_coverage}`); this orchestration is correct-by-construction against the real `engine()` API
-//    and only runs under Peter's owner-gated runbook (needs Ollama + the real embedder). ──
+//    and only runs under Peter's owner-gated runbook (needs Ollama + the real embedder). Two distinct
+//    current-thread runtimes: `score_rt` drives the WIRE arm (owned by `LiveAirArm`), while the
+//    evolve/reflect ENGINE ticks run on `drive_rt.block_on` (the in-process `engine()` handle) — kept
+//    separate so a scoring recall and an engine tick never nest a `block_on`. ──
 
 /// Wall-clock Unix seconds for the reflect tick's `now` (bi-temporal miss bookkeeping).
 fn now_unix() -> i64 {
@@ -548,7 +551,7 @@ fn reflect_gate(args: ReflectGateArgs) -> anyhow::Result<()> {
         let gold_in_topk = memharness::arms::gold_rank(&hits, gold).is_some();
         let mut best_citing_dossier_rank: Option<usize> = None;
         for (rank, h) in hits.iter().enumerate() {
-            if let Some(page_event_id) = h.page_id.strip_prefix("__dossier__:") {
+            if let Some(page_event_id) = h.page_id.strip_prefix(memharness::arms::DOSSIER_PID_PREFIX) {
                 if dossier_cites_gold(&events, page_event_id, &resolver, gold) {
                     best_citing_dossier_rank =
                         Some(best_citing_dossier_rank.map_or(rank, |b| b.min(rank)));

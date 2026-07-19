@@ -93,6 +93,12 @@ impl LiveAirArm {
     }
 }
 
+/// The synthetic page-id prefix for a reflected-brain dossier (`page` event) hit. SINGLE-SOURCED:
+/// the producer (`map_hits`, below) and the reflect-gate's union-coverage consumer (`main.rs`, which
+/// `strip_prefix`es it to recover the page event id) MUST share this const, so a future rename can
+/// never silently drift the compile-only consumer into finding zero citing dossiers.
+pub const DOSSIER_PID_PREFIX: &str = "__dossier__:";
+
 /// Map wire hits → RetrievedHits through the resolver. Free function so e2e #1 exercises the
 /// EXACT same mapping the live arm uses (Rev 2, finding 2 — the un-rigged path).
 pub fn map_hits(
@@ -104,11 +110,14 @@ pub fn map_hits(
         .map(|h| {
             // §5.3(b): a reflected-brain dossier (`page` event) is NOT a corpus file, so it does
             // not resolve through the file bridge. Give it a SYNTHETIC page id that occupies a rank
-            // slot (so crowding the gold FILE page out of top-k registers as a regression) but can
-            // NEVER equal a corpus gold id (the gate credits gold ONLY as itself). File hits keep
-            // the loud no-evolve invariant.
+            // slot (so crowding the gold FILE page out of top-k registers as a regression). The
+            // [`DOSSIER_PID_PREFIX`] keeps it in a DISJOINT id space from corpus gold ids under the
+            // documented assumption that no real ~/brain relative path yields a `__dossier__:`-prefixed
+            // page id via `page_id_from_rel` — so the gate credits gold ONLY as itself. (A runtime
+            // guard would be over-engineering for a dev-only harness.) File hits keep the loud
+            // no-evolve invariant.
             let page_id = if h.hit.kind == bossclaw_core::graph::PAGE_EVENT_TYPE {
-                format!("__dossier__:{}", h.hit.event_id)
+                format!("{DOSSIER_PID_PREFIX}{}", h.hit.event_id)
             } else {
                 resolver.page_id_of(&h.hit.event_id)? // loud: unmapped file hit = run error
             };
@@ -489,7 +498,12 @@ mod tests {
             },
         ];
         let mapped = map_hits(&resolver, hits).expect("a page hit must not abort the run");
-        assert_eq!(mapped[0].page_id, "__dossier__:page-ev-9", "dossier → synthetic non-gold id");
+        // Build the expected id from the shared const so a prefix rename can't pass a stale literal.
+        assert_eq!(
+            mapped[0].page_id,
+            format!("{DOSSIER_PID_PREFIX}page-ev-9"),
+            "dossier → synthetic non-gold id"
+        );
         assert_ne!(
             mapped[0].page_id, "air/kenny",
             "a dossier NEVER equals the gold it cites (gate: gold-as-itself)"

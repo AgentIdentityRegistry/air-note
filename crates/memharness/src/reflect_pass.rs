@@ -36,7 +36,8 @@ pub fn drive_to_quiescence(
 /// cited FILE id through the SAME `PageResolver` (non-file cites are skipped), and records whether any
 /// resolved cite equals this case's `gold_page_id`).
 pub struct UnionCase {
-    /// Whether the gold FILE page itself made top-k (from the deduped hits, the gate's own read).
+    /// Whether the gold FILE page itself made top-k (from a fresh re-retrieval over the reflected
+    /// brain — the scored `CaseResult`s don't expose per-case ranks, so union-coverage re-recalls).
     pub gold_in_topk: bool,
     /// The best (lowest) rank of a top-k dossier hit whose cites resolve to this case's gold, if any.
     pub best_citing_dossier_rank: Option<usize>,
