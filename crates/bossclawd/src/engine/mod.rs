@@ -1071,7 +1071,8 @@ impl EngineHandle {
         // Non-destructive read of the SP3 miss ring (queries only). The durable backlog's `seed_miss`
         // is upsert-if-new, so re-reading the same ≤20 queries every tick is idempotent (a terminal
         // miss is never reset); a non-destructive read also PRESERVES the App's `RecallStats` "recent
-        // misses" view.
+        // misses" view. A missing/unreadable telemetry store degrades to a zero-miss tick, never an
+        // error (I6 fail-safe — telemetry absence must not block reflection).
         let new_misses: Vec<String> = self
             .data_dir()
             .and_then(|d| crate::telemetry::Telemetry::open(d).ok())
@@ -3459,6 +3460,44 @@ mod tests {
         let report = engine.reflect_once(onboarded, 1000).await.expect("reflect tick runs");
         assert!(!report.skipped_disabled, "enabled → runs");
         assert_eq!(report.attempted, 0, "no seeded misses yet");
+    }
+
+    /// Task 10 review (reflect_lock): a second overlapping `reflect_once` returns `Busy("reflect")` —
+    /// pinning BOTH the dedicated lock (a wrapper that locked `evolve_lock` instead would sail past
+    /// the held guard and run) AND the exact tag. Mirrors the reliable
+    /// `second_concurrent_detect_conflicts_is_busy` pattern — hold the lock guard DIRECTLY
+    /// (deterministic, not a racy two-task overlap) so the guarded call's `try_lock` fails, then
+    /// confirm release lets a full tick run again.
+    #[tokio::test]
+    async fn second_concurrent_reflect_is_busy() {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineHandle::new(
+            TestVault::new(),
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::from_reasoner(Arc::new(
+                bossclaw_core::ScriptedReasoner::new("test"),
+            ))),
+        );
+        let onboarded = true;
+        // Same fixture as the enabled-tick test above (core setter through get_or_open; the engine
+        // setter is T12's surface). Enabled, so the post-release tick proves FULL service restored.
+        {
+            let log = engine.get_or_open(onboarded).await.unwrap();
+            tokio::task::spawn_blocking(move || log.set_reflect_enabled(true)).await.unwrap().unwrap();
+        }
+        // Hold the reflect lock to simulate an in-flight tick, then a real call must be Busy.
+        let guard = engine.reflect_lock.try_lock().expect("first lock acquired");
+        let err = engine.reflect_once(onboarded, 1000).await.unwrap_err();
+        assert!(
+            matches!(err, EngineOpError::Busy("reflect")),
+            "overlapping tick is Busy(\"reflect\") off the DEDICATED lock"
+        );
+        drop(guard);
+        // After release, a full tick runs again (enabled → a real, non-skipped empty tick).
+        let report = engine.reflect_once(onboarded, 1000).await.expect("post-release tick runs");
+        assert!(!report.skipped_disabled, "lock release restores service");
     }
 
     #[tokio::test]
