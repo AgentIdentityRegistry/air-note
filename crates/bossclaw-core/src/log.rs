@@ -7610,6 +7610,67 @@ impl EventLog {
         Ok(report)
     }
 
+    /// Run ONE reflect tick (spec §2.1/§2.4). Off-switch FIRST (no work when disabled, I3). Seeds the tick's
+    /// `new_misses` into the backlog (upsert-if-new), attempts ≤ [`crate::reflect::REFLECT_MISSES_PER_TICK`]
+    /// open misses (misses first), then refreshes ≤ [`crate::reflect::REFLECT_REFRESH_PER_TICK`] stale pages,
+    /// updates the cumulative counters, and returns the [`crate::reflect::ReflectReport`]. Per-item errors are
+    /// isolated (a poisoned miss/page counts its error bucket and the tick continues — the Rung-3 poison
+    /// lesson at item granularity, I6). `now` is daemon-supplied (clock-free core). PORTABLE.
+    pub fn reflect_once(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+        new_misses: &[String],
+        now: i64,
+    ) -> Result<crate::reflect::ReflectReport, BossclawError> {
+        use crate::reflect::{
+            normalized_query_key, MissOutcome, ReflectReport, REFLECT_MISSES_PER_TICK,
+            REFLECT_REFRESH_PER_TICK,
+        };
+        let mut report = ReflectReport::default();
+        if !self.reflect_enabled()? {
+            report.skipped_disabled = true;
+            return Ok(report);
+        }
+        // Seed the ring's queries into the durable backlog (upsert-if-new; churn cannot drop a seen miss).
+        for q in new_misses {
+            self.seed_miss(&normalized_query_key(q), q, now)?;
+        }
+        // Attempt the oldest open misses (misses first, spec §2.1 priority). `miss_emits` counts the
+        // pipeline's REAL dossier emits (`TopicRefreshOutcome::Emitted`s inside attempt_miss step 3).
+        let mut miss_emits = 0usize;
+        for m in self.open_misses(REFLECT_MISSES_PER_TICK)? {
+            report.attempted += 1;
+            let attempt = self.attempt_miss(embedder, reasoner, &m.key, &m.query_text, now)?;
+            miss_emits += attempt.dossiers_emitted;
+            match attempt.outcome {
+                MissOutcome::RepairedByTime => report.repaired_by_time += 1,
+                MissOutcome::NoMaterial => report.no_material += 1,
+                MissOutcome::CandidateRepaired => report.candidate_repaired += 1,
+                MissOutcome::Parked => report.parked += 1,
+                MissOutcome::ReasonerError => report.reasoner_errors += 1,
+                MissOutcome::TransientError => report.transient_errors += 1,
+                MissOutcome::StillMissing => {}
+            }
+        }
+        // Then the stale-dossier tidy with the remaining budget.
+        let stale = self.refresh_stale_pages(reasoner, REFLECT_REFRESH_PER_TICK)?;
+        // The digest's honest unit (critic M2 / OQ4 LOCK): `dossiers_refreshed` = REAL dossier emits only —
+        // miss-pipeline `Emitted`s + tidy heals. `candidate_repaired` (a replay-recall classification) NEVER
+        // feeds the digest: a replay can hit without any emit this tick (e.g. a prior night's page finally
+        // matching), and an emit can happen without a replay hit.
+        report.dossiers_refreshed = miss_emits + stale.healed;
+        report.unhealable_thin = stale.unhealable_thin;
+        // Both error kinds from the tidy pass fold in APART (§2.4 taxonomy): a write hiccup stays a
+        // transient, never blamed on the model.
+        report.reasoner_errors += stale.reasoner_errors;
+        report.transient_errors += stale.transient_errors;
+        self.add_reflect_counters(report.dossiers_refreshed as i64, report.no_material as i64)?;
+        // §7.3 hygiene (critic m1): age out TERMINAL-repaired rows; parked/no_material persist.
+        self.prune_reflect_backlog(now)?;
+        Ok(report)
+    }
+
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
@@ -13105,5 +13166,33 @@ mod tests {
         assert_eq!(out.outcome, MissOutcome::CandidateRepaired, "the replay now hits the fresh dossier");
         assert_eq!(out.dossiers_emitted, 1, "exactly one real dossier emit fed the repair");
         assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("candidate_repaired"));
+    }
+
+    #[test]
+    fn reflect_once_is_off_by_default_then_reports_when_enabled() {
+        use crate::reflect::normalized_query_key;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        log.rebuild_entity_index(&emb).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1");
+
+        // Off by default → skipped_disabled, nothing else (I3).
+        let off = log.reflect_once(&emb, &reasoner, &["who is nobody?".to_string()], 100).unwrap();
+        assert!(off.skipped_disabled, "reflect is off by default");
+        assert_eq!(off.attempted, 0, "no work when disabled");
+        assert!(log.open_misses(10).unwrap().is_empty(), "no backlog seeded when disabled");
+
+        // Enable → the new miss is seeded and attempted; with no known topic it resolves no_material.
+        log.set_reflect_enabled(true).unwrap();
+        let r = log.reflect_once(&emb, &reasoner, &["who is nobody?".to_string()], 200).unwrap();
+        assert!(!r.skipped_disabled);
+        assert_eq!(r.attempted, 1, "one open miss attempted");
+        assert_eq!(r.no_material, 1, "resolves to no known topic → no_material");
+        let (_refreshed, no_material_total) = log.reflect_counters().unwrap();
+        assert_eq!(no_material_total, 1, "cumulative no_material_total advanced");
+        // The miss is now terminal (no_material) → not re-attempted next tick.
+        let qk = normalized_query_key("who is nobody?");
+        assert!(log.open_misses(10).unwrap().iter().all(|m| m.key != qk), "no_material miss left open set");
     }
 }
