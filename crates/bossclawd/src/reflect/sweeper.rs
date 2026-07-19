@@ -69,11 +69,26 @@ pub fn decide_reflect(i: &ReflectDecisionInput) -> ReflectDecision {
 /// disabled/non-onboarded brain (I3). No silent caps — `unhealable_thin` et al. surface in `report`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReflectSweepReport {
+    /// Not onboarded OR reflection disabled — no readiness probe, no gate reads, no model call (I3:
+    /// merging ships reflection dormant).
     pub gated_off: bool,
+    /// A memory-class append landed within `REFLECT_QUIET_SECS` of now — not sleep time; skipped this
+    /// cycle (§2.1 quiet gate).
     pub not_quiet: bool,
+    /// Evolve is enabled with a non-empty queue — the daytime helper drains first (§2.1 defer).
     pub deferred_evolve_backlog: bool,
+    /// This cycle's `Run` came from the §2.1 starvation floor. The floor marker is stamped BEFORE the
+    /// tick (a crashed tick cannot re-fire immediately), so this stays set even when the tick then errs.
     pub floor_fired: bool,
+    /// The sweep could not complete this cycle for any transient reason — reasoner not ready, a
+    /// gate-input open failure, a tick already running (`Busy("reflect")`: the overlapping manual tick
+    /// that holds the lock records its own telemetry), or a transient open/Core failure from the tick
+    /// itself. A safe no-op; retried next cycle (I6). Persistent in-tick failures still surface via
+    /// `ReflectTelemetry` (`error_count`/`last_error`) — the engine wrapper records the outcome of
+    /// every tick body it runs, Ok or Err.
     pub reasoner_unavailable: bool,
+    /// The core tick report — all-zero unless the tick ran. No silent caps: `unhealable_thin` and
+    /// `transient_errors` ride here into the sweeper's work line.
     pub report: bossclaw_core::ReflectReport,
 }
 
@@ -171,6 +186,33 @@ pub fn spawn(engine: Arc<EngineHandle>, data_dir: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{embed, reason};
+
+    /// The I3 ships-dormant keystone pinned at the SWEEPER boundary (sibling parity with the conflict
+    /// sweeper's run-once test): no `identity.json` on disk → `is_onboarded` false → the `&&`
+    /// short-circuit returns `gated_off` WITHOUT touching the engine's readiness probes (no Ollama
+    /// HTTP probe — the test stays hermetic) and without reading the gate inputs. The full-struct
+    /// equality also pins gated_off apart from `reasoner_unavailable`: a regression that reaches
+    /// `reflect_gate_inputs` first (get_or_open fails when not onboarded → `None`) would flip the
+    /// wrong flag and fail here.
+    #[tokio::test]
+    async fn not_onboarded_sweep_is_gated_off_dormant() {
+        // Keychain-free: in-memory vault + empty provider-key cache (nothing is read on this path).
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap(); // deliberately NO identity.json
+        let engine = EngineHandle::new(
+            crate::server::shared_test_vault(),
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(8)),
+            Arc::new(reason::MockReasonerProvider::new("test")), // never invoked on this path
+        );
+        let report = run_reflect_sweep_once(&engine, dir.path(), 100).await;
+        assert_eq!(
+            report,
+            ReflectSweepReport { gated_off: true, ..Default::default() },
+            "not onboarded → gated_off with every other field default (I3 dormant)"
+        );
+    }
 
     fn base() -> ReflectDecisionInput {
         ReflectDecisionInput {
