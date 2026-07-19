@@ -212,9 +212,13 @@ pub struct ReflectReport {
     /// `true` iff the tick was a no-op because reflection is disabled (flag off).
     pub skipped_disabled: bool,
     /// Per-item compose REASONER errors this tick (model transport/quality; isolated + counted, §2.4).
+    /// GRANULARITY (this field and `transient_errors`): error EVENTS at mixed grain — one per erroring
+    /// MISS from the pipeline (N erroring topics within one miss collapse to one) plus one per erroring
+    /// stale PAGE from the tidy pass. Honest activity signals, not per-topic counts.
     pub reasoner_errors: usize,
     /// Per-item TRANSIENT engine-I/O errors this tick (gather/emit; retry-fixable, counted APART from
     /// `reasoner_errors` so a write hiccup is never blamed on the model — §2.4; feeds the T8 cap).
+    /// Granularity: mixed, exactly as `reasoner_errors` documents.
     pub transient_errors: usize,
 }
 

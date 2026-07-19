@@ -7615,7 +7615,11 @@ impl EventLog {
     /// open misses (misses first), then refreshes ≤ [`crate::reflect::REFLECT_REFRESH_PER_TICK`] stale pages,
     /// updates the cumulative counters, and returns the [`crate::reflect::ReflectReport`]. Per-item errors are
     /// isolated (a poisoned miss/page counts its error bucket and the tick continues — the Rung-3 poison
-    /// lesson at item granularity, I6). `now` is daemon-supplied (clock-free core). PORTABLE.
+    /// lesson at item granularity, I6). `Err` is returned ONLY on infrastructure failure (storage/lock
+    /// poisoning propagated by the primitives) and aborts the tick — already-persisted miss states stay
+    /// persisted; the remaining tidy/counters/prune are skipped; per-item reasoner/engine failures NEVER
+    /// `Err`, they fold into the report buckets (T10 maps `Err`→Core; `Busy` is the daemon's own lock,
+    /// never raised here). `now` is daemon-supplied (clock-free core). PORTABLE.
     pub fn reflect_once(
         &self,
         embedder: &dyn Embedder,
@@ -13194,5 +13198,45 @@ mod tests {
         // The miss is now terminal (no_material) → not re-attempted next tick.
         let qk = normalized_query_key("who is nobody?");
         assert!(log.open_misses(10).unwrap().iter().all(|m| m.key != qk), "no_material miss left open set");
+    }
+
+    #[test]
+    fn reflect_once_counts_real_emits_into_dossiers_refreshed_separately_from_candidate_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        log.set_reflect_enabled(true).unwrap();
+        // T7's Nova Signal scenario driven end-to-end through the ORCHESTRATOR: the memory text shares no
+        // token with the query and the vector arm stays unbuilt (no rebuild_indexes), so the seeded miss
+        // step-1 misses; the refresh emits a page NAMING the topic → the step-4 replay keyword-hits it.
+        let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+        let topic = log.entity("Nova Signal", &[], "product", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.link_machine(&topic, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.rebuild_graph().unwrap();
+        log.rederive_entity_vectors_pending(&emb).unwrap(); // MAJOR-1
+        log.rebuild_entity_index(&emb).unwrap();
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Nova Signal",
+                "claims": [{ "text": "Nova Signal runs the platform group.", "cites": [m1.clone()] }] }),
+        );
+
+        let r = log.reflect_once(&emb, &reasoner, &["Nova Signal".to_string()], 20).unwrap();
+        // T9's uniquely-owned line pinned NON-ZERO: `dossiers_refreshed` (a real-emit count) and
+        // `candidate_repaired` (a replay-recall classification) track DIFFERENT facts even when both are 1
+        // — the sum's miss_emits term comes from the attempt's real `Emitted`, never the classification.
+        // (The converse fixture — candidate_repaired with dossiers_refreshed == 0 — is UNCONSTRUCTIBLE in
+        // one tick: with zero emits the step-1 and step-4 recalls are identical calls, so a step-4 hit
+        // implies a step-1 hit → RepairedByTime. The stale.healed term of the sum stays pinned by T8's
+        // suite + the T16 e2e.)
+        assert_eq!(r.attempted, 1, "the seeded miss was attempted");
+        assert_eq!(r.candidate_repaired, 1, "the replay hit the fresh dossier");
+        assert_eq!(r.dossiers_refreshed, 1, "exactly one REAL emit fed the honest sum");
+        let (refreshed_total, _no_material_total) = log.reflect_counters().unwrap();
+        assert_eq!(refreshed_total, 1, "cumulative refreshed_total advanced by the emit");
     }
 }
