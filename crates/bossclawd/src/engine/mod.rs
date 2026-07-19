@@ -1194,6 +1194,30 @@ impl EngineHandle {
             .unwrap_or(false)
     }
 
+    /// Rung-4 R4-A: flip the sticky reflection off-switch (the toggle behind the settings panel). The
+    /// wire write behind [`Request::SetReflectEnabled`]. Gated. Mirrors [`Self::set_evolve_enabled`].
+    pub async fn set_reflect_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_reflect_enabled(enabled).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-4 R4-A: read the sticky reflection flag (the toggle POSITION; default CLOSED). The
+    /// Result-returning wire read behind [`Request::ReflectEnabled`]; DISTINCT from
+    /// [`Self::reflect_enabled_or_false`] (the fail-safe bool gate the sweeper reads each cycle).
+    /// Mirrors [`Self::capture_enabled`]. Gated.
+    pub async fn reflect_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.reflect_enabled().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
     /// The core reads `decide_reflect` needs, in ONE spawn_blocking. `None` on an open failure (→ the
     /// sweeper no-ops that cycle).
     pub async fn reflect_gate_inputs(&self, onboarded: bool) -> Option<ReflectGateInputs> {
