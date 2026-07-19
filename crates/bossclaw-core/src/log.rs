@@ -1821,12 +1821,14 @@ impl EventLog {
     /// when both fail is `Err` returned.
     ///
     /// # Lifecycle note
-    /// The semantic (vector) arm reflects the index state at the last
+    /// BOTH arms reflect the index state at the last
     /// [`EventLog::rebuild_indexes`] / [`EventLog::open_with_recall`] call.
-    /// **Events appended after that call are not yet in the vector index** and
-    /// will only surface via the keyword arm until `rebuild_indexes(embedder)`
-    /// is called again. This is intentional spec §10 graceful degradation, not a
-    /// bug — but callers should be aware of the gap.
+    /// **Events appended after that call are in neither index yet** — the FTS
+    /// keyword arm is wiped-and-repopulated by `rebuild_indexes` exactly like the
+    /// vector arm (log.rs:1638), NOT live on append — so an appended event
+    /// becomes recall-visible only after the next `rebuild_indexes(embedder)`.
+    /// This is intentional spec §10 graceful degradation, not a bug — but callers
+    /// should be aware of the gap.
     pub fn recall(
         &self,
         embedder: &dyn Embedder,
@@ -7362,6 +7364,11 @@ impl EventLog {
     /// [`crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS`] (spec §7.3, critic m1): `repaired_by_time` /
     /// `candidate_repaired` are pruned (no forward information); `parked` / `no_material` PERSIST. Keeps
     /// the table bounded. Returns the pruned row count. Called at the end of each `reflect_once` tick.
+    ///
+    /// The `parked` / `no_material` rows PERSIST forever by §7.3 intent (they carry information — "we
+    /// tried and could not" / "we never knew this"). That is bounded by the distinct-miss count per user,
+    /// not by time; if a brain ever sees heavy miss traffic, the future pressure valve is an
+    /// `event_type`/`state` index or a longer-horizon prune, not eviction of these terminal rows.
     pub fn prune_reflect_backlog(&self, now: i64) -> Result<usize, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let n = store.conn().execute(
@@ -8178,6 +8185,8 @@ impl EventLog {
             ts: String::new(),
             valid_time: None,
             event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
             content: serde_json::Value::Object({
                 let mut m = serde_json::Map::new();
                 m.insert(REFLECT_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
@@ -12859,7 +12868,7 @@ mod tests {
     /// recall's memory arm already uses. On a corpus with nothing retired, gather is byte-stable
     /// (the control) — which is why the evolve/summarize goldens stay green.
     #[test]
-    fn gather_fact_set_excludes_retired_and_superseded_lineage_from_texts_and_cited_ids() {
+    fn gather_fact_set_excludes_retired_lineage_from_texts_and_cited_ids() {
         let dir = tempfile::tempdir().unwrap();
         let log = open_log(dir.path());
         let emb = MockEmbedder::new(8);

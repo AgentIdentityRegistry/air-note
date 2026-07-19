@@ -1,4 +1,4 @@
-//! Recall-miss telemetry (SP3 A12) — the retrieval-floor tuning signal (spec §8) AND, since Rung-4 R4-A,
+//! Recall-miss telemetry (SP3 A12) — the rung-1/2 retrieval-floor tuning signal (spec §8) AND, since Rung-4 R4-A,
 //! the ACTIVE input to the reflect loop, which reads these miss queries each quiet tick to repair coverage
 //! gaps (design §2.4). With cloud consent ON, gathered material may egress under the existing consent.
 //!

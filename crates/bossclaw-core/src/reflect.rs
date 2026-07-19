@@ -33,6 +33,13 @@ pub const REFLECT_TOPIC_N: usize = 2;
 /// `k` for the repair-check recalls in `attempt_miss` (spec §2.2 steps 1 & 4). The SP3 miss ring stores
 /// only the query, not its original `k`, so reflection re-checks "does this query find anything now?" at a
 /// stable modest `k`; any `k >= 1` answers hit-vs-miss, and 5 keeps the check cheap.
+///
+/// Verified design property (whole-branch adjudication): recall is FLOORLESS — HNSW applies no distance
+/// cutoff — so on a POPULATED brain a query records an SP3 miss ONLY when recall genuinely returned zero
+/// (an empty/sparse index, or a not-yet-built index). The reflect step-1 re-recall uses the SAME floorless
+/// `recall` + `RecallOptions::default()`, so `RepairedByTime` honestly means "the brain grew a matching
+/// neighbor / the index came online since the miss," not "a nearer neighbor crossed a threshold." That
+/// narrow reach is BY DESIGN, and §5.3(d) is what measures it.
 pub const REFLECT_RECALL_K: usize = 5;
 
 /// Minimum cosine SIMILARITY (= `1.0 - entity_search` cosine distance, which lies in `[0,2]`; the
@@ -53,9 +60,11 @@ pub const REFLECT_BACKLOG_TERMINAL_TTL_SECS: i64 = 30 * 86_400;
 use sha2::{Digest, Sha256};
 
 /// Normalized backlog key (spec §2.2 / §7.2): SHA-256 hex of the TRIMMED, casefolded query. v1 casefold =
-/// `to_lowercase()` (semantic dedup stays OUT, §6). Fixed-length hex keeps the PK bounded; the raw
-/// `query_text` is stored in its own column for the digest/UI. Bloat is bounded because pages are
-/// ENTITY-keyed — near-duplicate queries about one topic converge on the same dossier. PURE.
+/// `to_lowercase()` — NOT full Unicode casefold, so locale-specific forms (Turkish İ/ı, German ß) may not
+/// converge; acceptable, as at worst it costs a few extra backlog rows (semantic dedup stays OUT, §6).
+/// Fixed-length hex keeps the PK bounded; the raw `query_text` is stored in its own column for the
+/// digest/UI. Bloat is bounded because pages are ENTITY-keyed — near-duplicate queries about one topic
+/// converge on the same dossier. PURE.
 pub fn normalized_query_key(query: &str) -> String {
     let mut h = Sha256::new();
     h.update(query.trim().to_lowercase().as_bytes());
