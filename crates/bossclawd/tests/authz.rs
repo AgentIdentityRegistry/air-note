@@ -222,3 +222,25 @@ async fn memory_client_can_resolve_conflicts_but_still_cannot_retire_directly() 
         .await;
     assert!(is_not_permitted(&resp), "guest still cannot RetireMemory directly, got {resp:?}");
 }
+
+/// R4-A (Task 16): reflection enable/read is App-only OVER THE SOCKET. A `MemoryClient` guest is
+/// refused BOTH ops at the role boundary (never reaches the engine — `Role::allows` is unchanged,
+/// I8); the `App` gets the full round-trip: default CLOSED, enable acks `Ok`, reads back `true`.
+#[tokio::test]
+async fn reflect_enable_is_app_only_over_the_socket() {
+    let (_tmp, sock) = spawn_onboarded_daemon().await;
+    // Guest: refused at the role boundary (never reaches the engine) — Role::allows is UNCHANGED (I8).
+    let mut guest = RoleClient::connect(&sock, Role::MemoryClient).await;
+    let resp = guest.call(Request::SetReflectEnabled { onboarded: true, enabled: true }).await;
+    assert!(is_not_permitted(&resp), "guest cannot enable reflection: {resp:?}");
+    let resp = guest.call(Request::ReflectEnabled { onboarded: true }).await;
+    assert!(is_not_permitted(&resp), "guest cannot read the reflect flag: {resp:?}");
+    // App: full round-trip — default CLOSED, enable acks Ok, reads back true.
+    let mut app = RoleClient::connect(&sock, Role::App).await;
+    let resp = app.call(Request::ReflectEnabled { onboarded: true }).await;
+    assert!(matches!(resp, Response::ReflectEnabled(false)), "default CLOSED, got {resp:?}");
+    let resp = app.call(Request::SetReflectEnabled { onboarded: true, enabled: true }).await;
+    assert!(matches!(resp, Response::Ok), "App enable acks Ok, got {resp:?}");
+    let resp = app.call(Request::ReflectEnabled { onboarded: true }).await;
+    assert!(matches!(resp, Response::ReflectEnabled(true)), "reads back enabled, got {resp:?}");
+}

@@ -3637,6 +3637,89 @@ mod tests {
         assert!(!report.skipped_disabled, "lock release restores service");
     }
 
+    /// Task 16 (R4-A final wire-in, §5 exit gate / §4 I3): the END-TO-END reflect path over the
+    /// in-process engine — the product enable path (T12 engine setter), the miss classifier, and the
+    /// §2.4 neutral digest line, all exercised together. Both classification branches fire and the
+    /// digest renders the byte-exact `0 dossier(s) refreshed, 1 unknown-topic gap(s)` (a self-heal
+    /// emits NO dossier; the honest gap is the only tally), then a second startup serve is empty
+    /// (T13 "since last session" window consumed).
+    ///
+    /// SEEDING NOTE (verified against real seams, NOT the plan sketch's single tick): recall is
+    /// FLOORLESS — [`crate::engine::mod`]'s `ensure_indexed` folds every memory into the vector arm and
+    /// `HnswIndex::search` (core `index.rs`) returns the nearest neighbour for ANY query with no
+    /// distance cutoff. So the instant one memory is indexed, EVERY re-attempted miss recall-hits at
+    /// `attempt_miss` step 1 → `repaired_by_time`, and `no_material` (step-1 recall EMPTY) is
+    /// unreachable in that SAME tick. This is the established Rung-4 core behaviour: the canonical
+    /// `attempt_miss_classifies_repaired_by_time_and_no_material` (core `log.rs`) proves it by
+    /// attempting `no_material` on a memory-LESS index, THEN `repaired_by_time` after indexing. We
+    /// mirror that two-index-state ordering across two ENGINE ticks; the durable `reflect_counters`
+    /// table accumulates across ticks, so the cumulative digest is still exactly the plan's line.
+    #[tokio::test]
+    async fn reflect_tick_classifies_misses_and_the_digest_line_appears() {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("identity.json"), serde_json::json!({
+            "did": "did:wba:example.com:tester", "name": "Tester",
+            "created_at": "2026-07-11T00:00:00+00:00" }).to_string()).unwrap();
+        let engine = EngineHandle::new(
+            crate::server::shared_test_vault(), dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(reason::MockReasonerProvider::from_reasoner(
+                Arc::new(bossclaw_core::ScriptedReasoner::new("test")))));
+        let onboarded = true;
+        // T12's engine setter (landed) — the product enable path, end to end.
+        engine.set_reflect_enabled(onboarded, true).await.unwrap();
+        let log = engine.get_or_open(onboarded).await.unwrap();
+        let emb = engine.ensure_indexed(&log).await.unwrap(); // the engine's OWN embedder (model ids match)
+
+        // ── Tick 1 (memory-LESS recall index): one unknowable miss → an honest `no_material` gap. ──
+        {
+            let log = log.clone();
+            tokio::task::spawn_blocking(move || {
+                log.seed_miss(
+                    &bossclaw_core::reflect::normalized_query_key("zzz unknowable gibberish 9182"),
+                    "zzz unknowable gibberish 9182", 10).unwrap();
+            }).await.unwrap();
+        }
+        let r1 = engine.reflect_once(onboarded, 1_000).await.expect("tick 1 runs");
+        assert!(!r1.skipped_disabled);
+        assert_eq!(r1.attempted, 1, "the one open miss is attempted");
+        assert_eq!(r1.no_material, 1, "unknowable on a memory-less index is an honest gap");
+        assert_eq!(r1.dossiers_refreshed, 0, "a gap emits no dossier");
+
+        // ── Remember one answerable memory + make it recall-visible IN PLACE (the manual rebuild wins
+        //    over `ensure_indexed`'s memoized build flag), then seed its exact-text miss. ──
+        {
+            let log = log.clone();
+            let emb = emb.clone();
+            tokio::task::spawn_blocking(move || {
+                let _m = log.remember(&*emb, "The capital of France is Paris.").unwrap();
+                log.rebuild_indexes(&*emb).unwrap();
+                log.seed_miss(
+                    &bossclaw_core::reflect::normalized_query_key("The capital of France is Paris."),
+                    "The capital of France is Paris.", 11).unwrap();
+            }).await.unwrap();
+        }
+
+        // ── Tick 2 (memory now indexed): the matching miss self-heals via recall → `repaired_by_time`,
+        //    emitting NO dossier. The terminal tick-1 gap is NOT re-attempted (open-misses only). ──
+        let r2 = engine.reflect_once(onboarded, 2_000).await.expect("tick 2 runs");
+        assert!(!r2.skipped_disabled);
+        assert_eq!(r2.attempted, 1, "only the still-open miss is attempted (the gap is terminal)");
+        assert_eq!(r2.repaired_by_time, 1, "the answerable miss self-heals via recall");
+        assert_eq!(r2.no_material, 0, "the gap was already tallied in tick 1");
+        assert_eq!(r2.dossiers_refreshed, 0, "a recall self-heal emits no dossier");
+
+        // The NEUTRAL digest line renders byte-exactly on a startup serve — cumulative counters are
+        // 0 dossiers refreshed (both branches emit nothing) + 1 gap — then the since-last-session
+        // window is consumed (T13 rule) so a second startup serve is empty.
+        let lines = engine.serve_reflect_digest_line("startup").await;
+        assert_eq!(lines,
+            vec!["0 dossier(s) refreshed, 1 unknown-topic gap(s) since last session.".to_string()]);
+        assert!(engine.serve_reflect_digest_line("startup").await.is_empty(),
+            "startup consumed the since-last-session window (T13 rule)");
+    }
+
     #[tokio::test]
     async fn set_folder_writable_toggles_the_write_grant_and_list_writable_reflects_it() {
         let (vault, dir) = test_vault_and_dir();
