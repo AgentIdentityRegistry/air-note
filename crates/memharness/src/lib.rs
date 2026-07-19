@@ -13,6 +13,7 @@ pub mod frontmatter;
 pub mod judge;
 pub mod mine;
 pub mod ollama;
+pub mod probes;
 pub mod reflect_pass;
 pub mod report;
 pub mod resolve;
