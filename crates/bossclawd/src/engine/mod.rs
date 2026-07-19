@@ -1005,14 +1005,8 @@ impl EngineHandle {
         // Serialize manual + scheduled ticks: a second overlapping tick is Busy, not queued.
         let _guard = self.evolve_lock.try_lock().map_err(|_| EngineOpError::Busy("evolve"))?;
         // Consent chokepoint for BOTH the scheduler AND manual `engine_evolve_now` (R1/R5/R8),
-        // shared with the conflict sweep (I2). Placed BEFORE the reasoner is built (and any
-        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner and egresses
-        // nothing.
-        if !self.cloud_consent_ok(onboarded).await {
-            return Err(EngineOpError::Reasoner(
-                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
-            ));
-        }
+        // shared with the reflect + conflict ticks (I2) — see `consent_gate`.
+        self.consent_gate(onboarded).await?;
         let embedder = self.ensure_indexed(&log).await?;
         let reasoner = self.reasoner_provider.reasoner()?;
         let t0 = std::time::Instant::now();
@@ -1068,14 +1062,9 @@ impl EngineHandle {
         // Serialize manual + scheduled ticks: a second overlapping tick is Busy, not queued. DEDICATED
         // lock (never `evolve_lock`): a long evolve tick must never block a reflect tick and vice-versa.
         let _guard = self.reflect_lock.try_lock().map_err(|_| EngineOpError::Busy("reflect"))?;
-        // Shared cloud-egress consent barrier (I2), placed BEFORE the reasoner is built (and any
-        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner and egresses
-        // nothing — the same chokepoint `evolve_once`/`detect_conflicts_once` use.
-        if !self.cloud_consent_ok(onboarded).await {
-            return Err(EngineOpError::Reasoner(
-                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
-            ));
-        }
+        // Shared cloud-egress consent barrier (I2) — the same chokepoint `evolve_once` /
+        // `detect_conflicts_once` use; see `consent_gate`.
+        self.consent_gate(onboarded).await?;
         // Non-destructive read of the SP3 miss ring (queries only). The durable backlog's `seed_miss`
         // is upsert-if-new, so re-reading the same ≤20 queries every tick is idempotent (a terminal
         // miss is never reset); a non-destructive read also PRESERVES the App's `RecallStats` "recent
@@ -1293,14 +1282,9 @@ impl EngineHandle {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         // Serialize manual + scheduled cycles: a second overlapping cycle is Busy, not queued.
         let _guard = self.conflict_lock.try_lock().map_err(|_| EngineOpError::Busy("conflict"))?;
-        // Shared cloud-egress consent barrier (I2), placed BEFORE the reasoner is built (and any
-        // spawn_blocking/network), so a cloud-not-ready cycle constructs no reasoner and egresses
-        // nothing — the same chokepoint `evolve_once` uses.
-        if !self.cloud_consent_ok(onboarded).await {
-            return Err(EngineOpError::Reasoner(
-                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
-            ));
-        }
+        // Shared cloud-egress consent barrier (I2) — the same chokepoint `evolve_once` /
+        // `reflect_once` use; see `consent_gate`.
+        self.consent_gate(onboarded).await?;
         // Core holds only passage VECTORS; the daemon supplies passage TEXT by reading the `.md`.
         // Resolve the data dir now (fail-safe) for the resolver closure below.
         let Some(data_dir) = self.data_dir().map(|p| p.to_path_buf()) else {
@@ -1937,8 +1921,9 @@ impl EngineHandle {
 
     /// The shared cloud-egress consent barrier (spec I2). `true` when it is safe to run the
     /// reasoner: Local mode (no egress at all), or Cloud mode with a signed consent record matching
-    /// the current config + vault key (`reasoner_ready_or_false`, fail-closed). Both `evolve_once`
-    /// and the conflict sweep gate on this before building the reasoner.
+    /// the current config + vault key (`reasoner_ready_or_false`, fail-closed). `evolve_once` /
+    /// `reflect_once` / `detect_conflicts_once` gate on this (via [`Self::consent_gate`]) before
+    /// building the reasoner.
     pub async fn cloud_consent_ok(&self, onboarded: bool) -> bool {
         if matches!(
             self.reasoner_config_or_default(onboarded).await.mode,
@@ -1948,6 +1933,20 @@ impl EngineHandle {
         } else {
             true
         }
+    }
+
+    /// The shared cloud-egress consent gate as a `Result` guard: `Ok(())` when
+    /// [`Self::cloud_consent_ok`] passes, else `Err(EngineOpError::Reasoner(..))`. Called at the TOP
+    /// of `evolve_once` / `reflect_once` / `detect_conflicts_once` — BEFORE the reasoner is built (and
+    /// any spawn_blocking/network) — so a cloud-not-ready tick constructs no reasoner and egresses
+    /// nothing (I2). Single-sources the failure message across the three ticks.
+    async fn consent_gate(&self, onboarded: bool) -> Result<(), EngineOpError> {
+        if !self.cloud_consent_ok(onboarded).await {
+            return Err(EngineOpError::Reasoner(
+                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Persist the NON-security reasoner config (mode/provider/model/base_url). Does NOT grant
