@@ -37,8 +37,10 @@ export function LibraryPanel() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // C6: recall telemetry (queries-only miss log — spec §8). A read-only status strip; a stats hiccup
-  // must never break the Library, so it loads on its own and degrades to a hidden strip on failure.
+  // C6: recall telemetry (queries-only miss log — spec §8). Since Rung-4 R4-A these miss queries also
+  // ACTIVELY drive the reflect loop's dossier refreshes (design §2.4) — no longer a passive display; a
+  // stats hiccup must never break the Library, so it loads on its own and degrades to a hidden strip on
+  // failure.
   const [stats, setStats] = useState<RecallStatsDto | null>(null);
 
   // One search box: `query` drives the instant client-side filter AND is the recall query.
@@ -250,8 +252,9 @@ export function LibraryPanel() {
         Typing filters what’s loaded; press Enter or “Search memory” to search your whole memory.
       </p>
 
-      {/* C6: recall-miss stats strip — a compact, read-only status line. Only past search QUERIES that
-          found nothing are shown (never result text — spec §8; the daemon guarantees queries-only). */}
+      {/* C6: recall-miss stats strip. Since R4-A these queries actively drive reflection (dossier
+          refreshes for missed topics — design §2.4). Still only past search QUERIES that found nothing
+          are shown (never result text — spec §8; the daemon guarantees queries-only). */}
       {stats && stats.total > 0 ? (
         <div style={{ margin: "0 0 16px", fontSize: 12, color: "var(--text-tertiary)", lineHeight: 1.5 }}>
           <div>

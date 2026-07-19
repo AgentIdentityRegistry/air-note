@@ -451,6 +451,24 @@ impl<T: Transport + ?Sized> EngineClient<T> {
         }
     }
 
+    // ── Reflection (Rung-4 R4-A). App-only ops, like the capture pair: `onboarded` is THREADED from
+    //    the caller, never hardcoded true, so a pre-onboarding call cleanly `NotOnboarded`s with no
+    //    brain minted. The `SetCaptureEnabled` wiring, minus `backfill` — reflection is a plain bool
+    //    switch (no history import), and the daemon's reflect sweeper self-gates on the flag alone. ──
+
+    /// Enable/disable reflection. App-only; the daemon supplies nothing extra (a plain bool switch).
+    pub async fn set_reflect_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        self.unit(Request::SetReflectEnabled { onboarded, enabled }).await
+    }
+
+    /// Read the sticky reflect-enabled flag (default CLOSED). Mirrors `capture_enabled`.
+    pub async fn reflect_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        match self.request(Request::ReflectEnabled { onboarded }).await? {
+            Response::ReflectEnabled(b) => Ok(b),
+            other => Err(unexpected(other)),
+        }
+    }
+
     // ── Memory-browser Library (SP3 C1). App-only ops: the daemon's role gate denies `MemoryClient`
     //    for each, and it resolves onboarding from its OWN identity — but the wire still carries an
     //    `onboarded` flag, so like every sibling (B5) it is THREADED from the caller's real
@@ -1277,6 +1295,18 @@ mod tests {
         assert!(!bounded(client.capture_enabled(true)).await.expect("capture_enabled"), "default closed");
         bounded(client.set_capture_enabled(true, true, true)).await.expect("set_capture_enabled");
         assert!(bounded(client.capture_enabled(true)).await.expect("capture_enabled"), "enabled reads back");
+    }
+
+    #[tokio::test]
+    async fn set_and_get_reflect_enabled_over_the_socket() {
+        // Rung-4 R4-A: the reflect flag round-trips through the real hermetic daemon. A fresh brain has
+        // reflection CLOSED (default-off + boot force-off, mirroring capture); enabling it (a plain bool
+        // switch — no backfill) flips the read to true.
+        let daemon = TestDaemon::spawn().await;
+        let client = daemon.client();
+        assert!(!bounded(client.reflect_enabled(true)).await.unwrap(), "default CLOSED");
+        bounded(client.set_reflect_enabled(true, true)).await.unwrap();
+        assert!(bounded(client.reflect_enabled(true)).await.unwrap(), "reads back enabled");
     }
 
     #[tokio::test]

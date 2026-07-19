@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   integrationsStatus, connectClaudeCode, disconnectClaudeCode,
   backfillCount, setCaptureEnabled, captureEnabled, isConnected,
+  setReflectEnabled, reflectEnabled,
 } from "./integrations";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -44,6 +45,17 @@ describe("api/integrations", () => {
     vi.mocked(invoke).mockResolvedValue(true);
     expect(await captureEnabled()).toBe(true);
     expect(invoke).toHaveBeenCalledWith("integrations_capture_enabled");
+  });
+
+  it("setReflectEnabled forwards the enabled flag as a camelCase arg", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await setReflectEnabled(true);
+    expect(invoke).toHaveBeenCalledWith("integrations_set_reflect_enabled", { enabled: true });
+  });
+  it("reflectEnabled invokes its command and returns the bool", async () => {
+    vi.mocked(invoke).mockResolvedValue(false);
+    expect(await reflectEnabled()).toBe(false);
+    expect(invoke).toHaveBeenCalledWith("integrations_reflect_enabled");
   });
 
   it("isConnected narrows only the object-form Connected variant, never the bare strings", () => {
