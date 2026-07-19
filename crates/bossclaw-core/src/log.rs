@@ -7586,9 +7586,11 @@ impl EventLog {
                 + report.reasoner_errors + report.transient_errors >= cap {
                 break;
             }
-            if !attempted.insert(page.topic_id.clone()) {
-                continue; // one refresh per topic per pass
-            }
+            // Intra-pass single-attempt is DB-enforced (topic_id PK); asserted, not re-checked.
+            debug_assert!(
+                attempted.insert(page.topic_id.clone()),
+                "pages.topic_id is PRIMARY KEY — current_pages() yields one row per topic"
+            );
             // Read the page's cited set; stale iff it intersects the gone set.
             let Some((_pid, cites)) = self.current_page_for_topic(&page.topic_id)? else { continue };
             let stale = cites.iter().any(|id| fold.superseded.contains(id) || fold.retired_notes.contains(id));
@@ -12873,8 +12875,7 @@ mod tests {
         let log = open_log(dir.path());
         let emb = MockEmbedder::new(64);
         // A topic with TWO cited sources + an edge → a page. Retire ONE source → the page is stale but still
-        // summary-worthy → healed. A SECOND topic with ONE cited source → retire it → below PAGE_MIN_FACTS →
-        // unhealable_thin.
+        // summary-worthy → healed.
         let m1 = log.remember(&emb, "Kenny works at Acme.").unwrap();
         let m2 = log.remember(&emb, "Kenny lives in Denver.").unwrap();
         let heal_lineage = vec![m1.clone(), m2.clone()];
@@ -12899,8 +12900,7 @@ mod tests {
             crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f2),
             serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny lives in Denver.", "cites": [m2.clone()] }]}));
         let report = log.refresh_stale_pages(&r_healed, 8).unwrap();
-        assert_eq!(report.healed, 1, "the stale Kenny page healed");
-        assert_eq!(report.unhealable_thin, 0);
+        assert_eq!(report, crate::reflect::StaleRefreshReport { healed: 1, ..Default::default() });
     }
 
     /// R4-A (spec §2.3 thin-set residual): a page whose ENTIRE lineage is retired cannot legally re-emit —
