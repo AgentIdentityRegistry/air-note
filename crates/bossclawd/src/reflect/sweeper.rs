@@ -108,7 +108,7 @@ pub async fn run_reflect_sweep_once(engine: &EngineHandle, data_dir: &Path, now:
     if !reflect_enabled {
         return ReflectSweepReport { gated_off: true, ..Default::default() };
     }
-    let reasoner_ready = engine.reflect_reasoner_ready(onboarded).await;
+    let reasoner_ready = engine.scheduling_reasoner_ready(onboarded).await;
     let evolve_enabled = engine.evolve_enabled_or_false(onboarded).await;
     let evolve_queue_depth = engine.queue_depth_or_zero(onboarded).await;
     let Some(g) = engine.reflect_gate_inputs(onboarded).await else {

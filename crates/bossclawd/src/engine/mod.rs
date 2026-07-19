@@ -1237,10 +1237,11 @@ impl EngineHandle {
         .ok()
     }
 
-    /// Reasoner readiness for reflection, mirroring the evolve scheduler's `select_ready` block
-    /// (scheduler.rs): cloud mode trusts signed-consent readiness, local mode the Ollama probe; cloud
-    /// NEVER silently falls back to local (spec §2.1 / §3.4).
-    pub async fn reflect_reasoner_ready(&self, onboarded: bool) -> bool {
+    /// Reasoner readiness for a background tick, in the scheduler's mode-aware form: cloud mode trusts
+    /// signed-consent readiness (`reasoner_ready_or_false`), local mode the Ollama probe; cloud NEVER
+    /// silently falls back to local (spec §2.1 / §3.4). The SINGLE source of tick readiness for both
+    /// the evolve scheduler loop (`scheduler::spawn`) and reflection's sweeper.
+    pub async fn scheduling_reasoner_ready(&self, onboarded: bool) -> bool {
         let cfg = self.reasoner_config_or_default(onboarded).await;
         let cloud_mode = matches!(cfg.mode, crate::engine::reason::ReasonerMode::Cloud);
         let ollama_ready = if cloud_mode {

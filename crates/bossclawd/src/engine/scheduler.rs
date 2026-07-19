@@ -13,7 +13,7 @@
 //! ALL gating logic lives in the pure `decide_tick` (unit-tested). The `spawn` loop is a thin
 //! shell over it — exercised by manual launch, not unit tests.
 
-use crate::engine::{ollama_probe, EngineHandle};
+use crate::engine::EngineHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,23 +95,9 @@ pub fn spawn(engine: Arc<EngineHandle>, data_dir: PathBuf) {
             ticker.tick().await;
             let onboarded = crate::identity::is_onboarded(&data_dir);
             let evolve_enabled = engine.evolve_enabled_or_false(onboarded).await;
-            let config = engine.reasoner_config_or_default(onboarded).await;
-            let cloud_mode = matches!(config.mode, crate::engine::reason::ReasonerMode::Cloud);
-            // Probe ONLY the active source; the inactive one is `false`. In cloud mode the
-            // Ollama probe is SKIPPED entirely and there is NO fallback to local (spec §3.4):
-            // readiness is `reasoner_ready_or_false`, itself fail-closed on signed consent.
-            let ollama_ready = if cloud_mode {
-                false
-            } else {
-                let oll = ollama_probe::probe(crate::engine::reason::REASONER_MODEL_ID).await;
-                oll.reachable && oll.model_present
-            };
-            let cloud_ready = if cloud_mode {
-                engine.reasoner_ready_or_false(onboarded).await
-            } else {
-                false
-            };
-            let ready = select_ready(cloud_mode, ollama_ready, cloud_ready);
+            // Mode-aware reasoner readiness (cloud→signed-consent, local→Ollama probe; no silent
+            // fallback, spec §3.4) — the SAME source reflection's sweeper reads.
+            let ready = engine.scheduling_reasoner_ready(onboarded).await;
             let queue_depth = engine.queue_depth_or_zero(onboarded).await;
             if decide_tick(onboarded, evolve_enabled, ready, queue_depth) == TickGate::Run {
                 // Records telemetry inside; a `Busy` (manual tick overlap) is a harmless skip.
