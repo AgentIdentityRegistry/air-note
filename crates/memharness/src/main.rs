@@ -30,6 +30,11 @@ enum Command {
     Compare(CompareArgs),
     /// Grade the rung-3 conflict judge on a frozen labelled set (spec §9).
     ConflictGrade(ConflictGradeArgs),
+    /// Rung-4 R4-A reflection non-regression gate (spec §5.2/§5.3): score the AIR arm over a frozen
+    /// scoring set BEFORE and AFTER driving evolve+reflect to quiescence (seeded retire + frozen miss
+    /// set), gate on `recall_regressed`, and REPORT union-coverage. LIVE + Peter-gated (NOT in CI):
+    /// needs Ollama up and the real embedder; see the runbook on `ReflectGateArgs`.
+    ReflectGate(ReflectGateArgs),
 }
 
 /// Which INDEX the judge-free retrieval grader searches (Rung-3 §9/§13). `title` = the pre-Rung-3
@@ -133,6 +138,48 @@ struct CompareArgs {
     candidate: PathBuf,
 }
 
+/// Rung-4 R4-A reflection non-regression gate (spec §5.2/§5.3). LIVE + Peter-gated (NOT in CI).
+///
+/// RUNBOOK (owner-only, from repo root, needs Ollama up + the real embedder fetched):
+///   cargo run -p memharness -- reflect-gate \
+///     --corpus ~/brain \
+///     --cases  <FROZEN scoring set.jsonl> \
+///     --miss-set <FROZEN synthetic miss set.jsonl> \
+///     --reports-dir <a dir OUTSIDE the repo>
+///
+/// It ingests the corpus, scores the AIR arm over the frozen KNOWN-ITEM scoring set (the un-reflected
+/// BASELINE), enables evolve+reflect, seeds a scripted retire + the frozen miss set, drives BOTH loops
+/// to quiescence, re-scores (the REFLECTED arm), and gates with `recall_regressed` (a significant
+/// known-item s@k drop on ANY segment ⇒ exit 1). Union-coverage prints as a REPORTED-only metric and
+/// NEVER affects the gate — the gold FILE page scores only as itself (critic New-Blocker-1). The
+/// miss-set file is JSONL, one `{"query": "..."}` per line.
+#[derive(clap::Args)]
+struct ReflectGateArgs {
+    /// Corpus source (default ~/brain). Ingested into the isolated in-process daemon.
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+    /// The FROZEN scoring set (JSONL `QueryCase`s). Both arms score the SAME list so the paired
+    /// comparison is valid; only its known-item cases are scored (the gate is judge-free recall).
+    #[arg(long)]
+    cases: PathBuf,
+    /// The FROZEN synthetic miss set (JSONL, one `{"query": "..."}` per line) seeded into the reflect
+    /// backlog so the reflect loop has real misses to work — the material the dossiers are built from.
+    #[arg(long)]
+    miss_set: PathBuf,
+    /// A reports dir OUTSIDE the repo (a one-line summary is written there when set; validated like `run`).
+    #[arg(long)]
+    reports_dir: Option<PathBuf>,
+    /// Local Ollama model for the reflect/evolve reasoner + (unused-on-known-item) answerer/judge seams.
+    #[arg(long, default_value = memharness::ollama::DEFAULT_OLLAMA_MODEL)]
+    model: String,
+    /// Retrieval depth AND scoring depth for the AIR arm (one knob: retrieval-k == scoring-k).
+    #[arg(long, default_value_t = 10)]
+    k: usize,
+    /// RNG seed for the scoring loop (blinding/bootstrap are unused on the known-item path but threaded).
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
@@ -142,6 +189,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run(args) => run(args),
         Command::Compare(args) => compare(args),
         Command::ConflictGrade(args) => conflict_grade_cmd(args),
+        Command::ReflectGate(args) => reflect_gate(args),
     }
 }
 
@@ -248,6 +296,300 @@ fn compare(args: CompareArgs) -> anyhow::Result<()> {
         );
     }
     println!("\nGating segments (spec §1): synthetic·en·known-item, synthetic·ko·known-item ONLY.");
+    Ok(())
+}
+
+// ── Rung-4 R4-A reflection non-regression gate (spec §5.2/§5.3). LIVE + Peter-gated (NOT in CI).
+//    The hermetic halves are unit-tested (`arms::map_hits`, `reflect_pass::{drive_to_quiescence,
+//    union_coverage}`); this orchestration is correct-by-construction against the real `engine()` API
+//    and only runs under Peter's owner-gated runbook (needs Ollama + the real embedder). ──
+
+/// Wall-clock Unix seconds for the reflect tick's `now` (bi-temporal miss bookkeeping).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The FROZEN synthetic miss set: JSONL, one `{"query": "..."}` per line. Blank lines skipped; a
+/// zero-query file fails loud (a frozen miss set with nothing in it is always a mistake).
+fn load_miss_set(path: &Path) -> anyhow::Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct MissSetRow {
+        query: String,
+    }
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("reading miss set {}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let row: MissSetRow = serde_json::from_str(line)
+            .map_err(|e| anyhow::anyhow!("miss set {} line {}: {e}", path.display(), i + 1))?;
+        out.push(row.query);
+    }
+    if out.is_empty() {
+        anyhow::bail!("miss set {} contains zero queries", path.display());
+    }
+    Ok(out)
+}
+
+/// Build the minimal scores.json `compare_runs` reads (case_list_sha + corpus_sha + case_results) —
+/// so the gate reuses the TESTED paired-comparison machinery verbatim over two IN-MEMORY arms.
+fn scores_json(
+    case_list_sha: &str,
+    corpus_sha: &str,
+    results: &[memharness::run::CaseResult],
+) -> anyhow::Result<String> {
+    Ok(serde_json::json!({
+        "case_list_sha": case_list_sha,
+        "corpus_sha": corpus_sha,
+        "case_results": results,
+    })
+    .to_string())
+}
+
+/// Does the dossier `page` event `page_event_id` CITE the case's gold FILE page? Reads the event's
+/// `model_meta.source_event_ids` and maps each through the SAME `PageResolver` the gate uses; a cite
+/// that does not resolve to a file page (non-file lineage) is skipped, never counted.
+fn dossier_cites_gold(
+    events: &[bossclaw_core::Event],
+    page_event_id: &str,
+    resolver: &memharness::resolve::PageResolver,
+    gold: &str,
+) -> bool {
+    events
+        .iter()
+        .find(|e| e.id == page_event_id && e.event_type == bossclaw_core::graph::PAGE_EVENT_TYPE)
+        .and_then(|e| e.model_meta.as_ref())
+        .map(|mm| {
+            mm.source_event_ids
+                .iter()
+                .any(|src| resolver.page_id_of(src).map(|p| p == gold).unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+/// A no-op GBrain arm for the reflect-gate: this gate scores the AIR arm ONLY (recall
+/// non-regression), so the GBrain side is irrelevant and must NOT shell out to the `gbrain` CLI on
+/// every case. `run_queries` still requires a `GbrainRetriever`; this returns zero hits.
+struct NoGbrain;
+impl GbrainRetriever for NoGbrain {
+    fn retrieve(&self, _query: &str, _k: usize) -> anyhow::Result<Vec<RetrievedHit>> {
+        Ok(Vec::new())
+    }
+}
+
+fn reflect_gate(args: ReflectGateArgs) -> anyhow::Result<()> {
+    let corpus_src = args.corpus.clone().unwrap_or_else(|| dirs_home().join("brain"));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // ── Preflights (fail fast before any expensive work). ──
+    memharness::ollama::preflight(&args.model)?;
+    if let Some(dir) = &args.reports_dir {
+        memharness::report::ensure_outside_repo(dir, &repo_root)?;
+    }
+
+    // Frozen scoring set → KNOWN-ITEM only (the gate is judge-free recall). The frozen list's sha is
+    // the paired-comparison identity: both arms score the SAME list in the SAME order (case_idx-aligned).
+    let (all_cases, case_list_sha) = memharness::cases::load_cases(&args.cases)?;
+    let cases: Vec<QueryCase> =
+        all_cases.into_iter().filter(|c| c.gold_page_id.is_some()).collect();
+    if cases.is_empty() {
+        anyhow::bail!(
+            "frozen scoring set {} has no known-item cases — nothing to gate",
+            args.cases.display()
+        );
+    }
+    eprintln!(
+        "memharness: reflect-gate — {} known-item scoring cases (sha {}…)",
+        cases.len(),
+        &case_list_sha[..16.min(case_list_sha.len())]
+    );
+
+    // Frozen synthetic miss set (the material the dossiers are built from).
+    let miss_queries = load_miss_set(&args.miss_set)?;
+    eprintln!(
+        "memharness: reflect-gate — {} misses to seed from {}",
+        miss_queries.len(),
+        args.miss_set.display()
+    );
+
+    // ── Daemon (real embedder) + corpus ingest + bridge (same path as `run`). ──
+    let mut daemon = memharness::daemon::HarnessDaemon::spawn_real()?;
+    let corpus_home = daemon.home().join("corpus");
+    std::fs::create_dir_all(&corpus_home)?;
+    let manifest = memharness::corpus::prepare_corpus(
+        &corpus_src,
+        &corpus_home,
+        memharness::corpus::STRIP_FRONTMATTER,
+    )?;
+    if manifest.file_count == 0 {
+        anyhow::bail!("corpus at {corpus_src:?} contains no .md pages");
+    }
+    let corpus_sha = memharness::corpus::manifest_sha(&manifest);
+
+    let score_rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let mut client = score_rt.block_on(memharness::client::WireClient::connect(daemon.socket_path()))?;
+    score_rt.block_on(client.add_grant(&corpus_home))?;
+    let ingest = score_rt.block_on(client.run_ingest())?;
+    if !ingest.failed.is_empty() {
+        anyhow::bail!("{} ingest failures — refusing to score a partial corpus", ingest.failed.len());
+    }
+    let records = score_rt.block_on(client.list_files())?;
+    let resolver = memharness::resolve::PageResolver::from_file_records(&records, &corpus_home)?;
+
+    // Scoring seams: LOCAL-only, known-item ⇒ the answerer/judge are NEVER invoked (open cases only),
+    // and the GBrain arm is a no-op double (this gate measures the AIR arm's recall against itself).
+    let answerer = memharness::arms::OllamaAnswerer { model: args.model.clone() };
+    let judge = memharness::judge::OllamaJudge { model: args.model.clone() };
+    let cfg = RunConfig { k: args.k, seed: args.seed, local_only: true };
+    let mut air = memharness::arms::LiveAirArm::new(score_rt, client, resolver.clone());
+
+    // 1. BASELINE arm — un-reflected recall over the frozen scoring set.
+    let baseline =
+        memharness::run::run_queries(&cfg, &cases, &mut air, &NoGbrain, &answerer, &judge, None)?;
+    eprintln!("memharness: reflect-gate — baseline arm scored ({} cases)", baseline.case_results.len());
+
+    // 2. Enable BOTH loops through the in-process engine handle (OQ2: zero new wire ops).
+    let engine = daemon.engine();
+    let drive_rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    drive_rt
+        .block_on(engine.set_evolve_enabled(true, true))
+        .map_err(|e| anyhow::anyhow!("enable evolve: {e}"))?;
+    drive_rt
+        .block_on(engine.set_reflect_enabled(true, true))
+        .map_err(|e| anyhow::anyhow!("enable reflect: {e}"))?;
+
+    // 3. Seed the §5.3(c) scripted retire (a remembered note, then retired) + the frozen miss set.
+    let seed_now = now_unix();
+    let note_id = drive_rt
+        .block_on(engine.remember(true, "reflect-gate: scripted seed memory to retire".to_string()))
+        .map_err(|e| anyhow::anyhow!("seed remember: {e}"))?;
+    drive_rt
+        .block_on(engine.retire_memory(note_id))
+        .map_err(|e| anyhow::anyhow!("scripted retire: {e}"))?;
+    drive_rt.block_on(async {
+        let log = engine.get_or_open(true).await.map_err(|e| anyhow::anyhow!("open log: {e}"))?;
+        for q in &miss_queries {
+            let log = log.clone();
+            let q = q.clone();
+            // seed_miss is upsert-if-new (spec §2.2): re-seeding a seen key never resets progress.
+            tokio::task::spawn_blocking(move || {
+                log.seed_miss(&bossclaw_core::reflect::normalized_query_key(&q), &q, seed_now)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("seed_miss join: {e}"))?
+            .map_err(|e| anyhow::anyhow!("seed_miss: {e}"))?;
+        }
+        anyhow::Ok(())
+    })?;
+
+    // 4. Drive evolve+reflect to quiescence — the LIVE async twin, reusing the TESTED bound + loud
+    //    non-convergence message via the pure `drive_to_quiescence` (closures block_on the engine).
+    let cycles = memharness::reflect_pass::drive_to_quiescence(
+        || {
+            drive_rt
+                .block_on(engine.evolve_once(true))
+                .map_err(|e| anyhow::anyhow!("evolve tick: {e}"))?;
+            Ok(drive_rt.block_on(engine.queue_depth_or_zero(true)))
+        },
+        || {
+            drive_rt
+                .block_on(engine.reflect_once(true, now_unix()))
+                .map_err(|e| anyhow::anyhow!("reflect tick: {e}"))?;
+            Ok(drive_rt
+                .block_on(engine.reflect_gate_inputs(true))
+                .map(|g| g.open_unparked_misses)
+                .unwrap_or(0))
+        },
+    )?;
+    eprintln!("memharness: reflect-gate — reached quiescence in {cycles} cycles");
+
+    // 5a. REFLECTED arm → gate with `compare_runs` + `recall_regressed` over the two arms' known-item
+    //     success flags (the SHIP gate). A significant s@k drop on ANY segment ⇒ exit non-zero.
+    let reflected =
+        memharness::run::run_queries(&cfg, &cases, &mut air, &NoGbrain, &answerer, &judge, None)?;
+    let baseline_json = scores_json(&case_list_sha, &corpus_sha, &baseline.case_results)?;
+    let reflected_json = scores_json(&case_list_sha, &corpus_sha, &reflected.case_results)?;
+    let segments = memharness::compare::compare_runs(&baseline_json, &reflected_json)?;
+    println!("| segment | n | baseline s@k | reflected s@k | Δ | paired Wilcoxon p |");
+    println!("|---|---|---|---|---|---|");
+    for row in &segments {
+        println!(
+            "| {} | {} | {:.3} | {:.3} | {:+.3} | {:.4} |",
+            row.label,
+            row.n,
+            row.baseline_s_at_k,
+            row.candidate_s_at_k,
+            row.candidate_s_at_k - row.baseline_s_at_k,
+            row.wilcoxon.p_value,
+        );
+    }
+    let gate = memharness::compare::recall_regressed(&segments);
+
+    // 5b. Union-coverage (REPORTED-only, NEVER gated — critic New-Blocker-1). Re-retrieve per case
+    //     over a fresh wire client, read each top-k dossier hit's cites via stream_all, map through
+    //     the SAME resolver: how many gold-missing cases have a dossier CITING the gold, at what rank.
+    let mut ucl =
+        drive_rt.block_on(memharness::client::WireClient::connect(daemon.socket_path()))?;
+    let log = drive_rt
+        .block_on(engine.get_or_open(true))
+        .map_err(|e| anyhow::anyhow!("open log for cites: {e}"))?;
+    let events = log.stream_all().map_err(|e| anyhow::anyhow!("stream_all: {e}"))?;
+    let mut union_cases = Vec::with_capacity(cases.len());
+    for case in &cases {
+        let gold = case.gold_page_id.as_deref().expect("known-item cases retained above");
+        let wire = drive_rt.block_on(ucl.recall(&case.text, args.k))?;
+        let hits = memharness::arms::dedup_by_page(memharness::arms::map_hits(&resolver, wire)?);
+        let gold_in_topk = memharness::arms::gold_rank(&hits, gold).is_some();
+        let mut best_citing_dossier_rank: Option<usize> = None;
+        for (rank, h) in hits.iter().enumerate() {
+            if let Some(page_event_id) = h.page_id.strip_prefix("__dossier__:") {
+                if dossier_cites_gold(&events, page_event_id, &resolver, gold) {
+                    best_citing_dossier_rank =
+                        Some(best_citing_dossier_rank.map_or(rank, |b| b.min(rank)));
+                }
+            }
+        }
+        union_cases.push(memharness::reflect_pass::UnionCase {
+            gold_in_topk,
+            best_citing_dossier_rank,
+        });
+    }
+    let coverage = memharness::reflect_pass::union_coverage(&union_cases);
+    println!(
+        "\nunion-coverage (REPORTED, never gated): gold_missing_topk={} covered_by_citing_dossier={} covering_ranks={:?}",
+        coverage.gold_missing_topk, coverage.covered_by_citing_dossier, coverage.covering_ranks,
+    );
+
+    let verdict = match gate {
+        Some(seg) => format!(
+            "REGRESSED on {} (baseline {:.3} → reflected {:.3}, p={:.4})",
+            seg.label, seg.baseline_s_at_k, seg.candidate_s_at_k, seg.wilcoxon.p_value
+        ),
+        None => "NEUTRAL (no significant recall drop on any segment)".to_string(),
+    };
+    println!("\nreflect-gate: {cycles} drive cycles → {verdict}");
+    if let Some(dir) = &args.reports_dir {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(
+            dir.join("reflect-gate.txt"),
+            format!(
+                "reflect-gate: {cycles} drive cycles → {verdict}\nunion-coverage (REPORTED): \
+                 gold_missing_topk={} covered_by_citing_dossier={} covering_ranks={:?}\n",
+                coverage.gold_missing_topk, coverage.covered_by_citing_dossier, coverage.covering_ranks,
+            ),
+        )?;
+    }
+    daemon.kill();
+    if gate.is_some() {
+        anyhow::bail!("reflect-gate FAILED: recall regressed — see the segment table above");
+    }
+    eprintln!("memharness: reflect-gate PASSED (recall-neutral)");
     Ok(())
 }
 

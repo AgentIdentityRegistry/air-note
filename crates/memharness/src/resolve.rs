@@ -17,6 +17,9 @@ use bossclawd_proto::types::FileRecordMirror;
 use crate::corpus::page_id_from_rel;
 
 /// The bridge table: `file_event_id → page_id`. Built once per run, right after ingest.
+/// `Clone` so the reflect-gate can hold one copy in the scoring AIR arm and one for the
+/// union-coverage cites-mapping (both map cites through the SAME table — dev-only).
+#[derive(Clone)]
 pub struct PageResolver {
     by_event: HashMap<String, String>,
 }
@@ -55,6 +58,16 @@ impl PageResolver {
             "recall hit event {event_id} does not map to an ingested file — the no-evolve \
              invariant broke (or ListFiles is stale); refusing to score (no silent fallback)"
         ))
+    }
+
+    /// TEST-ONLY ctor: fill `by_event` directly from `(file_event_id, page_id)` pairs, bypassing
+    /// the file-record bridge. Lets the reflection page-arm test map a file event to a known gold
+    /// id without spinning a corpus; the load-bearing `from_file_records` ctor is untouched.
+    #[cfg(test)]
+    pub(crate) fn from_pairs_for_test(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            by_event: pairs.iter().map(|(ev, pid)| (ev.to_string(), pid.to_string())).collect(),
+        }
     }
 }
 
