@@ -7710,6 +7710,33 @@ impl EventLog {
         Ok(report)
     }
 
+    /// Append a signed `config` event carrying ONE boolean flag under `key` — the shared writer
+    /// behind every sticky bool toggle (evolve / proposals / mandates / conflict_detect / reflect).
+    /// Each write is Ed25519-signed + hash-chained, so a forged/replayed flip is tamper-evident via
+    /// `verify_chain`; it carries no model fields, so it never disturbs [`EventLog::active_model`].
+    /// The key is passed as the named const (an explicit map because `json!{}` cannot take a const
+    /// identifier as an object key). Multi-key config writes (e.g. [`EventLog::set_capture_enabled`])
+    /// build their own map and do NOT use this.
+    fn set_bool_flag(&self, key: &str, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(key.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
@@ -7725,25 +7752,7 @@ impl EventLog {
     /// Carries NO model fields, so it never disturbs [`EventLog::active_model`]
     /// (which skips configs lacking `active_model_id`/`dim`/`schema_version`).
     pub fn set_evolve_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
-        self.append(Event {
-            id: String::new(),
-            ts: String::new(),
-            valid_time: None,
-            event_type: CONFIG_EVENT_TYPE.to_string(),
-            // Explicit map so the key is the named const (json!{} cannot take a
-            // const identifier as an object key).
-            content: serde_json::Value::Object({
-                let mut m = serde_json::Map::new();
-                m.insert(EVOLVE_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
-                m
-            }),
-            model_meta: None,
-            prev_hash: String::new(),
-            hash: None,
-            signed_by_did: self.signer_did(),
-            signature: None,
-        })?;
-        Ok(())
+        self.set_bool_flag(EVOLVE_ENABLED_KEY, enabled)
     }
 
     /// Persist the non-security reasoner config (mode/provider/model/base_url)
@@ -7915,25 +7924,7 @@ impl EventLog {
     /// autonomous `write_proposal` synthesis, never the curation loop. Carries no
     /// model fields, so it never disturbs [`EventLog::active_model`].
     pub fn set_proposals_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
-        self.append(Event {
-            id: String::new(),
-            ts: String::new(),
-            valid_time: None,
-            event_type: CONFIG_EVENT_TYPE.to_string(),
-            // Explicit map so the key is the named const (json!{} cannot take a
-            // const identifier as an object key).
-            content: serde_json::Value::Object({
-                let mut m = serde_json::Map::new();
-                m.insert(PROPOSALS_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
-                m
-            }),
-            model_meta: None,
-            prev_hash: String::new(),
-            hash: None,
-            signed_by_did: self.signer_did(),
-            signature: None,
-        })?;
-        Ok(())
+        self.set_bool_flag(PROPOSALS_ENABLED_KEY, enabled)
     }
 
     /// Whether the M6b reconciliation proposer is enabled (M6b §5.3 off-switch).
@@ -7998,25 +7989,7 @@ impl EventLog {
     /// curation loop. Carries no model fields, so it never disturbs
     /// [`EventLog::active_model`].
     pub fn set_mandates_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
-        self.append(Event {
-            id: String::new(),
-            ts: String::new(),
-            valid_time: None,
-            event_type: CONFIG_EVENT_TYPE.to_string(),
-            // Explicit map so the key is the named const (json!{} cannot take a
-            // const identifier as an object key).
-            content: serde_json::Value::Object({
-                let mut m = serde_json::Map::new();
-                m.insert(MANDATES_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
-                m
-            }),
-            model_meta: None,
-            prev_hash: String::new(),
-            hash: None,
-            signed_by_did: self.signer_did(),
-            signature: None,
-        })?;
-        Ok(())
+        self.set_bool_flag(MANDATES_ENABLED_KEY, enabled)
     }
 
     /// Whether the M6c mandate proposer is enabled (M6c §5.5 / D8 off-switch).
@@ -8150,25 +8123,7 @@ impl EventLog {
     /// can never drift the shape). Carries no model fields → never disturbs `active_model`. Mirrors
     /// [`EventLog::set_mandates_enabled`].
     pub fn set_conflict_detect_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
-        self.append(Event {
-            id: String::new(),
-            ts: String::new(),
-            valid_time: None,
-            event_type: CONFIG_EVENT_TYPE.to_string(),
-            // Explicit map so the key is the named const (json!{} cannot take a
-            // const identifier as an object key).
-            content: serde_json::Value::Object({
-                let mut m = serde_json::Map::new();
-                m.insert(CONFLICT_DETECT_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
-                m
-            }),
-            model_meta: None,
-            prev_hash: String::new(),
-            hash: None,
-            signed_by_did: self.signer_did(),
-            signature: None,
-        })?;
-        Ok(())
+        self.set_bool_flag(CONFLICT_DETECT_ENABLED_KEY, enabled)
     }
 
     /// Whether Rung-4 reflection is enabled (spec §2.1). STICKY / fail-closed via
@@ -8187,25 +8142,7 @@ impl EventLog {
     /// shape). Carries no model fields → never disturbs `active_model`. Mirrors
     /// [`EventLog::set_conflict_detect_enabled`].
     pub fn set_reflect_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
-        self.append(Event {
-            id: String::new(),
-            ts: String::new(),
-            valid_time: None,
-            event_type: CONFIG_EVENT_TYPE.to_string(),
-            // Explicit map so the key is the named const (json!{} cannot take a
-            // const identifier as an object key).
-            content: serde_json::Value::Object({
-                let mut m = serde_json::Map::new();
-                m.insert(REFLECT_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
-                m
-            }),
-            model_meta: None,
-            prev_hash: String::new(),
-            hash: None,
-            signed_by_did: self.signer_did(),
-            signature: None,
-        })?;
-        Ok(())
+        self.set_bool_flag(REFLECT_ENABLED_KEY, enabled)
     }
 
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
