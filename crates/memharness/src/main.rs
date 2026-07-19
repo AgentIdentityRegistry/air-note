@@ -645,12 +645,24 @@ fn reflect_gate(args: ReflectGateArgs) -> anyhow::Result<()> {
     // composes open-case dossier-vs-source answers and calls this SAME scorer with `Some(cloud_auditor)`.
     let ab = memharness::probes::dossier_vs_source_ab(&[], &judge, None, args.seed)?;
     let dossier_line = match ab.lift_pp {
+        // Reachable only from the FUTURE dossier-primacy driver (>0 items + Some(cloud_auditor)); this
+        // local-gate call always yields None. Kept as the exhaustive shape that driver reuses.
         Some(pp) => format!("dossier-vs-source (REPORTED, never gated): {pp:+.1} pp (trusted)"),
-        None => format!(
-            "dossier-vs-source (REPORTED, never gated): UNINTERPRETABLE (local-only gate — no cloud \
-             auditor; trust ladder unevaluated: agreement {:.2}, κ {:.2}, audit_incomplete={})",
-            ab.verdict.agreement, ab.verdict.kappa, ab.verdict.audit_incomplete,
-        ),
+        None => {
+            // With no audit, agreement/κ are STRUCTURAL early-return zeros (not measured) — render them
+            // `n/a` so "agreement 0.00" can't misread as "the judges agreed 0% of the time". audit_incomplete
+            // stays the honest signal; a future audited-but-untrusted verdict shows its real measured numbers.
+            let (agr, kap) = if ab.verdict.audit_incomplete {
+                ("n/a".to_string(), "n/a".to_string())
+            } else {
+                (format!("{:.2}", ab.verdict.agreement), format!("{:.2}", ab.verdict.kappa))
+            };
+            format!(
+                "dossier-vs-source (REPORTED, never gated): UNINTERPRETABLE (local-only gate — no cloud \
+                 auditor; trust ladder unevaluated: agreement {agr}, κ {kap}, audit_incomplete={})",
+                ab.verdict.audit_incomplete,
+            )
+        }
     };
     println!("{dossier_line}");
 

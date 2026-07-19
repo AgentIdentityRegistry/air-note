@@ -56,7 +56,7 @@ pub struct AbItem {
 }
 
 /// The (e) outcome. `lift_pp` is `Some` ONLY when the judge cleared the Phase-0 trust ladder
-/// (`TRUST_AGREEMENT_MIN`/`TRUST_KAPPA_MIN`, judge.rs:67-68) — otherwise `None` and the report prints
+/// (`TRUST_AGREEMENT_MIN`/`TRUST_KAPPA_MIN`, judge.rs:68-69) — otherwise `None` and the report prints
 /// the lift as UNINTERPRETABLE (the honest tokens are `verdict.audit_incomplete` / `!verdict.trusted`).
 pub struct AbOutcome {
     pub verdict: TrustVerdict,
