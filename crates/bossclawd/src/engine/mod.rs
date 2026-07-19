@@ -1464,6 +1464,45 @@ impl EngineHandle {
         lines
     }
 
+    /// The PURE reflect digest line (spec §2.4). Renders ONLY when `n + m > 0` (an all-quiet reflect brain
+    /// adds nothing). Deliberately NEUTRAL copy — the digest must not present an operational counter as
+    /// proven benefit (critic New-Minor-1), and every unit must be TRUE under its label (critic M2/OQ4):
+    /// `n` = REAL dossier emits (miss-pipeline `Emitted`s + stale-refresh heals — the `refreshed_total`
+    /// counter; never `candidate_repaired`), so the copy carries no topic-attribution clause (the tidy's
+    /// share is not miss-driven). `m` (no_material) is the owner's most actionable signal ("your memory
+    /// never knew this"). Integer-only.
+    fn build_reflect_digest_line(n: u64, m: u64) -> Option<String> {
+        if n + m == 0 {
+            return None;
+        }
+        Some(format!("{n} dossier(s) refreshed, {m} unknown-topic gap(s) since last session."))
+    }
+
+    /// SERVE the reflect digest line for the SessionStart snapshot preamble (§2.4). INFALLIBLE — empty Vec
+    /// on any error / not onboarded / no new activity (I1). Integer counts only (no memory content → no
+    /// sanitize). Reads cumulative counters vs the last-served totals; advances the last-served totals ONLY
+    /// on `source == "startup"` (mirrors `serve_conflict_digest_lines` — a mid-session compact must not
+    /// consume the "since last session" window). Non-startup serves render the (unconsumed) line honestly.
+    pub async fn serve_reflect_digest_line(&self, source: &str) -> Vec<String> {
+        let onboarded = self.is_onboarded_local();
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return Vec::new();
+        };
+        let advance = source == "startup";
+        spawn_blocking(move || {
+            let (refreshed_total, no_material_total) = log.reflect_counters().unwrap_or((0, 0));
+            let cur = log.reflect_cursor().unwrap_or_default();
+            let n = refreshed_total.saturating_sub(cur.last_served_refreshed.max(0) as u64);
+            let m = no_material_total.saturating_sub(cur.last_served_no_material.max(0) as u64);
+            if advance {
+                let _ = log.set_reflect_last_served(refreshed_total as i64, no_material_total as i64);
+            }
+            Self::build_reflect_digest_line(n, m).into_iter().collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
     /// default read the scheduler loop uses each tick (a `0` makes the tick a no-op, the safe
     /// default — never run a tick we can't size).
@@ -2393,6 +2432,28 @@ mod tests {
         assert_eq!(
             EngineHandle::build_digest_lines(0, &kept_only),
             vec!["Since last session: 0 retired, 0 dismissed, 4 kept-both via conflict resolution."]
+        );
+    }
+
+    /// Task 13: the REAL reflect digest line-builder (§2.4), byte-exact + gated on `n + m > 0`. Mirrors
+    /// the conflict builder's byte-exact test — pins the exact `format!` output and the non-zero gate so a
+    /// format typo or a dropped branch cannot pass.
+    #[test]
+    fn build_reflect_digest_line_is_byte_exact_and_gated_on_nonzero() {
+        // Nothing new since last session → no line (an all-quiet reflect brain adds nothing).
+        assert_eq!(EngineHandle::build_reflect_digest_line(0, 0), None);
+        // Neutral copy, integer-only, pluralized with a bare `(s)` (matches the conflict-line style).
+        // Critic M2 lock: NO topic-attribution clause — `n` counts real dossier emits from BOTH the miss
+        // pipeline AND the stale-refresh tidy, so "for recently-missed topics" would be false for the
+        // tidy's share. Every unit is now true under its label.
+        assert_eq!(
+            EngineHandle::build_reflect_digest_line(2, 3),
+            Some("2 dossier(s) refreshed, 3 unknown-topic gap(s) since last session.".to_string()),
+        );
+        // Either non-zero alone still renders (both counts always shown for honesty).
+        assert_eq!(
+            EngineHandle::build_reflect_digest_line(0, 1),
+            Some("0 dossier(s) refreshed, 1 unknown-topic gap(s) since last session.".to_string()),
         );
     }
 
