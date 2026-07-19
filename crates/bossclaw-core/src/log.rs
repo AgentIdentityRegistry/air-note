@@ -2808,6 +2808,13 @@ impl EventLog {
     /// (no orphan supersede); when `None` (first page), just the `page`. Returns
     /// `(page_event_id, superseded)`. The caller guarantees `claims` are already
     /// floor-verified, cap-applied, and `cites`-sorted (F6/F7).
+    /// Concurrency (R4-A): reflect is now a 2nd page-writer on its own
+    /// `reflect_lock`, so a floor-fired reflect can race an evolve summarize on
+    /// one topic and both supersede the same prior (`prior_page_id` is read
+    /// before the compose, not under a held lock) → one recoverable orphan page
+    /// event. Benign: `fold_pages` is last-write-wins keyed by `topic_id` and
+    /// `rebuild_graph`'s mutex-held DELETE+INSERT keep exactly ONE current page
+    /// per topic — design §2.3's accepted churn reached via concurrency.
     // Explicit-args shape mirrors [`EventLog::page`]; a params struct would add
     // indirection without safety benefit (same rationale as `append_graph_event`).
     #[allow(clippy::too_many_arguments)]

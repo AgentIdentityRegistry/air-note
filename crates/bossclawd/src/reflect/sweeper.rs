@@ -50,6 +50,12 @@ pub fn decide_reflect(i: &ReflectDecisionInput) -> ReflectDecision {
     let floor = i.open_unparked_misses > 0
         && i.now - i.last_completed_run_at > REFLECT_STALENESS_FLOOR_SECS
         && i.now - i.last_floor_fire_at > REFLECT_STALENESS_FLOOR_SECS;
+    // Backlog-bootstrap reach (R4-A, whole-branch review): `open_unparked_misses` reads the DURABLE
+    // backlog, seeded ONLY inside a Run tick (`reflect_once`). A brain that is never quiet (a
+    // memory-class append every < REFLECT_QUIET_SECS) AND evolve-backlogged thus never seeds it, so the
+    // floor can't self-bootstrap from empty — misses live only in the ≤20 SP3 ring until the first quiet
+    // gap (earliest lost if >20 churn first). Accepted best-effort (§2.1/I5); minimal-close deferred to
+    // dogfood: seed the backlog from the ring in `reflect_gate_inputs` unconditionally per sweep.
     if floor {
         return ReflectDecision::Run { floor_fired: true }; // overrides quiet AND evolve-backlog defer
     }

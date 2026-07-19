@@ -351,3 +351,18 @@ in Rev 2's own fix; convergent floor/defer minor):**
 - Arch residual 2 (narrow repair surface): §2.2 step 3 reach paragraph + pre-registered (d) threshold
   before the dogfood; §5.5 names the review-surface-absent first live run; §5.3(e) gains the Phase-0
   judge-trust contract (≥85% / κ≥0.6, else lift reported uninterpretable).
+
+**Rev 4 (whole-branch dual review of R4-A — both reviewers SHIP; 2 conscious-acceptance Info residuals,
+DOC-ONLY, no behavior change):**
+- Concurrent page-writer churn — a floor-fired reflect tick can race an evolve summarize on the same
+  topic; both may supersede the same prior page, leaving one recoverable orphan page event. Benign by
+  construction (`fold_pages` last-write-wins keyed by topic + `rebuild_graph`'s atomic DELETE+INSERT →
+  always exactly one current page per topic); it is design §2.3's accepted churn reached via concurrency.
+  Surfaced by the whole-branch security review.
+- Floor cannot bootstrap an empty backlog on a continuously-active brain — the starvation floor arms only
+  on a non-empty durable backlog, which is seeded only inside a Run tick; a brain that is never quiet
+  (memory-class append every <600s) AND evolve-backlogged never seeds it, so misses live only in the ≤20
+  SP3 ring until the first quiet gap (earliest lost if >20 churn first). Design-faithful (§2.1/I5:
+  best-effort, non-empty-backlog-predicated); practically bounded (sleep-time loop). Minimal-close if
+  dogfood shows it matters: seed the backlog from the ring in `reflect_gate_inputs` unconditionally per
+  sweep. Surfaced by the whole-branch integration review; decide at dogfood.
