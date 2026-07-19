@@ -497,6 +497,12 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
         Request::CaptureEnabled { onboarded } => {
             op_result(engine.capture_enabled(onboarded).await, Response::CaptureEnabled)
         }
+        Request::SetReflectEnabled { onboarded, enabled } => {
+            unit_result(engine.set_reflect_enabled(onboarded, enabled).await)
+        }
+        Request::ReflectEnabled { onboarded } => {
+            op_result(engine.reflect_enabled(onboarded).await, Response::ReflectEnabled)
+        }
     }
 }
 

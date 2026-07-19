@@ -124,6 +124,31 @@ pub async fn integrations_capture_enabled(state: State<'_, AppState>) -> Result<
     Ok(state.engine.capture_enabled(onboarded).await.unwrap_or(false))
 }
 
+/// The Reflect toggle (Rung-4 R4-A, §2.5) — write the engine's sticky reflect-enabled flag. Mirrors
+/// `integrations_set_capture_enabled` MINUS the capture-only `backfill` and MINUS any
+/// `toggle_capture_wiring`-style side call: reflection is a brain-local loop, unrelated to Claude Code
+/// connection state, so it pokes NO sweeper wiring (the daemon's reflect sweeper self-gates on the flag
+/// alone) and re-detects NO Claude Code status (returns unit, not the status DTO). `onboarded` is the
+/// caller's real flag (a pre-onboarding write cleanly `NotOnboarded`s here, minting no brain).
+#[tauri::command]
+pub async fn integrations_set_reflect_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let onboarded = state.identity_store.is_onboarded();
+    state.engine.set_reflect_enabled(onboarded, enabled).await.map_err(|e| e.to_string())
+}
+
+/// The engine's reflect-enabled flag — the Reflect toggle POSITION (the counterpart the frontend reads
+/// to render the toggle after `integrations_set_reflect_enabled` writes it). Fail-CLOSED to `false` on
+/// any error (not onboarded / daemon down): a toggle read must never hard-fail, and "off" is the safe
+/// default to show. Mirrors `integrations_capture_enabled`.
+#[tauri::command]
+pub async fn integrations_reflect_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    let onboarded = state.identity_store.is_onboarded();
+    Ok(state.engine.reflect_enabled(onboarded).await.unwrap_or(false))
+}
+
 // ── Consent wiring (the M4 guarantee lives in the `backfill` value each path chooses). Split out as
 //    small async helpers so the load-bearing property is unit-testable against a fake engine without a
 //    live daemon or a full `AppState`. ──
@@ -187,6 +212,7 @@ mod tests {
         async fn request(&self, req: Request) -> Result<Response, EngineOpError> {
             let resp = match &req {
                 Request::CaptureEnabled { .. } => Response::CaptureEnabled(false),
+                Request::ReflectEnabled { .. } => Response::ReflectEnabled(false),
                 _ => Response::Ok,
             };
             *self.last.lock().unwrap() = Some(req);
@@ -271,6 +297,49 @@ mod tests {
                 assert!(onboarded, "onboarded=true threaded through")
             }
             other => panic!("expected SetCaptureEnabled, got {other:?}"),
+        }
+    }
+
+    // ── Rung-4 R4-A: the Reflect toggle wiring. Unlike capture there is NO wiring helper (no backfill,
+    //    no sweeper poke), so the command calls the engine directly; these fake-transport tests assert
+    //    the exact wire shape the engine forwards — a plain `SetReflectEnabled` switch with the caller's
+    //    real `onboarded`, and a `ReflectEnabled` read that carries `onboarded` and reads back the bool. ──
+
+    #[tokio::test]
+    async fn reflect_set_forwards_plain_switch_and_threads_onboarded() {
+        let t = RecordingTransport::new();
+        let engine = engine_over(t.clone());
+
+        // enable, onboarded=true → SetReflectEnabled { onboarded:true, enabled:true } (no backfill field).
+        engine.set_reflect_enabled(true, true).await.expect("set reflect on");
+        match t.last() {
+            Request::SetReflectEnabled { onboarded, enabled } => {
+                assert!(onboarded, "onboarded=true threaded through");
+                assert!(enabled, "enable flag forwarded");
+            }
+            other => panic!("expected SetReflectEnabled, got {other:?}"),
+        }
+
+        // disable, onboarded=false → threaded through, not hardcoded true (pre-onboarding cleanly rejects).
+        engine.set_reflect_enabled(false, false).await.expect("set reflect off");
+        match t.last() {
+            Request::SetReflectEnabled { onboarded, enabled } => {
+                assert!(!onboarded, "onboarded=false threaded through (not hardcoded true)");
+                assert!(!enabled, "disable flag forwarded");
+            }
+            other => panic!("expected SetReflectEnabled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reflect_enabled_reads_back_the_flag_carrying_onboarded() {
+        let t = RecordingTransport::new();
+        let engine = engine_over(t.clone());
+        // The read op carries `onboarded` and returns the daemon's bool (RecordingTransport reports false).
+        assert!(!engine.reflect_enabled(true).await.expect("read reflect flag"));
+        match t.last() {
+            Request::ReflectEnabled { onboarded } => assert!(onboarded, "onboarded threaded through"),
+            other => panic!("expected ReflectEnabled, got {other:?}"),
         }
     }
 

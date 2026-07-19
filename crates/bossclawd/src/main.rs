@@ -151,15 +151,17 @@ mod unix_main {
         // signed InProgress record exists. Runs in the background; the UI polls model_state.
         engine.resume_migration_if_pending(onboarded).await;
 
-        // (6) Spawn the two background loops as siblings, each OFF by default with every gate
-        // re-read per wake: the evolve scheduler, and the capture sweeper (SP3 A9 — the
-        // durability guarantee + backfill engine; sweeps immediately on boot to heal crash
-        // windows and import quiet transcripts, then every SWEEP_INTERVAL).
+        // (6) Spawn the four background loops as siblings, each OFF by default with every gate
+        // re-read per wake: the evolve scheduler, the capture sweeper (SP3 A9), the Rung-3
+        // conflict-detection sweep, and the Rung-4 reflection sweep.
         scheduler::spawn(engine.clone(), data_dir.clone());
         bossclawd::capture::sweeper::spawn(engine.clone(), data_dir.clone());
         // Rung-3 Phase-2: the conflict-detection sweep. OFF by default (gated inside the loop on
         // the owner's `conflict_detect_enabled` flag), so merging ships detection dormant.
         bossclawd::conflict::sweeper::spawn(engine.clone(), data_dir.clone());
+        // Rung-4 R4-A: the reflection sweep. OFF by default (gated inside the loop on the owner's
+        // `reflect_enabled` flag), so merging ships reflection dormant.
+        bossclawd::reflect::sweeper::spawn(engine.clone(), data_dir.clone());
 
         eprintln!(
             "bossclawd: serving on {} (pid {})",

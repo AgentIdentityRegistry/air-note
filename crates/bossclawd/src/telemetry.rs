@@ -1,4 +1,6 @@
-//! Recall-miss telemetry (SP3 A12) — the rung-1/2 retrieval-floor tuning signal (spec §8).
+//! Recall-miss telemetry (SP3 A12) — the rung-1/2 retrieval-floor tuning signal (spec §8) AND, since Rung-4 R4-A,
+//! the ACTIVE input to the reflect loop, which reads these miss queries each quiet tick to repair coverage
+//! gaps (design §2.4). With cloud consent ON, gathered material may egress under the existing consent.
 //!
 //! Every recall the daemon serves is recorded here: a one-line append to the append-only
 //! `<data_dir>/telemetry/recall.jsonl` and a durable bump of the lifetime counters in
@@ -23,6 +25,9 @@
 //! are local-only and born `0600` under a `0700` dir. They record QUERIES ONLY — never a recall
 //! RESULT, title, or note text — so a deleted session's content can never resurface through
 //! telemetry (spec §7b honesty). Plan B's settings copy discloses this store to the user.
+//!
+//! Since Rung-4 R4-A the reflect loop READS these miss queries (never the results) to drive dossier
+//! refreshes; queries stay local unless the owner has enabled the cloud reasoner (I2). Still QUERIES ONLY.
 //!
 //! Unix-only, to match the capture siblings and reuse `bossclawd-paths`' `#[cfg(unix)]` 0600/0700
 //! primitives (no new dependency).

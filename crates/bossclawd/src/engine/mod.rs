@@ -70,7 +70,7 @@ pub enum EngineOpError {
     #[allow(dead_code)]
     Reasoner(String),
     /// A serialized op is already in flight; the `&'static str` names it ("ingest" | "evolve" |
-    /// "conflict").
+    /// "conflict" | "reflect").
     Busy(&'static str),
     /// The on-disk file changed since the proposal was drafted; the re-gate at confirm
     /// fails closed. Carries the reason. Nothing is written.
@@ -267,6 +267,38 @@ pub struct ConflictTelemetry {
     pub reasoner_errors_total: usize,
 }
 
+/// Session-scoped reflection telemetry (mirrors [`ConflictTelemetry`]; in-memory, cleared on restart — the
+/// durable operational totals live in the core `reflect_counters` table). Written by `record_reflect_tick`.
+#[derive(Debug, Default, Clone)]
+pub struct ReflectTelemetry {
+    /// Wall-clock duration of the most recent tick, ms.
+    pub last_tick_ms: Option<u128>,
+    /// Ticks that returned an engine error this session.
+    pub error_count: usize,
+    /// The most recent tick error (truncated ~512 bytes — it can embed paths/reasoner output).
+    pub last_error: Option<String>,
+    /// Cumulative session tallies from the per-tick `ReflectReport` (the scoreboard, §2.4).
+    pub dossiers_refreshed_total: usize,
+    /// Session total of honest "we never knew this" classifications.
+    pub no_material_total: usize,
+    /// Session total of misses parked at the attempt budget.
+    pub parked_total: usize,
+    /// Session total of structurally-unhealable stale pages (§2.3 residual).
+    pub unhealable_thin_total: usize,
+    /// Session total of per-item MODEL failures (see `ReflectReport::reasoner_errors` granularity note).
+    pub reasoner_errors_total: usize,
+    /// Session total of per-item ENGINE-I/O failures (kept apart — never blamed on the model).
+    pub transient_errors_total: usize,
+}
+
+/// The core reads the pure `decide_reflect` gate consumes (spec §2.1).
+pub struct ReflectGateInputs {
+    pub newest_activity_at: Option<i64>,
+    pub open_unparked_misses: usize,
+    pub last_completed_run_at: i64,
+    pub last_floor_fire_at: i64,
+}
+
 /// The single chokepoint for engine access. Holds one lazily-opened `Arc<EventLog>`
 /// behind an async mutex; `get_or_open` serializes first-open and gates on onboarding.
 pub struct EngineHandle {
@@ -301,6 +333,12 @@ pub struct EngineHandle {
     /// Session conflict-detection telemetry (a `std::sync::Mutex`, poison-recovered on read).
     /// Written by `record_conflict_tick` + read by `conflict_telemetry`. Mirrors `evolve_tel`.
     conflict_tel: std::sync::Mutex<ConflictTelemetry>,
+    /// Serializes manual + scheduled reflect ticks (`try_lock` → `Busy("reflect")`). DEDICATED, NOT reused
+    /// `evolve_lock`: a long evolve tick must never block a reflect tick and vice-versa (the Rung-3
+    /// dedicated-lock lesson).
+    reflect_lock: Mutex<()>,
+    /// Session reflection telemetry (poison-recovered on read). Mirrors `conflict_tel`.
+    reflect_tel: std::sync::Mutex<ReflectTelemetry>,
     /// The shared reasoner-config cell the daemon's `ConfigReasonerProvider` closure reads on
     /// every evolve tick (attached by `main.rs` via [`Self::with_reasoner_cell`]; `None` in unit
     /// tests that don't care). Held HERE so BOTH config-writing ops (`set_reasoner_config`,
@@ -340,6 +378,8 @@ impl EngineHandle {
             indexed: Mutex::new(false),
             evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
             conflict_tel: std::sync::Mutex::new(ConflictTelemetry::default()),
+            reflect_lock: Mutex::new(()),
+            reflect_tel: std::sync::Mutex::new(ReflectTelemetry::default()),
             reasoner_cell: None,
             probe_reasoner_for_test: None,
         }
@@ -590,6 +630,13 @@ impl EngineHandle {
         // Idempotent: `explicitly_set` is true afterward.
         if !log.explicitly_set(ConfigFlag::ConflictDetect)? {
             log.set_conflict_detect_enabled(false)?;
+        }
+        // Rung-4 R4-A (§2.1, I3): reflection is default-CLOSED — its getter already returns false when
+        // unset — so, like capture/conflict above, persist an EXPLICIT OFF the first time it was never set
+        // (a tamper-evident "this brain has reflection off" record). Idempotent: `explicitly_set` is true
+        // afterward, so a re-open writes nothing. This is the SIXTH sticky config event on a fresh brain.
+        if !log.explicitly_set(ConfigFlag::Reflect)? {
+            log.set_reflect_enabled(false)?;
         }
         Ok(())
     }
@@ -1005,6 +1052,83 @@ impl EngineHandle {
         result
     }
 
+    /// Run ONE reflect tick (gated, serialized). `reflect_lock.try_lock()` (`Busy("reflect")` on
+    /// overlap) → `cloud_consent_ok` (BEFORE the reasoner is built, so a cloud-not-ready tick egresses
+    /// nothing, I2) → read the SP3 miss-ring queries (non-destructive) → `ensure_indexed` →
+    /// `spawn_blocking`: `rebuild_entity_index` (the query→topic bridge precondition) THEN core
+    /// `reflect_once` THEN `rebuild_indexes` + `rebuild_graph` (so a follow-up recall sees the refreshed
+    /// dossiers) → record telemetry → stamp the floor's last-completed marker. `now` is the
+    /// sweeper-boundary clock (mirrors `detect_conflicts_once(onboarded, now)`).
+    pub async fn reflect_once(
+        &self,
+        onboarded: bool,
+        now: i64,
+    ) -> Result<bossclaw_core::ReflectReport, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        // Serialize manual + scheduled ticks: a second overlapping tick is Busy, not queued. DEDICATED
+        // lock (never `evolve_lock`): a long evolve tick must never block a reflect tick and vice-versa.
+        let _guard = self.reflect_lock.try_lock().map_err(|_| EngineOpError::Busy("reflect"))?;
+        // Shared cloud-egress consent barrier (I2), placed BEFORE the reasoner is built (and any
+        // spawn_blocking/network), so a cloud-not-ready tick constructs no reasoner and egresses
+        // nothing — the same chokepoint `evolve_once`/`detect_conflicts_once` use.
+        if !self.cloud_consent_ok(onboarded).await {
+            return Err(EngineOpError::Reasoner(
+                "cloud reasoner not ready — signed consent or provider key missing".to_string(),
+            ));
+        }
+        // Non-destructive read of the SP3 miss ring (queries only). The durable backlog's `seed_miss`
+        // is upsert-if-new, so re-reading the same ≤20 queries every tick is idempotent (a terminal
+        // miss is never reset); a non-destructive read also PRESERVES the App's `RecallStats` "recent
+        // misses" view. A missing/unreadable telemetry store degrades to a zero-miss tick, never an
+        // error (I6 fail-safe — telemetry absence must not block reflection).
+        let new_misses: Vec<String> = self
+            .data_dir()
+            .and_then(|d| crate::telemetry::Telemetry::open(d).ok())
+            .and_then(|t| t.stats().ok())
+            .map(|s| s.recent_misses.into_iter().map(|m| m.query).collect())
+            .unwrap_or_default();
+        let embedder = self.ensure_indexed(&log).await?;
+        let reasoner = self.reasoner_provider.reasoner()?;
+        let t0 = std::time::Instant::now();
+        let result = spawn_blocking({
+            let log = log.clone();
+            let emb = embedder.clone();
+            move || -> Result<bossclaw_core::ReflectReport, EngineOpError> {
+                // Precondition: the miss→topic bridge resolves queries via the entity-resolution
+                // index (as `evolve_once` does), which `entity_search` requires be built. It is
+                // SEPARATE from the recall index (`ensure_indexed`) and NOT built by `open` — the
+                // FIRST tick on a freshly-opened log must build it here.
+                log.rebuild_entity_index(&*emb).map_err(|e| EngineOpError::Core(e.to_string()))?;
+                let report = log
+                    .reflect_once(&*emb, &*reasoner, &new_misses, now)
+                    .map_err(|e| EngineOpError::Core(e.to_string()))?;
+                // Fold the refreshed dossiers/vectors so a follow-up recall reflects this tick.
+                log.rebuild_indexes(&*emb).map_err(|e| EngineOpError::Core(e.to_string()))?;
+                log.rebuild_graph().map_err(|e| EngineOpError::Core(e.to_string()))?;
+                Ok(report)
+            }
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?;
+        self.record_reflect_tick(t0.elapsed().as_millis(), &result);
+        // On a completed tick, stamp the last-completed-run marker (best-effort; backs the §2.1
+        // starvation floor). ONLY on Ok — a failed tick must not advance the floor's clock.
+        if result.is_ok() {
+            let log2 = log.clone();
+            let _ = spawn_blocking(move || log2.set_reflect_last_completed_run(now)).await;
+        }
+        result
+    }
+
+    /// Record one reflect tick's telemetry (thin `&self` wrapper over the pure recorder).
+    fn record_reflect_tick(
+        &self,
+        ms: u128,
+        result: &Result<bossclaw_core::ReflectReport, EngineOpError>,
+    ) {
+        record_reflect_tick_into(&self.reflect_tel, ms, result);
+    }
+
     /// Record one tick's telemetry. Thin wrapper over the pure [`record_tick_into`] so the
     /// recorder (including the spec-R4 cloud-0-item backstop) is unit-testable without a handle.
     fn record_tick(
@@ -1056,6 +1180,86 @@ impl EngineHandle {
         spawn_blocking(move || log.conflict_detect_enabled().unwrap_or(false))
             .await
             .unwrap_or(false)
+    }
+
+    /// The reflection off-switch verdict, defaulting to `false` (OFF) on ANY error (not onboarded, open
+    /// failure, …). The gate the reflect sweep reads each cycle — it must never propagate an error (a
+    /// transient read failure must not trip reflection ON). Mirrors [`Self::conflict_detect_enabled_or_false`].
+    pub async fn reflect_enabled_or_false(&self, onboarded: bool) -> bool {
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return false;
+        };
+        spawn_blocking(move || log.reflect_enabled().unwrap_or(false))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Rung-4 R4-A: flip the sticky reflection off-switch (the toggle behind the settings panel). The
+    /// wire write behind [`Request::SetReflectEnabled`]. Gated. Mirrors [`Self::set_evolve_enabled`].
+    pub async fn set_reflect_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.set_reflect_enabled(enabled).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-4 R4-A: read the sticky reflection flag (the toggle POSITION; default CLOSED). The
+    /// Result-returning wire read behind [`Request::ReflectEnabled`]; DISTINCT from
+    /// [`Self::reflect_enabled_or_false`] (the fail-safe bool gate the sweeper reads each cycle).
+    /// Mirrors [`Self::capture_enabled`]. Gated.
+    pub async fn reflect_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.reflect_enabled().map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// The core reads `decide_reflect` needs, in ONE spawn_blocking. `None` on an open failure (→ the
+    /// sweeper no-ops that cycle).
+    pub async fn reflect_gate_inputs(&self, onboarded: bool) -> Option<ReflectGateInputs> {
+        let log = self.get_or_open(onboarded).await.ok()?;
+        spawn_blocking(move || {
+            let cur = log.reflect_cursor().unwrap_or_default();
+            ReflectGateInputs {
+                newest_activity_at: log.newest_memory_activity_at().unwrap_or(None),
+                open_unparked_misses: log.open_miss_count().unwrap_or(0),
+                last_completed_run_at: cur.last_completed_run_at,
+                last_floor_fire_at: cur.last_floor_fire_at,
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// Reasoner readiness for reflection, mirroring the evolve scheduler's `select_ready` block
+    /// (scheduler.rs): cloud mode trusts signed-consent readiness, local mode the Ollama probe; cloud
+    /// NEVER silently falls back to local (spec §2.1 / §3.4).
+    pub async fn reflect_reasoner_ready(&self, onboarded: bool) -> bool {
+        let cfg = self.reasoner_config_or_default(onboarded).await;
+        let cloud_mode = matches!(cfg.mode, crate::engine::reason::ReasonerMode::Cloud);
+        let ollama_ready = if cloud_mode {
+            false
+        } else {
+            let oll = crate::engine::ollama_probe::probe(crate::engine::reason::REASONER_MODEL_ID).await;
+            oll.reachable && oll.model_present
+        };
+        let cloud_ready = if cloud_mode {
+            self.reasoner_ready_or_false(onboarded).await
+        } else {
+            false
+        };
+        crate::engine::scheduler::select_ready(cloud_mode, ollama_ready, cloud_ready)
+    }
+
+    /// Stamp the last-floor-fire marker (best-effort; the §2.1 re-fire guard).
+    pub async fn stamp_reflect_floor_fire(&self, onboarded: bool, now: i64) {
+        if let Ok(log) = self.get_or_open(onboarded).await {
+            let _ = spawn_blocking(move || log.set_reflect_last_floor_fire(now)).await;
+        }
     }
 
     /// Run ONE conflict-detection cycle (gated, serialized). Gate → `conflict_lock.try_lock()`
@@ -1258,6 +1462,45 @@ impl EngineHandle {
             ));
         }
         lines
+    }
+
+    /// The PURE reflect digest line (spec §2.4). Renders ONLY when `n + m > 0` (an all-quiet reflect brain
+    /// adds nothing). Deliberately NEUTRAL copy — the digest must not present an operational counter as
+    /// proven benefit (critic New-Minor-1), and every unit must be TRUE under its label (critic M2/OQ4):
+    /// `n` = REAL dossier emits (miss-pipeline `Emitted`s + stale-refresh heals — the `refreshed_total`
+    /// counter; never `candidate_repaired`), so the copy carries no topic-attribution clause (the tidy's
+    /// share is not miss-driven). `m` (no_material) is the owner's most actionable signal ("your memory
+    /// never knew this"). Integer-only.
+    fn build_reflect_digest_line(n: u64, m: u64) -> Option<String> {
+        if n + m == 0 {
+            return None;
+        }
+        Some(format!("{n} dossier(s) refreshed, {m} unknown-topic gap(s) since last session."))
+    }
+
+    /// SERVE the reflect digest line for the SessionStart snapshot preamble (§2.4). INFALLIBLE — empty Vec
+    /// on any error / not onboarded / no new activity (I1). Integer counts only (no memory content → no
+    /// sanitize). Reads cumulative counters vs the last-served totals; advances the last-served totals ONLY
+    /// on `source == "startup"` (mirrors `serve_conflict_digest_lines` — a mid-session compact must not
+    /// consume the "since last session" window). Non-startup serves render the (unconsumed) line honestly.
+    pub async fn serve_reflect_digest_line(&self, source: &str) -> Vec<String> {
+        let onboarded = self.is_onboarded_local();
+        let Ok(log) = self.get_or_open(onboarded).await else {
+            return Vec::new();
+        };
+        let advance = source == "startup";
+        spawn_blocking(move || {
+            let (refreshed_total, no_material_total) = log.reflect_counters().unwrap_or((0, 0));
+            let cur = log.reflect_cursor().unwrap_or_default();
+            let n = refreshed_total.saturating_sub(cur.last_served_refreshed.max(0) as u64);
+            let m = no_material_total.saturating_sub(cur.last_served_no_material.max(0) as u64);
+            if advance {
+                let _ = log.set_reflect_last_served(refreshed_total as i64, no_material_total as i64);
+            }
+            Self::build_reflect_digest_line(n, m).into_iter().collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// The unprocessed-memory queue depth, defaulting to `0` on ANY error. A thin gate-and-
@@ -1881,6 +2124,35 @@ fn record_tick_into(
     }
 }
 
+/// Pure reflect-tick recorder. The lock is poison-RECOVERED (a panicked tick must not wedge the status
+/// read); `last_tick_ms` is always set; on `Err` `error_count` bumps and `last_error` is stored TRUNCATED
+/// to ~512 bytes; on `Ok` the report's counters fold into the session totals (the §2.4 scoreboard, incl.
+/// the transient/reasoner split kept APART so a write hiccup is never blamed on the model).
+fn record_reflect_tick_into(
+    tel: &std::sync::Mutex<ReflectTelemetry>,
+    ms: u128,
+    result: &Result<bossclaw_core::ReflectReport, EngineOpError>,
+) {
+    let mut tel = tel.lock().unwrap_or_else(|p| p.into_inner());
+    tel.last_tick_ms = Some(ms);
+    match result {
+        Err(e) => {
+            tel.error_count += 1;
+            let mut s = e.to_string();
+            truncate_on_char_boundary(&mut s, 512);
+            tel.last_error = Some(s);
+        }
+        Ok(r) => {
+            tel.dossiers_refreshed_total += r.dossiers_refreshed;
+            tel.no_material_total += r.no_material;
+            tel.parked_total += r.parked;
+            tel.unhealable_thin_total += r.unhealable_thin;
+            tel.reasoner_errors_total += r.reasoner_errors;
+            tel.transient_errors_total += r.transient_errors;
+        }
+    }
+}
+
 /// Truncate `s` in place to at most `max` bytes WITHOUT splitting a UTF-8 char (plain
 /// `String::truncate` panics on a non-char-boundary). Walks back to the nearest boundary at
 /// or below `max`. Used to cap `last_error` before it flows to the webview DTO.
@@ -2163,6 +2435,28 @@ mod tests {
         );
     }
 
+    /// Task 13: the REAL reflect digest line-builder (§2.4), byte-exact + gated on `n + m > 0`. Mirrors
+    /// the conflict builder's byte-exact test — pins the exact `format!` output and the non-zero gate so a
+    /// format typo or a dropped branch cannot pass.
+    #[test]
+    fn build_reflect_digest_line_is_byte_exact_and_gated_on_nonzero() {
+        // Nothing new since last session → no line (an all-quiet reflect brain adds nothing).
+        assert_eq!(EngineHandle::build_reflect_digest_line(0, 0), None);
+        // Neutral copy, integer-only, pluralized with a bare `(s)` (matches the conflict-line style).
+        // Critic M2 lock: NO topic-attribution clause — `n` counts real dossier emits from BOTH the miss
+        // pipeline AND the stale-refresh tidy, so "for recently-missed topics" would be false for the
+        // tidy's share. Every unit is now true under its label.
+        assert_eq!(
+            EngineHandle::build_reflect_digest_line(2, 3),
+            Some("2 dossier(s) refreshed, 3 unknown-topic gap(s) since last session.".to_string()),
+        );
+        // Either non-zero alone still renders (both counts always shown for honesty).
+        assert_eq!(
+            EngineHandle::build_reflect_digest_line(0, 1),
+            Some("0 dossier(s) refreshed, 1 unknown-topic gap(s) since last session.".to_string()),
+        );
+    }
+
     #[test]
     fn mock_embedder_provider_yields_a_working_embedder() {
         use crate::engine::embed::{EmbedderProvider, MockEmbedderProvider};
@@ -2231,11 +2525,13 @@ mod tests {
         let st = h.status(true).await;
         assert!(matches!(st.state, EngineState::Ready), "state was {:?}", st.state);
         // First open primes the autonomy switches OFF (SP3 `prime_switches`): the three original
-        // flags (evolve/proposals/mandates), the SP3 capture force-off, and the Rung-3 Phase-2
-        // conflict-detect force-off — so a fresh brain holds exactly those 5 sticky `config` events,
-        // not zero.
-        assert_eq!(st.event_count, 5);
+        // flags (evolve/proposals/mandates), the SP3 capture force-off, the Rung-3 Phase-2
+        // conflict-detect force-off, and the Rung-4 R4-A reflect force-off (design §4 I3) — so a fresh
+        // brain holds exactly those 6 sticky `config` events, not zero.
+        assert_eq!(st.event_count, 6, "prime_switches wrote the 6 sticky config events");
         assert!(st.chain_ok);
+        // I3 dormancy: a fresh brain has reflect forced explicitly OFF, so the sweeper gate is closed.
+        assert!(!h.reflect_enabled_or_false(true).await, "fresh brain: reflect is forced off");
         // Second call reuses the same instance (Arc ptr identical).
         let a = h.get_or_open(true).await.unwrap();
         let b = h.get_or_open(true).await.unwrap();
@@ -3270,6 +3566,158 @@ mod tests {
         // After release, a cycle runs again (flag default-off → clean skip, no judge call).
         let report = handle.detect_conflicts_once(true, 100).await.unwrap();
         assert!(report.skipped_disabled, "post-release cycle runs (flag off → skipped)");
+    }
+
+    /// Task 10: the engine `reflect_once` wrapper drives the full op pattern (get_or_open → serialize
+    /// on the DEDICATED `reflect_lock` → Local consent-ok → non-destructive miss-ring read →
+    /// ensure_indexed → build reasoner → spawn_blocking the pre-rebuild + core tick + post-rebuilds →
+    /// record telemetry → stamp the floor). A fresh brain with no misses/pages runs an empty-but-
+    /// successful tick (NOT `skipped_disabled`) once reflection is enabled. Mirrors the conflict-sweep
+    /// engine e2e's inline setup (`MockEmbedderProvider::new(64)` + a scripted reasoner).
+    #[tokio::test]
+    async fn engine_reflect_once_runs_when_enabled_and_records_telemetry() {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineHandle::new(
+            TestVault::new(),
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::from_reasoner(Arc::new(
+                bossclaw_core::ScriptedReasoner::new("test"),
+            ))),
+        );
+        let onboarded = true;
+        // ARCH minor-a: enable via the CORE setter (T1) through get_or_open — the ENGINE setter method
+        // is T12's product surface and does not exist yet at this task; the test must compile+pass here.
+        {
+            let log = engine.get_or_open(onboarded).await.unwrap();
+            tokio::task::spawn_blocking(move || log.set_reflect_enabled(true)).await.unwrap().unwrap();
+        }
+        // A fresh brain with no misses/pages → an empty-but-successful tick (not skipped_disabled).
+        let report = engine.reflect_once(onboarded, 1000).await.expect("reflect tick runs");
+        assert!(!report.skipped_disabled, "enabled → runs");
+        assert_eq!(report.attempted, 0, "no seeded misses yet");
+    }
+
+    /// Task 10 review (reflect_lock): a second overlapping `reflect_once` returns `Busy("reflect")` —
+    /// pinning BOTH the dedicated lock (a wrapper that locked `evolve_lock` instead would sail past
+    /// the held guard and run) AND the exact tag. Mirrors the reliable
+    /// `second_concurrent_detect_conflicts_is_busy` pattern — hold the lock guard DIRECTLY
+    /// (deterministic, not a racy two-task overlap) so the guarded call's `try_lock` fails, then
+    /// confirm release lets a full tick run again.
+    #[tokio::test]
+    async fn second_concurrent_reflect_is_busy() {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        let engine = EngineHandle::new(
+            TestVault::new(),
+            dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(crate::engine::reason::MockReasonerProvider::from_reasoner(Arc::new(
+                bossclaw_core::ScriptedReasoner::new("test"),
+            ))),
+        );
+        let onboarded = true;
+        // Same fixture as the enabled-tick test above (core setter through get_or_open; the engine
+        // setter is T12's surface). Enabled, so the post-release tick proves FULL service restored.
+        {
+            let log = engine.get_or_open(onboarded).await.unwrap();
+            tokio::task::spawn_blocking(move || log.set_reflect_enabled(true)).await.unwrap().unwrap();
+        }
+        // Hold the reflect lock to simulate an in-flight tick, then a real call must be Busy.
+        let guard = engine.reflect_lock.try_lock().expect("first lock acquired");
+        let err = engine.reflect_once(onboarded, 1000).await.unwrap_err();
+        assert!(
+            matches!(err, EngineOpError::Busy("reflect")),
+            "overlapping tick is Busy(\"reflect\") off the DEDICATED lock"
+        );
+        drop(guard);
+        // After release, a full tick runs again (enabled → a real, non-skipped empty tick).
+        let report = engine.reflect_once(onboarded, 1000).await.expect("post-release tick runs");
+        assert!(!report.skipped_disabled, "lock release restores service");
+    }
+
+    /// Task 16 (R4-A final wire-in, §5 exit gate / §4 I3): the END-TO-END reflect path over the
+    /// in-process engine — the product enable path (T12 engine setter), the miss classifier, and the
+    /// §2.4 neutral digest line, all exercised together. Both classification branches fire and the
+    /// digest renders the byte-exact `0 dossier(s) refreshed, 1 unknown-topic gap(s)` (a self-heal
+    /// emits NO dossier; the honest gap is the only tally), then a second startup serve is empty
+    /// (T13 "since last session" window consumed).
+    ///
+    /// SEEDING NOTE (verified against real seams, NOT the plan sketch's single tick): recall is
+    /// FLOORLESS — [`crate::engine::mod`]'s `ensure_indexed` folds every memory into the vector arm and
+    /// `HnswIndex::search` (core `index.rs`) returns the nearest neighbour for ANY query with no
+    /// distance cutoff. So the instant one memory is indexed, EVERY re-attempted miss recall-hits at
+    /// `attempt_miss` step 1 → `repaired_by_time`, and `no_material` (step-1 recall EMPTY) is
+    /// unreachable in that SAME tick. This is the established Rung-4 core behaviour: the canonical
+    /// `attempt_miss_classifies_repaired_by_time_and_no_material` (core `log.rs`) proves it by
+    /// attempting `no_material` on a memory-LESS index, THEN `repaired_by_time` after indexing. We
+    /// mirror that two-index-state ordering across two ENGINE ticks; the durable `reflect_counters`
+    /// table accumulates across ticks, so the cumulative digest is still exactly the plan's line.
+    #[tokio::test]
+    async fn reflect_tick_classifies_misses_and_the_digest_line_appears() {
+        crate::vault::seed_secret_cache_for_test(Default::default());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("identity.json"), serde_json::json!({
+            "did": "did:wba:example.com:tester", "name": "Tester",
+            "created_at": "2026-07-11T00:00:00+00:00" }).to_string()).unwrap();
+        let engine = EngineHandle::new(
+            crate::server::shared_test_vault(), dir.path().to_path_buf(),
+            Arc::new(embed::MockEmbedderProvider::new(64)),
+            Arc::new(reason::MockReasonerProvider::from_reasoner(
+                Arc::new(bossclaw_core::ScriptedReasoner::new("test")))));
+        let onboarded = true;
+        // T12's engine setter (landed) — the product enable path, end to end.
+        engine.set_reflect_enabled(onboarded, true).await.unwrap();
+        let log = engine.get_or_open(onboarded).await.unwrap();
+        let emb = engine.ensure_indexed(&log).await.unwrap(); // the engine's OWN embedder (model ids match)
+
+        // ── Tick 1 (memory-LESS recall index): one unknowable miss → an honest `no_material` gap. ──
+        {
+            let log = log.clone();
+            tokio::task::spawn_blocking(move || {
+                log.seed_miss(
+                    &bossclaw_core::reflect::normalized_query_key("zzz unknowable gibberish 9182"),
+                    "zzz unknowable gibberish 9182", 10).unwrap();
+            }).await.unwrap();
+        }
+        let r1 = engine.reflect_once(onboarded, 1_000).await.expect("tick 1 runs");
+        assert!(!r1.skipped_disabled);
+        assert_eq!(r1.attempted, 1, "the one open miss is attempted");
+        assert_eq!(r1.no_material, 1, "unknowable on a memory-less index is an honest gap");
+        assert_eq!(r1.dossiers_refreshed, 0, "a gap emits no dossier");
+
+        // ── Remember one answerable memory + make it recall-visible IN PLACE (the manual rebuild wins
+        //    over `ensure_indexed`'s memoized build flag), then seed its exact-text miss. ──
+        {
+            let log = log.clone();
+            let emb = emb.clone();
+            tokio::task::spawn_blocking(move || {
+                let _m = log.remember(&*emb, "The capital of France is Paris.").unwrap();
+                log.rebuild_indexes(&*emb).unwrap();
+                log.seed_miss(
+                    &bossclaw_core::reflect::normalized_query_key("The capital of France is Paris."),
+                    "The capital of France is Paris.", 11).unwrap();
+            }).await.unwrap();
+        }
+
+        // ── Tick 2 (memory now indexed): the matching miss self-heals via recall → `repaired_by_time`,
+        //    emitting NO dossier. The terminal tick-1 gap is NOT re-attempted (open-misses only). ──
+        let r2 = engine.reflect_once(onboarded, 2_000).await.expect("tick 2 runs");
+        assert!(!r2.skipped_disabled);
+        assert_eq!(r2.attempted, 1, "only the still-open miss is attempted (the gap is terminal)");
+        assert_eq!(r2.repaired_by_time, 1, "the answerable miss self-heals via recall");
+        assert_eq!(r2.no_material, 0, "the gap was already tallied in tick 1");
+        assert_eq!(r2.dossiers_refreshed, 0, "a recall self-heal emits no dossier");
+
+        // The NEUTRAL digest line renders byte-exactly on a startup serve — cumulative counters are
+        // 0 dossiers refreshed (both branches emit nothing) + 1 gap — then the since-last-session
+        // window is consumed (T13 rule) so a second startup serve is empty.
+        let lines = engine.serve_reflect_digest_line("startup").await;
+        assert_eq!(lines,
+            vec!["0 dossier(s) refreshed, 1 unknown-topic gap(s) since last session.".to_string()]);
+        assert!(engine.serve_reflect_digest_line("startup").await.is_empty(),
+            "startup consumed the since-last-session window (T13 rule)");
     }
 
     #[tokio::test]

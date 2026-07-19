@@ -225,7 +225,11 @@ pub async fn build(
     // memory content → no sanitize) as the never-dropped fence preamble. INFALLIBLE — an empty Vec on
     // any error / detection-off, so the snapshot builder never breaks (I1). The digest window advances
     // only on a fresh `startup` serve (decided inside `serve_conflict_digest_lines` from `source`).
-    let preamble = engine.serve_conflict_digest_lines(source).await;
+    let mut preamble = engine.serve_conflict_digest_lines(source).await;
+    // Rung-4 R4-A (§2.4): the reflection digest line, integer-only + neutral copy, joins the never-dropped
+    // preamble AFTER the conflict lines. Its "since last session" window advances only on a fresh `startup`
+    // (decided inside serve_reflect_digest_line).
+    preamble.extend(engine.serve_reflect_digest_line(source).await);
     assemble_fence(&preamble, &entries)
 }
 

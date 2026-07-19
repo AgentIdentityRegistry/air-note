@@ -93,6 +93,12 @@ impl LiveAirArm {
     }
 }
 
+/// The synthetic page-id prefix for a reflected-brain dossier (`page` event) hit. SINGLE-SOURCED:
+/// the producer (`map_hits`, below) and the reflect-gate's union-coverage consumer (`main.rs`, which
+/// `strip_prefix`es it to recover the page event id) MUST share this const, so a future rename can
+/// never silently drift the compile-only consumer into finding zero citing dossiers.
+pub const DOSSIER_PID_PREFIX: &str = "__dossier__:";
+
 /// Map wire hits → RetrievedHits through the resolver. Free function so e2e #1 exercises the
 /// EXACT same mapping the live arm uses (Rev 2, finding 2 — the un-rigged path).
 pub fn map_hits(
@@ -102,10 +108,20 @@ pub fn map_hits(
     wire_hits
         .into_iter()
         .map(|h| {
-            Ok(RetrievedHit {
-                page_id: resolver.page_id_of(&h.hit.event_id)?, // loud: unmapped = run error
-                snippet: h.text,
-            })
+            // §5.3(b): a reflected-brain dossier (`page` event) is NOT a corpus file, so it does
+            // not resolve through the file bridge. Give it a SYNTHETIC page id that occupies a rank
+            // slot (so crowding the gold FILE page out of top-k registers as a regression). The
+            // [`DOSSIER_PID_PREFIX`] keeps it in a DISJOINT id space from corpus gold ids under the
+            // documented assumption that no real ~/brain relative path yields a `__dossier__:`-prefixed
+            // page id via `page_id_from_rel` — so the gate credits gold ONLY as itself. (A runtime
+            // guard would be over-engineering for a dev-only harness.) File hits keep the loud
+            // no-evolve invariant.
+            let page_id = if h.hit.kind == bossclaw_core::graph::PAGE_EVENT_TYPE {
+                format!("{DOSSIER_PID_PREFIX}{}", h.hit.event_id)
+            } else {
+                resolver.page_id_of(&h.hit.event_id)? // loud: unmapped file hit = run error
+            };
+            Ok(RetrievedHit { page_id, snippet: h.text })
         })
         .collect()
 }
@@ -449,6 +465,63 @@ mod tests {
         assert_eq!(
             stats.chars_packed,
             "short one".chars().count() + PER_SNIPPET_CHAR_CAP + "third".chars().count()
+        );
+    }
+
+    #[test]
+    fn page_hits_resolve_as_synthetic_non_gold_occupants_and_file_hits_stay_loud() {
+        // `HitMirror` lives at `bossclawd_proto::types` (only `HitWire` is re-exported at the crate
+        // root); the mapping semantics are the plan's exactly.
+        use bossclawd_proto::{types::HitMirror, HitWire};
+        // A resolver mapping ONE file event → the gold page id.
+        let resolver = PageResolver::from_pairs_for_test(&[("file-ev-1", "air/kenny")]);
+        let hits = vec![
+            // A reflected-brain dossier hit (kind="page") — must NOT abort, and must NOT equal any gold id.
+            HitWire {
+                hit: HitMirror {
+                    event_id: "page-ev-9".into(),
+                    score: 0.9,
+                    sources: vec![],
+                    kind: "page".into(),
+                },
+                text: "dossier body".into(),
+            },
+            // A file hit — resolves to the gold page id (the un-rigged path).
+            HitWire {
+                hit: HitMirror {
+                    event_id: "file-ev-1".into(),
+                    score: 0.8,
+                    sources: vec![],
+                    kind: "file_ingested".into(),
+                },
+                text: "source".into(),
+            },
+        ];
+        let mapped = map_hits(&resolver, hits).expect("a page hit must not abort the run");
+        // Build the expected id from the shared const so a prefix rename can't pass a stale literal.
+        assert_eq!(
+            mapped[0].page_id,
+            format!("{DOSSIER_PID_PREFIX}page-ev-9"),
+            "dossier → synthetic non-gold id"
+        );
+        assert_ne!(
+            mapped[0].page_id, "air/kenny",
+            "a dossier NEVER equals the gold it cites (gate: gold-as-itself)"
+        );
+        assert_eq!(mapped[1].page_id, "air/kenny", "the file hit still resolves to gold");
+        // An unmapped FILE hit still fails loud (the no-evolve invariant for file hits is preserved).
+        let bad = vec![HitWire {
+            hit: HitMirror {
+                event_id: "ghost".into(),
+                score: 0.1,
+                sources: vec![],
+                kind: "file_ingested".into(),
+            },
+            text: "x".into(),
+        }];
+        assert!(
+            map_hits(&resolver, bad).is_err(),
+            "an unmapped file hit still stops the run (no silent fallback)"
         );
     }
 }

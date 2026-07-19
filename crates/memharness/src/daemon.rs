@@ -19,6 +19,11 @@ pub struct HarnessDaemon {
     dir: tempfile::TempDir,
     sock: PathBuf,
     rt: Option<DaemonRuntime>,
+    /// The in-process daemon's engine handle (dev-harness only). Held so `engine()` can hand out
+    /// clones for the T14/T15 reflection drive — enables/ticks/reads all flow through this ONE
+    /// handle, so the harness needs ZERO new wire ops (OQ2). A plain in-memory struct: it stays
+    /// callable after `kill()` tears down the accept loop (the harness always reads it before kill).
+    engine: Arc<bossclawd::engine::EngineHandle>,
 }
 
 struct DaemonRuntime {
@@ -81,8 +86,8 @@ impl HarnessDaemon {
         bossclawd::vault::seed_secret_cache_for_test(std::collections::HashMap::new());
         let dir = tempfile::tempdir()?;
         let sock = dir.path().join("bossclawd.sock");
-        let rt = Self::start_runtime(&sock, dir.path().to_path_buf(), provider)?;
-        Ok(Self { dir, sock, rt: Some(rt) })
+        let (rt, engine) = Self::start_runtime(&sock, dir.path().to_path_buf(), provider)?;
+        Ok(Self { dir, sock, rt: Some(rt), engine })
     }
 
     /// Own current-thread runtime + OS thread; blocks until the listener is bound
@@ -91,12 +96,16 @@ impl HarnessDaemon {
         sock: &Path,
         home: PathBuf,
         provider: Option<Arc<dyn EmbedderProvider>>,
-    ) -> anyhow::Result<DaemonRuntime> {
+    ) -> anyhow::Result<(DaemonRuntime, Arc<bossclawd::engine::EngineHandle>)> {
         use std::os::unix::fs::PermissionsExt;
         let shutdown = Arc::new(Notify::new());
         let shutdown_for_thread = shutdown.clone();
         let sock_buf = sock.to_path_buf();
-        let (bound_tx, bound_rx) = std::sync::mpsc::sync_channel::<anyhow::Result<()>>(0);
+        // The readiness handshake now also FERRIES the engine handle back to the caller (OQ2): the
+        // daemon builds it inside its own runtime thread, and the harness reflection drive needs a
+        // clone. The Ok payload widens `()` → `Arc<EngineHandle>`; the Err arms are unchanged.
+        let (bound_tx, bound_rx) =
+            std::sync::mpsc::sync_channel::<anyhow::Result<Arc<bossclawd::engine::EngineHandle>>>(0);
         let thread = std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
@@ -127,7 +136,9 @@ impl HarnessDaemon {
                     Some(p) => bossclawd::server::test_engine_with_embedder(home, p),
                     None => bossclawd::server::test_engine(home),
                 });
-                if bound_tx.send(Ok(())).is_err() {
+                // Send the caller a CLONE of the engine handle; the accept loop keeps the original
+                // Arc. Same readiness point as before — a client connect still can't race the bind.
+                if bound_tx.send(Ok(engine.clone())).is_err() {
                     return; // caller gone
                 }
                 tokio::select! {
@@ -137,8 +148,10 @@ impl HarnessDaemon {
             });
             // Runtime dropped at end of scope → all daemon tasks gone.
         });
-        bound_rx.recv().map_err(|_| anyhow::anyhow!("daemon thread died during startup"))??;
-        Ok(DaemonRuntime { shutdown, thread })
+        let engine = bound_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("daemon thread died during startup"))??;
+        Ok((DaemonRuntime { shutdown, thread }, engine))
     }
 
     /// The private socket path (for a `WireClient`).
@@ -149,6 +162,12 @@ impl HarnessDaemon {
     /// The per-run home (corpus is copied under it).
     pub fn home(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The in-process daemon's engine handle (dev-harness only — the production daemon exposes no such
+    /// thing; this is why the harness needs ZERO new wire ops for enables/ticks/reads, OQ2).
+    pub fn engine(&self) -> Arc<bossclawd::engine::EngineHandle> {
+        self.engine.clone()
     }
 
     /// Fully kill the daemon: notify shutdown, join the thread (drops the runtime + every

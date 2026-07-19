@@ -48,6 +48,11 @@ pub mod server;
 // Unix-gated like `server`/`telemetry`: it calls the cfg(unix) `engine`/`identity`.
 #[cfg(unix)]
 pub mod conflict;
+// Rung-4 R4-A reflection sweep — the off-by-default sleep-time loop that re-composes topic dossiers and
+// drains the recall-miss backlog through the same citation-floored composer evolve uses (no new UI here).
+// Unix-gated like `conflict`: it calls the cfg(unix) `engine`/`identity`.
+#[cfg(unix)]
+pub mod reflect;
 // Recall-miss telemetry (SP3 A12): the rung-1/2 retrieval-floor tuning signal. Records every
 // recall's hit/miss outcome under `<data_dir>/telemetry/` (best-effort, rotation-proof counters,
 // queries-only recent-miss ring) and backs the App-only `RecallStats` op. Unix-only to reuse

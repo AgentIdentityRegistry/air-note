@@ -53,3 +53,18 @@ export const setCaptureEnabled = (enabled: boolean): Promise<IntegrationsStatusD
  */
 export const captureEnabled = (): Promise<boolean> =>
   invoke<boolean>("integrations_capture_enabled");
+
+/**
+ * The Reflect toggle (Rung-4 R4-A) — write the engine's sticky reflect-enabled flag. A plain bool
+ * switch: no backfill, and deliberately NOT tied to Claude Code connection state (reflection is a
+ * brain-local loop), so it returns nothing. Tauri renames the camelCase `enabled` to the Rust param.
+ */
+export const setReflectEnabled = (enabled: boolean): Promise<void> =>
+  invoke<void>("integrations_set_reflect_enabled", { enabled });
+
+/**
+ * The engine's live reflect flag — the Reflect toggle POSITION. Fails closed to `false` on the Rust
+ * side (not onboarded / daemon down). Mirrors `captureEnabled()`.
+ */
+export const reflectEnabled = (): Promise<boolean> =>
+  invoke<boolean>("integrations_reflect_enabled");

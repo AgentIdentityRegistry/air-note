@@ -251,6 +251,12 @@ pub enum Request {
     /// SP3 capture-toggle query: whether ongoing session capture is enabled. App-only. Mirrors
     /// `MandatesEnabled`.
     CaptureEnabled { onboarded: bool },
+    /// Rung-4 R4-A: enable/disable the reflection loop. App-only (guest-refused). Follows the
+    /// `SetCaptureEnabled` shape minus the capture-only `backfill` (reflection is a plain bool switch,
+    /// like `SetMandatesEnabled`/conflict-detect). Acked with `Response::Ok`.
+    SetReflectEnabled { onboarded: bool, enabled: bool },
+    /// Rung-4 R4-A: read the sticky reflection flag (the toggle POSITION). App-only. Mirrors `CaptureEnabled`.
+    ReflectEnabled { onboarded: bool },
     /// Rung-3 Phase-3: list the pending conflict proposals (already excludes coexist/dismissed). Reachable
     /// from `MemoryClient` (the I8 relaxation) so Claude Code can review conflicts. Sanitized daemon-side.
     ListConflicts { onboarded: bool },
@@ -359,6 +365,8 @@ pub enum Response {
     RecallStats(RecallStatsWire),
     /// `CaptureEnabled` result — the sticky capture-enabled flag.
     CaptureEnabled(bool),
+    /// `ReflectEnabled` result — the sticky reflect-enabled flag.
+    ReflectEnabled(bool),
     /// The engine is not onboarded (mirrors `EngineError::NotOnboarded`). A signal,
     /// not a fault — the UI shows onboarding.
     NotOnboarded,
@@ -859,8 +867,8 @@ mod protocol_tests {
     /// `MemoryClient` allows EXACTLY the six guest ops — recall/remember, the SP3 capture and snapshot
     /// pokes, and the two Rung-3 Phase-3 resolution ops (`ListConflicts` + `ResolveConflict`, the I8
     /// relaxation) — and REFUSES every other new SP3 op (listing, get, delete, notes, supersede, stats,
-    /// capture toggle/query, retire/unretire). Enumerates all new variants so a future variant wrongly
-    /// admitted to the guest role fails here (the fail-closed allowlist's positive guarantee, pinned per-op).
+    /// capture toggle/query, reflect toggle/query, retire/unretire). Enumerates all new variants so a future
+    /// variant wrongly admitted to the guest role fails here (the fail-closed allowlist's positive guarantee, pinned per-op).
     #[test]
     fn memory_client_allows_exactly_six_ops() {
         use Request::*;
@@ -882,10 +890,32 @@ mod protocol_tests {
             RecallStats { onboarded: true },
             SetCaptureEnabled { onboarded: true, enabled: true, backfill: false },
             CaptureEnabled { onboarded: true },
+            SetReflectEnabled { onboarded: true, enabled: true },
+            ReflectEnabled { onboarded: true },
             RetireMemory { onboarded: true, target: RetireTarget::Note { event_id: "e".into() } },
             Unretire { onboarded: true, retired_event_id: "r".into() },
         ];
         for r in no { assert!(!Role::MemoryClient.allows(&r), "{r:?}"); }
+    }
+
+    /// Rung-4 R4-A: the two reflect-enable ops are App-only (guest-refused BY CONSTRUCTION — `Role::allows`
+    /// is UNCHANGED, so they fall through the `MemoryClient` allowlist's `matches!` to `false`) and survive
+    /// the externally-tagged JSON round-trip. Additive variants only → `PROTO_VERSION` stays 1.
+    #[test]
+    fn reflect_ops_are_app_only_and_round_trip() {
+        use Request::*;
+        // App allows both; MemoryClient (guest) refuses both — Role::allows is UNCHANGED.
+        assert!(Role::App.allows(&SetReflectEnabled { onboarded: true, enabled: true }));
+        assert!(Role::App.allows(&ReflectEnabled { onboarded: true }));
+        assert!(!Role::MemoryClient.allows(&SetReflectEnabled { onboarded: true, enabled: true }),
+            "reflect enable is App-only (guest-refused by construction)");
+        assert!(!Role::MemoryClient.allows(&ReflectEnabled { onboarded: true }));
+        // Additive → version stays 1.
+        assert_eq!(PROTO_VERSION, 1);
+        for req in [SetReflectEnabled { onboarded: true, enabled: false }, ReflectEnabled { onboarded: true }] {
+            let back: Request = serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
     }
 
     #[test]

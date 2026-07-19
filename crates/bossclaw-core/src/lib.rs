@@ -39,6 +39,7 @@ pub mod ollama;
 pub mod reason;
 pub mod recall;
 pub mod reconcile;
+pub mod reflect;
 pub mod sign;
 pub mod summarize;
 pub mod store;
@@ -57,6 +58,7 @@ pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
 pub use event::{Event, ModelMeta};
 pub use evolve::{EvolveReport, EvolveStatus};
+pub use reflect::ReflectReport;
 #[cfg(feature = "fastembed")]
 pub use fastembed::FastEmbed;
 pub use graph::{AsOf, Edge, Entity, Grant, Mandate, Node, Page, WriteGrant, MAX_RECIPE_LEN};

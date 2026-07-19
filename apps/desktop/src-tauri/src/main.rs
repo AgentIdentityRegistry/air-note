@@ -247,6 +247,10 @@ fn main() {
             commands::integrations::integrations_set_capture_enabled,
             #[cfg(unix)]
             commands::integrations::integrations_capture_enabled,
+            #[cfg(unix)]
+            commands::integrations::integrations_set_reflect_enabled,
+            #[cfg(unix)]
+            commands::integrations::integrations_reflect_enabled,
             a2a_demo_round_trip,
             commands::inbox::inbox_status,
             commands::inbox::inbox_identity,

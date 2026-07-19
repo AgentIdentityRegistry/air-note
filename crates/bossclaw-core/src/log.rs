@@ -271,6 +271,12 @@ const CAPTURE_ENABLED_AT_KEY: &str = "capture_enabled_at";
 /// never consented (invariant I3), exactly like [`CAPTURE_ENABLED_KEY`].
 const CONFLICT_DETECT_ENABLED_KEY: &str = "conflict_detect_enabled";
 
+/// The `content` key carrying the Rung-4 R4-A reflection on/off switch (spec §2.1). Single-sourced (one
+/// writer [`EventLog::set_reflect_enabled`], one reader [`EventLog::reflect_enabled`]). DEFAULT CLOSED —
+/// the reflect loop never runs for a user who never consented (invariant I3), exactly like
+/// [`CONFLICT_DETECT_ENABLED_KEY`].
+const REFLECT_ENABLED_KEY: &str = "reflect_enabled";
+
 /// A typed identifier for a control-`config` key, mapping to the private `*_KEY` consts. Used by
 /// `EventLog::explicitly_set` (and the capture getters) so callers (e.g. the desktop
 /// `prime_switches`) reference a compile-checked variant instead of a stringly-typed key that could
@@ -295,6 +301,8 @@ pub enum ConfigFlag {
     BackfillConsented,
     /// The Rung-3 Phase-2 conflict-detection on/off switch ([`CONFLICT_DETECT_ENABLED_KEY`]). Default CLOSED.
     ConflictDetect,
+    /// The Rung-4 R4-A reflection on/off switch ([`REFLECT_ENABLED_KEY`]). Default CLOSED.
+    Reflect,
 }
 
 impl ConfigFlag {
@@ -310,6 +318,7 @@ impl ConfigFlag {
             ConfigFlag::CaptureEnabled => CAPTURE_ENABLED_KEY,
             ConfigFlag::BackfillConsented => BACKFILL_CONSENTED_KEY,
             ConfigFlag::ConflictDetect => CONFLICT_DETECT_ENABLED_KEY,
+            ConfigFlag::Reflect => REFLECT_ENABLED_KEY,
         }
     }
 }
@@ -1035,6 +1044,37 @@ impl EventLog {
             "CREATE TABLE IF NOT EXISTS conflict_digest_cursor (
                 id       INTEGER PRIMARY KEY CHECK (id = 0),
                 last_seq INTEGER NOT NULL
+            )",
+        )?;
+        // Rung-4 R4-A (§2.2): the durable miss backlog, re-derivable from the SP3 miss ring (I5). PK =
+        // trimmed-casefold sha256 so near-duplicate queries converge; `query_text` kept for the digest/UI.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS reflect_miss_backlog (
+                normalized_query_key TEXT PRIMARY KEY,
+                query_text           TEXT NOT NULL,
+                first_seen           INTEGER NOT NULL,
+                attempts             INTEGER NOT NULL DEFAULT 0,
+                state                TEXT NOT NULL DEFAULT 'open',
+                updated_at           INTEGER NOT NULL
+            )",
+        )?;
+        // Rung-4 R4-A (§2.4): cumulative operational counters (single row id=0).
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS reflect_counters (
+                id                INTEGER PRIMARY KEY CHECK (id = 0),
+                refreshed_total   INTEGER NOT NULL DEFAULT 0,
+                no_material_total INTEGER NOT NULL DEFAULT 0
+            )",
+        )?;
+        // Rung-4 R4-A (§2.1/§2.4): progress cursor (single row id=0) — digest last-served totals + the
+        // daemon-supplied floor timing markers.
+        store.exec(
+            "CREATE TABLE IF NOT EXISTS reflect_cursor (
+                id                    INTEGER PRIMARY KEY CHECK (id = 0),
+                last_served_refreshed INTEGER NOT NULL DEFAULT 0,
+                last_served_no_material INTEGER NOT NULL DEFAULT 0,
+                last_completed_run_at INTEGER NOT NULL DEFAULT 0,
+                last_floor_fire_at    INTEGER NOT NULL DEFAULT 0
             )",
         )?;
         // Route FTS5 merge temporaries to memory, preventing any plaintext index
@@ -1781,12 +1821,14 @@ impl EventLog {
     /// when both fail is `Err` returned.
     ///
     /// # Lifecycle note
-    /// The semantic (vector) arm reflects the index state at the last
+    /// BOTH arms reflect the index state at the last
     /// [`EventLog::rebuild_indexes`] / [`EventLog::open_with_recall`] call.
-    /// **Events appended after that call are not yet in the vector index** and
-    /// will only surface via the keyword arm until `rebuild_indexes(embedder)`
-    /// is called again. This is intentional spec §10 graceful degradation, not a
-    /// bug — but callers should be aware of the gap.
+    /// **Events appended after that call are in neither index yet** — the FTS
+    /// keyword arm is wiped-and-repopulated by `rebuild_indexes` exactly like the
+    /// vector arm (log.rs:1638), NOT live on append — so an appended event
+    /// becomes recall-visible only after the next `rebuild_indexes(embedder)`.
+    /// This is intentional spec §10 graceful degradation, not a bug — but callers
+    /// should be aware of the gap.
     pub fn recall(
         &self,
         embedder: &dyn Embedder,
@@ -2766,6 +2808,13 @@ impl EventLog {
     /// (no orphan supersede); when `None` (first page), just the `page`. Returns
     /// `(page_event_id, superseded)`. The caller guarantees `claims` are already
     /// floor-verified, cap-applied, and `cites`-sorted (F6/F7).
+    /// Concurrency (R4-A): reflect is now a 2nd page-writer on its own
+    /// `reflect_lock`, so a floor-fired reflect can race an evolve summarize on
+    /// one topic and both supersede the same prior (`prior_page_id` is read
+    /// before the compose, not under a held lock) → one recoverable orphan page
+    /// event. Benign: `fold_pages` is last-write-wins keyed by `topic_id` and
+    /// `rebuild_graph`'s mutex-held DELETE+INSERT keep exactly ONE current page
+    /// per topic — design §2.3's accepted churn reached via concurrency.
     // Explicit-args shape mirrors [`EventLog::page`]; a params struct would add
     // indirection without safety benefit (same rationale as `append_graph_event`).
     #[allow(clippy::too_many_arguments)]
@@ -6589,6 +6638,25 @@ impl EventLog {
         }
     }
 
+    /// Resolve a missed query to ≤ [`crate::reflect::REFLECT_TOPIC_N`] KNOWN topic entity ids (spec §2.2
+    /// step 2, the read-only bridge). Uses [`EventLog::entity_search`] over the entity-resolution index and
+    /// keeps only candidates at/above [`crate::reflect::REFLECT_TOPIC_FLOOR`] cosine SIMILARITY
+    /// (`1.0 - dist`, mirroring `resolve_mention`). NEVER mints (minting is a write, evolve's job): an empty
+    /// result IS the `no_material` signal. Requires the entity index built (the reflect wrapper rebuilds it
+    /// pre-tick, like evolve); a fresh brain with zero entities returns an empty index → empty result.
+    pub fn reflect_topics_for_query(
+        &self,
+        embedder: &dyn Embedder,
+        query: &str,
+    ) -> Result<Vec<String>, BossclawError> {
+        Ok(self
+            .entity_search(embedder, query, crate::reflect::REFLECT_TOPIC_N)?
+            .into_iter()
+            .filter(|(_, dist)| 1.0 - dist >= crate::reflect::REFLECT_TOPIC_FLOOR)
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// Rebuild the SEPARATE conflict index (Rung-3 §7.1) from the
     /// `session_passage_vectors` table: one vector per CURRENT session's live
     /// passage, keyed by `(session_id, passage_ix)`. Mirrors
@@ -7208,6 +7276,440 @@ impl EventLog {
         Ok(())
     }
 
+    // ── Rung-4 R4-A reflection progress state (re-derivable, spec §2.2/§2.4). PORTABLE. ──
+
+    /// Seed a miss into the backlog, upsert-IF-NEW (spec §2.2): a new key lands `open`; an existing key
+    /// (any state, incl. parked/no_material) is left UNTOUCHED so ring churn can never reset progress.
+    pub fn seed_miss(&self, key: &str, query: &str, now: i64) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO reflect_miss_backlog
+                 (normalized_query_key, query_text, first_seen, attempts, state, updated_at)
+             VALUES (?1, ?2, ?3, 0, 'open', ?3)
+             ON CONFLICT(normalized_query_key) DO NOTHING",
+            rusqlite::params![key, query, now],
+        )?;
+        Ok(())
+    }
+
+    /// The open misses, oldest `first_seen` first, capped at `limit`. The `normalized_query_key`
+    /// tiebreak makes the order total (stable across ties).
+    pub fn open_misses(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::reflect::OpenMiss>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        let mut stmt = conn.prepare(
+            "SELECT normalized_query_key, query_text, attempts FROM reflect_miss_backlog
+             WHERE state = 'open' ORDER BY first_seen ASC, normalized_query_key ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+            Ok(crate::reflect::OpenMiss {
+                key: r.get(0)?,
+                query_text: r.get(1)?,
+                attempts: r.get::<_, i64>(2)? as u32,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Count OPEN (unparked) misses (spec §2.1 floor input). `parked`/`no_material`/repaired states are
+    /// excluded by construction (only `state = 'open'` counts).
+    pub fn open_miss_count(&self) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM reflect_miss_backlog WHERE state = 'open'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// The epoch-seconds ts of the NEWEST memory-class event (`memory` ∪ `session_captured`), or `None`
+    /// if none exist (spec §2.1 quiet predicate; the daemon computes `now - this >= REFLECT_QUIET_SECS`).
+    /// Reads the newest by `seq DESC` and parses its RFC3339 `ts` to epoch (clock-free: a stored ts, not
+    /// the wall clock). A table scan is acceptable at the 300s cadence (spec §2.1 — same cost class as
+    /// `dirty_entities_since`; add a partial `event_type` index only if measured to matter).
+    pub fn newest_memory_activity_at(&self) -> Result<Option<i64>, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let ts: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT ts FROM events WHERE event_type IN (?1, ?2) ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![
+                    crate::graph::MEMORY_EVENT_TYPE,
+                    crate::graph::SESSION_CAPTURED_EVENT_TYPE
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(ts.and_then(|t| DateTime::parse_from_rfc3339(&t).ok().map(|d| d.timestamp())))
+    }
+
+    /// Move a miss to a terminal or intermediate state (spec §2.2). Transition contract: the expected
+    /// flow is `open` → {`repaired_by_time` | `candidate_repaired` | `no_material` | `parked`};
+    /// terminal→open resurrection is NOT expected in v1 (no runtime guard — this is re-derivable
+    /// state with a benign blast radius; the T7 review decides whether an `AND state = 'open'` guard
+    /// is warranted).
+    pub fn set_miss_state(
+        &self,
+        key: &str,
+        state: crate::reflect::MissState,
+        now: i64,
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "UPDATE reflect_miss_backlog SET state = ?2, updated_at = ?3
+             WHERE normalized_query_key = ?1",
+            rusqlite::params![key, state.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Age out TERMINAL-repaired backlog rows older than
+    /// [`crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS`] (spec §7.3, critic m1): `repaired_by_time` /
+    /// `candidate_repaired` are pruned (no forward information); `parked` / `no_material` PERSIST. Keeps
+    /// the table bounded. Returns the pruned row count. Called at the end of each `reflect_once` tick.
+    ///
+    /// The `parked` / `no_material` rows PERSIST forever by §7.3 intent (they carry information — "we
+    /// tried and could not" / "we never knew this"). That is bounded by the distinct-miss count per user,
+    /// not by time; if a brain ever sees heavy miss traffic, the future pressure valve is an
+    /// `event_type`/`state` index or a longer-horizon prune, not eviction of these terminal rows.
+    pub fn prune_reflect_backlog(&self, now: i64) -> Result<usize, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let n = store.conn().execute(
+            "DELETE FROM reflect_miss_backlog
+             WHERE state IN ('repaired_by_time','candidate_repaired') AND updated_at < ?1",
+            rusqlite::params![now - crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS],
+        )?;
+        Ok(n)
+    }
+
+    /// Increment a miss's attempt count, returning the NEW count (spec §2.2). ONE atomic
+    /// `UPDATE … RETURNING` statement (bundled SQLCipher is SQLite ≥3.35, where RETURNING landed).
+    /// PRECONDITION: the key must already be seeded ([`EventLog::seed_miss`]); a missing key is a
+    /// loud `Err` (`QueryReturnedNoRows`) by design — callers always seed first (T7).
+    pub fn bump_miss_attempt(&self, key: &str, now: i64) -> Result<u32, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        Ok(store.conn().query_row(
+            "UPDATE reflect_miss_backlog SET attempts = attempts + 1, updated_at = ?2
+             WHERE normalized_query_key = ?1 RETURNING attempts",
+            rusqlite::params![key, now],
+            |r| r.get::<_, i64>(0),
+        )? as u32)
+    }
+
+    /// Add to the cumulative operational counters (spec §2.4). Upsert of the single row.
+    pub fn add_reflect_counters(
+        &self,
+        refreshed: i64,
+        no_material: i64,
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        store.conn().execute(
+            "INSERT INTO reflect_counters (id, refreshed_total, no_material_total)
+             VALUES (0, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET refreshed_total = refreshed_total + ?1,
+                                           no_material_total = no_material_total + ?2",
+            rusqlite::params![refreshed, no_material],
+        )?;
+        Ok(())
+    }
+
+    /// Read the cumulative `(refreshed_total, no_material_total)` (spec §2.4). `(0,0)` if never written.
+    pub fn reflect_counters(&self) -> Result<(u64, u64), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let row: Option<(i64, i64)> = store
+            .conn()
+            .query_row(
+                "SELECT refreshed_total, no_material_total FROM reflect_counters WHERE id = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (a, b) = row.unwrap_or((0, 0));
+        Ok((a as u64, b as u64))
+    }
+
+    /// Read the reflect progress cursor (spec §2.1/§2.4). Default row if never written.
+    pub fn reflect_cursor(&self) -> Result<crate::reflect::ReflectCursor, BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let row: Option<(i64, i64, i64, i64)> = store
+            .conn()
+            .query_row(
+                "SELECT last_served_refreshed, last_served_no_material,
+                        last_completed_run_at, last_floor_fire_at
+                 FROM reflect_cursor WHERE id = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (a, b, c, d) = row.unwrap_or((0, 0, 0, 0));
+        Ok(crate::reflect::ReflectCursor {
+            last_served_refreshed: a,
+            last_served_no_material: b,
+            last_completed_run_at: c,
+            last_floor_fire_at: d,
+        })
+    }
+
+    /// Advance the digest last-served totals (spec §2.4; T13 advances only on `source == "startup"`).
+    pub fn set_reflect_last_served(
+        &self,
+        refreshed: i64,
+        no_material: i64,
+    ) -> Result<(), BossclawError> {
+        self.upsert_reflect_cursor(
+            "last_served_refreshed = ?1, last_served_no_material = ?2",
+            rusqlite::params![refreshed, no_material],
+        )
+    }
+
+    /// Record the wall-clock of the last COMPLETED reflect run (daemon-supplied; §2.1 floor).
+    pub fn set_reflect_last_completed_run(&self, at: i64) -> Result<(), BossclawError> {
+        self.upsert_reflect_cursor("last_completed_run_at = ?1", rusqlite::params![at])
+    }
+
+    /// Record the wall-clock of the last floor fire (daemon-supplied; §2.1 floor re-fire guard).
+    pub fn set_reflect_last_floor_fire(&self, at: i64) -> Result<(), BossclawError> {
+        self.upsert_reflect_cursor("last_floor_fire_at = ?1", rusqlite::params![at])
+    }
+
+    /// Shared single-row upsert for `reflect_cursor` (the row is created with defaults if absent). The
+    /// `set_clause` is `&'static str`, so the injection-impossibility is COMPILER-ENFORCED: a
+    /// runtime-built string cannot compile at the call site — only the compile-time SQL fragments the
+    /// three setters above pass; the mutated VALUES ride as bound `params`.
+    fn upsert_reflect_cursor(
+        &self,
+        set_clause: &'static str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Result<(), BossclawError> {
+        let store = self.inner.lock().expect(POISON);
+        let conn = store.conn();
+        conn.execute("INSERT OR IGNORE INTO reflect_cursor (id) VALUES (0)", [])?;
+        conn.execute(
+            &format!("UPDATE reflect_cursor SET {set_clause} WHERE id = 0"),
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// Attempt to repair ONE open miss (spec §2.2 steps 1-4). Persists the resulting state via the backlog
+    /// accessors and returns the [`crate::reflect::MissAttempt`] for the tick tally. PORTABLE. The refresh
+    /// (step 3) recomposes the resolved entities' OWN lineage through the shared, §2.3-excluded gather — it
+    /// injects NO new material and mints nothing (I1), so a true repair occurs only where a known topic's
+    /// dossier was under-composed or stale (reach is LOW BY DESIGN; §5.3(d) measures it).
+    pub fn attempt_miss(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+        key: &str,
+        query: &str,
+        now: i64,
+    ) -> Result<crate::reflect::MissAttempt, BossclawError> {
+        use crate::reflect::{
+            MissAttempt, MissOutcome, MissState, TopicRefreshOutcome, REFLECT_MISS_ATTEMPT_BUDGET,
+            REFLECT_RECALL_K,
+        };
+        let opts = crate::recall::RecallOptions::default();
+        // 1. Re-run recall. Hit → repaired_by_time (no reasoner call, no emit).
+        if !self.recall(embedder, query, REFLECT_RECALL_K, &opts)?.is_empty() {
+            self.set_miss_state(key, MissState::RepairedByTime, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::RepairedByTime, dossiers_emitted: 0 });
+        }
+        // 2. Resolve query → known topics. Empty → no_material.
+        let topics = self.reflect_topics_for_query(embedder, query)?;
+        if topics.is_empty() {
+            self.set_miss_state(key, MissState::NoMaterial, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::NoMaterial, dossiers_emitted: 0 });
+        }
+        // 3. Refresh each resolved topic's dossier (per-item error isolation). Count REAL `Emitted`s —
+        //    the digest's honest "refreshed" unit (critic M2/OQ4); a skip emits nothing and counts nothing.
+        let entities = self.all_entities()?;
+        let mut dossiers_emitted = 0usize;
+        let mut reasoner_errored = false;
+        let mut transient_errored = false; // CONTROLLER OVERRIDE: the T4 taxonomy split
+        for tid in &topics {
+            if let Some(entity) = entities.iter().find(|e| &e.entity_id == tid) {
+                match self.refresh_topic_page(reasoner, entity)? {
+                    TopicRefreshOutcome::Emitted { .. } => dossiers_emitted += 1,
+                    TopicRefreshOutcome::ReasonerError => reasoner_errored = true,
+                    TopicRefreshOutcome::TransientError => transient_errored = true,
+                    TopicRefreshOutcome::SkippedUnchanged | TopicRefreshOutcome::SkippedThin => {}
+                }
+            }
+        }
+        // CONTROLLER OVERRIDE (verified against real seams): make any dossier JUST emitted this attempt
+        // recall-visible for the step-4 replay. The plan's within-tick note assumed the FTS keyword arm is
+        // "live on append"; it is NOT — `keyword_add` runs ONLY inside `rebuild_indexes` (log.rs:1646), so a
+        // freshly `emit_page`'d dossier is in neither recall arm, and recall's F2 gate (log.rs:2026) drops a
+        // page hit unless the page is a CURRENT page in the `rebuild_graph` projection. Gated on a real emit:
+        // (a) `rebuild_graph` materializes the page projection so the F2 gate keeps it (mirrors
+        // `summarize_topics`' post-emit rebuild_graph), and (b) `keyword_add` incrementally indexes each
+        // resolved topic's current page into the FTS arm ONLY — deliberately NOT `rebuild_indexes`, whose
+        // vector-arm rebuild would make floorless recall return nearest-neighbours for ANY query and mask
+        // true misses (the vector arm folds the dossier at the wrapper's post-tick rebuild, per §5.1). This
+        // keeps recall keyword-only within the tick, which is exactly what the within-tick note intends.
+        if dossiers_emitted > 0 {
+            self.rebuild_graph()?;
+            let pages = self.current_pages()?;
+            for tid in &topics {
+                if let Some(page) = pages.iter().find(|p| &p.topic_id == tid) {
+                    self.keyword_add(&page.page_event_id, &page.text)?;
+                }
+            }
+        }
+        // 4. Replay recall. Hit → candidate_repaired (operational, §5.1 — the emit count above is what
+        //    feeds the digest, never this classification by itself).
+        if !self.recall(embedder, query, REFLECT_RECALL_K, &opts)?.is_empty() {
+            self.set_miss_state(key, MissState::CandidateRepaired, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::CandidateRepaired, dossiers_emitted });
+        }
+        // Still missing: bump the attempt; at budget → parked (bounded loss, I6).
+        let attempts = self.bump_miss_attempt(key, now)?;
+        if attempts >= REFLECT_MISS_ATTEMPT_BUDGET {
+            self.set_miss_state(key, MissState::Parked, now)?;
+            return Ok(MissAttempt { outcome: MissOutcome::Parked, dossiers_emitted });
+        }
+        // CONTROLLER OVERRIDE: error precedence reasoner > transient > still-missing (both error kinds
+        // consumed the attempt, same as the plan's ReasonerError semantics — bounded by the same budget).
+        // (Parked already returned above: a budget-exhausted attempt parks regardless of error kind —
+        // I6 bounded loss.)
+        let outcome = if reasoner_errored {
+            MissOutcome::ReasonerError
+        } else if transient_errored {
+            MissOutcome::TransientError
+        } else {
+            MissOutcome::StillMissing
+        };
+        Ok(MissAttempt { outcome, dossiers_emitted })
+    }
+
+    /// Refresh dossiers whose cited sources went stale (spec §2.3). A page is STALE when its per-claim
+    /// CITES UNION — the same set `current_page_for_topic` reads and the F6 emit idempotency compares —
+    /// intersects `superseded ∪ retired_notes` (the aftermath of a Rung-3 retire). (The page-level D8
+    /// `model_meta.source_event_ids` provenance anchor shrinks too, via the same T3 gather filter, but it
+    /// is a DISTINCT set and not the staleness read here — ARCH minor-c.) For each stale topic (≤ `cap`
+    /// total ATTEMPTS — reasoner AND transient errors count toward the cap, critic m2), call
+    /// [`EventLog::refresh_topic_page`] and tally: `Emitted` → healed, `SkippedUnchanged` → unchanged,
+    /// `SkippedThin` → `unhealable_thin` (the §2.3 residual — an all-retired lineage cannot re-emit;
+    /// counted, never retried within this pass), `ReasonerError` → reasoner_errors, `TransientError` →
+    /// transient_errors (both isolated per-item). The pass-level `fold_sessions` here is the STALENESS
+    /// read; `refresh_topic_page`'s own gather re-folds per call — accepted: each such call precedes an
+    /// LLM compose that dwarfs it, bounded by `cap` (the T3-review cost note). Reflection NEVER retires a
+    /// page (I1). PORTABLE.
+    pub fn refresh_stale_pages(
+        &self,
+        reasoner: &dyn crate::reason::Reasoner,
+        cap: usize,
+    ) -> Result<crate::reflect::StaleRefreshReport, BossclawError> {
+        use crate::reflect::{StaleRefreshReport, TopicRefreshOutcome};
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        // Nothing gone → nothing stale (the fresh-corpus fast path).
+        if fold.superseded.is_empty() && fold.retired_notes.is_empty() {
+            return Ok(StaleRefreshReport::default());
+        }
+        let entities = self.all_entities()?;
+        let mut report = StaleRefreshReport::default();
+        let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for page in self.current_pages()? {
+            // Per-tick budget over total ATTEMPTS (critic m2 + T4-split): errors of BOTH kinds consume
+            // budget too, so a failing reasoner or a write hiccup cannot turn the cap into an unbounded
+            // retry sweep. [CONTROLLER OVERRIDE: + transient_errors in the sum]
+            if report.healed + report.unchanged + report.unhealable_thin
+                + report.reasoner_errors + report.transient_errors >= cap {
+                break;
+            }
+            // Intra-pass single-attempt is DB-enforced (topic_id PK); asserted, not re-checked.
+            debug_assert!(
+                attempted.insert(page.topic_id.clone()),
+                "pages.topic_id is PRIMARY KEY — current_pages() yields one row per topic"
+            );
+            // Read the page's cited set; stale iff it intersects the gone set.
+            let Some((_pid, cites)) = self.current_page_for_topic(&page.topic_id)? else { continue };
+            let stale = cites.iter().any(|id| fold.superseded.contains(id) || fold.retired_notes.contains(id));
+            if !stale {
+                continue;
+            }
+            let Some(entity) = entities.iter().find(|e| e.entity_id == page.topic_id) else { continue };
+            match self.refresh_topic_page(reasoner, entity)? {
+                TopicRefreshOutcome::Emitted { .. } => report.healed += 1,
+                TopicRefreshOutcome::SkippedUnchanged => report.unchanged += 1,
+                TopicRefreshOutcome::SkippedThin => report.unhealable_thin += 1,
+                TopicRefreshOutcome::ReasonerError => report.reasoner_errors += 1,
+                // CONTROLLER OVERRIDE (T4 split): engine-I/O hiccups are transient, never "unhealable".
+                TopicRefreshOutcome::TransientError => report.transient_errors += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    /// Run ONE reflect tick (spec §2.1/§2.4). Off-switch FIRST (no work when disabled, I3). Seeds the tick's
+    /// `new_misses` into the backlog (upsert-if-new), attempts ≤ [`crate::reflect::REFLECT_MISSES_PER_TICK`]
+    /// open misses (misses first), then refreshes ≤ [`crate::reflect::REFLECT_REFRESH_PER_TICK`] stale pages,
+    /// updates the cumulative counters, and returns the [`crate::reflect::ReflectReport`]. Per-item errors are
+    /// isolated (a poisoned miss/page counts its error bucket and the tick continues — the Rung-3 poison
+    /// lesson at item granularity, I6). `Err` is returned ONLY on infrastructure failure (storage/lock
+    /// poisoning propagated by the primitives) and aborts the tick — already-persisted miss states stay
+    /// persisted; the remaining tidy/counters/prune are skipped; per-item reasoner/engine failures NEVER
+    /// `Err`, they fold into the report buckets (T10 maps `Err`→Core; `Busy` is the daemon's own lock,
+    /// never raised here). `now` is daemon-supplied (clock-free core). PORTABLE.
+    pub fn reflect_once(
+        &self,
+        embedder: &dyn Embedder,
+        reasoner: &dyn crate::reason::Reasoner,
+        new_misses: &[String],
+        now: i64,
+    ) -> Result<crate::reflect::ReflectReport, BossclawError> {
+        use crate::reflect::{
+            normalized_query_key, MissOutcome, ReflectReport, REFLECT_MISSES_PER_TICK,
+            REFLECT_REFRESH_PER_TICK,
+        };
+        let mut report = ReflectReport::default();
+        if !self.reflect_enabled()? {
+            report.skipped_disabled = true;
+            return Ok(report);
+        }
+        // Seed the ring's queries into the durable backlog (upsert-if-new; churn cannot drop a seen miss).
+        for q in new_misses {
+            self.seed_miss(&normalized_query_key(q), q, now)?;
+        }
+        // Attempt the oldest open misses (misses first, spec §2.1 priority). `miss_emits` counts the
+        // pipeline's REAL dossier emits (`TopicRefreshOutcome::Emitted`s inside attempt_miss step 3).
+        let mut miss_emits = 0usize;
+        for m in self.open_misses(REFLECT_MISSES_PER_TICK)? {
+            report.attempted += 1;
+            let attempt = self.attempt_miss(embedder, reasoner, &m.key, &m.query_text, now)?;
+            miss_emits += attempt.dossiers_emitted;
+            match attempt.outcome {
+                MissOutcome::RepairedByTime => report.repaired_by_time += 1,
+                MissOutcome::NoMaterial => report.no_material += 1,
+                MissOutcome::CandidateRepaired => report.candidate_repaired += 1,
+                MissOutcome::Parked => report.parked += 1,
+                MissOutcome::ReasonerError => report.reasoner_errors += 1,
+                MissOutcome::TransientError => report.transient_errors += 1,
+                MissOutcome::StillMissing => {}
+            }
+        }
+        // Then the stale-dossier tidy with the remaining budget.
+        let stale = self.refresh_stale_pages(reasoner, REFLECT_REFRESH_PER_TICK)?;
+        // The digest's honest unit (critic M2 / OQ4 LOCK): `dossiers_refreshed` = REAL dossier emits only —
+        // miss-pipeline `Emitted`s + tidy heals. `candidate_repaired` (a replay-recall classification) NEVER
+        // feeds the digest: a replay can hit without any emit this tick (e.g. a prior night's page finally
+        // matching), and an emit can happen without a replay hit.
+        report.dossiers_refreshed = miss_emits + stale.healed;
+        report.unhealable_thin = stale.unhealable_thin;
+        // Both error kinds from the tidy pass fold in APART (§2.4 taxonomy): a write hiccup stays a
+        // transient, never blamed on the model.
+        report.reasoner_errors += stale.reasoner_errors;
+        report.transient_errors += stale.transient_errors;
+        self.add_reflect_counters(report.dossiers_refreshed as i64, report.no_material as i64)?;
+        // §7.3 hygiene (critic m1): age out TERMINAL-repaired rows; parked/no_material persist.
+        self.prune_reflect_backlog(now)?;
+        Ok(report)
+    }
+
     /// Set the evolve on/off switch by appending a control `config` event whose
     /// content is `{ "evolve_enabled": <enabled> }` (Rev 2 F2-sec(b)).
     ///
@@ -7669,6 +8171,43 @@ impl EventLog {
         Ok(())
     }
 
+    /// Whether Rung-4 reflection is enabled (spec §2.1). STICKY / fail-closed via
+    /// [`EventLog::latest_config_value`]'s newest-first scan; DEFAULT CLOSED (a never-set flag reads
+    /// `false`), so the reflect loop never runs for a user who never consented (I3). Mirrors
+    /// [`EventLog::conflict_detect_enabled`].
+    pub fn reflect_enabled(&self) -> Result<bool, BossclawError> {
+        Ok(self
+            .latest_config_value(ConfigFlag::Reflect.key())?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// Flip the reflection switch by appending ONE signed + hash-chained control `config` event
+    /// `{ "reflect_enabled": <enabled> }`. The ONLY writer of the key (so the reader can never drift the
+    /// shape). Carries no model fields → never disturbs `active_model`. Mirrors
+    /// [`EventLog::set_conflict_detect_enabled`].
+    pub fn set_reflect_enabled(&self, enabled: bool) -> Result<(), BossclawError> {
+        self.append(Event {
+            id: String::new(),
+            ts: String::new(),
+            valid_time: None,
+            event_type: CONFIG_EVENT_TYPE.to_string(),
+            // Explicit map so the key is the named const (json!{} cannot take a
+            // const identifier as an object key).
+            content: serde_json::Value::Object({
+                let mut m = serde_json::Map::new();
+                m.insert(REFLECT_ENABLED_KEY.to_string(), serde_json::Value::Bool(enabled));
+                m
+            }),
+            model_meta: None,
+            prev_hash: String::new(),
+            hash: None,
+            signed_by_did: self.signer_did(),
+            signature: None,
+        })?;
+        Ok(())
+    }
+
     /// The `(seq, id, text)` of each unprocessed extractable event strictly after
     /// the cursor, in `seq ASC` order, capped at `limit` (the per-tick batch).
     ///
@@ -8095,6 +8634,16 @@ impl EventLog {
         }
         lineage.sort();
         lineage.dedup();
+        // §2.3 (I9 single-source): drop retired/superseded source ids from the gathered lineage so BOTH the
+        // memory texts (fact_texts_for_ids below) AND the cited `source_event_ids` (the D8 taint anchor +
+        // the F6 idempotency key) shrink together. The "gone" set is `superseded ∪ retired_notes` — the
+        // SAME exclusion recall's memory arm applies (log.rs:2029-2030). Consumed by BOTH evolve's summarize
+        // and reflection's refresh, so the two writers can never fight over a stale citation. On a corpus
+        // with no retirements both sets are empty → this is a no-op (evolve goldens unchanged).
+        let fold = fold_sessions(&self.session_events_ordered()?);
+        if !fold.superseded.is_empty() || !fold.retired_notes.is_empty() {
+            lineage.retain(|id| !fold.superseded.contains(id) && !fold.retired_notes.contains(id));
+        }
         let memories = self.fact_texts_for_ids(&lineage)?;
         Ok(crate::summarize::FactSet { entity: entity.clone(), edges, memories, source_ids: lineage })
     }
@@ -8127,83 +8676,20 @@ impl EventLog {
                 // with a seq PAST the advanced cursor, re-dirtying the topic
                 // for the next tick. Nothing is silently dropped forever.
             };
-            let facts = match self.gather_fact_set(&entity) {
-                Ok(f) if f.fact_count() >= crate::summarize::PAGE_MIN_FACTS => f,
-                _ => continue, // too thin, or a gather error → skip this topic (F4)
-            };
-            let raw = match reasoner.complete_json(
-                crate::summarize::SUMMARIZE_SYSTEM,
-                &crate::summarize::build_compose_prompt(&facts),
-                &crate::summarize::compose_schema(),
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!("summarize: compose failed for {topic_id}, skipping: {e}");
-                    continue;
-                }
-            };
-            let draft = match crate::summarize::parse_draft(&raw) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::warn!("summarize: malformed draft for {topic_id}, skipping: {e}");
-                    continue;
-                }
-            };
-            let floored = crate::summarize::citation_floor(&draft, &facts);
-            // F4: the empty-floor path NEVER reaches emit_page/append (an empty
-            // source set would hit the Tier-B reject and is not an emit anyway).
-            let rendered = match crate::summarize::assemble(&floored) {
-                Some(r) => r,
-                None => continue,
-            };
-            // Idempotency (F6): compare the cited-source SET against the current
-            // page; an unchanged grounding set emits nothing (no supersede churn).
-            let prior = self.current_page_for_topic(topic_id)?;
-            if let Some((_pid, prior_cites)) = &prior {
-                if prior_cites == &rendered.cites {
-                    continue;
-                }
-            }
-            // Canonicalize each claim's own `cites` for F7 signed content. This
-            // is NOT removable and NOT a duplicate of assemble(): assemble() sorts
-            // the cites UNION to produce `source_event_ids` (the page-level set),
-            // while this block sorts each INDIVIDUAL claim's `cites` array (the
-            // per-claim attribution stored in `content.claims[].cites`). Removing
-            // this leaves per-claim cites in raw model order → JCS-canonical
-            // signing becomes non-deterministic. The cap precedes signing.
-            let claims_json: Vec<serde_json::Value> = floored
-                .claims
-                .iter()
-                .map(|c| {
-                    let mut cites = c.cites.clone();
-                    cites.sort();
-                    cites.dedup();
-                    serde_json::json!({ "text": c.text, "cites": cites })
-                })
-                .collect();
-            let claims_capped =
-                &claims_json[..claims_json.len().min(crate::summarize::MAX_CLAIMS_PER_PAGE)];
-            let prior_id = prior.as_ref().map(|(id, _)| id.as_str());
-            match self.emit_page(
-                topic_id,
-                &rendered.title,
-                &rendered.text,
-                claims_capped,
-                &[],
-                reasoner.model_id(),
-                &facts.source_ids, // D8: engine gather lineage (taint anchor), not model cites
-                prior_id,
-            ) {
-                Ok((_pid, superseded)) => {
+            // Per-topic body extracted to `refresh_topic_page` (I9 single-source with
+            // reflection). The outcome maps to this batch's counters; every Skipped/error
+            // variant is a no-op `continue` (behavior-preserving vs the old inline body).
+            match self.refresh_topic_page(reasoner, &entity)? {
+                crate::reflect::TopicRefreshOutcome::Emitted { superseded } => {
                     report.pages_emitted += 1;
                     if superseded {
                         report.pages_superseded += 1;
                     }
                 }
-                Err(e) => {
-                    log::warn!("summarize: emit_page failed for {topic_id}, skipping: {e}");
-                    continue;
-                }
+                crate::reflect::TopicRefreshOutcome::SkippedUnchanged
+                | crate::reflect::TopicRefreshOutcome::SkippedThin
+                | crate::reflect::TopicRefreshOutcome::ReasonerError
+                | crate::reflect::TopicRefreshOutcome::TransientError => {}
             }
         }
         // Refresh the projection only if the phase changed the page set.
@@ -8215,6 +8701,97 @@ impl EventLog {
             self.set_summarize_cursor(max_seq)?;
         }
         Ok(())
+    }
+
+    /// Refresh ONE topic's dossier through the citation-floored machinery (spec §2.2 step 3): gather →
+    /// (thin? → SkippedThin) → compose → citation floor → assemble → F6 cited-set idempotency → emit_page
+    /// (atomic supersede). PORTABLE, reasoner-only (no embedder: pages embed lazily via `append` and become
+    /// recall-visible at the caller's post-tick `rebuild_indexes`). Most per-topic failures fold to a
+    /// Skipped/error outcome (F4: one topic's failure must never poison the batch); the ONE exception is
+    /// the idempotency read (`current_page_for_topic`), whose error propagates — same as the
+    /// pre-extraction code. Extracted from `summarize_topics` so evolve's batch AND reflection share ONE
+    /// composer (I9 single-source) — the §2.3 gather exclusion applies to both by construction (it lives
+    /// in `gather_fact_set`).
+    fn refresh_topic_page(
+        &self,
+        reasoner: &dyn crate::reason::Reasoner,
+        entity: &crate::graph::Entity,
+    ) -> Result<crate::reflect::TopicRefreshOutcome, BossclawError> {
+        use crate::reflect::TopicRefreshOutcome;
+        let facts = match self.gather_fact_set(entity) {
+            Ok(f) if f.fact_count() >= crate::summarize::PAGE_MIN_FACTS => f,
+            // Below PAGE_MIN_FACTS → STRUCTURALLY thin (F4; T8 counts it unhealable_thin).
+            Ok(_) => return Ok(TopicRefreshOutcome::SkippedThin),
+            // A gather read error is engine I/O — retry-fixable, NOT thinness (F4).
+            Err(_) => return Ok(TopicRefreshOutcome::TransientError),
+        };
+        let raw = match reasoner.complete_json(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            &crate::summarize::compose_schema(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("refresh: compose failed for {}, skipping: {e}", entity.entity_id);
+                return Ok(TopicRefreshOutcome::ReasonerError);
+            }
+        };
+        let draft = match crate::summarize::parse_draft(&raw) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("refresh: malformed draft for {}, skipping: {e}", entity.entity_id);
+                // Malformed model JSON is a reasoner-QUALITY failure (retry-fixable), not thinness.
+                return Ok(TopicRefreshOutcome::ReasonerError);
+            }
+        };
+        let floored = crate::summarize::citation_floor(&draft, &facts);
+        // F4: the empty-floor path NEVER reaches emit_page/append (an empty source
+        // set would hit the Tier-B reject and is not an emit anyway).
+        let rendered = match crate::summarize::assemble(&floored) {
+            Some(r) => r,
+            None => return Ok(TopicRefreshOutcome::SkippedThin), // empty floor → structurally thin (F4)
+        };
+        // Idempotency (F6): an unchanged cited-source SET emits nothing (no supersede churn).
+        let prior = self.current_page_for_topic(&entity.entity_id)?;
+        if let Some((_pid, prior_cites)) = &prior {
+            if prior_cites == &rendered.cites {
+                return Ok(TopicRefreshOutcome::SkippedUnchanged);
+            }
+        }
+        // Canonicalize each claim's own `cites` for F7 signed content (identical to
+        // summarize_topics's old inline block): assemble() sorts the cites UNION into
+        // `source_event_ids` (page-level), while this sorts each INDIVIDUAL claim's
+        // `cites` array (per-claim attribution). The cap precedes signing.
+        let claims_json: Vec<serde_json::Value> = floored
+            .claims
+            .iter()
+            .map(|c| {
+                let mut cites = c.cites.clone();
+                cites.sort();
+                cites.dedup();
+                serde_json::json!({ "text": c.text, "cites": cites })
+            })
+            .collect();
+        let claims_capped =
+            &claims_json[..claims_json.len().min(crate::summarize::MAX_CLAIMS_PER_PAGE)];
+        let prior_id = prior.as_ref().map(|(id, _)| id.as_str());
+        match self.emit_page(
+            &entity.entity_id,
+            &rendered.title,
+            &rendered.text,
+            claims_capped,
+            &[],
+            reasoner.model_id(),
+            &facts.source_ids, // D8: engine gather lineage (taint anchor), post-exclusion
+            prior_id,
+        ) {
+            Ok((_pid, superseded)) => Ok(TopicRefreshOutcome::Emitted { superseded }),
+            Err(e) => {
+                log::warn!("refresh: emit_page failed for {}, skipping: {e}", entity.entity_id);
+                // A write failure is engine I/O (retry-fixable) — never "unhealable" thinness.
+                Ok(TopicRefreshOutcome::TransientError)
+            }
+        }
     }
 
     /// Map a proposed mention to its resolved `entity:<ulid>` if known, else pass
@@ -10748,6 +11325,80 @@ mod tests {
         assert_eq!((d3.dismissed, d3.kept), (1, 1), "dismissed + coexist counted since the cursor");
     }
 
+    /// Rung-4 R4-A (§2.2/§2.4/§7.3): the miss backlog is upsert-if-new (ring churn never resets
+    /// progress), a terminal transition drops a row from `open` while `parked`/`no_material` persist,
+    /// TERMINAL-repaired rows age out after the TTL, and the counters + cursor round-trip.
+    #[test]
+    fn reflect_backlog_seeds_upsert_only_transitions_and_counters_roundtrip() {
+        use crate::reflect::{normalized_query_key, MissState};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let k1 = normalized_query_key("where is kenny?");
+        let k2 = normalized_query_key("what is beta?");
+
+        // Seed twice: upsert-if-new keeps the FIRST first_seen/state (no reset of progress).
+        log.seed_miss(&k1, "where is kenny?", 100).unwrap();
+        log.seed_miss(&k1, "where is kenny?", 200).unwrap(); // ignored (already present)
+        log.seed_miss(&k2, "what is beta?", 150).unwrap();
+        let open = log.open_misses(10).unwrap();
+        assert_eq!(open.len(), 2, "two open misses");
+        assert_eq!(open[0].key, k1, "oldest first_seen first"); // k1 seeded at 100 < k2 at 150
+
+        // A terminal transition removes it from `open`; parked/no_material persist (spec §7.3).
+        log.set_miss_state(&k1, MissState::NoMaterial, 300).unwrap();
+        assert_eq!(log.open_misses(10).unwrap().len(), 1, "no_material is no longer open");
+        assert_eq!(log.open_miss_count().unwrap(), 1, "floor input counts only open misses");
+
+        // Attempt bump returns the new count; at budget the caller parks (see T7).
+        let a = log.bump_miss_attempt(&k2, 400).unwrap();
+        assert_eq!(a, 1, "first attempt");
+
+        // §7.3 age-out (critic m1): TERMINAL-repaired rows prune after the TTL; parked/no_material persist.
+        log.set_miss_state(&k2, MissState::CandidateRepaired, 500).unwrap();
+        let horizon = 500 + crate::reflect::REFLECT_BACKLOG_TERMINAL_TTL_SECS + 1;
+        assert_eq!(
+            log.prune_reflect_backlog(horizon).unwrap(),
+            1,
+            "aged-out candidate_repaired row pruned"
+        );
+        assert_eq!(
+            log.prune_reflect_backlog(horizon).unwrap(),
+            0,
+            "no_material (k1) persists — it carries information (spec §7.3)"
+        );
+
+        // Counters accumulate; cursor holds the last-served totals + the daemon-supplied timing markers.
+        log.add_reflect_counters(3, 2).unwrap();
+        log.add_reflect_counters(1, 0).unwrap();
+        assert_eq!(log.reflect_counters().unwrap(), (4, 2), "refreshed_total, no_material_total");
+        let c0 = log.reflect_cursor().unwrap();
+        assert_eq!(
+            (c0.last_served_refreshed, c0.last_served_no_material),
+            (0, 0),
+            "nothing served yet"
+        );
+        log.set_reflect_last_served(4, 2).unwrap();
+        log.set_reflect_last_completed_run(999).unwrap();
+        log.set_reflect_last_floor_fire(888).unwrap();
+        let c = log.reflect_cursor().unwrap();
+        assert_eq!((c.last_served_refreshed, c.last_served_no_material), (4, 2));
+        assert_eq!((c.last_completed_run_at, c.last_floor_fire_at), (999, 888));
+    }
+
+    /// Rung-4 R4-A (§2.1 quiet predicate): the newest memory-class append (memory ∪ session-capture)
+    /// registers activity as epoch seconds; a fresh log with no such event reads `None` (treated as
+    /// quiet). Backs the daemon's `now - this >= REFLECT_QUIET_SECS` idle gate.
+    #[test]
+    fn newest_memory_activity_at_tracks_memory_and_session_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        assert_eq!(log.newest_memory_activity_at().unwrap(), None, "no activity yet → None (treated as quiet)");
+        log.remember(&emb, "a note").unwrap();
+        let t = log.newest_memory_activity_at().unwrap().expect("a memory append registers activity");
+        assert!(t > 0, "epoch seconds of the newest memory-class event");
+    }
+
     /// Open-Q9: the accepted both-sides torn-write edge is DIGEST-VISIBLE, which is what makes it
     /// acceptable. A torn `RetireOlder` (tagged retire landed, `conflict_resolved` lost) is rolled
     /// forward by a deliberate `RetireNewer` that retires the newer side too — both retires carry
@@ -11341,6 +11992,26 @@ mod tests {
         assert!(log.explicitly_set(ConfigFlag::ConflictDetect).unwrap(), "now explicit");
         log.set_conflict_detect_enabled(false).unwrap();
         assert!(!log.conflict_detect_enabled().unwrap(), "sticky OFF");
+    }
+
+    #[test]
+    fn reflect_flag_is_default_closed_sticky_and_explicit_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        // Default CLOSED, exactly like conflict-detect: a never-set flag reads false (I3).
+        assert!(!log.reflect_enabled().unwrap(), "reflect defaults CLOSED (never runs without consent)");
+        assert!(!log.explicitly_set(ConfigFlag::Reflect).unwrap(), "never set yet");
+        // Set true → sticky true; explicitly_set flips.
+        log.set_reflect_enabled(true).unwrap();
+        assert!(log.reflect_enabled().unwrap(), "explicit true wins");
+        assert!(log.explicitly_set(ConfigFlag::Reflect).unwrap(), "now explicit");
+        // A flagLESS later config event (e.g. a capture flip) must NOT re-close reflect (sticky newest-explicit).
+        log.set_capture_enabled(true, false, 0).unwrap();
+        assert!(log.reflect_enabled().unwrap(), "an unrelated config event does not disturb the reflect flag");
+        // Explicit false wins over the earlier true.
+        log.set_reflect_enabled(false).unwrap();
+        assert!(!log.reflect_enabled().unwrap(), "newest explicit false is sticky");
+        log.verify_chain().unwrap();
     }
 
     /// SP3 §6a: the Integrations-toggle path — enable ongoing capture WITHOUT backfill. Records the
@@ -12196,5 +12867,427 @@ mod tests {
         let r = log.detect_conflicts_once(&emb, &reasoner, &no_passages, &empty, 1).unwrap();
         assert!(r.judged <= CONFLICT_JUDGE_PER_SWEEP, "day-one judging is budget-bounded ({})", r.judged);
         assert!(r.proposed <= CONFLICT_JUDGE_PER_SWEEP, "day-one proposals are a trickle ({})", r.proposed);
+    }
+
+    /// §2.3 (arch M2) + §4 I3: the gather path drops retired/superseded lineage from BOTH the
+    /// gathered memory texts AND the cited `source_event_ids` (the D8 anchor + the F6 idempotency
+    /// key). The exclusion set is `fold.superseded ∪ fold.retired_notes` — the same "gone" set
+    /// recall's memory arm already uses. On a corpus with nothing retired, gather is byte-stable
+    /// (the control) — which is why the evolve/summarize goldens stay green.
+    #[test]
+    fn gather_fact_set_excludes_retired_lineage_from_texts_and_cited_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        // Two source notes fold into one topic's lineage; a link ties the entity to a second endpoint.
+        let m1 = log.remember(&emb, "Kenny joined Acme in 2019.").unwrap();
+        let m2 = log.remember(&emb, "Kenny leads the platform team.").unwrap();
+        let lineage = vec![m1.clone(), m2.clone()];
+        let topic = log.entity("Kenny", &[], "person", "test-v1", &lineage).unwrap();
+        let acme = log.entity("Acme", &[], "org", "test-v1", &lineage).unwrap();
+        log.link_machine(&topic, "works_at", &acme, 0.9, "test-v1", &lineage).unwrap();
+        log.rebuild_graph().unwrap();
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+
+        // Before any retire: both source ids are gathered (texts + cited set).
+        let before = log.gather_fact_set(&entity).unwrap();
+        assert!(before.source_ids.contains(&m1) && before.source_ids.contains(&m2), "both cited");
+        assert!(before.memories.iter().any(|(id, _)| id == &m1), "m1 text gathered");
+
+        // Retire m1 (App path). The gather path must now drop it from BOTH the memory texts AND source_ids.
+        log.retire_memory(&m1, None).unwrap();
+        let after = log.gather_fact_set(&entity).unwrap();
+        assert!(!after.source_ids.contains(&m1), "retired m1 dropped from the cited source_event_ids (D8 anchor)");
+        assert!(!after.memories.iter().any(|(id, _)| id == &m1), "retired m1 dropped from the gathered texts");
+        assert!(after.source_ids.contains(&m2), "the surviving source is untouched");
+        assert!(after.memories.iter().any(|(id, _)| id == &m2), "m2 text still gathered");
+
+        // Control: a topic with nothing retired gathers identically on repeat calls (deterministic); the
+        // pre/post-patch equivalence proof is the untouched evolve golden suite.
+        let c = log.remember(&emb, "Beta is a database.").unwrap();
+        let ct = log.entity("Beta", &[], "product", "test-v1", std::slice::from_ref(&c)).unwrap();
+        log.rebuild_graph().unwrap();
+        let ce = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == ct).unwrap();
+        let g1 = log.gather_fact_set(&ce).unwrap();
+        let g2 = log.gather_fact_set(&ce).unwrap();
+        assert_eq!(g1.source_ids, g2.source_ids, "no retirement → gather is stable (control)");
+    }
+
+    /// R4-A (spec §2.2 step 3): the extracted `refresh_topic_page` maps ONE topic to its outcome
+    /// directly — `Emitted{superseded}` on a fresh emit, `SkippedUnchanged` when the cited set matches
+    /// the current page (F6 idempotency), `SkippedThin` below `PAGE_MIN_FACTS`. This drives the
+    /// behavior-preserving extraction out of `summarize_topics`; the untouched evolve/summarize
+    /// goldens are the proof the batch loop's behavior is unchanged.
+    #[test]
+    fn refresh_topic_page_returns_emitted_unchanged_or_thin() {
+        use crate::reflect::TopicRefreshOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(8);
+        // Summary-worthy topic (>= PAGE_MIN_FACTS): one memory + one edge.
+        let m1 = log.remember(&emb, "Kenny works at Acme.").unwrap();
+        let topic = log.entity("Kenny", &[], "person", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        let acme = log.entity("Acme", &[], "org", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.link_machine(&topic, "works_at", &acme, 0.9, "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.rebuild_graph().unwrap();
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny works at Acme.", "cites": [m1] }]}),
+        );
+        // First refresh → Emitted (no prior page → not superseded).
+        assert_eq!(log.refresh_topic_page(&reasoner, &entity).unwrap(),
+            TopicRefreshOutcome::Emitted { superseded: false });
+        log.rebuild_graph().unwrap();
+        // Second refresh, identical grounding → SkippedUnchanged (F6 cited-set idempotency).
+        let entity2 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts2 = log.gather_fact_set(&entity2).unwrap();
+        let reasoner2 = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&facts2),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny works at Acme.", "cites": [
+                facts2.memories[0].0.clone()] }]}),
+        );
+        assert_eq!(log.refresh_topic_page(&reasoner2, &entity2).unwrap(), TopicRefreshOutcome::SkippedUnchanged);
+        // A compose failure (no canned response for this prompt) on a summary-worthy topic →
+        // ReasonerError (the model bucket) — NOT SkippedThin: the topic is not structurally thin.
+        let empty_reasoner = crate::reason::ScriptedReasoner::new("test-v1");
+        assert_eq!(log.refresh_topic_page(&empty_reasoner, &entity2).unwrap(),
+            TopicRefreshOutcome::ReasonerError);
+        // Grow the grounding (a new memory + edge) so the cited set differs from the current
+        // page's → the refresh replaces that page atomically: Emitted { superseded: true } (F5).
+        let m2 = log.remember(&emb, "Kenny mentors the platform team.").unwrap();
+        let team = log.entity("Platform", &[], "team", "test-v1", std::slice::from_ref(&m2)).unwrap();
+        log.link_machine(&topic, "mentors", &team, 0.8, "test-v1", std::slice::from_ref(&m2)).unwrap();
+        log.rebuild_graph().unwrap();
+        let entity3 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts3 = log.gather_fact_set(&entity3).unwrap();
+        let reasoner3 = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&facts3),
+            serde_json::json!({ "title": "Kenny", "claims": [
+                { "text": "Kenny works at Acme.", "cites": [m1] },
+                { "text": "Kenny mentors the platform team.", "cites": [m2] },
+            ]}),
+        );
+        assert_eq!(log.refresh_topic_page(&reasoner3, &entity3).unwrap(),
+            TopicRefreshOutcome::Emitted { superseded: true });
+        // A topic below PAGE_MIN_FACTS → SkippedThin (no reasoner call needed).
+        let thin = log.remember(&emb, "lonely note").unwrap();
+        let te = log.entity("Lonely", &[], "misc", "test-v1", std::slice::from_ref(&thin)).unwrap();
+        log.rebuild_graph().unwrap();
+        let thin_entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == te).unwrap();
+        // fact_count = 0 edges + 1 memory = 1 < PAGE_MIN_FACTS(2) → thin.
+        assert_eq!(log.refresh_topic_page(&reasoner, &thin_entity).unwrap(), TopicRefreshOutcome::SkippedThin);
+    }
+
+    /// R4-A (spec §2.3): the ONE autonomous tidy job heals a page whose cited lineage went stale. A
+    /// topic with two cited sources + an edge is paged, then ONE source is retired: the page's claim-cites
+    /// union now intersects `retired_notes` (stale), and its post-exclusion fact-set still clears
+    /// `PAGE_MIN_FACTS` (m2 + one edge), so the refresh emits a healed revision → `healed == 1`.
+    #[test]
+    fn refresh_stale_pages_heals_a_stale_dossier() {
+        use crate::reflect::TopicRefreshOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        // A topic with TWO cited sources + an edge → a page. Retire ONE source → the page is stale but still
+        // summary-worthy → healed.
+        let m1 = log.remember(&emb, "Kenny works at Acme.").unwrap();
+        let m2 = log.remember(&emb, "Kenny lives in Denver.").unwrap();
+        let heal_lineage = vec![m1.clone(), m2.clone()];
+        let kenny = log.entity("Kenny", &[], "person", "test-v1", &heal_lineage).unwrap();
+        let acme = log.entity("Acme", &[], "org", "test-v1", &heal_lineage).unwrap();
+        log.link_machine(&kenny, "works_at", &acme, 0.9, "test-v1", &heal_lineage).unwrap();
+        log.rebuild_graph().unwrap();
+        let ke = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == kenny).unwrap();
+        let f = log.gather_fact_set(&ke).unwrap();
+        let r_heal = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny works at Acme.", "cites": [m1.clone(), m2.clone()] }]}));
+        assert_eq!(log.refresh_topic_page(&r_heal, &ke).unwrap(), TopicRefreshOutcome::Emitted { superseded: false });
+        log.rebuild_graph().unwrap();
+
+        // Retire m1 → the Kenny page's cited set now intersects retired → stale → healed on refresh (its
+        // post-exclusion facts still clear PAGE_MIN_FACTS: one memory m2 + one edge). Script the healed compose.
+        log.retire_memory(&m1, None).unwrap();
+        let ke2 = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == kenny).unwrap();
+        let f2 = log.gather_fact_set(&ke2).unwrap();
+        let r_healed = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f2),
+            serde_json::json!({ "title": "Kenny", "claims": [{ "text": "Kenny lives in Denver.", "cites": [m2.clone()] }]}));
+        let report = log.refresh_stale_pages(&r_healed, 8).unwrap();
+        assert_eq!(report, crate::reflect::StaleRefreshReport { healed: 1, ..Default::default() });
+    }
+
+    /// R4-A (spec §2.3 thin-set residual): a page whose ENTIRE lineage is retired cannot legally re-emit —
+    /// its post-exclusion fact-set falls below `PAGE_MIN_FACTS`, so `refresh_topic_page` returns
+    /// `SkippedThin` BEFORE any reasoner turn. This pass counts it `unhealable_thin` (a distinct outcome,
+    /// not an error), never retries it, and — per I1 — leaves the stale page CURRENT (provenance-true).
+    #[test]
+    fn refresh_stale_pages_counts_unhealable_thin_when_all_sources_retired() {
+        use crate::reflect::TopicRefreshOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        // A SINGLE-source topic: one memory + one edge → fact_count 2 == PAGE_MIN_FACTS → page-worthy.
+        let m = log.remember(&emb, "Gamma ships crates.").unwrap();
+        let gamma = log.entity("Gamma", &[], "product", "test-v1", std::slice::from_ref(&m)).unwrap();
+        let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m)).unwrap();
+        log.link_machine(&gamma, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m)).unwrap();
+        log.rebuild_graph().unwrap();
+        let ge = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == gamma).unwrap();
+        let f = log.gather_fact_set(&ge).unwrap();
+        let seed_reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM, &crate::summarize::build_compose_prompt(&f),
+            serde_json::json!({ "title": "Gamma",
+                "claims": [{ "text": "Gamma ships crates.", "cites": [m.clone()] }]}));
+        assert_eq!(log.refresh_topic_page(&seed_reasoner, &ge).unwrap(),
+            TopicRefreshOutcome::Emitted { superseded: false });
+        log.rebuild_graph().unwrap();
+
+        // Retire the ONLY source: the page's claim-cites union intersects `retired_notes` (stale), but the
+        // post-exclusion fact-set is 1 edge + 0 memories < PAGE_MIN_FACTS(2) → it cannot legally re-emit
+        // (§2.3 residual). An EMPTY ScriptedReasoner proves no compose call happens (SkippedThin fires
+        // BEFORE any reasoner turn — a scripted reasoner with no canned response errors if consulted).
+        log.retire_memory(&m, None).unwrap();
+        let report = log.refresh_stale_pages(&crate::reason::ScriptedReasoner::new("test-v1"), 8).unwrap();
+        assert_eq!(report.unhealable_thin, 1, "the all-retired-lineage page is counted, not retried as an error");
+        assert_eq!(report.healed, 0);
+        assert_eq!(report.reasoner_errors, 0, "no reasoner call for a thin topic");
+        // I1: reflection never retires a page — the stale page STAYS current (provenance-true) until new
+        // current facts arrive.
+        assert_eq!(log.current_pages().unwrap().len(), 1, "the stale page remains current");
+    }
+
+    /// R4-A (spec §2.2 step 2, arch B1): the read-only query→topic bridge resolves a missed query to
+    /// ≤ REFLECT_TOPIC_N KNOWN topics via the real `entity_search`, keeping only candidates at/above
+    /// REFLECT_TOPIC_FLOOR cosine similarity (`1.0 - dist`, mirroring `resolve_mention`). Reflection
+    /// NEVER mints — a query resolving to no known topic IS the `no_material` path (empty result).
+    #[test]
+    fn reflect_topics_for_query_resolves_known_topics_and_empties_on_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64); // higher dim → distinct vectors for distinct labels
+        let m = log.remember(&emb, "seed").unwrap();
+        let kenny = log.entity("Kenny Ortega", &[], "person", "test-v1", std::slice::from_ref(&m)).unwrap();
+        let _acme = log.entity("Acme Corporation", &[], "org", "test-v1", std::slice::from_ref(&m)).unwrap();
+        // `entity()` only APPENDS the entity event; the `entities` projection that the backfill reads
+        // (`SELECT ... FROM entities`) is materialized by rebuild_graph (mirrors the sibling reflect test).
+        log.rebuild_graph().unwrap();
+        // ARCH MAJOR-1: `log.entity()` mints NO vector (derive happens only at evolve-mint, log.rs:9152, or
+        // via this backfill, :2449) — rebuild_entity_index only READS `entity_vectors`, so without this the
+        // index is empty and every search below returns nothing.
+        log.rederive_entity_vectors_pending(&emb).unwrap();
+        log.rebuild_entity_index(&emb).unwrap(); // entity_search precondition
+
+        // A query naming a known topic resolves to it (MockEmbedder is deterministic; the exact label
+        // embeds to distance 0 → similarity 1.0, well above the floor).
+        let topics = log.reflect_topics_for_query(&emb, "Kenny Ortega").unwrap();
+        assert!(topics.contains(&kenny), "an above-floor query resolves to the known topic");
+        assert!(topics.len() <= crate::reflect::REFLECT_TOPIC_N, "capped at N");
+
+        // A garbage query far from every label → empty → the no_material path.
+        let none = log.reflect_topics_for_query(&emb, "zzzz qqqq unrelated gibberish 9182").unwrap();
+        assert!(none.is_empty(), "no known topic above the floor → empty (no_material)");
+    }
+
+    impl EventLog {
+        /// Test-only backlog state read (the accessors expose only the OPEN set; parked/terminal assertions
+        /// need the raw row state).
+        fn miss_state_for_test(&self, key: &str) -> Option<String> {
+            let store = self.inner.lock().expect(POISON);
+            store
+                .conn()
+                .query_row(
+                    "SELECT state FROM reflect_miss_backlog WHERE normalized_query_key = ?1",
+                    rusqlite::params![key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn attempt_miss_classifies_repaired_by_time_and_no_material() {
+        use crate::reflect::{normalized_query_key, MissOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        log.rebuild_entity_index(&emb).unwrap(); // empty index is valid
+
+        // ── no_material: a query resolving to no known topic (fresh brain, no entities). ──
+        let qk = normalized_query_key("who is nobody?");
+        log.seed_miss(&qk, "who is nobody?", 10).unwrap();
+        let empty_reasoner = crate::reason::ScriptedReasoner::new("test-v1");
+        let out = log.attempt_miss(&emb, &empty_reasoner, &qk, "who is nobody?", 20).unwrap();
+        assert_eq!(out.outcome, MissOutcome::NoMaterial);
+        assert_eq!(out.dossiers_emitted, 0, "no topic → no refresh → no emit");
+        assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("no_material"));
+
+        // ── repaired_by_time: a query that recall now answers (a matching memory exists). ──
+        let mem = log.remember(&emb, "The capital of France is Paris.").unwrap();
+        log.rebuild_indexes(&emb).unwrap(); // make the memory recall-visible
+        let rk = normalized_query_key("The capital of France is Paris.");
+        log.seed_miss(&rk, "The capital of France is Paris.", 10).unwrap();
+        let out = log.attempt_miss(&emb, &empty_reasoner, &rk, "The capital of France is Paris.", 20).unwrap();
+        assert_eq!(out.outcome, MissOutcome::RepairedByTime);
+        assert_eq!(out.dossiers_emitted, 0, "a time-repaired miss consumes no reasoner and emits nothing");
+        assert_eq!(log.miss_state_for_test(&rk).as_deref(), Some("repaired_by_time"));
+        let _ = mem;
+    }
+
+    #[test]
+    fn attempt_miss_parks_after_three_failed_attempts() {
+        use crate::reflect::{normalized_query_key, MissOutcome, REFLECT_MISS_ATTEMPT_BUDGET};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        // A known topic whose LABEL equals the missed query exactly (MockEmbedder: identical text →
+        // identical vector → similarity 1.0 ≥ REFLECT_TOPIC_FLOOR), while the memory texts share NO token
+        // with the query — the keyword arm can never match, and with no `rebuild_indexes` call the vector
+        // arm stays unbuilt (recall degrades keyword-only per resolve_arms), so the replay stays a miss.
+        let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+        let m2 = log.remember(&emb, "He joined in 2019.").unwrap();
+        let lineage = vec![m1.clone(), m2.clone()];
+        let topic = log.entity("Kenny Ortega", &[], "person", "test-v1", &lineage).unwrap();
+        let beta = log.entity("Beta", &[], "org", "test-v1", &lineage).unwrap();
+        log.link_machine(&topic, "works_at", &beta, 0.9, "test-v1", &lineage).unwrap();
+        log.rebuild_graph().unwrap();
+        // ARCH MAJOR-1: log.entity() mints NO vector — derive the pending ones BEFORE building the index.
+        log.rederive_entity_vectors_pending(&emb).unwrap();
+        log.rebuild_entity_index(&emb).unwrap();
+
+        // The scripted dossier ALSO avoids the query tokens (title + claim), so the emitted page cannot
+        // keyword-match "Kenny Ortega" either.
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Team lead dossier",
+                "claims": [{ "text": "He runs the platform group.", "cites": [m1.clone()] }] }),
+        );
+        let qk = normalized_query_key("Kenny Ortega");
+        log.seed_miss(&qk, "Kenny Ortega", 10).unwrap();
+
+        // Attempt 1: the bridge resolves the topic, the refresh EMITS a dossier, the replay still misses.
+        let a1 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 20).unwrap();
+        assert_eq!(a1.outcome, MissOutcome::StillMissing, "refresh fired but the replay still misses");
+        assert_eq!(a1.dossiers_emitted, 1, "attempt 1 emitted a real dossier revision");
+        // (No external rebuild needed between attempts: attempt 1's visibility block already projected
+        // the page; the F6 check reads that projection.)
+
+        // Attempt 2: identical grounding → F6 skips the emit; the attempt still accrues.
+        let a2 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 30).unwrap();
+        assert_eq!(a2.outcome, MissOutcome::StillMissing);
+        assert_eq!(a2.dossiers_emitted, 0, "F6 cited-set idempotency: no re-emit on an unchanged topic");
+
+        // Attempt 3 = REFLECT_MISS_ATTEMPT_BUDGET → parked (bounded loss, I6/I9).
+        let a3 = log.attempt_miss(&emb, &reasoner, &qk, "Kenny Ortega", 40).unwrap();
+        assert_eq!(a3.outcome, MissOutcome::Parked, "attempt {REFLECT_MISS_ATTEMPT_BUDGET} parks the miss");
+        assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("parked"), "backlog row is parked");
+        assert!(log.open_misses(10).unwrap().is_empty(), "a parked miss is never re-attempted (I9)");
+    }
+
+    #[test]
+    fn attempt_miss_candidate_repaired_when_the_refreshed_dossier_answers_the_replay() {
+        use crate::reflect::{normalized_query_key, MissOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+        let topic = log.entity("Nova Signal", &[], "product", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.link_machine(&topic, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.rebuild_graph().unwrap();
+        log.rederive_entity_vectors_pending(&emb).unwrap(); // MAJOR-1
+        log.rebuild_entity_index(&emb).unwrap();
+
+        // The scripted claim text NAMES the topic, so the emitted page keyword-matches the replay query.
+        // The visibility block's keyword_add indexes the fresh page into the FTS arm, and its
+        // rebuild_graph keeps it past the F2 gate — so the replay's keyword arm hits it.
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Nova Signal",
+                "claims": [{ "text": "Nova Signal runs the platform group.", "cites": [m1.clone()] }] }),
+        );
+        let qk = normalized_query_key("Nova Signal");
+        log.seed_miss(&qk, "Nova Signal", 10).unwrap();
+        let out = log.attempt_miss(&emb, &reasoner, &qk, "Nova Signal", 20).unwrap();
+        assert_eq!(out.outcome, MissOutcome::CandidateRepaired, "the replay now hits the fresh dossier");
+        assert_eq!(out.dossiers_emitted, 1, "exactly one real dossier emit fed the repair");
+        assert_eq!(log.miss_state_for_test(&qk).as_deref(), Some("candidate_repaired"));
+    }
+
+    #[test]
+    fn reflect_once_is_off_by_default_then_reports_when_enabled() {
+        use crate::reflect::normalized_query_key;
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        log.rebuild_entity_index(&emb).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1");
+
+        // Off by default → skipped_disabled, nothing else (I3).
+        let off = log.reflect_once(&emb, &reasoner, &["who is nobody?".to_string()], 100).unwrap();
+        assert!(off.skipped_disabled, "reflect is off by default");
+        assert_eq!(off.attempted, 0, "no work when disabled");
+        assert!(log.open_misses(10).unwrap().is_empty(), "no backlog seeded when disabled");
+
+        // Enable → the new miss is seeded and attempted; with no known topic it resolves no_material.
+        log.set_reflect_enabled(true).unwrap();
+        let r = log.reflect_once(&emb, &reasoner, &["who is nobody?".to_string()], 200).unwrap();
+        assert!(!r.skipped_disabled);
+        assert_eq!(r.attempted, 1, "one open miss attempted");
+        assert_eq!(r.no_material, 1, "resolves to no known topic → no_material");
+        let (_refreshed, no_material_total) = log.reflect_counters().unwrap();
+        assert_eq!(no_material_total, 1, "cumulative no_material_total advanced");
+        // The miss is now terminal (no_material) → not re-attempted next tick.
+        let qk = normalized_query_key("who is nobody?");
+        assert!(log.open_misses(10).unwrap().iter().all(|m| m.key != qk), "no_material miss left open set");
+    }
+
+    #[test]
+    fn reflect_once_counts_real_emits_into_dossiers_refreshed_separately_from_candidate_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let emb = MockEmbedder::new(64);
+        log.set_reflect_enabled(true).unwrap();
+        // T7's Nova Signal scenario driven end-to-end through the ORCHESTRATOR: the memory text shares no
+        // token with the query and the vector arm stays unbuilt (no rebuild_indexes), so the seeded miss
+        // step-1 misses; the refresh emits a page NAMING the topic → the step-4 replay keyword-hits it.
+        let m1 = log.remember(&emb, "He runs the platform group.").unwrap();
+        let topic = log.entity("Nova Signal", &[], "product", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        let delta = log.entity("Delta", &[], "org", "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.link_machine(&topic, "made_by", &delta, 0.9, "test-v1", std::slice::from_ref(&m1)).unwrap();
+        log.rebuild_graph().unwrap();
+        log.rederive_entity_vectors_pending(&emb).unwrap(); // MAJOR-1
+        log.rebuild_entity_index(&emb).unwrap();
+        let entity = log.all_entities().unwrap().into_iter().find(|e| e.entity_id == topic).unwrap();
+        let facts = log.gather_fact_set(&entity).unwrap();
+        let reasoner = crate::reason::ScriptedReasoner::new("test-v1").with_response(
+            crate::summarize::SUMMARIZE_SYSTEM,
+            &crate::summarize::build_compose_prompt(&facts),
+            serde_json::json!({ "title": "Nova Signal",
+                "claims": [{ "text": "Nova Signal runs the platform group.", "cites": [m1.clone()] }] }),
+        );
+
+        let r = log.reflect_once(&emb, &reasoner, &["Nova Signal".to_string()], 20).unwrap();
+        // T9's uniquely-owned line pinned NON-ZERO: `dossiers_refreshed` (a real-emit count) and
+        // `candidate_repaired` (a replay-recall classification) track DIFFERENT facts even when both are 1
+        // — the sum's miss_emits term comes from the attempt's real `Emitted`, never the classification.
+        // (The converse fixture — candidate_repaired with dossiers_refreshed == 0 — is UNCONSTRUCTIBLE in
+        // one tick: with zero emits the step-1 and step-4 recalls are identical calls, so a step-4 hit
+        // implies a step-1 hit → RepairedByTime. The stale.healed term of the sum stays pinned by T8's
+        // suite + the T16 e2e.)
+        assert_eq!(r.attempted, 1, "the seeded miss was attempted");
+        assert_eq!(r.candidate_repaired, 1, "the replay hit the fresh dossier");
+        assert_eq!(r.dossiers_refreshed, 1, "exactly one REAL emit fed the honest sum");
+        let (refreshed_total, _no_material_total) = log.reflect_counters().unwrap();
+        assert_eq!(refreshed_total, 1, "cumulative refreshed_total advanced by the emit");
     }
 }

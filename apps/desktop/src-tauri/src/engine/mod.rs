@@ -513,6 +513,17 @@ impl Engine {
         self.client.capture_enabled(onboarded).await
     }
 
+    /// Mirrors `EngineClient::set_reflect_enabled` (Rung-4 R4-A): enable/disable the reflection loop —
+    /// a plain bool switch (no `backfill`; reflection imports no history). Threads the real `onboarded`.
+    pub async fn set_reflect_enabled(&self, onboarded: bool, enabled: bool) -> Result<(), EngineOpError> {
+        self.client.set_reflect_enabled(onboarded, enabled).await
+    }
+
+    /// Mirrors `EngineClient::reflect_enabled` (Rung-4 R4-A): read the sticky reflect-enabled flag.
+    pub async fn reflect_enabled(&self, onboarded: bool) -> Result<bool, EngineOpError> {
+        self.client.reflect_enabled(onboarded).await
+    }
+
     // ── Memory-browser Library (SP3 C1). App-only ops (the daemon's role gate denies MemoryClient);
     //    `onboarded` is threaded from the caller like every sibling. ──
 
