@@ -191,6 +191,8 @@ AIR did:wba identity key (`did_wba.rs`). The binding attestation closes that gap
 
 Additive ops, refused for `MemoryClient` by the existing positive-allowlist role gate:
 
+- `BrainVerifyingKey → key` — read-only: the app fetches the daemon's ACTUAL brain verifying key to
+  construct the binding payload (§2.3 round-trip; plan-stage addition, ratified 2026-07-21).
 - `SetBinding{attestation}` — one-time (idempotent per epoch) binding storage (§2.3).
 - `ExportBundle{selection} → Bundle` — pure-read; runs `verify_chain` FIRST and refuses to export from a
   log that does not verify (§7).
