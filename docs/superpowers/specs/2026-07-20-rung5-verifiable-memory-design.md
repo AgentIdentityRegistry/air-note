@@ -7,9 +7,9 @@ confirmed resolved in substance — the critic re-attacked the Blocker fix and i
 second wave (architect N1 Major stamped-metadata disclosure + N2 copy pin; critic NEW-1 Major
 owner-adversary label scoping + NEW-2/3/4 Minors) → Rev 3 folds all of those (changelog §11). Final
 verdicts: architect **SOUND-WITH-CHANGES**, critic **APPROVE-WITH-CHANGES** — both explicitly plan-ready
-with these folds; findings shrank across rounds (the house STOP signal). ⚠️ ONE owner-ratifiable default
-inside (§2.2: session/ingest items export content-only — write-time stamps on those classes would
-disclose local paths/project/session metadata). Awaiting file-level owner review → planning. Build gated
+with these folds; findings shrank across rounds (the house STOP signal). The §2.2 privacy-over-proof
+default (session/ingest items export content-only; stamps would disclose local paths/project/session
+metadata) was **owner-RATIFIED 2026-07-21**. Awaiting file-level owner review → planning. Build gated
 behind the R4-A dogfood verdict (after Sun 2026-07-27).
 **North Star anchor:** `air/memory-strategy-2026-07-03-beat-the-stack` Phase 5 — "M4 verifiable memory
 (after the targeted niche-emptiness check). The moat: signed, exportable, counterparty-verifiable bundles —
@@ -134,8 +134,9 @@ A single canonical-JSON document:
     class: derived-event bytes leak `model_meta.source_event_ids` ULIDs (count + creation timestamps of
     unshared memories) + `prompt_hash` (A4/C5); session/ingest event bytes leak the owner's LOCAL
     provenance metadata — absolute filesystem paths, `project`, `session_id`, `grant_root`, content
-    hashes (`log.rs:9955-9968`, `ingest.rs:698-711`; re-verification A-N1). **Owner-ratifiable
-    default:** trading write-time proof for zero metadata leakage on these classes is a product choice;
+    hashes (`log.rs:9955-9968`, `ingest.rs:698-711`; re-verification A-N1). **Owner-RATIFIED default
+    (2026-07-21):** trading write-time proof for zero metadata leakage on these classes is a product
+    choice, decided for privacy;
     the recorded alternative (keep stamps + disclose the metadata plainly in the §6 review sheet) and
     the salted-commitment upgrade (§9, restores write-time proof leak-free) both remain open.
   - Every item carries its Merkle leaf hash and `kind`; origin labels follow §3-H2 (verifier-derived for
