@@ -51,9 +51,11 @@ Modified:
 - `apps/desktop/src/api/export.ts` (new) — TS wrapper.
 - `apps/desktop/src/memory/LibraryPanel.tsx` — multi-select (notes + sessions + ingests) + "Export signed bundle" entry point.
 
-**Status:** **Rev 2.** Anchored to spec Rev 3 as amended on-branch (commit `8c5d17a`: Story-C scope honest — ingests in, dossiers empty-by-construction; kind-aware seal-vouched labels; `BundleTooLarge` in §7; `BrainVerifyingKey` in §2.4, commit `472fc02`). SP-V1 scope ONLY (spec §1: export side — Stories A-export + C; L1/offline verification). SP-V2 (verify page, registry L2 HTTP, `PublishClaim` pin) is OUT of scope. **Build is gated behind the R4-A dogfood verdict** — do not start before the go/no-go after Sun 2026-07-27.
+**Status:** **Rev 2.1.** Anchored to spec Rev 3 as amended on-branch (commit `8c5d17a`: Story-C scope honest — ingests in, dossiers empty-by-construction; kind-aware seal-vouched labels; `BundleTooLarge` in §7; `BrainVerifyingKey` in §2.4, commit `472fc02`). SP-V1 scope ONLY (spec §1: export side — Stories A-export + C; L1/offline verification). SP-V2 (verify page, registry L2 HTTP, `PublishClaim` pin) is OUT of scope. **Build is gated behind the R4-A dogfood verdict** — do not start before the go/no-go after Sun 2026-07-27.
 
 **Rev 2 changelog:** Folded the dual plan review (architect SOUND-WITH-CHANGES, critic REWORK, no Blocker). Convergent: added ingested-file gathering (`current_ingests`) so Story C is honest, a pre-frame `BundleTooLarge{bytes,max}` size guard + a measurement checkpoint + a whole-brain large-fixture test, and merged the L2 resolver into Task 6 (resolver created first; renumbered to 11 tasks). Architect: session bodies now read by the daemon through its bounded capture reader (`read_capture_markdown`, 16 MiB) and passed into a fs-free core export, missing body → placeholder; dropped the dead `ConfigFlag::Binding`; L2 key comparison decodes both sides to `[u8;32]` (encoding-agnostic). Critic: `OriginMismatch` is now LIVE via a leaf-excluded `carried_origin` cross-check; a server-side stamped guard (memory + external only); kind-aware seal-vouched labels (session/ingest/dossier, never cross-rendered); `flip_original_signature` now asserts `ItemStampInvalid`; expanded tamper matrix (BindingKeyMismatch, BindingInvalid, re-attribution→BindingDidMismatch, ts-flip, bare-field→SealInvalid); C-NEW-1b origin-unattested test; clippy-slop removed. Citation fix: `open_log` at `log.rs:10309`.
+
+**Rev 2.1 changelog:** Final confirmation round (architect SOUND / critic APPROVE-WITH-CHANGES, 2 Minors). NEW-A: the daemon dispatch now bounds the ACTUAL wire-serialized `Response::Bundle` length against `MAX_FRAME` (the frame JSON-escapes the already-JSON `.airmem`, so the 2 MiB gap below `MAX_EXPORT_BYTES` is smaller than typical JSON-in-JSON escaping — a ~30 MiB bundle could pass the belt yet trip a generic frame error); a wasted-build cannot substitute for the typed `BundleTooLarge`. The pre-build estimate stays as the coarse guard. NEW-B: the seal-vouched no-leak test now includes an ingest item, and a new core test builds a REAL `file_ingested` event (with a `provenance{canonical_path, content_hash, grant_root}` block, ingest.rs:698-711) and asserts the serialized bundle discloses none of those strings.
 
 **Toolchain prerequisite (once):** `rustup target add wasm32-unknown-unknown` (Task 1's wasm check needs it).
 
@@ -1145,14 +1147,26 @@ Steps:
           assert_eq!(v.item_labels[0], "origin unattested");
       }
 
-      // ---- SEAL-VOUCHED NO-LEAK (A-N1 + A4/C5). ----
+      // ---- SEAL-VOUCHED NO-LEAK (A-N1 + A4/C5) — covers BOTH session AND ingest classes (NEW-B). ----
       #[test] fn seal_vouched_discloses_no_local_metadata() {
-          let b = valid_bundle();
+          let mut b = valid_bundle(); // items[0]=stamped note, items[1]=session
+          // Add an ingest seal-vouched item (content-only; the item shape has NO provenance field —
+          // the real file_ingested provenance block is stripped by core, proven end-to-end in Task 11).
+          let mut ingest = AirmemItem { leaf: String::new(), class: ItemClass::SealVouched,
+              kind: "ingest".into(), event_bytes: None, signature: None, carried_origin: None,
+              content: Some("extracted file text".into()), display: None };
+          ingest.leaf = hex::encode(merkle::leaf_hash(&ingest));
+          b.items.push(ingest);
+          let leaves: Vec<_> = b.items.iter().map(merkle::leaf_hash).collect();
+          b.manifest.merkle_root = hex::encode(merkle::root(&leaves));
+          b.manifest.item_count = b.items.len() as u64;
+          reseal(&mut b);
+          verify(&b, &off()).expect("still verifies with the ingest item");
           let whole = serde_json::to_string(&b).unwrap();
-          for needle in ["source_event_ids", "prompt_hash", "session_id", "grant_root", "canonical_path"] {
+          for needle in ["source_event_ids", "prompt_hash", "session_id", "grant_root", "canonical_path", "content_hash"] {
               assert!(!whole.contains(needle), "seal-vouched item leaked `{needle}`");
           }
-          assert!(b.items[1].event_bytes.is_none());
+          assert!(b.items[1].event_bytes.is_none() && b.items[2].event_bytes.is_none());
       }
 
       // ---- L2 (mocked registry) — proves the RegistryResolved branch + key-mismatch. ----
@@ -1620,7 +1634,22 @@ Steps:
       }
       // 3. Build + seal.
       match engine.export_bundle(onboarded, selection, bodies).await {
-          Ok(text) => Response::Bundle(text),
+          Ok(text) => {
+              // NEW-A wire-honesty: the frame is `serde_json::to_vec(&Response::Bundle(text))` (proto
+              // lib.rs:667/708), which JSON-ESCAPES the already-JSON .airmem — escaping overhead is
+              // larger than the 2 MiB gap between MAX_EXPORT_BYTES (30 MiB) and MAX_FRAME (32 MiB), so a
+              // bundle that passed the pre-build estimate + the core belt can still overflow the frame.
+              // Bound the ACTUAL serialized Response length; a generic frame error must never replace the
+              // typed refusal (spec §7). This is the authoritative size gate; the estimate is the coarse
+              // pre-build guard that avoids a wasted build in the common case.
+              let resp = Response::Bundle(text);
+              match serde_json::to_vec(&resp) {
+                  Ok(wire) if wire.len() > bossclawd_proto::MAX_FRAME =>
+                      Response::BundleTooLarge { bytes: wire.len() as u64, max: bossclawd_proto::MAX_FRAME as u64 },
+                  Ok(_) => resp,
+                  Err(e) => Response::Err { kind: OpErrorKindWire::Core, message: e.to_string() },
+              }
+          }
           Err(ExportError::BundleTooLarge { bytes, max }) => Response::BundleTooLarge { bytes, max },
           Err(ExportError::ChainInvalid) => protocol_reject("cannot export: memory chain does not verify"),
           Err(ExportError::EmptySelection) => protocol_reject("empty selection"),
@@ -1664,8 +1693,22 @@ Steps:
           other => panic!("App BrainVerifyingKey should succeed, got {other:?}"),
       }
   }
+
+  /// NEW-A characterization (no socket): the wire frame JSON-ESCAPES the already-JSON .airmem, so
+  /// escaping overhead can push an under-MAX_EXPORT_BYTES bundle over MAX_FRAME. A `.airmem` text just
+  /// under the 30 MiB core belt, once wrapped in `Response::Bundle` and serialized, exceeds the 32 MiB
+  /// frame — which is exactly why `export_dispatch` bounds the SERIALIZED length, not the raw text.
+  #[test]
+  fn wire_frame_escaping_can_overflow_a_sub_cap_bundle() {
+      use bossclawd_proto::{Response, MAX_FRAME};
+      // 30 MiB of quote/backslash-heavy JSON text (worst-case escaping — each byte doubles on the wire).
+      let text = "\\\"".repeat(30 * 1024 * 1024 / 2);
+      assert!(text.len() <= 30 * 1024 * 1024, "raw text is within the core belt");
+      let wire = serde_json::to_vec(&Response::Bundle(text)).unwrap();
+      assert!(wire.len() > MAX_FRAME, "escaped wire frame overflows MAX_FRAME → export_dispatch must refuse with BundleTooLarge, not a generic frame error");
+  }
   ```
-  Run (foreground): `cargo test -p bossclawd --test authz rung5`. Expected: pass.
+  Run (foreground): `cargo test -p bossclawd --test authz rung5 && cargo test -p bossclawd --test authz wire_frame`. Expected: both pass.
 
 - [ ] Commit: `git add crates/bossclawd-proto/src/lib.rs crates/bossclawd/Cargo.toml crates/bossclawd/src/engine/mod.rs crates/bossclawd/src/server.rs crates/bossclawd/tests/authz.rs && git commit -m "feat(rung5): App-only wire ops BrainVerifyingKey/SetBinding/ExportBundle + BundleTooLarge guard + bounded session-body reads"`
 
@@ -1896,7 +1939,7 @@ Steps:
   ```
   Add a `regen` helper gated on `std::env::var("AIRMEM_REGEN")` that authors each fixture from fixed keys (reuse Task 6's `valid_bundle` shape + the tamper transforms; `origin_mismatch` = flip `carried_origin` on a stamped item; `re_attribution` = swap the binding). Run once `AIRMEM_REGEN=1 cargo test -p bossclaw-bundle --test conformance`, then `cargo test -p bossclaw-bundle --test conformance` (reads committed files) — expected: 6 pass. Write `tests/vectors/README.md` (format version, Merkle A7 rules, "consumed by air-site verify-page CI, cross-repo, spec §8").
 
-- [ ] Add the Story-C whole-brain large-fixture test (notes + sessions + ingests) to `crates/bossclaw-core` tests, characterizing size + the `BundleTooLarge` bound. Append several `remember` notes + a `file_ingested` fixture (mirror the ingest setup already in `log.rs` tests) + a captured session, store a binding, then: (a) `export_bundle` over a modest select-all verifies green and `item_count` matches the selection; (b) `estimate_export_bytes` on a synthetically padded selection exceeds `MAX_EXPORT_BYTES` (assert the estimate crosses the bound — the daemon turns this into `BundleTooLarge`). Keep it hermetic (`open_log` + `MockEmbedder`). Run (foreground): `cargo test -p bossclaw-core story_c`. Expected: pass.
+- [ ] Add the Story-C whole-brain large-fixture test (notes + sessions + ingests) to `crates/bossclaw-core` tests, characterizing size + the `BundleTooLarge` bound. Append several `remember` notes + a REAL ingested file via the unix ingest path (mirror the `#[cfg(unix)]` ingest setup already in `log.rs` tests, so it lands in the `files` projection and `current_ingests()` includes it, carrying a `provenance{canonical_path, content_hash, grant_root}` block, ingest.rs:698-711) + a captured session, store a binding, then: (a) `export_bundle` over a modest select-all verifies green and `item_count` matches the selection; (b) `estimate_export_bytes` on a synthetically padded selection exceeds `MAX_EXPORT_BYTES` (assert the core pre-build estimate crosses the bound — the daemon turns this into `BundleTooLarge`); (c) NEW-B end-to-end: assert the serialized `.airmem` contains NONE of `canonical_path` / `content_hash` / `grant_root` (core discloses the ingest's `content["text"]` only, stripping the real provenance block). Keep it hermetic (`open_log` + `MockEmbedder`); the ingest arm is `#[cfg(unix)]` like the fold it mirrors. The AUTHORITATIVE wire-length belt (NEW-A: serialized `Response::Bundle` length vs `MAX_FRAME`, which the raw-text estimate cannot see because of JSON-in-JSON escaping) is characterized in Task 8's `wire_frame_escaping_can_overflow_a_sub_cap_bundle` test — this core test covers only the coarse pre-build estimate. Run (foreground): `cargo test -p bossclaw-core story_c`. Expected: pass.
 
 - [ ] Final exit gate (all foreground; each must be green):
   - `cargo clippy --workspace --all-targets -- -D warnings` (whole workspace — only here).
