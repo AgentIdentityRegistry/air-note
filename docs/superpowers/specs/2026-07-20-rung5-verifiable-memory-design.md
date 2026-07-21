@@ -66,8 +66,11 @@ One shared **Core** plus two thin story layers; the third story falls out free; 
   verify page at `agentidentityregistry.org/verify` (cross-repo: page + registry lookup live in
   `~/air-site`; format conformance vectors shared between repos, following the existing AIR conformance-
   vector pattern).
-- **Story C — trustable whole-brain backup**: free byproduct — "select everything" export. Named here so
-  its tests exist; no extra machinery.
+- **Story C — trustable whole-brain backup**: "select everything" export across notes + captured
+  sessions + ingested-file extracts (each via its §2.2 class). Dossier items are excluded in SP-V1 with
+  zero data loss today — Rung 4 ships dormant, so the class is empty by construction on any real brain
+  (plan review A1/C1; revisit when reflection dogfood turns them on). §8 carries a whole-brain
+  large-fixture test and export carries a typed `BundleTooLarge` size guard (§7).
 - **Story D — public timestamped claims**: publish ONE hash (the envelope's Merkle root) to the registry's
   public anchor stream (reusing the shipped `audit-anchors` externally-anchored pattern); the verify page
   upgrades date-vouching when it finds a pin.
@@ -239,8 +242,11 @@ HTML/JS/bidi-control payloads inert — pinned by §8 test rows, not left to imp
   C-NEW-1, A-N2).** For STAMPED items the verifier recomputes origin by running `is_external` over the
   disclosed, stamp-covered event bytes; any carried display label is cross-checked (`OriginMismatch{i}`).
   For SEAL-VOUCHED items the label is **exporter-asserted** — rendered with explicitly weaker wording
-  and visual weight ("labeled machine-derived by the exporter; not independently verified"), never with
-  stamped-item confidence. **H2's scope, stated plainly (C-NEW-1):** labels are trustworthy under an
+  and visual weight, never with stamped-item confidence — and the weaker-label copy is KIND-AWARE:
+  session → "captured session, content only; not independently verified"; ingest → "ingested file
+  extract; not independently verified"; dossier → "machine-derived by the exporter; not independently
+  verified" (plan review C5: the dossier phrasing must never render on a session/ingest — "machine-
+  derived" would be factually false there). **H2's scope, stated plainly (C-NEW-1):** labels are trustworthy under an
   honest recording daemon and against any third-party tampering; against a MALICIOUS brain-key holder —
   who can mint events with any origin field, or place arbitrary text in seal-vouched items — only H5
   survives, which is exactly why H5, not H2, is the invariant printed on every surface. Taxonomy honesty
@@ -306,7 +312,8 @@ event.
 ## §7 Error handling (specific, never vague)
 
 Export refusals: `ChainInvalid` (S4), `EmptySelection`, `BindingUnavailable` (no stored binding —
-app-side mint required first). Verify errors (enum, one per failure class): `SealInvalid`,
+app-side mint required first), `BundleTooLarge{bytes, max}` (typed pre-frame size refusal against the
+wire's 32 MiB `MAX_FRAME` — never a generic frame error after a wasted seal; plan review C2). Verify errors (enum, one per failure class): `SealInvalid`,
 `ItemStampInvalid{i}` (bad stamp OR stamp not by `manifest.brain_verifying_key`), `ItemHashMismatch{i}`,
 `TreeMismatch`, `BindingInvalid` (internal signature check), `BindingKeyMismatch`,
 **`BindingDidMismatch`** (C1), **`BindingHashMismatch`** (C-NEW-2: recompute `H(binding)` vs the sealed
