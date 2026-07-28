@@ -60,3 +60,15 @@ impl From<rusqlite::Error> for BossclawError {
         BossclawError::Store(e.to_string())
     }
 }
+
+impl From<bossclaw_canon::CanonError> for BossclawError {
+    fn from(e: bossclaw_canon::CanonError) -> Self {
+        use bossclaw_canon::CanonError as C;
+        match e {
+            C::Canonical(s) => BossclawError::Canonical(s),
+            C::Signature(s) => BossclawError::Signature(s),
+            C::Multibase(s) => BossclawError::Multibase(s),
+            C::Chain(s) => BossclawError::Chain(s),
+        }
+    }
+}

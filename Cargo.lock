@@ -718,9 +718,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bossclaw-canon"
+version = "0.0.1"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "multibase",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "bossclaw-core"
 version = "0.0.1"
 dependencies = [
+ "bossclaw-canon",
  "chrono",
  "ed25519-dalek",
  "fastembed",

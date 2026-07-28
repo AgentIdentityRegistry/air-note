@@ -21,7 +21,6 @@ mod chunk;
 pub mod conflict;
 pub mod embed;
 pub mod error;
-pub mod event;
 pub mod evolve;
 pub mod extract;
 #[cfg(feature = "fastembed")]
@@ -40,7 +39,6 @@ pub mod reason;
 pub mod recall;
 pub mod reconcile;
 pub mod reflect;
-pub mod sign;
 pub mod summarize;
 pub mod store;
 /// M6c Task 10: the live filesystem watcher + debounced self-driver. unix-only —
@@ -56,6 +54,10 @@ pub use actuator::{
 pub use chunk::chunk_text;
 pub use embed::{Embedder, MockEmbedder};
 pub use error::BossclawError;
+// The canonical-bytes/hash + Ed25519 signing primitives now live in the wasm-clean
+// `bossclaw-canon` leaf crate; re-export the modules so every `crate::event::…` /
+// `crate::sign::…` / `bossclaw_core::event::…` call site keeps compiling unchanged.
+pub use bossclaw_canon::{event, sign};
 pub use event::{Event, ModelMeta};
 pub use evolve::{EvolveReport, EvolveStatus};
 pub use reflect::ReflectReport;

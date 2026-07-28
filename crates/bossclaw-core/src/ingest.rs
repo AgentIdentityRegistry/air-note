@@ -711,11 +711,11 @@ fn file_ingested_content(
 }
 
 /// True iff `event` is externally-tainted (M5a, D5). The classifier the M6
-/// actuator's fail-closed lineage walk will consume; here it is the taint root +
-/// a tested predicate. Reads the single-sourced `EXTERNAL_ORIGIN` stamp.
-pub fn is_external(event: &Event) -> bool {
-    event.content.get("origin").and_then(|v| v.as_str()) == Some(crate::graph::EXTERNAL_ORIGIN)
-}
+/// actuator's fail-closed lineage walk consumes; the taint root + a tested predicate.
+/// Now lives in the wasm-clean `bossclaw-canon` leaf crate (single-sourced alongside
+/// `EXTERNAL_ORIGIN`); re-exported so `crate::ingest::is_external` and every call site
+/// keep resolving unchanged (zero behavior change).
+pub use bossclaw_canon::is_external;
 
 #[cfg(unix)]
 impl EventLog {

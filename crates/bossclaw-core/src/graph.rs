@@ -68,11 +68,12 @@ pub const REVOKE_EVENT_TYPE: &str = "revoke";
 pub const WRITE_GRANT_EVENT_TYPE: &str = "write_grant";
 /// The `event_type` discriminator for a folder-WRITE-revoke event (M6a). Ground-truth.
 pub const WRITE_REVOKE_EVENT_TYPE: &str = "write_revoke";
-/// The taint stamp written at `content["origin"]` of every `file_ingested` event
-/// (M5a, D4). Distinct from the `edges.origin` column (`"manual"`/`"machine"`):
-/// this marks external-origin content so the M6 lineage walk can fail closed.
-/// Single-sourced so the stamp site and the `is_external` classifier cannot drift.
-pub const EXTERNAL_ORIGIN: &str = "external";
+/// The taint stamp written at `content["origin"]` of external-origin content (M5a, D4).
+/// Distinct from the `edges.origin` column (`"manual"`/`"machine"`): this marks
+/// external-origin content so the M6 lineage walk can fail closed. Now lives (single-sourced
+/// alongside `is_external`) in the wasm-clean `bossclaw-canon` leaf crate; re-exported so
+/// `crate::graph::EXTERNAL_ORIGIN` and every call site keep resolving unchanged (zero value change).
+pub use bossclaw_canon::EXTERNAL_ORIGIN;
 
 /// The `event_type` discriminator for a `file_written` actuator event (M6a, T4).
 /// **Always Tier-B by construction** (spec L9/W6): `EventLog::execute_write` is the

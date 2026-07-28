@@ -1,0 +1,22 @@
+[package]
+name = "bossclaw-canon"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Canonical event bytes + Ed25519 hash-signing, extracted from bossclaw-core so the Rung-5 verifier can reproduce the engine's exact bytes on wasm32 without engine deps."
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+
+# ALL deps are wasm32-unknown-unknown clean; the verify side needs NO RNG (signing is
+# deterministic Ed25519). CONSENSUS-CRITICAL PINS (spec §2.1 C-NEW-3): serde_jcs +
+# unicode-normalization + the ed25519-dalek/multibase/sha2 encoding surface are exact-pinned
+# to the versions the log's historical events were signed under.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_jcs = "=0.1.0"
+unicode-normalization = "=0.1.25"
+sha2 = "=0.10.9"
+hex = "0.4"
+ed25519-dalek = "=2.2.0"
+multibase = "=0.9.2"
+thiserror = "1"

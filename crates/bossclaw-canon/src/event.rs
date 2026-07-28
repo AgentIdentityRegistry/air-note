@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::BossclawError;
+use crate::error::CanonError;
 
 /// Provenance for a model-derived (Tier-B) event. `source_event_ids` MUST be
 /// non-empty for Tier-B events (enforced at append, see `EventLog::append`).
@@ -52,23 +52,23 @@ pub struct Event {
 /// Produce the canonical JSON bytes of an event per the spec §5.2 recipe:
 /// serialize → strip `hash` + `signature` → NFC-normalize every string →
 /// RFC 8785 JCS via `serde_jcs`. Mirrors `air-rs/signing.rs::canonical_bytes`.
-pub fn canonical_bytes(event: &Event) -> Result<Vec<u8>, BossclawError> {
+pub fn canonical_bytes(event: &Event) -> Result<Vec<u8>, CanonError> {
     let mut value = serde_json::to_value(event)
-        .map_err(|e| BossclawError::Canonical(format!("event to_value: {e}")))?;
+        .map_err(|e| CanonError::Canonical(format!("event to_value: {e}")))?;
     if let serde_json::Value::Object(ref mut map) = value {
         map.remove("hash");
         map.remove("signature");
     }
     nfc_normalize(&mut value);
-    serde_jcs::to_vec(&value).map_err(|e| BossclawError::Canonical(format!("serde_jcs: {e}")))
+    serde_jcs::to_vec(&value).map_err(|e| CanonError::Canonical(format!("serde_jcs: {e}")))
 }
 
 /// Compute the 32-byte chain hash: `SHA256(prev_hash_bytes ‖ canonical_bytes)`.
-pub fn compute_hash(event: &Event) -> Result<[u8; 32], BossclawError> {
+pub fn compute_hash(event: &Event) -> Result<[u8; 32], CanonError> {
     let prev = hex::decode(&event.prev_hash)
-        .map_err(|e| BossclawError::Chain(format!("prev_hash not hex: {e}")))?;
+        .map_err(|e| CanonError::Chain(format!("prev_hash not hex: {e}")))?;
     if prev.len() != 32 {
-        return Err(BossclawError::Chain(format!(
+        return Err(CanonError::Chain(format!(
             "prev_hash must be 32 bytes, got {}",
             prev.len()
         )));
@@ -88,4 +88,15 @@ fn nfc_normalize(value: &mut serde_json::Value) {
         serde_json::Value::Array(arr) => arr.iter_mut().for_each(nfc_normalize),
         _ => {}
     }
+}
+
+/// The taint stamp written at `content["origin"]` of every externally-sourced event (remember()
+/// notes, captured sessions, file ingests). Single-sourced so the stamp site and the `is_external`
+/// classifier can never drift. (Moved from graph.rs:75, zero value change.)
+pub const EXTERNAL_ORIGIN: &str = "external";
+
+/// True iff `event` is externally-tainted — reads the single-sourced `EXTERNAL_ORIGIN` stamp.
+/// (Moved from ingest.rs:716, zero behavior change.)
+pub fn is_external(event: &Event) -> bool {
+    event.content.get("origin").and_then(|v| v.as_str()) == Some(EXTERNAL_ORIGIN)
 }
