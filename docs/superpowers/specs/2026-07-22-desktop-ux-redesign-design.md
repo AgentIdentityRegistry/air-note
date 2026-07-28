@@ -1,15 +1,16 @@
 # Desktop UX Redesign — tray-first presence + the reading room — Design
 
-**Status:** Rev 2 — Rev 1 owner-approved conversationally 2026-07-22 (visual brainstorm; mockups in
-`2026-07-22-ux-mockups/`); independently reviewed 2026-07-22: architect **SOUND-WITH-CHANGES**
-(3 Blocker / 5 Major / 4 Minor — every finding source-verified with file:line evidence) + critic
-**REWORK** (4 Critical / 6 Major / 4 Minor + gap list). ALL findings folded into this revision
-(changelog §11). Convergent findings (both reviewers independently): the empty-Topics default trap,
-the orphaned write-powers retirement, the op undercount, the phantom CI, the wrong room inventory —
-per the house convergence rule, all treated as certain. Owner rulings 2026-07-22: **powers → compact
-Settings section** (everything stays revocable); **CSS-only glass** (no private API — Mac App Store
-stays possible); **Quit = app only, the brain keeps running**. Awaiting reviewer re-verification +
-file-level owner review before per-sub-project planning.
+**Status:** Rev 3 — Rev 1 owner-approved conversationally 2026-07-22; review round 1 (architect
+SOUND-WITH-CHANGES 3B/5M/4m + critic REWORK 4C/6M/4m) → Rev 2 folded all 26. Re-verification round
+(same reviewers): **all 26 confirmed resolved**; architect verified the Rev-2 Pause mechanism
+implementable exactly as written; the round produced 1 convergent Blocker (Pause gated only one of
+capture's two entry points) + 7 smaller items — then the owner ruled **"no pause option at all"
+(2026-07-22)**, which removes the Pause feature entirely and moots the Blocker and three siblings;
+the remaining items are folded here (changelog §11). Final verdicts: architect SOUND-WITH-CHANGES,
+critic APPROVE-WITH-CHANGES — both plan-ready with these folds; findings 26 → 8 → 0 (4 mooted by
+removal, 4 folded). Owner rulings on record: powers → compact Settings section; CSS-only glass
+(premise under re-verification — §1 L2 spike); Quit = app only, brain keeps running; **no Pause**.
+Awaiting file-level owner review before per-sub-project planning.
 **Build queue (owner, 2026-07-22): design now, BUILD AFTER Rung 5 SP-V1** (which itself gates on the
 R4-A dogfood verdict after Sun 2026-07-27). Sub-project plans are written when their build slot
 arrives, never earlier.
@@ -29,10 +30,11 @@ Replace the accumulated multi-room desktop app with **three surfaces** — a men
 two-pane reading room, one Settings page — governed by two laws (§1). Rev 1 claimed "a wrong UI
 decision here costs pixels, never memories"; review proved that sentence false and it is struck:
 **several decisions in this spec govern memories, consents, and file-writing powers** — each such
-decision is called out inline with its safety treatment. Daemon posture, stated honestly: **no
-existing daemon behavior changes**, plus (a) six new read-only App-only wire ops (§6), (b) ONE new
-engine behavior — the durable Pause (§2a), designed precisely so the UI can never touch the consent
-machinery — and (c) a derived read-shape addition to the pages projection (updated-at + count).
+decision is called out inline with its safety treatment. Daemon posture, stated honestly and now
+fully clean (the Pause removal restored it): **zero daemon behavior changes**, plus (a) five new
+read-only App-only wire ops (§6), (b) one EXISTING write op surfaced through tauri/TS
+(`RetireMemory` — it has no binding today), and (c) a derived read-shape addition to the pages
+projection (updated-at + count).
 
 ## §1 The two laws (enforced by CI that SP-U0 builds first)
 
@@ -56,6 +58,14 @@ machinery — and (c) a derived read-shape addition to the pages projection (upd
   swept in §5); the colors grep extends to `.ts` as well as `.tsx`. Light/dark follow the system;
   the constellation is dark-native. Visual reference: the committed mockups, EXCEPT where this spec
   supersedes them (the spec wins over the mockups on tray contents — §2 is authoritative).
+  **Design risk + premise check (re-verification NEW-5):** CSS-only glass may not deliver the
+  perceived depth the trigger critique asked for — especially in the tray panel, where every native
+  menu-bar extra blurs the wallpaper behind it. AND the ruling's premise is under challenge: the
+  vibrancy library in this workspace's own lockfile uses public AppKit, suggesting true vibrancy may
+  NOT require the private API (that flag may only gate transparent windows). SP-U0 carries a cheap
+  spike: build one vibrancy panel via Tauri's `windowEffects` and settle the fact. If public-API
+  vibrancy works, the glass ruling is RE-PRESENTED to the owner with true facts before SP-U2
+  hardcodes anything; if the private API really is required, the CSS-only ruling stands as made.
 
 ## §2 Surface 1 — the menu-bar presence
 
@@ -63,15 +73,17 @@ The app process owns a template (monochrome) menu-bar icon derived from the gold
 (prerequisite: the `feat-app-icon` branch lands first; tray needs the `tray-icon` + `image-png`
 cargo features — two flags, verified). Clicking opens one glass panel:
 
-1. Heartbeat, three states: `🟢 On — remembering as you work` · `⏸ Paused — not remembering right
-   now` (daemon reachable, remembering off or paused) · `🌙 Asleep — open AIR Agent to wake it`
-   (daemon unreachable).
+1. Heartbeat, three states: `🟢 On — remembering as you work` · `⏸ Off — not remembering right now`
+   (daemon reachable, remembering switched off; the line refers to REMEMBERING only — other
+   consented loops carry their own labeled switches and are unaffected) · `🌙 Asleep — open AIR
+   Agent to wake it` (daemon unreachable).
 2. Vitals: memory count + last night's tidy report in plain words — served by the new `Vitals` read
    op (§6; the digest is engine-internal today and reachable only inside Snapshot — verified).
 3. Search → opens the reading room pre-filtered.
-4. Switch chips: *Remember* ✓ · *Night tidy* ✓ · *⏸ Pause 1h* (§2a). Chips flip only
-   already-consented flags via the existing App-only ops; a first-ever enable still routes through
-   the full consent modal. The dropdown is never a consent surface.
+4. Switch chips: *Remember* ✓ · *Night tidy* ✓. Chips flip only already-consented flags via the
+   EXISTING App-only ops with today's exact semantics — byte-identical to the Settings toggles, no
+   new machinery (§8 pins the parity). A first-ever enable still routes through the full consent
+   modal. The dropdown is never a consent surface. **There is NO pause chip (owner ruling, §2a).**
 5. Recent saves — **privacy-first (critic M7):** by default a COUNT + relative time ("3 saves in the
    last hour"), never content; click-to-reveal shows titles; a persisted "Show recent saves"
    preference (default OFF) can keep titles visible. Rationale: titles are verbatim first-prompt
@@ -86,23 +98,19 @@ clearly-worded *Stop the brain* control lives in Settings' danger zone for a ful
 stated: with the app quit, the daemon runs with NO indicator (that is the North-Star state); the
 presence returns on next launch. Login-item autostart and Dock-icon policy are §10 plan questions.
 
-### §2a Pause — a first-class engine feature (forced by critic Critical 1+2; Rev 1's mapping is DISQUALIFIED)
+### §2a No Pause — decision record (owner ruling 2026-07-22)
 
-Review traced Rev 1's "UI-side timed disable+re-enable" to permanent, silent memory loss: re-enabling
-capture REWRITES the forward-only window (`capture_enabled_at`) and SPENDS the one-time backfill
-consent (`backfill_consented: false` on disable — engine's own test: "forward-only window moves to
-re-enable"), destroying the paused hour AND the entire in-flight 30-day backfill; and a UI-side timer
-dies with the app, leaving remembering off indefinitely. Therefore:
-
-- Pause is a **new engine op** (`SetPause{until}` — App-only): a durable, signed `pause_until`
-  deadline the **daemon itself enforces and auto-expires** — it gates the capture sweeper while
-  active and **never touches** `capture_enabled` / `capture_enabled_at` / `backfill_consented`.
-  Survives app quit and daemon restart; hard maximum 8 hours; the tray offers 1h.
-- Scope, stated in the panel's own copy: Pause stops **remembering new activity** only ("new
-  activity won't be remembered until 15:00 — summaries and file automations are unaffected; their
-  own switches are in Settings"). No hidden couplings.
-- Tests (§8): pause → sweep skips; expiry → resumes with the ORIGINAL window and backfill state
-  byte-untouched; app-death during pause → daemon still expires it.
+**There is no pause feature.** The history matters, so it is recorded: Rev 1 proposed a casual
+"Pause 1h" as a UI-side toggle timer; review proved that mapping would permanently spend the
+one-time backfill consent and move the forward-only capture window (silent memory loss), and that a
+UI-side timer dies with the app. Rev 2 replaced it with a durable engine `SetPause`; re-verification
+then found it gated only one of capture's TWO entry points (the periodic sweep but not the
+SessionEnd poke — the primary path), and that "what happens to the paused hour" (defer vs drop) was
+an unstated product semantics fork. Presented with that fork, the owner ruled: **no pause option at
+all.** Consequences: no `SetPause` op, no new engine behavior anywhere in this redesign; a user who
+wants to stop remembering uses the *Remember* switch, whose EXISTING deliberate semantics are
+already privacy-honest (the off-period is never captured — the engine's designed forward-only
+window; re-enabling does not backfill the gap, and the switch's copy says so plainly).
 
 ## §3 Surface 2 — the reading room
 
@@ -166,12 +174,19 @@ settings (library/memory/review/mandates live inside the Brain hub).
 consent switches in plain English — *Remembering*, *Night tidy-up*, **"Keep summaries fresh"** (the
 summary loop's plain-English switch — review Blocker: it must exist and must explain when a
 summarizer isn't set up yet: "needs a local model or cloud assist") — · Cloud assist (existing blunt
-modal + banner) · Language pack (the embedding model — not UI localization; copy will say so) ·
+modal + banner) · **"Notice when you've saved two versions"** (the plain-English switch for the
+contradiction-detection consent — added per re-verification: without it the §3 disagreement card is
+unreachable, the same default-off-flag trap the summaries switch fixes; SP-U0 carries a one-time
+audit of EVERY default-off engine flag against this Settings inventory so the whole class is closed,
+not the instance) · Language pack (the embedding model — not UI localization; copy will say so) ·
 **"What AIR can touch"** (owner ruling — the powers section): folder grants (list/add/revoke),
 per-folder write permission (with its existing proposals coupling), the automation kill-switch +
 standing-automation list + revoke, write history + undo, and the pending-review queue with the
 existing loud-confirmation apply/decline. Nothing live is ever headless: every consent granted
-anywhere remains revocable here. · *Stop the brain* + reset (danger zone).
+anywhere remains revocable here. · *Stop the brain* + reset (danger zone). **Stop the brain is NOT
+a daemon-shutdown op** (none exists, and the daemon's lifecycle deliberately belongs to the service
+manager — re-verification N2): it turns every switch off in one action, with honest copy ("the brain
+stops doing anything until you turn something back on"); the daemon idles. Zero new machinery.
 
 **Data, stated (critic gap):** retiring the inbox room removes the UI only — archived conversations
 remain on disk untouched and unsurfaced (recorded here so it is a decision, not an accident).
@@ -187,11 +202,14 @@ stays; the conversations source is removed, a topics source added; budgeted as i
 **Engine surface, enumerated honestly (was "2-3", verified ≈ six + one behavior):** new App-only
 READ ops — `ListTopics` (counts + updated-at; the pages projection gains derived updated-at/count —
 a read-shape change, named here), `TopicPage` (page + sources grouped by time), `TopicNeighbors`
-(constellation), `Vitals` (memory count + tidy digest line), `RecentSaves`; plus surfacing the
-EXISTING `RetireMemory` wire op through tauri + TS (it has no binding today). Each new read op ships
-with a daemon-side sanitizer (the `sanitize_conflict_row` precedent) so retired/tombstoned content
-cannot leak, an allowlist entry (App-only), and socket tests. The ONE write/behavior addition is
-`SetPause` (§2a). Conflict resolution stays out (view-only card, §3).
+(constellation), `Vitals` (memory count + tidy digest line), `RecentSaves` — **five new read ops**
+— plus surfacing the EXISTING `RetireMemory` write op through tauri + TS (it has no binding today;
+re-verification confirmed passage-retire is live-dispatched, so "forget this" works on session
+cards too). Each new read op ships with a daemon-side sanitizer (the `sanitize_conflict_row`
+precedent) so retired/tombstoned content cannot leak, an allowlist entry (App-only), and socket
+tests. There is NO new write op and NO new engine behavior (§2a). Conflict resolution stays out
+(view-only card, §3). The egress banner's data feed (today a per-panel 5s poll) hoists into a
+shell-level provider — a named SP-U1 task, not a discovered one (re-verification N4).
 
 **Tray mechanics:** Tauri v2 `tray-icon` + `image-png` features (additive); template icon from
 `app-icon.svg` (prerequisite: that branch merges first); the panel is a small always-on-top window
@@ -200,11 +218,16 @@ interaction question).
 
 ## §7 Sub-projects + order (restructured per review)
 
-- **SP-U0 — plumbing + gates first** (new; executor note from review): the desktop **CI lane**
-  (vitest + eslint --max-warnings 0 + colors grep incl. `.ts` + jargon linter) and ALL §6 engine
-  work (six read ops + sanitizers + `SetPause` + socket tests + the pages read-shape change). Lands
-  before any UI change, so every later commit is provably green and the UI is never built against
-  invented op shapes.
+- **SP-U0 — plumbing + gates first** (new; executor note from review): opens with a **written
+  op-shape review** — the five read-op shapes drafted against §3's numeric layout as the consumer
+  contract, reviewed BEFORE implementation (re-verification NEW-6: U0 ships ops with no consumer,
+  so the layout serves as the contract) — then the desktop **CI lane** (vitest + eslint
+  --max-warnings 0 + colors grep incl. `.ts` + jargon linter), ALL §6 engine work (five read ops +
+  sanitizers + socket tests + the pages read-shape change + the `RetireMemory` binding), the
+  **default-off-flag audit** (every `ConfigFlag` vs the §5 switch inventory, verdict recorded per
+  flag — closes the unreachable-feature class), and the **vibrancy spike** (§1 L2). Lands before
+  any UI change, so every later commit is provably green and the UI is never built against invented
+  op shapes.
 - **SP-U1 — the reading room + Settings + retirement**: new shell, sidebar, topic pages (reading
   view, numeric bounds), the three empty states, Settings incl. the powers section, string table +
   error-translation boundary + copy audit, retirement/re-home/sweep per §5. Commit rule (architect
@@ -222,8 +245,10 @@ week (expected DOWN — the North Star is fewer visits) and tray-opens per week 
 
 - All engine-call failures render through the §1 translation boundary — plain-English inline states,
   never raw `String(e)`, never modals. Daemon-unreachable states per §2.
-- Tests: the §2a pause suite (window + backfill byte-untouched; daemon-side expiry; app-death case);
-  numeric calm-screen assertions (§3 bounds as rendered-node/height checks on a large fixture);
+- Tests: tray-chip parity (the *Remember*/*Night tidy* chips call byte-identically the same ops as
+  the Settings toggles — no divergent semantics can ever ship); the conflict-switch + disagreement-
+  card states; numeric calm-screen assertions (§3 bounds as rendered-node/height checks on a large
+  fixture);
   privacy default (recent saves show counts, not titles, until revealed); banner-presence test on
   every §3 surface with cloud on; the three empty states; jargon linter + colors grep in the new CI
   lane; socket tests for every new op incl. guest-refusal; constellation floor benchmark (§4);
@@ -235,6 +260,9 @@ week (expected DOWN — the North Star is fewer visits) and tray-opens per week 
 ## §9 Non-goals / deferred
 
 - In-app conflict RESOLUTION (view-only card ships; resolving stays in Claude Code — revisit later).
+  `Unretire` likewise stays Claude-Code-only (re-verification open question, resolved: the powers
+  section covers write-capability revocation; memory-level undo lives where resolution lives).
+- A pause feature of any kind (owner ruling — §2a decision record).
 - AIR Note inbox slot in the tray; Windows/Linux tray + glass parity (labeled seams).
 - Full i18n/localization (strings are keyed and Korean-ready; per-locale banned lists later; the
   "language pack" naming collision with the embedding model gets fixed copy now, §5).
@@ -248,13 +276,27 @@ week (expected DOWN — the North Star is fewer visits) and tray-opens per week 
 - Exact op shapes/names for the six read ops + `SetPause`, verified against source at SP-U0 plan
   time (never invented — house rule).
 - Dock-icon policy while the window is closed; login-item autostart for the tray presence.
-- Final pause copy (the §2a scope sentence), and whether 1h/8h are the right presets.
 - String-table module location; how tauri-side dialog strings join the linter corpus (the daemon
   side is covered by the §1 mapper).
-- Reference machine definition for the §4 floors.
+- Reference machine for the §4 floors = the oldest supported target (base M1, 8 GB), NOT the
+  fastest available machine (re-verification: a floor measured on the best machine isn't a floor);
+  exact definition pinned at SP-U3 plan time.
 
 ## §11 Changelog
 
+- **Rev 3 (2026-07-22):** folded the re-verification round — all 26 round-1 findings confirmed
+  resolved (architect verified §2a's mechanism implementable exactly as written before it was
+  removed). The round's 1 convergent Blocker (Pause gated the sweep but not the SessionEnd poke —
+  the primary capture path) + its siblings (defer-vs-drop semantics, clock skew, the copy fork)
+  were MOOTED by the owner ruling **"no pause option at all"** → §2a is now a decision record; the
+  tray keeps Remember/Night-tidy chips with byte-identical existing semantics (parity-tested).
+  Folded: A-N2 Stop-the-brain = all-switches-off, no op; A-N3 op arithmetic (five new reads + one
+  surfaced write binding); A-N4 banner provider hoist named; C-NEW-4 conflict switch in §5 + the
+  SP-U0 default-off-flag audit (closes the unreachable-feature class); C-NEW-5 L2 design-risk line
+  + vibrancy premise spike (re-present to owner if public-API vibrancy works); C-NEW-6 U0 opens
+  with the op-shape review against §3-as-contract; reference-machine floor defined as oldest
+  supported target. Final verdicts: architect SOUND-WITH-CHANGES, critic APPROVE-WITH-CHANGES —
+  plan-ready with these folds; findings 26 → 8 → 0.
 - **Rev 2 (2026-07-22):** folded independent review round 1 — architect SOUND-WITH-CHANGES (A1
   sources-orphan → powers section; A2 mandates/review orphan → owner ruling: compact Settings
   powers section, everything revocable; A3 no app-side topic path + evolve force-off → §6 op
