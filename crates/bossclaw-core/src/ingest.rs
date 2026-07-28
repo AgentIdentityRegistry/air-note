@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-// `Event` is used by the cross-platform `is_external` classifier, so it stays
+// `Event` is used by the cross-platform `ground_truth_*` constructors, so it stays
 // un-gated. `sha2` (content hashing) and `EventLog` (the orchestrator impl) are
 // consumed ONLY by the `#[cfg(unix)]` ingest path — gate them so the Windows
 // build has no unused imports (the walk, hence the orchestrator, is unix-only).

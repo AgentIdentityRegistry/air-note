@@ -52,6 +52,10 @@ pub struct Event {
 /// Produce the canonical JSON bytes of an event per the spec §5.2 recipe:
 /// serialize → strip `hash` + `signature` → NFC-normalize every string →
 /// RFC 8785 JCS via `serde_jcs`. Mirrors `air-rs/signing.rs::canonical_bytes`.
+///
+/// # Errors
+/// * [`CanonError::Canonical`] if the event cannot be serialised to a JSON value or
+///   the JCS (RFC 8785) canonicalisation fails.
 pub fn canonical_bytes(event: &Event) -> Result<Vec<u8>, CanonError> {
     let mut value = serde_json::to_value(event)
         .map_err(|e| CanonError::Canonical(format!("event to_value: {e}")))?;
@@ -64,6 +68,10 @@ pub fn canonical_bytes(event: &Event) -> Result<Vec<u8>, CanonError> {
 }
 
 /// Compute the 32-byte chain hash: `SHA256(prev_hash_bytes ‖ canonical_bytes)`.
+///
+/// # Errors
+/// * [`CanonError::Chain`] if `prev_hash` is not exactly 32 hex-encoded bytes.
+/// * [`CanonError::Canonical`] if canonical-byte production fails (see [`canonical_bytes`]).
 pub fn compute_hash(event: &Event) -> Result<[u8; 32], CanonError> {
     let prev = hex::decode(&event.prev_hash)
         .map_err(|e| CanonError::Chain(format!("prev_hash not hex: {e}")))?;
