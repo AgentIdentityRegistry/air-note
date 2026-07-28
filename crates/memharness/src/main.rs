@@ -518,9 +518,18 @@ fn reflect_gate(args: ReflectGateArgs) -> anyhow::Result<()> {
     let note_id = drive_rt
         .block_on(engine.remember(true, "reflect-gate: scripted seed memory to retire".to_string()))
         .map_err(|e| anyhow::anyhow!("seed remember: {e}"))?;
-    drive_rt
-        .block_on(engine.retire_memory(note_id))
-        .map_err(|e| anyhow::anyhow!("scripted retire: {e}"))?;
+    // The engine wrapper's `retire_memory` reads `is_onboarded_local()` — the DESKTOP's real
+    // onboarding state, which the isolated gate brain never has (first live run found this).
+    // Retire through the harness's asserted-onboarded log handle instead, the same trust pattern
+    // as the `seed_miss` block below (minting an identity here would add machinery to a measurement).
+    drive_rt.block_on(async {
+        let log = engine.get_or_open(true).await.map_err(|e| anyhow::anyhow!("open log: {e}"))?;
+        tokio::task::spawn_blocking(move || log.retire_memory(&note_id, None))
+            .await
+            .map_err(|e| anyhow::anyhow!("scripted retire join: {e}"))?
+            .map_err(|e| anyhow::anyhow!("scripted retire: {e}"))?;
+        anyhow::Ok(())
+    })?;
     drive_rt.block_on(async {
         let log = engine.get_or_open(true).await.map_err(|e| anyhow::anyhow!("open log: {e}"))?;
         for q in &miss_queries {
