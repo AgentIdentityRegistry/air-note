@@ -149,4 +149,16 @@ mod tests {
         let s = String::from_utf8(canonical_json(&a.manifest).unwrap()).unwrap();
         assert!(s.find("binding_hash").unwrap() < s.find("brain_verifying_key").unwrap(), "JCS sorts keys");
     }
+    #[test]
+    fn seal_vouched_item_round_trips() {
+        let mut a = sample();
+        a.items = vec![AirmemItem {
+            leaf: "12".repeat(32), class: ItemClass::SealVouched, kind: "session".into(),
+            event_bytes: None, signature: None, carried_origin: None,
+            content: Some("full transcript text".into()),
+            display: Some(serde_json::json!({"when": "2026-07-20", "source": "session"})),
+        }];
+        let back: Airmem = serde_json::from_slice(&canonical_json(&a).unwrap()).unwrap();
+        assert_eq!(a, back);
+    }
 }

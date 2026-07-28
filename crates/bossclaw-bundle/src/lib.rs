@@ -4,4 +4,4 @@
 
 pub mod format;
 
-pub use format::{Airmem, AirmemItem, Binding, BindingPayload, ItemClass, Manifest, FORMAT_VERSION};
+pub use format::{Airmem, AirmemItem, Binding, BindingPayload, ItemClass, Manifest, canonical_json, FORMAT_VERSION};
