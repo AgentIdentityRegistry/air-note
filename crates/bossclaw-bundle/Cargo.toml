@@ -1,0 +1,17 @@
+[package]
+name = "bossclaw-bundle"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Build + verify of the Rung-5 .airmem signed memory bundle. Depends on bossclaw-canon ONLY (never the engine)."
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+
+[dependencies]
+bossclaw-canon = { path = "../bossclaw-canon" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_jcs = "=0.1.0"
+sha2 = "=0.10.9"
+hex = "0.4"
+multibase = "=0.9.2"
+thiserror = "1"

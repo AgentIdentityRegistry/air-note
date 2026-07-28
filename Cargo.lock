@@ -718,6 +718,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bossclaw-bundle"
+version = "0.0.1"
+dependencies = [
+ "bossclaw-canon",
+ "hex",
+ "multibase",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "bossclaw-canon"
 version = "0.0.1"
 dependencies = [
