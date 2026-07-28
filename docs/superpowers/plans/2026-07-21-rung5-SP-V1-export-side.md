@@ -787,6 +787,11 @@ Steps:
 
 ## Task 6 — `verify`: resolver seam + L1 checklist + tamper matrix + forgery + kind-aware labels + L2
 
+> **CARRY-FORWARD from the Task 2 quality review (2026-07-29) — three items to enforce HERE, not before:**
+> 1. **`class↔field-set` invariant** — the flat `AirmemItem` type permits illegal combinations. Verify MUST reject: `Stamped` ⟹ `event_bytes`+`signature` PRESENT and `content`/`display` ABSENT; `SealVouched` ⟹ the inverse (`content` present, `event_bytes`/`signature`/`carried_origin` absent). Add a `Malformed{detail}` case + a tamper-matrix row for each violation. Also enforce kind↔class: `note`⟹Stamped, `session`/`ingest`/`dossier`⟹SealVouched.
+> 2. **`deny_unknown_fields`** — add `#[serde(deny_unknown_fields)]` to `Manifest`, `Binding`, `BindingPayload`, `AirmemItem` in `format.rs` AS PART OF THIS TASK, coupled to a **canonicalize-FROM-STRUCT** verify strategy (re-serialize the parsed struct via `canonical_json`, never trust the received byte stream), so an injected field cannot ride under the seal. (Deferred from Task 2 because its correctness is coupled to this verify strategy.)
+> 3. **NFC-normalization decision for `canonical_json`** — `bossclaw-canon::canonical_bytes` NFC-normalizes before JCS; `bundle::canonical_json` does NOT. For SP-V1 + SP-V2 this is byte-identical-by-construction (same crate, incl. the WASM verifier), so **no code change is required now**; but record explicitly in a `verify.rs` doc comment that `.airmem` manifest/binding canonicalization is JCS-only (no NFC) and same-crate-verify-only, and that a future FOREIGN verifier (C2PA/VC/SCITT lift, §9 non-goal) must revisit. Make it a conscious documented choice, not an accident.
+
 The heart of the spec (§2.5 L1/L2, §7 error enum, §8 tamper matrix, §3-H2 kind-aware labels). Offline, fail-closed, one bad byte = ❌. The resolver seam is created FIRST (folded from the old Task 7).
 
 **Files:**
