@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AIR Agent — Topic Page: Reading vs Constellation</title>
+<style>
+  body { font-family: -apple-system, "SF Pro Text", system-ui, sans-serif; margin: 0; padding: 24px; background: #f4f4f7; color: #1b1b1f; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: #6b6b74; margin: 0 0 22px; font-size: 14px; }
+  .card { background: #fff; border-radius: 16px; padding: 16px; margin-bottom: 22px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+  .card h3 { margin: 12px 0 4px; font-size: 16px; }
+  .card > p { margin: 0; color: #55555e; font-size: 13.5px; }
+  .badge { display: inline-block; background: #1b1b1f; color: #fff; border-radius: 8px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+  .lg-wall { background: linear-gradient(135deg, #667eea 0%, #764ba2 40%, #f093fb 100%); border-radius: 14px; padding: 20px; display: flex; justify-content: center; }
+  .lg-win { width: 100%; max-width: 480px; border-radius: 16px; overflow: hidden; background: rgba(255,255,255,0.62); backdrop-filter: blur(28px) saturate(180%); -webkit-backdrop-filter: blur(28px) saturate(180%); border: 1px solid rgba(255,255,255,0.55); box-shadow: 0 12px 40px rgba(0,0,0,0.2); font-size: 11.5px; text-align: left; }
+  .lg-toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: rgba(255,255,255,0.35); }
+  .lg-toggle { margin-left: auto; display: flex; border-radius: 9px; overflow: hidden; border: 1px solid rgba(0,0,0,0.08); font-size: 10px; }
+  .lg-toggle span { padding: 3px 9px; }
+  .lg-toggle .on { background: rgba(255,255,255,0.85); font-weight: 700; }
+  .lg-page { padding: 14px 16px 16px; }
+  .lg-page h4 { margin: 0 0 2px; font-size: 15px; }
+  .lg-meta { color: rgba(27,27,31,0.5); font-size: 10.5px; margin-bottom: 10px; }
+  .lg-summary { padding: 10px 12px; border-radius: 12px; background: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.65); line-height: 1.5; }
+  .lg-grp { margin: 12px 0 4px; color: rgba(27,27,31,0.5); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+  .lg-src { margin: 5px 0; padding: 7px 9px; border-radius: 10px; background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6); }
+  .lg-tag { font-size: 9px; padding: 1px 6px; border-radius: 6px; background: rgba(102,126,234,0.18); color: #4c5cbb; font-weight: 600; margin-right: 4px; }
+  .lg-more { text-align: center; color: rgba(27,27,31,0.55); padding: 6px; font-size: 10.5px; }
+  .space { background: radial-gradient(ellipse at 60% 40%, #2b2350 0%, #171233 55%, #0d0a20 100%); }
+</style>
+</head>
+<body>
+<h1>Inside a topic — the page that never becomes a list</h1>
+<p class="subtitle">Same topic, two views, one toggle (top-right of the window). This is what fixes the "grows too big" problem.</p>
+
+<div class="card">
+  <span class="badge">Reading view — the default</span>
+  <div style="height:10px"></div>
+  <div class="lg-wall"><div class="lg-win">
+    <div class="lg-toolbar">‹ Topics
+      <div class="lg-toggle"><span class="on">☰ Read</span><span>✦ Constellation</span></div>
+    </div>
+    <div class="lg-page">
+      <h4>AIR Agent</h4>
+      <div class="lg-meta">34 memories · last updated last night</div>
+      <div class="lg-summary">
+        Your memory-keeper app. The export feature's design finished review this week; the overnight
+        tidy-up trial runs through Sunday. The app icon was finalized in gold. Next decision: reading
+        this scoreboard together on Sunday evening.
+      </div>
+      <div class="lg-grp">This week · 5</div>
+      <div class="lg-src"><span class="lg-tag">conversation</span>Export design approved after review</div>
+      <div class="lg-src"><span class="lg-tag">note</span>Trial week started — check results Sunday</div>
+      <div class="lg-more">▾ 3 more from this week</div>
+      <div class="lg-grp">July · 18 &nbsp;&nbsp;·&nbsp;&nbsp; Earlier · 11</div>
+      <div class="lg-more">collapsed — open on click</div>
+    </div>
+  </div></div>
+  <h3>The summary is the page; the memories are footnotes</h3>
+  <p>The living summary your brain already writes leads. Beneath it: only this week's handful, with older months collapsed into groups. 34 memories or 3,400 — the page stays one calm screen.</p>
+</div>
+
+<div class="card">
+  <span class="badge" style="background:#4c5cbb">Constellation view — one click away</span>
+  <div style="height:10px"></div>
+  <div class="lg-wall" style="background: linear-gradient(135deg,#1a1440 0%,#2d1b5e 60%,#4a2a7a 100%)"><div class="lg-win space" style="border-color: rgba(255,255,255,0.18)">
+    <div class="lg-toolbar" style="background: rgba(255,255,255,0.08); color:#ddd">‹ Topics
+      <div class="lg-toggle" style="border-color: rgba(255,255,255,0.2)"><span style="color:#bbb">☰ Read</span><span class="on" style="background:rgba(255,255,255,0.2); color:#fff">✦ Constellation</span></div>
+    </div>
+    <svg viewBox="0 0 480 300" style="width:100%; display:block">
+      <defs>
+        <radialGradient id="sun" cx="50%" cy="45%">
+          <stop offset="0%" stop-color="#ffd76e"/><stop offset="100%" stop-color="#b8860b"/>
+        </radialGradient>
+        <filter id="glow"><feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+      </defs>
+      <ellipse cx="240" cy="150" rx="150" ry="58" fill="none" stroke="rgba(255,255,255,0.14)" stroke-width="1"/>
+      <ellipse cx="240" cy="150" rx="210" ry="92" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>
+      <line x1="240" y1="150" x2="130" y2="105" stroke="rgba(255,215,110,0.35)" stroke-width="1"/>
+      <line x1="240" y1="150" x2="352" y2="118" stroke="rgba(255,215,110,0.35)" stroke-width="1"/>
+      <line x1="240" y1="150" x2="305" y2="212" stroke="rgba(255,215,110,0.3)" stroke-width="1"/>
+      <line x1="240" y1="150" x2="163" y2="205" stroke="rgba(255,215,110,0.3)" stroke-width="1"/>
+      <line x1="352" y1="118" x2="305" y2="212" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+      <line x1="130" y1="105" x2="163" y2="205" stroke="rgba(255,255,255,0.12)" stroke-width="1"/>
+      <circle cx="240" cy="150" r="26" fill="url(#sun)" filter="url(#glow)"/>
+      <text x="240" y="154" text-anchor="middle" font-size="10" font-weight="700" fill="#1b1207">AIR Agent</text>
+      <circle cx="130" cy="105" r="10" fill="#e8e2ff" filter="url(#glow)"/>
+      <text x="130" y="88" text-anchor="middle" font-size="8.5" fill="#cfc8f5">export design</text>
+      <circle cx="352" cy="118" r="12" fill="#ffe9b0" filter="url(#glow)"/>
+      <text x="352" y="99" text-anchor="middle" font-size="8.5" fill="#f2e2b5">trial week</text>
+      <circle cx="305" cy="212" r="8" fill="#d9f0ff" filter="url(#glow)"/>
+      <text x="305" y="232" text-anchor="middle" font-size="8.5" fill="#bfe0f5">gold icon</text>
+      <circle cx="163" cy="205" r="7" fill="#ffd6ec" filter="url(#glow)"/>
+      <text x="163" y="224" text-anchor="middle" font-size="8.5" fill="#f0c4de">Sunday review</text>
+      <circle cx="415" cy="180" r="5" fill="rgba(255,255,255,0.5)"/>
+      <text x="415" y="196" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.45)">Job search →</text>
+      <circle cx="62" cy="160" r="5" fill="rgba(255,255,255,0.5)"/>
+      <text x="62" y="176" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.45)">Family →</text>
+    </svg>
+    <div style="padding: 0 14px 12px; color: rgba(255,255,255,0.55); font-size: 10px">
+      Bigger and brighter = newer and more connected · faded dots at the edge = neighboring topics · click any star to read it
+    </div>
+  </div></div>
+  <h3>Your memory as a small galaxy</h3>
+  <p>The topic is the sun; its memories orbit it — sized by importance, placed by relatedness. Neighboring topics glow at the edges, so you can drift across your whole brain the way Obsidian's graph does. Same view zoomed all the way out = every topic as a constellation: the "giant globe."</p>
+</div>
+
+</body>
+</html>

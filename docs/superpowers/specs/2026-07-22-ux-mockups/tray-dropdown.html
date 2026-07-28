@@ -1,0 +1,99 @@
+<style>
+.lg-wall {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 40%, #f093fb 100%);
+  border-radius: 18px; padding: 28px 20px 34px; display: flex; justify-content: center;
+}
+.lg-panel {
+  width: 270px; border-radius: 22px; padding: 16px;
+  background: rgba(255, 255, 255, 0.55);
+  backdrop-filter: blur(28px) saturate(180%);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.6);
+  font-family: -apple-system, "SF Pro Text", system-ui, sans-serif;
+  font-size: 13px; color: #1b1b1f; text-align: left;
+}
+.lg-panel p { margin: 6px 0; }
+.lg-status { font-weight: 600; font-size: 14px; }
+.lg-dim { color: rgba(27,27,31,0.55); font-size: 12.5px; }
+.lg-search {
+  width: 100%; box-sizing: border-box; margin: 10px 0; padding: 8px 12px;
+  border-radius: 12px; border: 1px solid rgba(0,0,0,0.08);
+  background: rgba(255,255,255,0.65); font-size: 13px; color: #555;
+}
+.lg-row { display: flex; gap: 6px; margin: 10px 0 4px; }
+.lg-chip {
+  flex: 1; text-align: center; padding: 6px 4px; border-radius: 11px;
+  background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6);
+  font-size: 11.5px; font-weight: 500;
+}
+.lg-btn {
+  width: 100%; margin-top: 10px; padding: 9px 0; border: none; border-radius: 13px;
+  background: rgba(255,255,255,0.75); font-weight: 600; font-size: 13px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: default;
+}
+.lg-divider { height: 1px; background: rgba(0,0,0,0.07); margin: 10px 0; }
+</style>
+
+<h2>Click the 🪐 in the menu bar — what opens?</h2>
+<p class="subtitle">Same three sizes, now in plain English and glass. Click your pick.</p>
+
+<div class="cards">
+  <div class="card" data-choice="glanceable" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="lg-wall"><div class="lg-panel">
+        <p class="lg-status">🟢 On — remembering as you work</p>
+        <p class="lg-dim">Tidied up overnight: 2 topics refreshed</p>
+        <div class="lg-divider"></div>
+        <button class="lg-btn">Open AIR Agent</button>
+      </div></div>
+    </div>
+    <div class="card-body">
+      <h3>A — Glanceable</h3>
+      <p>A heartbeat and one line. Everything else lives in the window.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="control" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="lg-wall"><div class="lg-panel">
+        <p class="lg-status">🟢 On — remembering as you work</p>
+        <p class="lg-dim">1,204 memories · tidied 2 topics overnight</p>
+        <input class="lg-search" value="" placeholder="Search your memory…"/>
+        <div class="lg-row">
+          <span class="lg-chip">Remember ✓</span>
+          <span class="lg-chip">Night tidy ✓</span>
+          <span class="lg-chip">⏸ Pause 1h</span>
+        </div>
+        <div class="lg-divider"></div>
+        <button class="lg-btn">Browse your memory</button>
+      </div></div>
+    </div>
+    <div class="card-body">
+      <h3>B — Control center</h3>
+      <p>Vitals, the overnight report, search, and gentle switches. The window becomes something you rarely need.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="command" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="lg-wall"><div class="lg-panel">
+        <p class="lg-status">🟢 On · 1,204 memories</p>
+        <input class="lg-search" value="" placeholder="Search your memory…"/>
+        <p class="lg-dim">Recently saved: project decisions · yesterday's sessions</p>
+        <div class="lg-row">
+          <span class="lg-chip">Remember ✓</span>
+          <span class="lg-chip">Night tidy ✓</span>
+          <span class="lg-chip">⏸ Pause</span>
+        </div>
+        <p class="lg-dim">📬 Notes — coming soon</p>
+        <div class="lg-divider"></div>
+        <button class="lg-btn">Browse your memory</button>
+      </div></div>
+    </div>
+    <div class="card-body">
+      <h3>C — Mini command center</h3>
+      <p>B plus a recent-saves line and the future inbox slot. Richest, busiest.</p>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>AIR Agent — Window Layouts</title>
+<style>
+  body { font-family: -apple-system, "SF Pro Text", system-ui, sans-serif; margin: 0; padding: 24px; background: #f4f4f7; color: #1b1b1f; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: #6b6b74; margin: 0 0 22px; font-size: 14px; }
+  .card { background: #fff; border-radius: 16px; padding: 16px; margin-bottom: 22px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+  .card h3 { margin: 12px 0 4px; font-size: 16px; }
+  .card > p { margin: 0; color: #55555e; font-size: 13.5px; }
+  .lg-wall { background: linear-gradient(135deg, #667eea 0%, #764ba2 40%, #f093fb 100%); border-radius: 14px; padding: 20px; display: flex; justify-content: center; }
+  .lg-win { width: 100%; max-width: 460px; border-radius: 16px; overflow: hidden; background: rgba(255,255,255,0.6); backdrop-filter: blur(28px) saturate(180%); -webkit-backdrop-filter: blur(28px) saturate(180%); border: 1px solid rgba(255,255,255,0.55); box-shadow: 0 12px 40px rgba(0,0,0,0.2); font-size: 11.5px; text-align: left; }
+  .lg-titlebar { padding: 7px 10px; display: flex; gap: 5px; background: rgba(255,255,255,0.35); }
+  .lg-dot { width: 9px; height: 9px; border-radius: 50%; }
+  .lg-body { display: flex; min-height: 210px; }
+  .lg-side { width: 112px; padding: 10px 8px; background: rgba(255,255,255,0.28); border-right: 1px solid rgba(0,0,0,0.05); flex-shrink: 0; }
+  .lg-side p { margin: 3px 0; padding: 3px 6px; border-radius: 7px; }
+  .lg-side .sel { background: rgba(255,255,255,0.7); font-weight: 600; }
+  .lg-side .grp { color: rgba(27,27,31,0.45); font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em; margin-top: 8px; }
+  .lg-list { width: 120px; padding: 10px 8px; background: rgba(255,255,255,0.18); border-right: 1px solid rgba(0,0,0,0.05); flex-shrink: 0; }
+  .lg-list p { margin: 2px 0; padding: 4px 6px; border-radius: 7px; }
+  .lg-main { flex: 1; padding: 12px 14px; }
+  .lg-main h4 { margin: 0 0 6px; font-size: 14px; }
+  .lg-src { margin: 6px 0; padding: 7px 9px; border-radius: 10px; background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6); }
+  .lg-tag { font-size: 9px; padding: 1px 6px; border-radius: 6px; background: rgba(102,126,234,0.18); color: #4c5cbb; font-weight: 600; }
+  .lg-search-side { width: 92%; box-sizing: border-box; margin: 0 0 8px; padding: 5px 8px; border-radius: 9px; border: 1px solid rgba(0,0,0,0.07); background: rgba(255,255,255,0.65); font-size: 10.5px; color: #777; }
+  .lg-bigsearch { margin: 26px auto 14px; display: block; width: 78%; padding: 11px 16px; border-radius: 14px; border: 1px solid rgba(0,0,0,0.08); background: rgba(255,255,255,0.7); font-size: 14px; color: #666; text-align: left; }
+  .lg-cardrow { display: flex; gap: 8px; padding: 0 20px 20px; flex-wrap: wrap; }
+  .lg-topic { flex: 1; min-width: 100px; padding: 10px; border-radius: 12px; background: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.6); }
+  .badge { display: inline-block; background: #1b1b1f; color: #fff; border-radius: 8px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>The window — which shape is your reading room?</h1>
+<p class="subtitle">All three replace the endless list. Reply with a letter (remixes welcome).</p>
+
+<div class="card">
+  <span class="badge">A — Two-pane · classic Obsidian · my recommendation</span>
+  <div style="height:10px"></div>
+  <div class="lg-wall"><div class="lg-win">
+    <div class="lg-titlebar"><span class="lg-dot" style="background:#ff5f57"></span><span class="lg-dot" style="background:#febc2e"></span><span class="lg-dot" style="background:#28c840"></span></div>
+    <div class="lg-body">
+      <div class="lg-side">
+        <input class="lg-search-side" value="" placeholder="🔍 Search…"/>
+        <p class="grp">Topics</p>
+        <p class="sel">AIR Agent</p>
+        <p>Job search</p>
+        <p>Family</p>
+        <p class="grp">Saved by you</p>
+        <p>Notes</p>
+        <p class="grp">From your work</p>
+        <p>Conversations</p>
+        <p>Files</p>
+      </div>
+      <div class="lg-main">
+        <h4>AIR Agent</h4>
+        <p style="color:rgba(27,27,31,0.7)">Your memory-keeper app. Latest: the export feature design finished review; the overnight tidy-up trial runs through Sunday…</p>
+        <div class="lg-src"><span class="lg-tag">conversation</span> Yesterday — export design approved</div>
+        <div class="lg-src"><span class="lg-tag">note</span> Jul 20 — trial week started</div>
+      </div>
+    </div>
+  </div></div>
+  <h3>Sidebar of topics → click one → its page, with the memories behind it</h3>
+  <p>Familiar, browsable, calm. Search keeps a permanent home at the top of the sidebar. Grows into B naturally if topics ever number in the hundreds.</p>
+</div>
+
+<div class="card">
+  <span class="badge" style="background:#55555e">B — Three-pane · mail-style</span>
+  <div style="height:10px"></div>
+  <div class="lg-wall"><div class="lg-win">
+    <div class="lg-titlebar"><span class="lg-dot" style="background:#ff5f57"></span><span class="lg-dot" style="background:#febc2e"></span><span class="lg-dot" style="background:#28c840"></span></div>
+    <div class="lg-body">
+      <div class="lg-side">
+        <p class="sel">Topics</p>
+        <p>Notes</p>
+        <p>Conversations</p>
+        <p>Files</p>
+      </div>
+      <div class="lg-list">
+        <p class="sel">AIR Agent</p>
+        <p>Job search</p>
+        <p>Family</p>
+        <p>Health</p>
+        <p>Home projects</p>
+      </div>
+      <div class="lg-main">
+        <h4>AIR Agent</h4>
+        <p style="color:rgba(27,27,31,0.7)">Your memory-keeper app. Latest: export design finished…</p>
+        <div class="lg-src"><span class="lg-tag">conversation</span> Yesterday</div>
+      </div>
+    </div>
+  </div></div>
+  <h3>Sections → topic list → reading pane</h3>
+  <p>Scales to hundreds of topics; pays for that with more chrome on screen at all times.</p>
+</div>
+
+<div class="card">
+  <span class="badge" style="background:#55555e">C — Search-first · Spotlight-style</span>
+  <div style="height:10px"></div>
+  <div class="lg-wall"><div class="lg-win">
+    <div class="lg-titlebar"><span class="lg-dot" style="background:#ff5f57"></span><span class="lg-dot" style="background:#febc2e"></span><span class="lg-dot" style="background:#28c840"></span></div>
+    <input class="lg-bigsearch" value="" placeholder="🔍 Ask your memory anything…"/>
+    <div class="lg-cardrow">
+      <div class="lg-topic"><b>AIR Agent</b><br/><span style="color:rgba(27,27,31,0.55)">34 memories</span></div>
+      <div class="lg-topic"><b>Job search</b><br/><span style="color:rgba(27,27,31,0.55)">18 memories</span></div>
+      <div class="lg-topic"><b>Family</b><br/><span style="color:rgba(27,27,31,0.55)">9 memories</span></div>
+    </div>
+  </div></div>
+  <h3>One big question box, topic cards beneath</h3>
+  <p>The most minimal — but browsing ("show me what you saved") takes a back seat, which was your original complaint.</p>
+</div>
+
+</body>
+</html>
