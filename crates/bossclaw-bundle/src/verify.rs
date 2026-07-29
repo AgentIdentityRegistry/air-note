@@ -113,7 +113,11 @@ pub const MAX_ITEMS: usize = 50_000;
 
 /// The only legal binding purpose — a domain-separation tag (spec §2.3), so a card minted for any
 /// other identity-signed protocol can never be lifted into a bundle and honored here.
-const BINDING_PURPOSE: &str = "memory-signing";
+///
+/// `pub` (re-exported from the crate root) so the WRITE side shares this exact string: the daemon's
+/// `SetBinding` validation refuses a wrong-purpose card at storage time, and a duplicated literal
+/// there could drift from the value the verifier enforces at read time.
+pub const BINDING_PURPOSE: &str = "memory-signing";
 
 /// The only `kind` a [`ItemClass::Stamped`] item may carry (build stamps exactly this).
 const KIND_NOTE: &str = "note";

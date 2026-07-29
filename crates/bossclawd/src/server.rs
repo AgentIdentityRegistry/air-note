@@ -32,16 +32,16 @@ use bossclawd_proto::types::{
     SessionSummaryWire,
 };
 use bossclawd_proto::{
-    read_frame, write_frame, Hello, HelloOk, HitWire, OpErrorKindWire, Request, Response,
-    RetireTarget, Role, PROTO_VERSION,
+    read_frame, write_frame, ExportSelectionWire, Hello, HelloOk, HitWire, OpErrorKindWire, Request,
+    Response, RetireTarget, Role, MAX_FRAME, PROTO_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::capture::paths::{claude_projects_root, open_transcript_confined, valid_session_id};
 use crate::capture::render::{render_bounds, render_transcript};
 use crate::capture::store::{
-    delete_capture, read_capture_markdown, store_capture, CaptureIdentity, CaptureStoreError,
-    CAPTURE_TOOL,
+    capture_body, delete_capture, read_capture_markdown, store_capture, CaptureIdentity,
+    CaptureStoreError, CAPTURE_TOOL,
 };
 use crate::engine::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use crate::engine::{
@@ -503,7 +503,137 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
         Request::ReflectEnabled { onboarded } => {
             op_result(engine.reflect_enabled(onboarded).await, Response::ReflectEnabled)
         }
+        // ── Rung-5 SP-V1 §2.3/§2.4: brain-key read, binding write, sealed export. ALL App-only —
+        // `Role::allows` denies each for a `MemoryClient` BEFORE dispatch (a guest may read
+        // memories, but never read the brain key, write the identity binding, or seal an export),
+        // so no guest onboarding plumbing is needed here. The App keeps its self-asserted
+        // `onboarded` flag (I3), exactly like the reflect/capture toggles above. ──
+        Request::BrainVerifyingKey { onboarded } => {
+            op_result(engine.brain_verifying_key(onboarded).await, Response::BrainVerifyingKey)
+        }
+        Request::SetBinding { onboarded, attestation } => {
+            unit_result(engine.set_binding(onboarded, attestation).await)
+        }
+        Request::ExportBundle { onboarded, selection } => {
+            export_dispatch(engine, onboarded, selection).await
+        }
     }
+}
+
+/// Rung-5 §2.4 — the `ExportBundle` seam: coarse size guard → bounded session-body reads → build +
+/// seal → the authoritative pre-frame size guard.
+///
+/// The estimate runs FIRST so an over-cap selection costs no body read and no seal. The core export
+/// then runs its own ordering (`verify_chain` → empty → binding → per-class guards → build), so a
+/// log that does not verify can never be sealed from.
+async fn export_dispatch(
+    engine: &EngineHandle,
+    onboarded: bool,
+    selection: ExportSelectionWire,
+) -> Response {
+    use bossclaw_core::log::{ExportError, ExportSelection, MAX_EXPORT_BYTES};
+
+    let selection = ExportSelection {
+        note_event_ids: selection.note_event_ids,
+        session_event_ids: selection.session_event_ids,
+        ingest_event_ids: selection.ingest_event_ids,
+        description: selection.description,
+        // The daemon boundary stamps the export time so core stays clock-free and a client can
+        // never backdate a seal.
+        created_at: crate::engine::now_rfc3339(),
+    };
+
+    // 1. Coarse, pre-body, pre-seal guard.
+    match engine.estimate_export_bytes(onboarded, selection.clone()).await {
+        Ok(bytes) if bytes > MAX_EXPORT_BYTES => {
+            return Response::BundleTooLarge { bytes, max: MAX_EXPORT_BYTES }
+        }
+        Ok(_) => {}
+        Err(e) => return op_error_response(e),
+    }
+
+    // 2. Read the selected session bodies (bounded by `read_capture_markdown`, and confined to the
+    // daemon-authored `sessions/` dir — the SAME defense-in-depth check `get_session` applies), then
+    // STRIP THE FRONT MATTER.
+    //
+    // A-N1, and the reason `capture_body` is called here: `read_capture_markdown` returns the WHOLE
+    // document, and `compose_document`'s front-matter block carries the project PATH, the
+    // `session_id`, and the body `sha256`. A session is disclosed as a SEAL_VOUCHED item — content
+    // ONLY — and core already reduces the `display` project to its folder name (owner ruling
+    // `d0c5b14`); handing over the unstripped document would smuggle the very path that ruling
+    // removed straight back in through `content`.
+    //
+    // A body we cannot read (unconfined path, out-of-band deletion, unreadable file) is simply LEFT
+    // ABSENT from the map: core already substitutes its placeholder for a missing id, so the export
+    // still completes and the placeholder string stays single-sourced in core.
+    let mut session_bodies = std::collections::HashMap::new();
+    if !selection.session_event_ids.is_empty() {
+        let sessions = match engine.current_sessions().await {
+            Ok(s) => s,
+            Err(e) => return op_error_response(e),
+        };
+        let sessions_dir = engine.data_dir().map(|d| d.join("sessions"));
+        for id in &selection.session_event_ids {
+            let Some(captured) = sessions.iter().find(|c| &c.event_id == id) else { continue };
+            let confined = sessions_dir
+                .as_ref()
+                .is_some_and(|dir| Path::new(&captured.path).starts_with(dir));
+            if !confined {
+                continue;
+            }
+            if let Ok(document) = read_capture_markdown(Path::new(&captured.path)) {
+                session_bodies.insert(id.clone(), capture_body(&document).to_string());
+            }
+        }
+    }
+
+    // 3. Build + seal, then map each typed refusal to its own wire signal.
+    match engine.export_bundle(onboarded, selection, session_bodies).await {
+        // An open/join failure keeps flowing through the shared chokepoint, so a not-onboarded
+        // brain still answers with the onboarding SIGNAL rather than a fault.
+        Err(e) => op_error_response(e),
+        Ok(Ok(text)) => {
+            // The AUTHORITATIVE size gate. The frame is `serde_json::to_vec(&Response::Bundle(..))`,
+            // which JSON-ESCAPES the already-JSON `.airmem`; that escaping overhead is far larger
+            // than the 2 MiB gap between MAX_EXPORT_BYTES (30 MiB) and MAX_FRAME (32 MiB), so a
+            // bundle that passed BOTH the estimate and core's own byte belt can still overflow the
+            // frame. Bound the ACTUAL serialized length here — a generic frame write error must
+            // never replace the typed refusal the app renders (spec §7).
+            let response = Response::Bundle(text);
+            match serde_json::to_vec(&response) {
+                Ok(wire) if wire.len() > MAX_FRAME => {
+                    Response::BundleTooLarge { bytes: wire.len() as u64, max: MAX_FRAME as u64 }
+                }
+                Ok(_) => response,
+                Err(e) => {
+                    Response::Err { kind: OpErrorKindWire::Core, message: e.to_string() }
+                }
+            }
+        }
+        Ok(Err(ExportError::BundleTooLarge { bytes, max })) => {
+            Response::BundleTooLarge { bytes, max }
+        }
+        Ok(Err(ExportError::ChainInvalid)) => {
+            export_rejected("cannot export: memory chain does not verify")
+        }
+        Ok(Err(ExportError::EmptySelection)) => export_rejected("empty selection"),
+        Ok(Err(ExportError::BindingUnavailable)) => export_rejected("no identity binding stored"),
+        Ok(Err(ExportError::NotExportable(reason))) => export_rejected(&reason),
+        Ok(Err(ExportError::Core(message))) => {
+            Response::Err { kind: OpErrorKindWire::Core, message }
+        }
+    }
+}
+
+/// A typed `Rejected` refusal for the Rung-5 export ops. DELIBERATELY distinct from
+/// [`capture_rejected`], whose contract is a STATIC check name that never echoes attacker-influenced
+/// capture bytes (I4): an export refusal carries core's typed reason, which may embed an App-supplied
+/// event id ("note {id} not found"). That is the same asymmetry [`Request::SupersedeNote`] already
+/// documents — `ExportBundle` is App-only (guest-denied at the role gate) and the ids are
+/// daemon-minted ULIDs the App itself obtained from a listing op and echoed back over the trusted App
+/// socket, so surfacing them disambiguates the reject and is never a hostile-capture surface.
+fn export_rejected(message: &str) -> Response {
+    Response::Err { kind: OpErrorKindWire::Rejected, message: message.to_string() }
 }
 
 /// SP3 §9 (A13) — the App-only `GetSession` detail read. Validates the App-supplied `session_id`

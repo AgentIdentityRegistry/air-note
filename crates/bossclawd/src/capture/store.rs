@@ -558,7 +558,13 @@ fn front_matter_block(md: &str) -> Option<&str> {
 /// even when the body itself contains a bare `---` line (the FIRST `\n---\n` is always the closing
 /// fence, since our front-matter keys are never a bare `---` line, the guarantee
 /// [`front_matter_block`] already relies on).
-fn capture_body(md: &str) -> &str {
+///
+/// `pub(crate)` for a SECOND consumer with the same need for a different reason: the Rung-5 export
+/// (`server::export_dispatch`) discloses a session as a SEAL_VOUCHED item, which is content ONLY —
+/// and [`compose_document`]'s front matter carries the project path, the `session_id`, and the
+/// `sha256`, none of which may leave the machine (spec A-N1). Stripping here means the export and
+/// the healer share ONE definition of "the body", so neither can drift into shipping the block.
+pub(crate) fn capture_body(md: &str) -> &str {
     let Some(rest) = md.strip_prefix("---\n") else {
         return md; // not framed — the whole document is body
     };

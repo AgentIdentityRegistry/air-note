@@ -263,6 +263,18 @@ pub enum Request {
     /// Rung-3 Phase-3: resolve one conflict proposal with a deterministic action. Reachable from
     /// `MemoryClient` (the I8 relaxation). No LLM, no egress; the retire actions are reversible.
     ResolveConflict { onboarded: bool, proposal_id: String, action: ResolveActionWire },
+    /// Rung-5 §2.3: the daemon's ACTUAL brain verifying key (multibase base58btc) — the value the
+    /// app must mint the identity binding over. App-only (guest-refused by construction: `Role::allows`
+    /// is a positive allowlist, so a variant absent from it is denied).
+    BrainVerifyingKey { onboarded: bool },
+    /// Rung-5 §2.3: store an app-minted identity binding (the ID card). App-only. The daemon
+    /// VALIDATES before storing (C-NEW-4): purpose tag, identity signature over `jcs(payload)`,
+    /// brain-key match, and first-write-wins epoch idempotency — core stores what it is given, so a
+    /// buggy app must never be able to persist a card that would fail on every future export.
+    SetBinding { onboarded: bool, attestation: serde_json::Value },
+    /// Rung-5 §2.4: build a sealed `.airmem` for `selection`. App-only. Pure-read; the export runs
+    /// `verify_chain` FIRST (never seal from a log that does not verify).
+    ExportBundle { onboarded: bool, selection: ExportSelectionWire },
 }
 
 /// The subject of a [`Request::RetireMemory`]: either a whole `remember` note (by its event id) or a
@@ -276,6 +288,23 @@ pub enum RetireTarget {
     Note { event_id: String },
     /// A single session passage, addressed by `session_id` + passage index (Task 7).
     Passage { session_id: String, passage_id: usize },
+}
+
+/// The owner's export selection as it travels on the wire (Rung-5 §2.4). Mirrors
+/// `bossclaw_core::log::ExportSelection` MINUS `created_at`: the daemon stamps the export time at
+/// its own boundary so core stays clock-free and a client can never backdate a seal.
+///
+/// Derives match [`RetireTarget`] so it nests inside [`Request`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ExportSelectionWire {
+    /// Current-note event ids → STAMPED items (disclosed canonical event bytes + write-time signature).
+    pub note_event_ids: Vec<String>,
+    /// Current-session event ids → SEAL_VOUCHED items (bodies read daemon-side, bounded).
+    pub session_event_ids: Vec<String>,
+    /// Current-ingest (`file_ingested`) event ids → SEAL_VOUCHED items (content only).
+    pub ingest_event_ids: Vec<String>,
+    /// Free-text description shown to the receiver.
+    pub description: String,
 }
 
 /// One response from the daemon to the client. Each success variant carries the
@@ -367,6 +396,21 @@ pub enum Response {
     CaptureEnabled(bool),
     /// `ReflectEnabled` result — the sticky reflect-enabled flag.
     ReflectEnabled(bool),
+    /// `BrainVerifyingKey` result — the brain verifying key, multibase base58btc.
+    BrainVerifyingKey(String),
+    /// `ExportBundle` result — the canonical `.airmem` JSON text.
+    Bundle(String),
+    /// `ExportBundle` size refusal (Rung-5 §7 `BundleTooLarge`) — kept a DISTINCT signal rather than
+    /// an [`Response::Err`] string so the app can render "too big, select fewer memories" (with the
+    /// real numbers) instead of a fault. Emitted either by the pre-build estimate or by the
+    /// authoritative pre-frame check on the SERIALIZED response length (see the daemon's
+    /// `export_dispatch`): a generic frame error must never replace this typed refusal.
+    BundleTooLarge {
+        /// The measured (or estimated) size in bytes.
+        bytes: u64,
+        /// The ceiling that was exceeded.
+        max: u64,
+    },
     /// The engine is not onboarded (mirrors `EngineError::NotOnboarded`). A signal,
     /// not a fault — the UI shows onboarding.
     NotOnboarded,
@@ -866,8 +910,9 @@ mod protocol_tests {
 
     /// `MemoryClient` allows EXACTLY the six guest ops — recall/remember, the SP3 capture and snapshot
     /// pokes, and the two Rung-3 Phase-3 resolution ops (`ListConflicts` + `ResolveConflict`, the I8
-    /// relaxation) — and REFUSES every other new SP3 op (listing, get, delete, notes, supersede, stats,
-    /// capture toggle/query, reflect toggle/query, retire/unretire). Enumerates all new variants so a future
+    /// relaxation) — and REFUSES every other new op (listing, get, delete, notes, supersede, stats,
+    /// capture toggle/query, reflect toggle/query, retire/unretire, and the Rung-5 export trio).
+    /// Enumerates all new variants so a future
     /// variant wrongly admitted to the guest role fails here (the fail-closed allowlist's positive guarantee, pinned per-op).
     #[test]
     fn memory_client_allows_exactly_six_ops() {
@@ -894,8 +939,60 @@ mod protocol_tests {
             ReflectEnabled { onboarded: true },
             RetireMemory { onboarded: true, target: RetireTarget::Note { event_id: "e".into() } },
             Unretire { onboarded: true, retired_event_id: "r".into() },
+            // Rung-5 §2.4: a guest may read memories, but never read the brain key, write the
+            // identity binding, or seal a signed export.
+            BrainVerifyingKey { onboarded: true },
+            SetBinding { onboarded: true, attestation: serde_json::Value::Null },
+            ExportBundle {
+                onboarded: true,
+                selection: ExportSelectionWire {
+                    note_event_ids: vec![],
+                    session_event_ids: vec![],
+                    ingest_event_ids: vec![],
+                    description: String::new(),
+                },
+            },
         ];
         for r in no { assert!(!Role::MemoryClient.allows(&r), "{r:?}"); }
+    }
+
+    /// Rung-5 §2.4: the three export-side ops are App-only (guest-refused BY CONSTRUCTION —
+    /// `Role::allows`'s positive allowlist is UNCHANGED) and survive the externally-tagged JSON
+    /// round-trip, including the nested [`ExportSelectionWire`]. Additive variants only → the wire
+    /// version must NOT bump.
+    #[test]
+    fn rung5_export_ops_are_app_only_and_round_trip() {
+        use Request::*;
+        let ops = [
+            BrainVerifyingKey { onboarded: true },
+            SetBinding { onboarded: true, attestation: serde_json::json!({ "payload": { "epoch": 1 } }) },
+            ExportBundle {
+                onboarded: true,
+                selection: ExportSelectionWire {
+                    note_event_ids: vec!["01J-NOTE".into()],
+                    session_event_ids: vec!["01J-SESSION".into()],
+                    ingest_event_ids: vec!["01J-INGEST".into()],
+                    description: "for my lawyer".into(),
+                },
+            },
+        ];
+        for req in &ops {
+            assert!(Role::App.allows(req), "App may {req:?}");
+            assert!(!Role::MemoryClient.allows(req), "export ops are App-only: {req:?}");
+            let back: Request = serde_json::from_slice(&serde_json::to_vec(req).unwrap()).unwrap();
+            assert_eq!(&back, req, "request round-trips: {req:?}");
+        }
+        // The three new responses round-trip too (the app rebuilds `BundleTooLarge`'s numbers).
+        let responses = [
+            Response::BrainVerifyingKey("z6Mk...".into()),
+            Response::Bundle("{\"manifest\":{}}".into()),
+            Response::BundleTooLarge { bytes: 33 * 1024 * 1024, max: MAX_FRAME as u64 },
+        ];
+        for resp in &responses {
+            let back: Response = serde_json::from_slice(&serde_json::to_vec(resp).unwrap()).unwrap();
+            assert_eq!(&back, resp, "response round-trips: {resp:?}");
+        }
+        assert_eq!(PROTO_VERSION, 1);
     }
 
     /// Rung-4 R4-A: the two reflect-enable ops are App-only (guest-refused BY CONSTRUCTION — `Role::allows`

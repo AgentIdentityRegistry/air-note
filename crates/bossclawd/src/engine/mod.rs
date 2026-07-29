@@ -1220,6 +1220,115 @@ impl EngineHandle {
         .map_err(|e| EngineOpError::Join(e.to_string()))?
     }
 
+    // ── Rung-5 SP-V1 (verifiable memory): the three App-only export-side ops. ──────────────────
+
+    /// Rung-5 §2.3: the brain's ACTUAL verifying key (multibase base58btc) — the value the app must
+    /// mint the identity binding over, and the key every exported item stamp is checked against.
+    /// The wire read behind [`Request::BrainVerifyingKey`]; gated like every other op.
+    ///
+    /// NO `spawn_blocking`: `EventLog::brain_verifying_key_multibase` is a pure in-memory encode of
+    /// an already-held key — it takes no store lock and touches no SQLite, so handing it to the
+    /// blocking pool would cost a task spawn to save nothing.
+    pub async fn brain_verifying_key(&self, onboarded: bool) -> Result<String, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        Ok(log.brain_verifying_key_multibase())
+    }
+
+    /// Rung-5 §2.3: store an app-minted identity binding — the wire write behind
+    /// [`Request::SetBinding`]. Core stores what it is given, so the FOUR C-NEW-4 validations happen
+    /// HERE, before the append, and each refusal is the typed [`EngineOpError::Rejected`]:
+    ///
+    /// 1. the card parses as a `bossclaw_bundle::Binding` (which is `deny_unknown_fields`, so a
+    ///    smuggled extra key is refused at the parse boundary exactly as the verifier refuses it);
+    /// 2. `payload.purpose` is [`bossclaw_bundle::BINDING_PURPOSE`] — the domain-separation tag the
+    ///    verifier enforces on the READ side, so a card minted for another identity-signed protocol
+    ///    can never be stored, let alone lifted into a bundle;
+    /// 3. the identity signature verifies over `jcs(payload)` against the EMBEDDED identity key
+    ///    (L1 internal consistency — zero identity assurance, but a garbled card is refused);
+    /// 4. `payload.brain_verifying_key` equals THIS brain's key, and the epoch is not already
+    ///    stored (first-write-wins, A8/C9 — a repeated epoch is rejected, NEVER overwritten).
+    ///
+    /// Without (4) a buggy app could persist a card that makes every future export fail verification
+    /// or silently rewrite the rotation history.
+    pub async fn set_binding(
+        &self,
+        onboarded: bool,
+        attestation: serde_json::Value,
+    ) -> Result<(), EngineOpError> {
+        use serde::Deserialize;
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            // Borrow-deserialize so the attestation is parsed WITHOUT cloning it — the same
+            // `serde_json::Value` is then stored verbatim, byte-for-byte as the app minted it.
+            let binding = bossclaw_bundle::Binding::deserialize(&attestation)
+                .map_err(|e| EngineOpError::Rejected(format!("malformed binding: {e}")))?;
+            if binding.payload.purpose != bossclaw_bundle::BINDING_PURPOSE {
+                return Err(EngineOpError::Rejected(format!(
+                    "binding purpose must be \"{}\"",
+                    bossclaw_bundle::BINDING_PURPOSE
+                )));
+            }
+            if !bossclaw_bundle::verify_binding_internal(&binding) {
+                return Err(EngineOpError::Rejected(
+                    "binding identity signature invalid".to_string(),
+                ));
+            }
+            if binding.payload.brain_verifying_key != log.brain_verifying_key_multibase() {
+                return Err(EngineOpError::Rejected(
+                    "binding brain key does not match this brain".to_string(),
+                ));
+            }
+            let epochs = log.binding_epochs().map_err(|e| EngineOpError::Core(e.to_string()))?;
+            if epochs.contains(&binding.payload.epoch) {
+                return Err(EngineOpError::Rejected(format!(
+                    "binding epoch {} already stored",
+                    binding.payload.epoch
+                )));
+            }
+            log.set_binding(attestation).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-5 §7: the pre-build size estimate — the daemon's COARSE `BundleTooLarge` guard. Reads no
+    /// session body and seals nothing, so an over-cap selection is refused before any of that work.
+    /// The authoritative bound is the dispatch's post-build check on the SERIALIZED frame.
+    pub async fn estimate_export_bytes(
+        &self,
+        onboarded: bool,
+        selection: bossclaw_core::log::ExportSelection,
+    ) -> Result<u64, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || {
+            log.estimate_export_bytes(&selection).map_err(|e| EngineOpError::Core(e.to_string()))
+        })
+        .await
+        .map_err(|e| EngineOpError::Join(e.to_string()))?
+    }
+
+    /// Rung-5 §2.4: build the sealed `.airmem`. `session_bodies` are pre-read by the daemon
+    /// (bounded, confinement-checked, front-matter stripped) so the core export stays fs-free; a
+    /// session missing from the map gets core's placeholder rather than aborting the whole export.
+    ///
+    /// The NESTED `Result` is deliberate and load-bearing: the OUTER error is a transport/open
+    /// failure that must keep flowing through the shared [`crate::server::op_error_response`]
+    /// chokepoint (so `NotOnboarded` still reaches the app as the onboarding SIGNAL, not a fault),
+    /// while the INNER [`bossclaw_core::log::ExportError`] is a domain refusal the dispatch maps to
+    /// its own wire signal (`BundleTooLarge` / typed `Rejected`). Collapsing the two would turn
+    /// "the brain isn't set up yet" into a generic engine error.
+    pub async fn export_bundle(
+        &self,
+        onboarded: bool,
+        selection: bossclaw_core::log::ExportSelection,
+        session_bodies: std::collections::HashMap<String, String>,
+    ) -> Result<Result<String, bossclaw_core::log::ExportError>, EngineOpError> {
+        let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
+        spawn_blocking(move || log.export_bundle(&selection, &session_bodies))
+            .await
+            .map_err(|e| EngineOpError::Join(e.to_string()))
+    }
+
     /// The core reads `decide_reflect` needs, in ONE spawn_blocking. `None` on an open failure (→ the
     /// sweeper no-ops that cycle).
     pub async fn reflect_gate_inputs(&self, onboarded: bool) -> Option<ReflectGateInputs> {
@@ -2186,10 +2295,11 @@ fn map_err_state(e: &EngineError) -> EngineState {
     }
 }
 
-/// Current time as an RFC3339 string — the audit stamp for a signed language-pack consent record.
-/// Reuses the same `chrono` timestamp source the cloud-consent writer (`enable_cloud_reasoner`)
-/// uses, so every signed consent record the engine writes is stamped identically.
-fn now_rfc3339() -> String {
+/// Current time as an RFC3339 string — the daemon's single wall-clock stamp for the records that
+/// carry one: the signed language-pack consent, the cloud-consent writer (`enable_cloud_reasoner`),
+/// and the Rung-5 export's `created_at` (core stays clock-free, so the daemon boundary supplies it).
+/// One source so every daemon-written timestamp is formatted identically.
+pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 

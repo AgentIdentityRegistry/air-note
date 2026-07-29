@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use bossclawd::server;
 use bossclawd_proto::types::ResolveActionWire;
 use bossclawd_proto::{
-    read_frame, write_frame, Hello, HelloOk, OpErrorKindWire, Request, Response, RetireTarget, Role,
-    PROTO_VERSION,
+    read_frame, write_frame, ExportSelectionWire, Hello, HelloOk, OpErrorKindWire, Request, Response,
+    RetireTarget, Role, MAX_FRAME, PROTO_VERSION,
 };
 use tokio::net::UnixStream;
 
@@ -243,4 +243,69 @@ async fn reflect_enable_is_app_only_over_the_socket() {
     assert!(matches!(resp, Response::Ok), "App enable acks Ok, got {resp:?}");
     let resp = app.call(Request::ReflectEnabled { onboarded: true }).await;
     assert!(matches!(resp, Response::ReflectEnabled(true)), "reads back enabled, got {resp:?}");
+}
+
+/// An empty export selection — the shared fixture for the guest-refusal proof (a guest must be
+/// refused at the ROLE boundary, before any argument is even looked at).
+fn empty_selection() -> ExportSelectionWire {
+    ExportSelectionWire {
+        note_event_ids: vec![],
+        session_event_ids: vec![],
+        ingest_event_ids: vec![],
+        description: String::new(),
+    }
+}
+
+/// Rung-5 §2.4: all THREE export-side ops are App-only OVER THE SOCKET. A `MemoryClient` guest may
+/// read memories, but is refused at the role boundary (never reaches the engine) for each of: reading
+/// the brain verifying key, writing the identity binding, and sealing a signed export. The `App` side
+/// proves the ops are genuinely dispatched (not refused for everyone): `BrainVerifyingKey` returns a
+/// real multibase base58btc key.
+#[tokio::test]
+async fn rung5_export_ops_are_app_only() {
+    let (_dir, sock) = spawn_onboarded_daemon().await;
+    let mut guest = RoleClient::connect(&sock, Role::MemoryClient).await;
+    for req in [
+        Request::BrainVerifyingKey { onboarded: true },
+        Request::SetBinding { onboarded: true, attestation: serde_json::Value::Null },
+        Request::ExportBundle { onboarded: true, selection: empty_selection() },
+    ] {
+        let label = format!("{req:?}");
+        let resp = guest.call(req).await;
+        assert!(is_not_permitted(&resp), "guest must be refused {label}, got {resp:?}");
+    }
+    // Same guest connection still works for its own ops — the refusals above are per-op, not a
+    // broken/closed connection.
+    let resp = guest.call(Request::Remember { onboarded: true, text: "guest note".into() }).await;
+    assert!(matches!(resp, Response::Remember(_)), "guest keeps its own ops, got {resp:?}");
+
+    let mut app = RoleClient::connect(&sock, Role::App).await;
+    match app.call(Request::BrainVerifyingKey { onboarded: true }).await {
+        Response::BrainVerifyingKey(key) => {
+            assert!(key.starts_with('z'), "multibase base58btc key, got {key}")
+        }
+        other => panic!("App BrainVerifyingKey should succeed, got {other:?}"),
+    }
+}
+
+/// Characterization backing the daemon's authoritative pre-frame guard: the wire frame is
+/// `serde_json::to_vec(&Response::Bundle(text))`, which JSON-ESCAPES the already-JSON `.airmem`.
+/// That escaping overhead is far larger than the 2 MiB gap between core's `MAX_EXPORT_BYTES`
+/// (30 MiB) and `MAX_FRAME` (32 MiB), so a bundle that passed BOTH the pre-build estimate AND core's
+/// own byte belt can still overflow the frame — which is exactly why `export_dispatch` bounds the
+/// SERIALIZED response length and answers with the typed `BundleTooLarge` rather than letting a
+/// generic frame error replace it.
+#[test]
+fn wire_frame_escaping_can_overflow_a_sub_cap_bundle() {
+    const CORE_BELT: usize = 30 * 1024 * 1024; // bossclaw_core::log::MAX_EXPORT_BYTES
+    // Quote/backslash-heavy JSON text: every byte doubles under JSON escaping (worst case).
+    let text = "\\\"".repeat(CORE_BELT / 2);
+    assert!(text.len() <= CORE_BELT, "raw text is within core's byte belt");
+    let wire = serde_json::to_vec(&Response::Bundle(text)).unwrap();
+    assert!(
+        wire.len() > MAX_FRAME,
+        "escaped wire frame ({} bytes) must overflow MAX_FRAME ({MAX_FRAME}) — the dispatch has to \
+         refuse with the typed BundleTooLarge, not a generic frame error",
+        wire.len()
+    );
 }
