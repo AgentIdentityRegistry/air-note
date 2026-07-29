@@ -26,6 +26,9 @@ base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
 fs2 = "0.4"
+# Rung-5 export saves through a `NamedTempFile` in the target folder: O_EXCL under an unguessable
+# name (no symlink redirect) and deleted on drop (no readable fragment survives a failed write).
+tempfile = "3"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "1.0"
@@ -62,7 +65,8 @@ keyring = { version = "2.3", features = ["linux-secret-service", "linux-keyutils
 keyring = "2.3"
 
 [dev-dependencies]
-tempfile = "3"
+# `tempfile` is a REGULAR dependency now (the export save path uses it), and a regular dependency is
+# already available to tests — restating it here would be redundant, not additive.
 tauri = { version = "2", features = ["test"] }
 
 # M1a Task 5: the real daemon (with its `test-helpers` feature) so the transport/client tests can

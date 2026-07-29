@@ -164,10 +164,13 @@ describe("LibraryPanel", () => {
     expect(screen.queryByText(/No notes match/)).toBeNull();
   });
 
-  it("empty archive shows a neutral empty state", async () => {
-    primeArchive([], []);
+  it("empty archive shows a neutral empty state naming everything the Library holds", async () => {
+    // `archiveEmpty` covers files too, so the copy must name them — an empty state that lists two
+    // of the three kinds tells the owner ingested files belong somewhere else.
+    primeArchive([], [], []);
     render(<LibraryPanel />);
-    expect(await screen.findByText(/captured sessions and notes will appear here/i)).toBeInTheDocument();
+    expect(await screen.findByText(/captured sessions, notes, and ingested files will appear here/i))
+      .toBeInTheDocument();
   });
 
   it("a load error surfaces (not a blank panel)", async () => {
@@ -523,6 +526,12 @@ describe("LibraryPanel", () => {
     // The old id is gone from the current list, so the selection empties itself.
     expect(screen.getByRole("button", { name: /Export signed bundle/ })).toBeDisabled();
   });
+
+  // The wire carries a session's capture `event_id` as of daemon commit `ed3c14a`, but the desktop
+  // mapping still drops it (`session_summary_from_wire` → `engine::SessionSummary` →
+  // `SessionSummaryDto`), so `exportBundle`'s session bucket is hard-coded `[]` here. This marker
+  // exists so that stays visible instead of quietly remaining empty once the hop is finished.
+  it.todo("exports selected sessions once the desktop DTO carries the capture event_id");
 
   it("a files-list failure hides the Files section without breaking the Library", async () => {
     primeArchive([S_NEW], [NOTE]);

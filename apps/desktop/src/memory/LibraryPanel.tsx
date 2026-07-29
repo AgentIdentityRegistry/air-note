@@ -220,10 +220,12 @@ export function LibraryPanel() {
 
   // ---- Rung-5 SP-V1: export a selection as a signed .airmem ----
   //
-  // Notes and ingested files only. A session is addressed in an export by its CAPTURE EVENT id, and
-  // the Library's session listing carries `session_id` alone — the wire summary drops the event id
-  // — so there is no id to send yet. The review sheet already renders sessions honestly; wiring them
-  // in needs `event_id` on `SessionSummaryWire` (a daemon-side change).
+  // Notes and ingested files only. A session is addressed in an export by its CAPTURE EVENT id.
+  // `SessionSummaryWire` now carries that id (daemon commit `ed3c14a`), but the desktop side still
+  // drops it: `session_summary_from_wire` does not copy it, `engine::SessionSummary` has no field
+  // for it, and `SessionSummaryDto` does not expose it — so the panel has no id to send yet. The
+  // review sheet already renders sessions honestly; finishing the hop is those three layers plus
+  // a checkbox here (pinned by the `it.todo` in this panel's test).
   const [selectedNotes, setSelectedNotes] = useState<Set<string>>(new Set());
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const [reviewing, setReviewing] = useState(false);
@@ -317,7 +319,7 @@ export function LibraryPanel() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") void onSearchMemory(); }}
-          placeholder="Filter sessions & notes…"
+          placeholder="Filter sessions, notes & files…"
           aria-label="Filter your library, or press Enter to search all memory"
           style={{ flex: 1, padding: "8px 12px", borderRadius: 6, fontFamily: "inherit", fontSize: 14 }}
         />
@@ -388,7 +390,7 @@ export function LibraryPanel() {
 
       {archiveEmpty ? (
         <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
-          Your captured sessions and notes will appear here.
+          Your captured sessions, notes, and ingested files will appear here.
         </p>
       ) : (
         <>

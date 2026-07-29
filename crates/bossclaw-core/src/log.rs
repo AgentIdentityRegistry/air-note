@@ -13971,6 +13971,46 @@ mod tests {
         );
     }
 
+    /// FROZEN: exactly which fields a session's `display` object discloses.
+    ///
+    /// The app's export review sheet (`apps/desktop/src/memory/ExportReviewSheet.tsx`,
+    /// `DISCLOSURE.session`) ENUMERATES these to the owner before they send the file. An
+    /// enumeration that silently goes stale is precisely the failure that sheet exists to prevent,
+    /// and nothing else couples the two — so adding a key here must break a test rather than slip
+    /// out under copy that no longer describes it.
+    ///
+    /// **If this fails you ADDED (or removed) a field that an export ships.** Update
+    /// `DISCLOSURE.session` and its `ExportReviewSheet.test.tsx` assertions to name it, then update
+    /// this list. Keys are compared SORTED because the bundle is canonical (JCS) JSON.
+    #[test]
+    fn a_session_display_discloses_exactly_these_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let ev = log.capture_session(&embedder, &session_meta("s1", &"aa".repeat(32))).unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        let bodies = HashMap::from([(ev.clone(), "transcript".to_string())]);
+        let text = log.export_bundle(&selection(vec![], vec![ev], vec![]), &bodies).unwrap();
+        let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
+
+        let display =
+            bundle.items[0].display.as_ref().expect("a session ships display metadata");
+        let mut keys: Vec<&str> = display
+            .as_object()
+            .expect("display is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["approx_bytes", "ended_at", "project", "started_at", "title", "tool"],
+            "the owner-facing export disclosure enumerates exactly these"
+        );
+        // And `project` is the FOLDER NAME that copy promises — never the path the session ran in.
+        assert_eq!(display["project"], "repo", "`/repo` reduces to its folder name");
+    }
+
     /// A note the owner CORRECTED must never ship. It is still `memory` + external, so the
     /// kind/taint guard passes it — only the currency check stops it, and without that check it
     /// would leave carrying the format's strongest attestation.

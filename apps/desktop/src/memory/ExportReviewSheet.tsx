@@ -13,12 +13,17 @@ export type ExportIngest = { id: string; path: string };
  * daemon builds (`EventLog::export_bundle`), not a summary of it: a stamped note travels as its
  * entire signed event, a session as its entire transcript. Showing the owner less than what leaves
  * their machine would make this sheet a lie.
+ *
+ * `session` ENUMERATES the six fields core puts in a session's `display` object, so it is coupled to
+ * core by a frozen-key test — `a_session_display_discloses_exactly_these_fields` in
+ * `crates/bossclaw-core/src/log.rs`. Adding a seventh field there fails that test, which names this
+ * constant in its message. Do not edit one side without the other.
  */
 const DISCLOSURE = {
   note:
     "Ships the full signed record of this note: its exact text, when you saved it, its id, the link " +
-    "to the note before it in your chain, and your brain’s signature. The receiver can check that " +
-    "signature on its own.",
+    "to whatever you recorded just before it, your AIR name (your did), which is written inside the " +
+    "note itself, and your brain’s signature. The receiver can check that signature on its own.",
   session:
     "Ships the FULL transcript of this session, plus its title, which tool ran it, when it started " +
     "and ended, its rough size, and the project’s folder name — never the full path or the session id.",
@@ -123,6 +128,14 @@ export function ExportReviewSheet({
           Anyone you send this file to can read the plaintext of everything selected — signing proves
           you wrote it, it does not keep it secret. Exporting saves one file to your Mac and does not
           publish anything.
+        </p>
+
+        {/* The identifier disclosure. How STRONG the identity claim is belongs to the receiver's
+            verifier, not here — but THAT it travels, in every file, is the owner's to know, and the
+            linkability consequence is the part they would actually want warned about. */}
+        <p style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.5, margin: 0 }}>
+          Every file also carries your AIR name (your did) and your public keys, so the receiver can
+          tell it came from you — and so two receivers can tell two files came from the same person.
         </p>
 
         {notes.length > 0 ? (

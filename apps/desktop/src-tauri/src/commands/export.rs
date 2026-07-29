@@ -11,6 +11,13 @@
 //! # Nothing is published
 //! Exporting writes one local file. It sends nothing anywhere; the owner decides who receives it.
 //!
+//! # "Nothing happened" is not quite true of a FAILED first export
+//! Step 1 runs before step 2, so an export that the daemon then refuses (or that the owner cancels
+//! at the save dialog) can still leave the minted binding stored. That is harmless and deliberate —
+//! the card is the brain's ID, not a record of any export, and it is idempotent and first-write-wins
+//! — but it is the one durable trace a failed export leaves, so it is written down rather than
+//! implied away.
+//!
 //! # This module never READS a `.airmem`
 //! It only writes one, so it has no parse boundary and deliberately does NOT carry `air-verify`'s
 //! `MAX_INPUT_BYTES` ceiling. If a future app-side path ever PARSES a bundle (an in-app verifier),
@@ -175,21 +182,31 @@ fn default_file_name() -> String {
 }
 
 /// Write via a sibling temp file + rename (S1): a same-directory rename is atomic, so the chosen
-/// path is either absent or a COMPLETE bundle — never a half-written file the owner might send. A
-/// failed rename cleans the temp up rather than leaving litter next to the target.
+/// path is either absent or a COMPLETE bundle — never a half-written file the owner might send.
+///
+/// The temp is a [`tempfile::NamedTempFile`], not a predictable `<target>.tmp`, and that choice
+/// carries two guarantees a hand-rolled temp did not:
+/// * **No fragment survives ANY failure.** It is deleted on drop, so a write that dies partway
+///   (disk full, quota, I/O) leaves no truncated-but-readable copy of the owner's memories sitting
+///   in what may well be a synced folder. Cleanup on the rename path alone was not enough.
+/// * **No symlink redirect.** It is created `O_EXCL` under an unguessable name, so a pre-planted
+///   `<target>.tmp` symlink can be neither guessed nor followed (`fs::write` follows symlinks;
+///   `rename` does not, which is why only the temp needed fixing).
 fn write_all_or_nothing(path: &Path, text: &str) -> Result<(), String> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("{} is not a file path", path.display()))?
-        .to_string_lossy()
-        .into_owned();
-    let mut tmp = path.to_path_buf();
-    tmp.set_file_name(format!("{name}.tmp"));
-    std::fs::write(&tmp, text).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("could not save {}: {e}", path.display())
-    })
+    use std::io::Write;
+    // The save dialog always yields an absolute path; a bare file name (tests, odd input) means
+    // "the current directory" rather than an empty one `NamedTempFile` would refuse.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+        format!("could not create a temporary file in {}: {e}", parent.display())
+    })?;
+    tmp.write_all(text.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    tmp.persist(path).map_err(|e| format!("could not save {}: {e}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -413,6 +430,18 @@ mod tests {
         assert!(!t.seen().iter().any(|r| matches!(r, Request::SetBinding { .. })));
     }
 
+    /// Every name in `dir`, sorted — so a test can assert what a folder holds, not merely that the
+    /// one file it expected is present.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn saving_is_all_or_nothing_and_leaves_no_temp_behind() {
         let dir = tempfile::tempdir().unwrap();
@@ -420,16 +449,53 @@ mod tests {
         write_all_or_nothing(&target, "{\"manifest\":{}}").expect("write");
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"manifest\":{}}");
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "temp file must be renamed away, found {leftovers:?}");
+        assert_eq!(entries(dir.path()), ["memories.airmem"], "the temp is renamed away, not left");
 
         // Overwriting an existing bundle replaces it whole.
         write_all_or_nothing(&target, "second").expect("overwrite");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+        assert_eq!(entries(dir.path()), ["memories.airmem"]);
+    }
+
+    /// The failure path the success test cannot reach: the bundle is written to the temp, and the
+    /// SAVE then fails. Nothing readable may survive — a truncated `.airmem` fragment of the
+    /// owner's memories left in a synced folder is exactly the leak this write path exists to
+    /// prevent, and cleanup that lived only on the rename arm did not cover it.
+    ///
+    /// The failure is forced by aiming at a path that is already a DIRECTORY: the temp is created
+    /// and written, then `persist` fails. Deterministic for every user, root included.
+    #[test]
+    fn a_failed_save_leaves_no_readable_fragment_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let occupied = dir.path().join("memories.airmem");
+        std::fs::create_dir(&occupied).expect("something already sits at the chosen path");
+
+        let err = write_all_or_nothing(&occupied, "{\"manifest\":{}}").expect_err("save fails");
+        assert!(err.contains("could not save"), "names the failed step: {err}");
+        assert_eq!(
+            entries(dir.path()),
+            ["memories.airmem"],
+            "no temp fragment survives the failed save"
+        );
+        assert!(occupied.is_dir(), "and nothing clobbered what was already there");
+    }
+
+    /// A pre-planted symlink where a predictable temp name would land must not redirect the
+    /// bundle's plaintext out of the folder the owner chose. The temp name is unguessable AND
+    /// created `O_EXCL`, so the decoy is simply never touched.
+    #[test]
+    fn a_planted_temp_symlink_cannot_capture_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("attacker-readable");
+        std::fs::write(&elsewhere, "empty").expect("decoy target");
+        // The name the obvious implementation would have used.
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("memories.airmem.tmp"))
+            .expect("plant the decoy");
+
+        let target = dir.path().join("memories.airmem");
+        write_all_or_nothing(&target, "{\"manifest\":{}}").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "empty", "the decoy never received it");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"manifest\":{}}");
     }
 }
