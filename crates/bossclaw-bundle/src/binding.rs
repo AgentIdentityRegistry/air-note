@@ -25,11 +25,24 @@ pub fn verify_binding_internal(binding: &Binding) -> bool {
     verify_bytes(&binding_signing_bytes(&binding.payload), &binding.identity_signature, &vk).is_ok()
 }
 
+/// Longest accepted encoded key string. A multibase base58btc `0xed01` multikey of 34 bytes is
+/// ~48 chars; 64 leaves headroom for other multibase alphabets while bounding the O(n²) decode.
+const MAX_ENCODED_KEY_LEN: usize = 64;
+
 /// Decode a multibase Ed25519 public key to its raw 32 bytes, accepting BOTH the bare-32 form and
 /// the `0xed01`-prefixed multikey form (finding #6: the registry publishes multikey; the binding
 /// stores bare — L2 must compare the RAW KEY BYTES, never the encoded strings).
 pub fn decode_ed25519_key(mb: &str) -> Option<[u8; 32]> {
+    // DoS gate (Task-4 review, measured): `multibase::decode` is O(n²) on base58 input
+    // (100k chars ≈ 1.2s, 400k ≈ 19s), and this string is fully attacker-controlled in a
+    // received bundle. The longest legitimate value is a base58btc multikey of 34 bytes
+    // (~48 chars), so anything past 64 is refusable on sight — no honest input is affected.
+    if mb.len() > MAX_ENCODED_KEY_LEN {
+        return None;
+    }
     let (_b, raw) = multibase::decode(mb).ok()?;
+    // The `raw.len() == 34` check MUST stay first — `&&` short-circuits, so it is what guards
+    // the `raw[0]`/`raw[1]` indexing below from panicking on short input.
     let bytes: &[u8] = if raw.len() == 34 && raw[0] == 0xed && raw[1] == 0x01 { &raw[2..] } else { &raw };
     bytes.try_into().ok()
 }
@@ -86,5 +99,24 @@ mod tests {
         // no prefix, wrong length
         let long = multibase::encode(multibase::Base::Base58Btc, [7u8; 40]);
         assert!(decode_ed25519_key(&long).is_none());
+    }
+    #[test]
+    fn decode_rejects_oversized_input_without_quadratic_decode() {
+        // A hostile bundle could otherwise hang the WASM verifier (O(n²) base58 decode).
+        let huge = format!("z{}", "Z".repeat(200_000));
+        assert!(decode_ed25519_key(&huge).is_none());
+        // A boundary-length string is still refused cheaply.
+        assert!(decode_ed25519_key(&format!("z{}", "Z".repeat(64))).is_none());
+        // ...and every legitimate form still decodes (regression guard on the cap being too tight).
+        let k = SigningKey::from_bytes(&[9u8; 32]);
+        let bytes = k.verifying_key().to_bytes();
+        let bare = multibase::encode(multibase::Base::Base58Btc, bytes);
+        let mut multikey = vec![0xed, 0x01];
+        multikey.extend_from_slice(&bytes);
+        let mk = multibase::encode(multibase::Base::Base58Btc, &multikey);
+        assert!(bare.len() <= MAX_ENCODED_KEY_LEN, "bare form must fit the cap: {}", bare.len());
+        assert!(mk.len() <= MAX_ENCODED_KEY_LEN, "multikey form must fit the cap: {}", mk.len());
+        assert_eq!(decode_ed25519_key(&bare).unwrap(), bytes);
+        assert_eq!(decode_ed25519_key(&mk).unwrap(), bytes);
     }
 }
