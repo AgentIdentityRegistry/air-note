@@ -8,6 +8,9 @@ repository = "https://github.com/AgentIdentityRegistry/air-note"
 
 [dependencies]
 bossclaw-canon = { path = "../bossclaw-canon" }
+# Rung 5: the `.airmem` build/verify crate. It depends on `bossclaw-canon` ONLY (never the engine),
+# so this edge is acyclic — core → bundle → canon.
+bossclaw-bundle = { path = "../bossclaw-bundle" }
 model2vec-rs = { version = "0.2", default-features = false }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 ed25519-dalek = "2.1"

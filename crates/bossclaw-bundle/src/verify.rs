@@ -303,7 +303,11 @@ fn check_item_shape(i: usize, item: &AirmemItem) -> Result<(), VerifyError> {
 /// True iff every object key at every depth of `value` is ASCII. Recursion depth is bounded by
 /// `serde_json`'s own 128-level parse limit (the `unbounded_depth` feature is NOT enabled), so an
 /// adversarially nested `display` cannot reach this with a stack-blowing shape.
-fn object_keys_are_ascii(value: &serde_json::Value) -> bool {
+///
+/// `pub` so the BUILD side can guarantee on the write side exactly what this verifier enforces on
+/// the read side (`bossclaw_core::log::export_bundle` authors every `display` key). Two private
+/// copies of a conformance rule is precisely the drift this constraint exists to prevent.
+pub fn object_keys_are_ascii(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => {
             map.iter().all(|(k, v)| k.is_ascii() && object_keys_are_ascii(v))

@@ -67,8 +67,9 @@ pub use graph::{AsOf, Edge, Entity, Grant, Mandate, Node, Page, WriteGrant, MAX_
 pub use index::{ConflictRef, HnswIndex, VectorIndex};
 pub use log::{
     ActiveModel, ConfigFlag, ConflictDetectReport, ConflictDigest, ConflictProposalRow,
-    ConflictSubject, EventLog, LanguagePackRecord, MigrationState, ReembedStats, ResolveAction,
-    ResolveOutcome, SynthCacheRow, LOUD_ACK_REQUIRED_MSG, SCHEMA_VERSION,
+    ConflictSubject, CurrentIngest, EventLog, ExportError, ExportSelection, LanguagePackRecord,
+    MigrationState, ReembedStats, ResolveAction, ResolveOutcome, SynthCacheRow,
+    LOUD_ACK_REQUIRED_MSG, MAX_EXPORT_BYTES, SCHEMA_VERSION,
 };
 #[cfg(unix)]
 pub use log::MandateAction;
