@@ -529,6 +529,22 @@ fn checked_display(display: serde_json::Value) -> Result<serde_json::Value, Expo
     Ok(display)
 }
 
+/// The receiver-safe form of a session's `project`: the final path component ONLY.
+///
+/// In real use `project` is a repo PATH (e.g. `/Users/<name>/air-note`), so shipping it verbatim
+/// would disclose the exporter's username and directory layout — precisely what A-N1 strips from
+/// every other field of a seal-vouched item. Owner ruling 2026-07-29: folder name only, so the
+/// receiver still learns WHICH project the session was about while the layout stays private.
+///
+/// A bare name comes back unchanged; a trailing separator is ignored (`/a/b/` → `b`); a root or
+/// empty value yields `None` so the caller OMITS the key rather than emitting `""`. Splits on `\`
+/// as well as `/` so a Windows-shaped value degrades to its last component instead of shipping
+/// whole (out of scope for today's fixtures, but the failure mode there would be a silent leak).
+fn project_display_name(project: &str) -> Option<String> {
+    let name = project.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// One CURRENT remembered note, folded from the log: a `memory`-kind event
 /// ([`EventLog::remember`] / the corrected note of [`EventLog::supersede_note`])
 /// that is NOT itself retired by a `supersede`. The projection behind
@@ -8277,14 +8293,20 @@ impl EventLog {
                 .get(id)
                 .cloned()
                 .unwrap_or_else(|| "[session body unavailable at export time]".to_string());
-            let display = checked_display(serde_json::json!({
+            let mut display = serde_json::json!({
                 "title": s.title,
-                "project": s.project,
                 "tool": s.tool,
                 "started_at": s.started_at,
                 "ended_at": s.ended_at,
                 "approx_bytes": s.approx_bytes,
-            }))?;
+            });
+            // `json!` cannot conditionally include a key, and A-N1 wants the field OMITTED rather
+            // than emitted empty when the project reduces to nothing. JCS sorts keys, so inserting
+            // out of order here does not affect the canonical bytes.
+            if let Some(project) = project_display_name(&s.project) {
+                display["project"] = serde_json::Value::String(project);
+            }
+            let display = checked_display(display)?;
             items.push(bossclaw_bundle::ItemInput::SealVouched {
                 kind: "session".to_string(),
                 content,
@@ -13748,18 +13770,22 @@ mod tests {
     }
 
     /// A-N1: a session is disclosed CONTENT-ONLY. Its `session_captured` event carries the on-disk
-    /// body path, the `session_id`, and the body hash — none of which may reach the bundle, which
-    /// is exactly why sessions are seal-vouched rather than stamped. Also pins the missing-body
-    /// placeholder (a body the daemon could not read must not abort the export) and the
+    /// body path, the `session_id`, the body hash, and the project PATH — none of which may reach
+    /// the bundle, which is exactly why sessions are seal-vouched rather than stamped. Also pins
+    /// the owner's 2026-07-29 ruling that `project` ships as a folder NAME (the receiver learns
+    /// which project, not the exporter's username or directory layout), the missing-body
+    /// placeholder (a body the daemon could not read must not abort the export), and the
     /// kind-aware verifier label.
     #[test]
     fn exported_session_is_content_only_and_leaks_no_local_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let log = open_log(dir.path());
         let embedder = MockEmbedder::new(8);
-        let session_ev = log
-            .capture_session(&embedder, &session_meta("sess-abc-123", &"aa".repeat(32)))
-            .unwrap();
+        let meta = SessionMeta {
+            project: "/Users/testuser/air-note".into(),
+            ..session_meta("sess-abc-123", &"aa".repeat(32))
+        };
+        let session_ev = log.capture_session(&embedder, &meta).unwrap();
         log.set_binding(binding_attestation(&log, 1)).unwrap();
         let text = log
             .export_bundle(&selection(vec![], vec![session_ev], vec![]), &HashMap::new())
@@ -13774,6 +13800,16 @@ mod tests {
         ] {
             assert!(!text.contains(needle), "the exported session leaked `{needle}`");
         }
+        // Owner ruling 2026-07-29: the folder NAME ships, the path around it does not.
+        assert!(text.contains("air-note"), "the receiver still learns which project this was");
+        assert!(
+            !text.contains("/Users/testuser"),
+            "the exporter's username and directory layout stay private"
+        );
+        assert!(
+            !text.contains("/Users/testuser/air-note"),
+            "the full project path never ships verbatim"
+        );
         let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
         let v = bossclaw_bundle::verify(&bundle, &bossclaw_bundle::OfflineResolver).unwrap();
         assert_eq!(v.item_labels[0], "captured session, content only; not independently verified");
@@ -13782,6 +13818,34 @@ mod tests {
             bundle.items[0].content.as_deref(),
             Some("[session body unavailable at export time]"),
             "a body the daemon could not supply becomes a placeholder, never an abort"
+        );
+    }
+
+    /// Owner ruling 2026-07-29: a session's `project` ships as its folder NAME only. Covers the
+    /// four shapes the field can take, plus the Windows-shaped value the splitter also handles.
+    #[test]
+    fn project_display_name_reduces_a_path_to_its_folder() {
+        assert_eq!(
+            project_display_name("/Users/testuser/air-note").as_deref(),
+            Some("air-note"),
+            "an absolute path reduces to its basename"
+        );
+        assert_eq!(
+            project_display_name("air-note").as_deref(),
+            Some("air-note"),
+            "a bare name is already receiver-safe"
+        );
+        assert_eq!(
+            project_display_name("/a/b/").as_deref(),
+            Some("b"),
+            "a trailing separator is ignored, not treated as an empty component"
+        );
+        assert_eq!(project_display_name("/"), None, "a root has no folder to name → omit the key");
+        assert_eq!(project_display_name(""), None, "an empty project → omit the key, never \"\"");
+        assert_eq!(
+            project_display_name(r"C:\Users\testuser\air-note").as_deref(),
+            Some("air-note"),
+            "a Windows-shaped value degrades to its last component instead of shipping whole"
         );
     }
 
