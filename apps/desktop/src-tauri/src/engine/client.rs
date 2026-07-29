@@ -48,7 +48,9 @@ use bossclawd_proto::types::{
     ModelStatusWire, NoteWire, PreviewDataWire, ProposalSummaryWire, ReasonerConfigWire,
     ReasonerModeWire, RecallMissWire, RecallStatsWire, SessionDetailWire, SessionSummaryWire,
 };
-use bossclawd_proto::{HitWire, OpErrorKindWire, Request, Response};
+use bossclawd_proto::{
+    BundleLimitWire, ExportSelectionWire, HitWire, OpErrorKindWire, Request, Response,
+};
 
 use super::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
 use super::transport::Transport;
@@ -538,6 +540,54 @@ impl<T: Transport + ?Sized> EngineClient<T> {
         }
     }
 
+    // ── Rung-5 SP-V1 export (§2.3/§2.4). App-only ops (the daemon's role gate denies `MemoryClient`
+    //    for all three: a guest may read memories, but never read the brain key, write the identity
+    //    binding, or seal an export). `onboarded` is THREADED from the caller like every sibling. ──
+
+    /// Mirrors the daemon's `BrainVerifyingKey` (§2.3): this brain's ACTUAL verifying key, multibase
+    /// base58btc. The app must mint the identity binding over the value it reads HERE — never over a
+    /// remembered or app-derived key, or the daemon's brain-key check refuses the card.
+    pub async fn brain_verifying_key(&self, onboarded: bool) -> Result<String, EngineOpError> {
+        match self.request(Request::BrainVerifyingKey { onboarded }).await? {
+            Response::BrainVerifyingKey(k) => Ok(k),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Mirrors `SetBinding` (§2.3): store the app-minted identity binding (the ID card). The daemon
+    /// VALIDATES before storing (purpose tag, identity signature over `jcs(payload)`, brain-key
+    /// match, owner did, first-write-wins epoch) and returns a typed [`EngineOpError::Rejected`] for
+    /// each refusal — including "binding epoch N already stored", which the caller treats as the
+    /// idempotent success it is.
+    pub async fn set_binding(
+        &self,
+        onboarded: bool,
+        attestation: serde_json::Value,
+    ) -> Result<(), EngineOpError> {
+        self.unit(Request::SetBinding { onboarded, attestation }).await
+    }
+
+    /// Mirrors `ExportBundle` (§2.4): build a sealed `.airmem` for `selection`, returned as its
+    /// canonical JSON text. Pure-read (the export runs `verify_chain` first and never seals from a
+    /// log that does not verify).
+    ///
+    /// [`Response::BundleTooLarge`] is a typed SIZE REFUSAL, not a fault, so it folds into
+    /// [`EngineOpError::Rejected`] carrying [`bundle_too_large_message`]'s limit-aware text — the app
+    /// shows "select fewer memories", never "engine unavailable".
+    pub async fn export_bundle(
+        &self,
+        onboarded: bool,
+        selection: ExportSelectionWire,
+    ) -> Result<String, EngineOpError> {
+        match self.request(Request::ExportBundle { onboarded, selection }).await? {
+            Response::Bundle(text) => Ok(text),
+            Response::BundleTooLarge { bytes, max, limit } => {
+                Err(EngineOpError::Rejected(bundle_too_large_message(bytes, max, limit)))
+            }
+            other => Err(unexpected(other)),
+        }
+    }
+
     // ── Internal request helpers ─────────────────────────────────────────────
 
     /// Send `req` and unwrap the daemon's non-success signals to a typed error. Success and
@@ -609,6 +659,27 @@ fn op_error_from_wire(kind: OpErrorKindWire, message: String) -> EngineOpError {
         }
         // The app is always `App`, so it never receives this; the arm keeps the match exhaustive.
         OpErrorKindWire::NotPermitted => EngineOpError::Core(message),
+    }
+}
+
+/// Render a [`Response::BundleTooLarge`] for the owner, LIMIT-AWARE (proto's own requirement): the
+/// two refusal paths measure genuinely different quantities, so `bytes`/`max` are meaningless
+/// without the tag. [`BundleLimitWire::ExportBytes`] counts the `.airmem` text itself;
+/// [`BundleLimitWire::WireFrame`] counts that text after JSON-escaping into the daemon's reply
+/// frame (≈2–4× larger). Conflating them would tell the owner a size and a ceiling that do not
+/// describe the same thing, so each arm names WHAT was measured. Both are fixed the same way, and
+/// the fix is the last sentence of both messages.
+fn bundle_too_large_message(bytes: u64, max: u64, limit: BundleLimitWire) -> String {
+    match limit {
+        BundleLimitWire::ExportBytes => format!(
+            "too big to export: the signed file would be {bytes} bytes, over the {max}-byte limit. \
+             Select fewer memories and try again."
+        ),
+        BundleLimitWire::WireFrame => format!(
+            "too big to export: the reply carrying the signed file would be {bytes} bytes, over the \
+             {max}-byte limit (packing it for delivery makes it larger than the file itself). \
+             Select fewer memories and try again."
+        ),
     }
 }
 
@@ -1585,5 +1656,67 @@ mod tests {
             .await
             .expect("supersede_note");
         assert_eq!(id, "new-id");
+    }
+
+    // ── Rung-5 SP-V1 export ops ──
+
+    fn empty_selection() -> ExportSelectionWire {
+        ExportSelectionWire {
+            note_event_ids: vec![],
+            session_event_ids: vec![],
+            ingest_event_ids: vec![],
+            description: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn brain_verifying_key_returns_the_daemons_key() {
+        let client =
+            EngineClient::new(Arc::new(CannedTransport(Response::BrainVerifyingKey("zBrain".into()))));
+        let k = bounded(client.brain_verifying_key(true)).await.expect("brain_verifying_key");
+        assert_eq!(k, "zBrain", "the app mints over the daemon's ACTUAL key, verbatim");
+    }
+
+    #[tokio::test]
+    async fn export_bundle_returns_the_airmem_text() {
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::Bundle("{\"manifest\":{}}".into()))));
+        let text = bounded(client.export_bundle(true, empty_selection())).await.expect("export_bundle");
+        assert_eq!(text, "{\"manifest\":{}}");
+    }
+
+    /// `BundleTooLarge` is a typed SIZE REFUSAL: it must reach the UI as `Rejected` ("select fewer
+    /// memories"), never as a fault — and the message must name WHICH quantity was measured, because
+    /// the two limits count different things (proto's `BundleLimitWire` contract).
+    #[tokio::test]
+    async fn bundle_too_large_is_a_limit_aware_rejection_not_a_fault() {
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::BundleTooLarge {
+            bytes: 31_457_281,
+            max: 31_457_280,
+            limit: BundleLimitWire::ExportBytes,
+        })));
+        let err = bounded(client.export_bundle(true, empty_selection())).await.expect_err("refused");
+        let text = match &err {
+            EngineOpError::Rejected(m) => m.clone(),
+            other => panic!("expected Rejected, got {other:?}"),
+        };
+        assert!(text.contains("31457281") && text.contains("31457280"), "both numbers shown: {text}");
+        assert!(text.contains("signed file"), "names the FILE quantity: {text}");
+        assert!(!text.contains("delivery"), "must not borrow the frame arm's wording: {text}");
+        assert!(text.contains("Select fewer memories"), "tells the owner the fix: {text}");
+
+        // The frame arm measures the ESCAPED reply, so it says so — a renderer that ignored `limit`
+        // would show these bytes against the file wording and mislead the owner.
+        let client = EngineClient::new(Arc::new(CannedTransport(Response::BundleTooLarge {
+            bytes: 40_000_000,
+            max: 33_554_432,
+            limit: BundleLimitWire::WireFrame,
+        })));
+        let err = bounded(client.export_bundle(true, empty_selection())).await.expect_err("refused");
+        let text = match &err {
+            EngineOpError::Rejected(m) => m.clone(),
+            other => panic!("expected Rejected, got {other:?}"),
+        };
+        assert!(text.contains("delivery"), "names the FRAME quantity: {text}");
+        assert!(text.contains("Select fewer memories"), "tells the owner the fix: {text}");
     }
 }

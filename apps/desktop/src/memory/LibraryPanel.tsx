@@ -2,12 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { Card } from "../components/Card";
 import { Button } from "../components/Button";
 import {
-  listSessions, listNotes, recall, getSession, deleteSession, recallStats,
-  type SessionSummaryDto, type SessionDetailDto, type NoteDto, type HitDto, type RecallStatsDto,
+  listSessions, listNotes, listFiles, recall, getSession, deleteSession, recallStats,
+  type SessionSummaryDto, type SessionDetailDto, type NoteDto, type FileRecordDto,
+  type HitDto, type RecallStatsDto,
 } from "../api/engine";
+import { exportBundle } from "../api/export";
 import { HitList } from "./HitList";
 import { SessionReader } from "./SessionReader";
 import { NoteRow } from "./NoteRow";
+import { ExportReviewSheet } from "./ExportReviewSheet";
 import { formatDay } from "./format";
 
 /** The daemon's bare-string rejection when a session no longer exists (delete race — spec §3). */
@@ -17,6 +20,13 @@ const isGone = (e: unknown) => String(e).includes(SESSION_GONE);
 
 /** How many hits to request when the user runs a full-memory search. */
 const RECALL_K = 10;
+
+/** Add or remove `id` from a selection set, returning a NEW set (React state must not mutate). */
+function toggled(set: Set<string>, id: string): Set<string> {
+  const next = new Set(set);
+  if (!next.delete(id)) next.add(id);
+  return next;
+}
 
 /** Case-insensitive "contains" — the primitive behind the client-side filter. */
 function matches(haystack: string, needle: string): boolean {
@@ -29,11 +39,13 @@ function matches(haystack: string, needle: string): boolean {
  * instantly (client-side, over title/project/note text), while "Search memory" runs a full recall
  * across the whole brain and shows the hits in a separate Memory group (reusing the Brain search's
  * row rendering). Session View/Delete (C5) and note Supersede + the recall-stats strip (C6) attach
- * at the seams marked below. Tokens only (no hardcoded colors) per the shell-redesign gate.
+ * at the seams marked below, and Rung-5 export (tick memories → review sheet → one signed `.airmem`)
+ * at the seam after them. Tokens only (no hardcoded colors) per the shell-redesign gate.
  */
 export function LibraryPanel() {
   const [sessions, setSessions] = useState<SessionSummaryDto[]>([]);
   const [notes, setNotes] = useState<NoteDto[]>([]);
+  const [files, setFiles] = useState<FileRecordDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -95,9 +107,22 @@ export function LibraryPanel() {
   const loadStatsRef = useRef(loadStats);
   loadStatsRef.current = loadStats;
 
+  const loadFiles = async () => {
+    // Its OWN loader, not part of the sessions+notes `Promise.all`: an ingest-list hiccup must hide
+    // the Files section, never blank the whole Library (same rule as the stats strip).
+    try {
+      setFiles(await listFiles());
+    } catch {
+      setFiles([]);
+    }
+  };
+  const loadFilesRef = useRef(loadFiles);
+  loadFilesRef.current = loadFiles;
+
   useEffect(() => {
     void loadRef.current();
     void loadStatsRef.current();
+    void loadFilesRef.current();
   }, []);
 
   const onSearchMemory = async () => {
@@ -193,6 +218,57 @@ export function LibraryPanel() {
     }
   };
 
+  // ---- Rung-5 SP-V1: export a selection as a signed .airmem ----
+  //
+  // Notes and ingested files only. A session is addressed in an export by its CAPTURE EVENT id, and
+  // the Library's session listing carries `session_id` alone — the wire summary drops the event id
+  // — so there is no id to send yet. The review sheet already renders sessions honestly; wiring them
+  // in needs `event_id` on `SessionSummaryWire` (a daemon-side change).
+  const [selectedNotes, setSelectedNotes] = useState<Set<string>>(new Set());
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const [reviewing, setReviewing] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  // Resolve the selection against the CURRENT lists, so a note that was superseded (or a file that
+  // was re-ingested) between selecting and exporting silently drops out instead of being sent as a
+  // stale id the daemon would refuse.
+  const chosenNotes = notes.filter((n) => selectedNotes.has(n.event_id));
+  const chosenFiles = files.filter((f) => selectedFiles.has(f.file_event_id));
+  const chosenCount = chosenNotes.length + chosenFiles.length;
+
+  const openReview = () => {
+    setNotice(null);
+    setExportError(null);
+    setReviewing(true);
+  };
+
+  const confirmExport = async (description: string) => {
+    setExporting(true);
+    setExportError(null);
+    try {
+      const path = await exportBundle(
+        chosenNotes.map((n) => n.event_id),
+        [],
+        chosenFiles.map((f) => f.file_event_id),
+        description,
+      );
+      setReviewing(false);
+      // A cancelled save dialog yields null — nothing was written, so say nothing happened.
+      setNotice(path === null ? "Export cancelled — nothing was saved." : `Saved to ${path}`);
+      if (path !== null) {
+        setSelectedNotes(new Set());
+        setSelectedFiles(new Set());
+      }
+    } catch (e) {
+      // Tauri rejects Result<_, String> with a BARE STRING. Show the daemon's refusal verbatim —
+      // which memory it refused, and why, is the whole point.
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  };
+
   if (loading) {
     return (
       <Card>
@@ -222,7 +298,8 @@ export function LibraryPanel() {
   const visibleNotes = [...notes]
     .sort((a, b) => b.created_at - a.created_at)
     .filter((n) => needle === "" || matches(n.text, needle));
-  const archiveEmpty = sessions.length === 0 && notes.length === 0;
+  const visibleFiles = files.filter((f) => needle === "" || matches(f.canonical_path, needle));
+  const archiveEmpty = sessions.length === 0 && notes.length === 0 && files.length === 0;
 
   return (
     <Card>
@@ -251,6 +328,18 @@ export function LibraryPanel() {
       <p style={{ color: "var(--text-tertiary)", fontSize: 12, margin: "0 0 12px" }}>
         Typing filters what’s loaded; press Enter or “Search memory” to search your whole memory.
       </p>
+
+      {/* Rung-5 SP-V1: turn a selection into one signed .airmem the receiver can verify. */}
+      {archiveEmpty ? null : (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 0 16px", flexWrap: "wrap" }}>
+          <Button variant="secondary" disabled={chosenCount === 0} onClick={openReview}>
+            {chosenCount === 0 ? "Export signed bundle" : `Export signed bundle (${chosenCount})`}
+          </Button>
+          <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
+            Tick notes or files to send them as one signed file. Sessions can’t be exported yet.
+          </span>
+        </div>
+      )}
 
       {/* C6: recall-miss stats strip. Since R4-A these queries actively drive reflection (dossier
           refreshes for missed topics — design §2.4). Still only past search QUERIES that found nothing
@@ -343,13 +432,64 @@ export function LibraryPanel() {
                 {/* C6: each note is editable in place (Supersede). A saved edit re-lists notes so the
                     replacement shows and the old text vanishes (the daemon returns current notes only). */}
                 {visibleNotes.map((n) => (
-                  <NoteRow key={n.event_id} note={n} onSaved={refreshNotes} />
+                  <NoteRow
+                    key={n.event_id}
+                    note={n}
+                    selected={selectedNotes.has(n.event_id)}
+                    onToggleSelected={() => setSelectedNotes((prev) => toggled(prev, n.event_id))}
+                    onSaved={refreshNotes}
+                  />
                 ))}
               </ul>
             )}
           </section>
+
+          {files.length > 0 ? (
+            <section style={{ marginTop: 20 }}>
+              <h3 style={{ fontSize: 13, margin: "0 0 8px" }}>Files</h3>
+              {visibleFiles.length === 0 ? (
+                <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
+                  {`No files match “${query.trim()}”.`}
+                </p>
+              ) : (
+                <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                  {visibleFiles.map((f) => (
+                    <li
+                      key={f.file_event_id}
+                      style={{ padding: "10px 0", borderBottom: "1px solid var(--border-soft)" }}
+                    >
+                      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                        <input
+                          type="checkbox"
+                          checked={selectedFiles.has(f.file_event_id)}
+                          onChange={() =>
+                            setSelectedFiles((prev) => toggled(prev, f.file_event_id))
+                          }
+                          aria-label={`Select file for export: ${f.canonical_path}`}
+                          style={{ flexShrink: 0 }}
+                        />
+                        <span style={{ wordBreak: "break-word" }}>{f.canonical_path}</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          ) : null}
         </>
       )}
+
+      {reviewing ? (
+        <ExportReviewSheet
+          notes={chosenNotes.map((n) => ({ id: n.event_id, text: n.text }))}
+          sessions={[]}
+          ingests={chosenFiles.map((f) => ({ id: f.file_event_id, path: f.canonical_path }))}
+          exporting={exporting}
+          error={exportError}
+          onConfirm={(description) => void confirmExport(description)}
+          onCancel={() => setReviewing(false)}
+        />
+      ) : null}
 
       <SessionReader
         isOpen={openSessionId !== null}

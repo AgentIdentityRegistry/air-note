@@ -23,9 +23,20 @@ const rowStyle: CSSProperties = { padding: "10px 0", borderBottom: "1px solid va
  * Save writes a replacement via `supersedeNote` (the daemon makes the old note vanish and the new one
  * current), then asks the panel to re-list so the swap shows. Save is guarded: no blank (the engine
  * rejects it — A4) and no unchanged text (a pointless self-supersede). Edit state is local to the row;
- * the only thing crossing back to the panel is `onSaved`, the re-list trigger.
+ * the things crossing back to the panel are `onSaved` (the re-list trigger) and `onToggleSelected`
+ * (the Rung-5 export selection, which the panel owns because it spans notes and files).
  */
-export function NoteRow({ note, onSaved }: { note: NoteDto; onSaved: () => Promise<void> | void }) {
+export function NoteRow({
+  note,
+  selected,
+  onToggleSelected,
+  onSaved,
+}: {
+  note: NoteDto;
+  selected: boolean;
+  onToggleSelected: () => void;
+  onSaved: () => Promise<void> | void;
+}) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(note.text);
   const [saving, setSaving] = useState(false);
@@ -91,9 +102,18 @@ export function NoteRow({ note, onSaved }: { note: NoteDto; onSaved: () => Promi
   return (
     <li style={rowStyle}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-        <div>
-          <div style={{ fontSize: 14, lineHeight: 1.4 }}>{note.text}</div>
-          <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{formatDay(note.created_at)}</div>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggleSelected}
+            aria-label={`Select note for export: ${note.text}`}
+            style={{ marginTop: 3, flexShrink: 0 }}
+          />
+          <div>
+            <div style={{ fontSize: 14, lineHeight: 1.4 }}>{note.text}</div>
+            <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{formatDay(note.created_at)}</div>
+          </div>
         </div>
         <div style={{ flexShrink: 0 }}>
           <Button variant="secondary" onClick={startEdit}>Supersede</Button>

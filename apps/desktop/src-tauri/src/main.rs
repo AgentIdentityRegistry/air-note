@@ -236,6 +236,8 @@ fn main() {
             #[cfg(unix)]
             commands::engine::engine_recall_stats,
             #[cfg(unix)]
+            commands::export::export_bundle,
+            #[cfg(unix)]
             commands::integrations::integrations_status,
             #[cfg(unix)]
             commands::integrations::integrations_connect_claude_code,

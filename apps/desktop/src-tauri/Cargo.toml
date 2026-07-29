@@ -37,6 +37,10 @@ uuid = { version = "1", features = ["v4"] }
 # `#[cfg(unix)]`. `zeroize` is used only by the engine keystore, so it rides in the same section.
 [target.'cfg(unix)'.dependencies]
 bossclaw-core = { path = "../../../crates/bossclaw-core", features = ["ollama"] }
+# Rung-5 SP-V1: the `.airmem` format types. The app MINTS the identity binding (only it holds the
+# AIR identity key), so it must build a `Binding`/`BindingPayload` and canonicalize the payload with
+# the SAME code the daemon validates against and the verifier reads — never a re-typed shape.
+bossclaw-bundle = { path = "../../../crates/bossclaw-bundle" }
 # M1a Task 5: the daemon wire protocol (frame codec + Request/Response + Hello handshake + wire
 # mirrors). Unix-only alongside the engine — the daemon transport is a Unix-socket protocol, and the
 # `SocketTransport`/`EngineClient` live under `engine/` which is already `#[cfg(unix)]`-gated.

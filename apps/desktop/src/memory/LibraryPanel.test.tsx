@@ -3,9 +3,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, within, waitFor } from "@testing-library/react";
 import { LibraryPanel } from "./LibraryPanel";
 import {
-  listSessions, listNotes, recall, getSession, deleteSession, supersedeNote, recallStats,
+  listSessions, listNotes, listFiles, recall, getSession, deleteSession, supersedeNote, recallStats,
 } from "../api/engine";
-import type { SessionSummaryDto, NoteDto, HitDto } from "../api/engine";
+import { exportBundle } from "../api/export";
+import type { SessionSummaryDto, NoteDto, FileRecordDto, HitDto } from "../api/engine";
 
 // LibraryPanel drives the engine through the api module directly (the MemoryPanel/LanguagePackCard
 // convention); mock only the IPC wrappers it calls and keep everything else real.
@@ -13,11 +14,12 @@ vi.mock("../api/engine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/engine")>();
   return {
     ...actual,
-    listSessions: vi.fn(), listNotes: vi.fn(), recall: vi.fn(),
+    listSessions: vi.fn(), listNotes: vi.fn(), listFiles: vi.fn(), recall: vi.fn(),
     getSession: vi.fn(), deleteSession: vi.fn(),
     supersedeNote: vi.fn(), recallStats: vi.fn(),
   };
 });
+vi.mock("../api/export", () => ({ exportBundle: vi.fn() }));
 
 // Two sessions, deliberately given oldest-first so the newest-first sort is actually exercised.
 const S_OLD: SessionSummaryDto = {
@@ -35,13 +37,20 @@ const NOTE: NoteDto = {
 /** Format an epoch-second timestamp the same way the panel does — locale-agnostic within a run. */
 const day = (epochSeconds: number) => new Date(epochSeconds * 1000).toLocaleDateString();
 
-function primeArchive(sessions: SessionSummaryDto[], notes: NoteDto[]) {
+const FILE: FileRecordDto = {
+  canonical_path: "/Users/me/notes/plan.md", file_event_id: "f1",
+  content_hash: "abc", grant_root: "/Users/me/notes", writable: false,
+};
+
+function primeArchive(sessions: SessionSummaryDto[], notes: NoteDto[], files: FileRecordDto[] = []) {
   vi.mocked(listSessions).mockResolvedValue(sessions);
   vi.mocked(listNotes).mockResolvedValue(notes);
+  vi.mocked(listFiles).mockResolvedValue(files);
   vi.mocked(recall).mockResolvedValue([]);
   // No recalls yet by default → the stats strip stays hidden and out of these tests' way.
   vi.mocked(recallStats).mockResolvedValue({ total: 0, misses: 0, recent_misses: [] });
   vi.mocked(supersedeNote).mockResolvedValue("n-new");
+  vi.mocked(exportBundle).mockResolvedValue("/Users/me/Desktop/memories-2026-07-29.airmem");
 }
 
 describe("LibraryPanel", () => {
@@ -421,6 +430,109 @@ describe("LibraryPanel", () => {
     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
     // The raw refresh error string never leaks to the UI.
     expect(screen.queryByText(/listNotes hiccup/)).toBeNull();
+  });
+
+  // ---- Rung-5 SP-V1: export a selection as a signed .airmem ----
+
+  it("selecting a note and exporting opens the review sheet, then sends the chosen ids", async () => {
+    primeArchive([S_NEW], [NOTE], [FILE]);
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    // Nothing selected → the export button is inert (an empty selection is refused by core anyway).
+    const exportButton = () => screen.getByRole("button", { name: /Export signed bundle/ });
+    expect(exportButton()).toBeDisabled();
+
+    fireEvent.click(await screen.findByLabelText(/Select note for export/));
+    fireEvent.click(screen.getByLabelText(/Select file for export/));
+    expect(exportButton()).toBeEnabled();
+    fireEvent.click(exportButton());
+
+    // The review sheet lists BOTH picks with what actually ships for each.
+    const sheet = await screen.findByRole("dialog", { name: /Review what you are about to export/i });
+    expect(within(sheet).getByText(/full signed record/i)).toBeInTheDocument();
+    expect(within(sheet).getByText(/full extracted text/i)).toBeInTheDocument();
+    expect(within(sheet).getByText(/can read the plaintext of everything selected/i)).toBeInTheDocument();
+
+    fireEvent.change(within(sheet).getByLabelText(/note for whoever receives this/i), {
+      target: { value: "for review" },
+    });
+    fireEvent.click(within(sheet).getByRole("button", { name: /Export signed bundle/ }));
+
+    // Note ids and ingest ids travel in their OWN buckets (they seal as different item classes);
+    // sessions are empty until the wire carries their capture event id.
+    await waitFor(() =>
+      expect(exportBundle).toHaveBeenCalledWith(["n1"], [], ["f1"], "for review"),
+    );
+    expect(await screen.findByText(/Saved to \/Users\/me\/Desktop\/memories-2026-07-29.airmem/))
+      .toBeInTheDocument();
+  });
+
+  it("a cancelled save dialog says nothing was written (and keeps the selection)", async () => {
+    primeArchive([], [NOTE]);
+    vi.mocked(exportBundle).mockResolvedValue(null);
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    fireEvent.click(screen.getByLabelText(/Select note for export/));
+    fireEvent.click(screen.getByRole("button", { name: /Export signed bundle/ }));
+    const sheet = await screen.findByRole("dialog", { name: /Review what you are about to export/i });
+    fireEvent.click(within(sheet).getByRole("button", { name: /Export signed bundle/ }));
+
+    expect(await screen.findByText(/nothing was saved/i)).toBeInTheDocument();
+    // The pick survives, so the owner can retry without re-ticking.
+    expect(screen.getByRole("button", { name: /Export signed bundle \(1\)/ })).toBeInTheDocument();
+  });
+
+  it("an export refusal is shown verbatim in the sheet, not softened", async () => {
+    // Tauri rejects Result<_, String> with the daemon's BARE refusal string. Which refusal it was
+    // (not-current note vs too big vs empty) is exactly what the owner needs to see.
+    primeArchive([], [NOTE]);
+    vi.mocked(exportBundle).mockRejectedValue("note n1 is not a current note");
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+
+    fireEvent.click(screen.getByLabelText(/Select note for export/));
+    fireEvent.click(screen.getByRole("button", { name: /Export signed bundle/ }));
+    const sheet = await screen.findByRole("dialog", { name: /Review what you are about to export/i });
+    fireEvent.click(within(sheet).getByRole("button", { name: /Export signed bundle/ }));
+
+    expect(await screen.findByText("note n1 is not a current note")).toBeInTheDocument();
+    // The sheet stays open so the owner can adjust the selection.
+    expect(screen.getByRole("dialog", { name: /Review what you are about to export/i })).toBeInTheDocument();
+  });
+
+  it("a superseded note drops out of the export instead of being sent as a stale id", async () => {
+    primeArchive([], [NOTE]);
+    render(<LibraryPanel />);
+    await screen.findByText("Prefer tokens over hardcoded colors");
+    fireEvent.click(screen.getByLabelText(/Select note for export/));
+
+    // The note is edited; the daemon's re-list returns the REPLACEMENT under a new event id.
+    const CORRECTED: NoteDto = {
+      event_id: "n2", text: "Prefer design tokens", created_at: 1_750_000_500, superseded_by: null,
+    };
+    vi.mocked(listNotes).mockResolvedValue([CORRECTED]);
+    fireEvent.click(screen.getByRole("button", { name: "Supersede" }));
+    fireEvent.change(screen.getByRole("textbox", { name: /edit note/i }), {
+      target: { value: "Prefer design tokens" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Prefer design tokens");
+
+    // The old id is gone from the current list, so the selection empties itself.
+    expect(screen.getByRole("button", { name: /Export signed bundle/ })).toBeDisabled();
+  });
+
+  it("a files-list failure hides the Files section without breaking the Library", async () => {
+    primeArchive([S_NEW], [NOTE]);
+    vi.mocked(listFiles).mockRejectedValue("listFiles exploded");
+    render(<LibraryPanel />);
+
+    await screen.findByText("Design memory hub");
+    expect(screen.getByText("Prefer tokens over hardcoded colors")).toBeInTheDocument();
+    expect(screen.queryByText(/listFiles exploded/)).toBeNull();
+    expect(screen.queryByLabelText(/Select file for export/)).toBeNull();
   });
 
   it("a recall-stats failure degrades quietly (no strip, Library still works)", async () => {

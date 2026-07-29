@@ -558,4 +558,32 @@ impl Engine {
     pub async fn recall_stats(&self, onboarded: bool) -> Result<RecallStats, EngineOpError> {
         self.client.recall_stats(onboarded).await
     }
+
+    // ── Rung-5 SP-V1 export (§2.3/§2.4). App-only ops; `onboarded` threaded from the caller. ──
+
+    /// Mirrors `EngineClient::brain_verifying_key`: this brain's ACTUAL verifying key (multibase),
+    /// the value the app must mint the identity binding over.
+    pub async fn brain_verifying_key(&self, onboarded: bool) -> Result<String, EngineOpError> {
+        self.client.brain_verifying_key(onboarded).await
+    }
+
+    /// Mirrors `EngineClient::set_binding`: store the app-minted identity binding. The daemon
+    /// validates it and rejects a repeated epoch rather than overwriting (first-write-wins).
+    pub async fn set_binding(
+        &self,
+        onboarded: bool,
+        attestation: serde_json::Value,
+    ) -> Result<(), EngineOpError> {
+        self.client.set_binding(onboarded, attestation).await
+    }
+
+    /// Mirrors `EngineClient::export_bundle`: the sealed `.airmem` text for `selection`. A size
+    /// refusal arrives as the limit-aware [`EngineOpError::Rejected`], not a fault.
+    pub async fn export_bundle(
+        &self,
+        onboarded: bool,
+        selection: bossclawd_proto::ExportSelectionWire,
+    ) -> Result<String, EngineOpError> {
+        self.client.export_bundle(onboarded, selection).await
+    }
 }
