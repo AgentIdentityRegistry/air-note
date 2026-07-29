@@ -1917,6 +1917,25 @@ Steps:
 
 ## Task 10 — App: tauri command + TS api + Library multi-select + kind-aware review sheet
 
+> **REQUIRED from Task 9 (2026-07-29):**
+> - **Enforce the SAME parse-boundary byte ceiling.** Task 9's CLI landed `MAX_INPUT_BYTES = 32 MiB`
+>   (above core's 30 MiB `MAX_EXPORT_BYTES` so real exports still verify), enforced with TWO bounds: a
+>   cheap `metadata().len()` pre-check AND an authoritative `File::take(MAX + 1)` + length compare —
+>   because a stat length is TOCTOU-racy and absent for non-regular paths (`/dev/zero` streams forever).
+>   Parse from BYTES (`from_slice`), never a String round-trip, so serde_json's depth limit and
+>   out-of-range-float rejection stay in force. The constant is currently LOCAL to `air-verify`; **if
+>   this task adds a second host, HOIST it into `bossclaw-bundle` next to `MAX_ITEMS` rather than
+>   re-typing the literal.** Test it for TIMING (project rule), and mutation-check EACH bound separately
+>   — Task 9 proved they have different killers.
+> - **Honesty in rendered copy — the plan's own sketch was WRONG and must not be re-introduced.** Task 9's
+>   sketch printed, on every offline pass, a note claiming the file "proves which registered identity's
+>   brain recorded these exact bytes." That is FALSE at L1 and violates H5/C3. The shipped CLI renders
+>   `did: … (claimed by this file, NOT verified)` + `identity: unverified (offline)`; only
+>   `RegistryResolved` carries an identity claim. **Any app-side rendering must be level-aware the same
+>   way**, and should be pinned by a test asserting the verified-identity phrasing is ABSENT from an
+>   offline verdict. Per-item labels come VERBATIM from the verdict — never re-derived app-side.
+
+
 **Files:**
 - Modify `apps/desktop/src-tauri/src/engine/client.rs` + `engine/mod.rs` (proxies for the 3 ops — mirror `set_reflect_enabled`, client.rs:459 / mod.rs:518)
 - Create `apps/desktop/src-tauri/src/commands/export.rs`; modify `commands/mod.rs` (`pub mod export;`) + `main.rs` (`generate_handler!`, line 251)
