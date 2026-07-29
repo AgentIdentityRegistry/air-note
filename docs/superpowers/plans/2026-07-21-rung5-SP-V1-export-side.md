@@ -799,6 +799,29 @@ Steps:
 > 8. **Apply the same DoS reasoning to every other attacker-controlled string verify decodes** (Task-4 review): the encoded-key path is now length-gated (`MAX_ENCODED_KEY_LEN`, fix commit on Task 4) because `multibase::decode` is O(n²) on base58 (measured: 100k chars ≈ 1.2s, 400k ≈ 19s). Verify handles OTHER attacker-controlled multibase strings — `seal`, `items[].signature`, `binding.identity_signature` — and each must be length-bounded BEFORE decoding. An Ed25519 signature is 64 bytes ⇒ ~90 base58 chars; gate them the same way. The export-side `BundleTooLarge` cap does NOT protect the verifier (it is a daemon build-time refusal).
 > 3. **NFC-normalization decision for `canonical_json`** — `bossclaw-canon::canonical_bytes` NFC-normalizes before JCS; `bundle::canonical_json` does NOT. For SP-V1 + SP-V2 this is byte-identical-by-construction (same crate, incl. the WASM verifier), so **no code change is required now**; but record explicitly in a `verify.rs` doc comment that `.airmem` manifest/binding canonicalization is JCS-only (no NFC) and same-crate-verify-only, and that a future FOREIGN verifier (C2PA/VC/SCITT lift, §9 non-goal) must revisit. Make it a conscious documented choice, not an accident.
 
+> **DEFERRED TO SP-V2 from the Task-6 adversarial security review (2026-07-29) — restructures of the
+> most security-critical code, deliberately NOT churned in SP-V1; each deserves its own task + review:**
+> - **9. Two-pass verify loop (availability).** Per-item Ed25519 stamp verification currently runs in the
+>   SAME loop as leaf computation, i.e. BEFORE the root comparison — so a hostile bundle forces the full
+>   cryptographic bill before the cheap structural reject. Measured: rejecting a 2000-item bundle on
+>   `TreeMismatch` cost 126.3 ms vs 126.1 ms for a full valid verification — statistically identical.
+>   Fix: loop 1 computes/compares leaves (hashing only, ~2 µs/item) → compare root → loop 2 does stamps
+>   + labels. ~25× cheaper root-mismatch rejection. (Bounded meanwhile by the `MAX_ITEMS` floor.)
+> - **10. `Verdict` should make the assurance level un-ignorable (type ergonomics).** Today a consumer can
+>   write `if verify(..).is_ok() { render_green_check() }` without ever reading `identity` — the doc says
+>   "no surface may render an L1 pass as verified identity" but the TYPE permits it. With all consumers
+>   still unwritten this is the cheap moment: make `Verdict` an enum (`UnverifiedOffline{..}` /
+>   `RegistryResolved{..}`) so the level cannot be destructured away. Logic is correct today; this is
+>   about making the honesty invariant structural rather than documentary.
+> - **11. Split `Malformed(String)`.** It currently collapses nine distinct failure classes (bad semver,
+>   empty items, count mismatch, bad brain key, three oversized-encoding cases, every class↔field-set
+>   violation, non-ASCII display keys). Per-spec and human-readable, but a UI cannot branch on it and only
+>   substring-matching separates "your file is truncated" from "this file is attacking me". Consider
+>   `ItemShapeInvalid{i, detail}` + `EncodedTooLong{field, len}`.
+> Also INFO recorded: `epoch` is unvalidated (correct for SP-V1 — reserved, rotation out of scope; SP-V2's
+> rotation work must not assume the read side checks it); whole-bundle replay is unbounded (inherent to an
+> offline-verifiable artifact — an accepted design property, not a defect).
+
 The heart of the spec (§2.5 L1/L2, §7 error enum, §8 tamper matrix, §3-H2 kind-aware labels). Offline, fail-closed, one bad byte = ❌. The resolver seam is created FIRST (folded from the old Task 7).
 
 **Files:**
@@ -1731,6 +1754,18 @@ Steps:
 ---
 
 ## Task 9 — `air-verify` CLI crate
+
+> **REQUIRED from the Task-6 adversarial security review (2026-07-29) — the parse-boundary bound:**
+> `verify()` takes an ALREADY-PARSED `&Airmem`, so it cannot protect against a huge document; it now
+> carries a defensive `MAX_ITEMS` floor, but **the raw-byte ceiling belongs at the parse boundary and
+> is currently assigned to nobody.** Measured: ~55 µs per stamped item natively (2–5× in WASM), plus a
+> multi-hundred-MB `serde_json` allocation during parse of a ~100 MB document — i.e. a 30–60 s hang
+> before `verify` is ever called. **This CLI (and Task 10's app command, and SP-V2's WASM host) MUST
+> cap raw input bytes BEFORE `serde_json::from_*`,** and must parse from BYTES (not from a JS value)
+> so `serde_json`'s 128-level depth limit and out-of-range-float rejection stay in force. An attacker
+> mints their own brain key, so an arbitrarily large INTERNALLY VALID bundle is trivially producible.
+
+
 
 A tiny native crate (its own bin) so `bossclaw-bundle` stays a pure wasm-clean lib. Zero external deps beyond `bossclaw-bundle` — hand-rolled arg matching per the `air-memory-mcp` zero-dep precedent.
 
