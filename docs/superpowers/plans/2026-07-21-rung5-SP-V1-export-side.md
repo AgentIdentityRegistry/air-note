@@ -1924,6 +1924,11 @@ Steps:
 
 ## Task 11 — Conformance vectors + Story-C large fixture + final exit gate
 
+> **CARRY-FORWARD from the Task-3/4 rounds (2026-07-29) — what the unit tests do and do NOT guard:**
+> - **The frozen Merkle tag bytes (`0x00` leaf / `0x01` internal) have only INDIRECT unit-test protection.** Verified by mutation (implementer, not asserted): deleting both tags is caught ONLY by `odd_node_promoted_unpaired_not_duplicated`, which hardcodes `0x01` in its hand-computed expectation. The `domain_separation_*` test catches the *domains-collide* mutant (internal tag → `0x00`) but SURVIVES deletion of both tags, and its first assertion is a pure SHA-256 property that can never fail regardless of source. ⇒ **This task must add a hardcoded-digest conformance vector** (a fixed `.airmem` with its expected `merkle_root` written out) so the tag bytes get a direct, cross-repo-checkable guard. That is the vectors' job, not the unit tests'.
+> - Commit `4482a60`'s message says "mutation-proven"; accurate only for the collision mutant. Not amended (intermediate commit; the squash-merge message supersedes it) — recorded here so the branch review has the true picture.
+> - Also see the Task-6 carry-forward block: `display`-key ASCII constraint (a JCS UTF-8-vs-UTF-16 key-ordering divergence, proven, emoji-reachable) must be encoded in the vectors so no vector can ever carry a divergent bundle.
+
 **Files:**
 - Create `tests/vectors/{valid,tamper_seal,tamper_item,tamper_binding_hash,origin_mismatch,re_attribution}.airmem`, `tests/vectors/README.md`
 - Create `crates/bossclaw-bundle/tests/conformance.rs`
