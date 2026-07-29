@@ -6,7 +6,15 @@ use serde::{Deserialize, Serialize};
 pub const FORMAT_VERSION: &str = "1.0.0";
 
 /// The whole document: `{ manifest, items, binding, seal }`.
+///
+/// `deny_unknown_fields` here closes the LAST unlocked door. The rationale differs from the four
+/// hash-feeding types below (see [`Manifest`]): nothing at the top level feeds a hash, so an unknown
+/// sibling of `manifest`/`items`/`binding`/`seal` cannot change the VERDICT. What it can do is
+/// survive as payload to any downstream consumer that re-reads the raw file after verify said ✅ —
+/// the receiver's renderer, an archiver, a future lift into C2PA/VC/SCITT. A format that already
+/// refuses unknown fields at every other level should not leave one open at the outermost one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Airmem {
     /// The sealed sub-document (commits to items via `merkle_root`, to the card via `binding_hash`).
     pub manifest: Manifest,
@@ -174,17 +182,20 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected_at_the_parse_boundary() {
         // Verify canonicalizes FROM THE PARSED STRUCT, so a silently-dropped extra key would ride
-        // under a still-valid seal. These four types are the ones that feed hashes/signatures.
+        // under a still-valid seal. The four inner types are the ones that feed hashes/signatures;
+        // the top-level row closes the smuggling channel to consumers that re-read the raw file.
         let a = sample();
         for (pointer, field) in [
+            ("", "evil"), // top level: a sibling of manifest/items/binding/seal
             ("/manifest", "evil"),
             ("/items/0", "evil"),
             ("/binding", "evil"),
             ("/binding/payload", "evil"),
         ] {
+            let at = if pointer.is_empty() { "(top level)" } else { pointer };
             assert!(
                 parse_with_injected_field(&a, pointer, field).is_err(),
-                "an injected `{field}` at `{pointer}` must fail to parse, never be dropped"
+                "an injected `{field}` at `{at}` must fail to parse, never be dropped"
             );
         }
     }
