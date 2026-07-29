@@ -15,6 +15,10 @@
 //!   the binding's identity signature, and (in `binding.rs`) the keys — is bounded BEFORE decode.
 //!   The export-side `BundleTooLarge` cap does NOT protect this code: it is a daemon build-time
 //!   refusal on owner data, not a gate on a received file.
+//! * **Bound the WORK, not just the strings.** An attacker mints their own brain key, so every item
+//!   in a hostile bundle can be internally valid and force the full per-item cost; [`MAX_ITEMS`] is
+//!   the floor under that. It is not the whole answer — the host must also cap raw bytes before
+//!   parsing, which belongs at the parse boundary rather than here.
 //!
 //! CANONICALIZATION SCOPE (a conscious choice, Task-2 review #3): `.airmem` manifest/binding/item
 //! canonicalization is **JCS-only — it does NOT NFC-normalize**, unlike
@@ -36,7 +40,7 @@ use bossclaw_canon::event::{canonical_bytes, compute_hash, is_external, Event};
 use bossclaw_canon::sign::{verify_bytes, verify_hash, VerifyingKey};
 
 use self::semver_lite::major;
-use crate::binding::{binding_hash, decode_ed25519_key, verify_binding_internal};
+use crate::binding::{binding_hash, decode_ed25519_key, verify_binding_internal, MAX_ENCODED_SIG_LEN};
 use crate::format::{Airmem, AirmemItem, ItemClass};
 use crate::merkle;
 use crate::resolver::IdentityResolver;
@@ -96,10 +100,16 @@ pub struct Verdict {
 /// The newest `.airmem` MAJOR this verifier understands.
 const SUPPORTED_MAJOR: u64 = 1;
 
-/// Longest accepted encoded signature string. An Ed25519 signature is 64 bytes ⇒ ~90 base58btc
-/// chars; 128 leaves headroom for other multibase alphabets while bounding the O(n²) decode. Sibling
-/// of `binding::MAX_ENCODED_KEY_LEN`, which gates the key strings on the same reasoning.
-const MAX_ENCODED_SIG_LEN: usize = 128;
+/// Ceiling on items in a RECEIVED bundle. Verify costs ~55 µs per stamped item natively (several×
+/// that in WASM), and an attacker mints their OWN brain key, so every item in a hostile bundle can
+/// be internally valid and force 100% of the work — an unbounded count is therefore an availability
+/// hole, not merely a slow path. Generous enough for a whole-brain Story-C export. The host must
+/// ALSO cap raw bytes before parsing; that bound belongs at the parse boundary, not here.
+const MAX_ITEMS: usize = 50_000;
+
+/// The only legal binding purpose — a domain-separation tag (spec §2.3), so a card minted for any
+/// other identity-signed protocol can never be lifted into a bundle and honored here.
+const BINDING_PURPOSE: &str = "memory-signing";
 
 /// The only `kind` a [`ItemClass::Stamped`] item may carry (build stamps exactly this).
 const KIND_NOTE: &str = "note";
@@ -121,6 +131,12 @@ pub fn verify(bundle: &Airmem, resolver: &dyn IdentityResolver) -> Result<Verdic
     // WASM verifier instead of rendering a clean ❌ (Task-3 review #4).
     if bundle.items.is_empty() {
         return Err(VerifyError::Malformed("items: must not be empty".into()));
+    }
+    if bundle.items.len() > MAX_ITEMS {
+        return Err(VerifyError::Malformed(format!(
+            "items: {} entries exceeds the {MAX_ITEMS} ceiling",
+            bundle.items.len()
+        )));
     }
     if bundle.manifest.item_count != bundle.items.len() as u64 {
         return Err(VerifyError::Malformed(format!(
@@ -162,6 +178,16 @@ pub fn verify(bundle: &Airmem, resolver: &dyn IdentityResolver) -> Result<Verdic
     }
     if bundle.binding.payload.did != bundle.manifest.did {
         return Err(VerifyError::BindingDidMismatch);
+    }
+    // Domain separation. Nothing else in the system validates this tag, so it is inert only for as
+    // long as `memory-signing` is the ONLY payload AIR ever asks an identity key to sign. The moment
+    // a second one exists with these six fields, an unenforced `purpose` lets an attacker lift that
+    // card over their own brain key and reach RegistryResolved — re-attribution (C1) by side door.
+    if bundle.binding.payload.purpose != BINDING_PURPOSE {
+        return Err(VerifyError::Malformed(format!(
+            "binding.payload.purpose must be \"{BINDING_PURPOSE}\", got \"{}\"",
+            bundle.binding.payload.purpose
+        )));
     }
 
     let mut leaves = Vec::with_capacity(bundle.items.len());
@@ -502,6 +528,26 @@ mod tests {
         assert_eq!(verify(&b, &off()), Err(VerifyError::BindingInvalid));
     }
 
+    // ---- DOMAIN SEPARATION: a card minted for a DIFFERENT identity-signed protocol is refused ----
+    #[test]
+    fn wrong_binding_purpose_is_malformed() {
+        let mut b = valid_bundle();
+        let idk = SigningKey::from_bytes(&[9u8; 32]); // the identity key valid_bundle() used
+        b.binding.payload.purpose = "did-control-challenge".into();
+        // Re-sign the card and re-commit it, so this is a PERFECT binding in every other respect.
+        b.binding.identity_signature = sign_bytes(&binding_signing_bytes(&b.binding.payload), &idk);
+        b.manifest.binding_hash = hex::encode(crate::binding::binding_hash(&b.binding));
+        reseal(&mut b);
+        // Prove the rest of the chain really does pass: the card self-verifies, and its did and
+        // brain key still agree with the sealed manifest...
+        assert!(crate::binding::verify_binding_internal(&b.binding), "card is self-consistent");
+        assert_eq!(b.binding.payload.did, b.manifest.did);
+        assert_eq!(b.binding.payload.brain_verifying_key, b.manifest.brain_verifying_key);
+        // ...so the purpose tag is provably the only thing rejecting it.
+        let e = verify(&b, &off()).unwrap_err();
+        assert!(malformed_detail(&e).contains("purpose"), "got {e:?}");
+    }
+
     // ---- RE-ATTRIBUTION FORGERY (C1): fresh binding by a DIFFERENT identity over the same brain key.
     //      Layer 1 (binding_hash) tested here; layer 2 (BindingDidMismatch) after recompute+reseal. ----
     fn attacker_binding(brain_mb: &str) -> Binding {
@@ -544,6 +590,52 @@ mod tests {
             event_bytes: Some(event_bytes), signature: Some(fsig), carried_origin: Some("external".into()),
             content: None, display: None };
         reindex(&mut b);
+        assert_eq!(verify(&b, &off()), Err(VerifyError::ItemStampInvalid(0)));
+    }
+
+    // ---- EVENT-BYTES CANONICALITY: the disclosed bytes must be CANONICAL, not merely equivalent.
+    //      Both cases sign honestly over the canonical hash, so `verify_hash` PASSES and the
+    //      `recanon != bytes` check is the only thing that can reject. ----
+
+    /// Swap in a stamped item built from raw `event_bytes` + a signature over its canonical hash.
+    fn bundle_with_raw_event_bytes(event_bytes: String) -> Airmem {
+        let brain = SigningKey::from_bytes(&BRAIN);
+        let parsed: Event = serde_json::from_str(&event_bytes).expect("fixture is valid JSON");
+        let sig = sign_hash(&compute_hash(&parsed).unwrap(), &brain);
+        let mut b = valid_bundle();
+        b.items[0] = AirmemItem {
+            leaf: String::new(), class: ItemClass::Stamped, kind: "note".into(),
+            event_bytes: Some(event_bytes), signature: Some(sig),
+            carried_origin: Some("external".into()), content: None, display: None,
+        };
+        reindex(&mut b);
+        b
+    }
+
+    #[test]
+    fn non_canonical_event_bytes_are_rejected() {
+        // Pretty-printed: valid JSON, identical fields, honest signature — but not JCS. Accepting
+        // "equivalent" bytes would open a parser-differential class, e.g. duplicate keys inside the
+        // free-form `content` value, which serde silently resolves last-wins.
+        let ev = note_event("shared note", true);
+        let event_bytes = serde_json::to_string_pretty(&ev).unwrap();
+        assert_ne!(
+            event_bytes.as_bytes(), canonical_bytes(&ev).unwrap().as_slice(),
+            "fixture must actually be non-canonical, or the test proves nothing"
+        );
+        let b = bundle_with_raw_event_bytes(event_bytes);
+        assert_eq!(verify(&b, &off()), Err(VerifyError::ItemStampInvalid(0)));
+    }
+
+    #[test]
+    fn event_bytes_with_an_embedded_hash_field_are_rejected() {
+        // `canonical_bytes` STRIPS `hash` (and `signature`) before hashing, so bytes carrying one
+        // can never round-trip. Note the hash the signature covers is unchanged by the extra field,
+        // which is exactly why the stamp check alone would wave this through.
+        let ev = note_event("shared note", true);
+        let mut v: serde_json::Value = serde_json::from_slice(&canonical_bytes(&ev).unwrap()).unwrap();
+        v.as_object_mut().unwrap().insert("hash".into(), serde_json::json!("11".repeat(32)));
+        let b = bundle_with_raw_event_bytes(serde_json::to_string(&v).unwrap());
         assert_eq!(verify(&b, &off()), Err(VerifyError::ItemStampInvalid(0)));
     }
 
@@ -629,6 +721,20 @@ mod tests {
         reseal(&mut b); // cannot reindex: that would call merkle::root on an empty slice
         let e = verify(&b, &off()).unwrap_err();
         assert!(malformed_detail(&e).contains("empty"), "got {e:?}");
+    }
+
+    #[test]
+    fn too_many_items_is_malformed() {
+        // The attacker mints their own brain key, so an oversized bundle can be entirely valid and
+        // force 100% of the per-item work. Deliberately NOT reindexed: the ceiling has to reject
+        // before any hashing happens, so this bundle's leaves and root are stale and never reached.
+        let mut b = valid_bundle();
+        b.items = vec![seal_vouched("session", "x"); MAX_ITEMS + 1];
+        b.manifest.item_count = b.items.len() as u64; // so the count check cannot be what fires
+        let e = verify(&b, &off()).unwrap_err();
+        let detail = malformed_detail(&e);
+        assert!(detail.contains(&MAX_ITEMS.to_string()), "should name the ceiling: {e:?}");
+        assert!(detail.contains(&(MAX_ITEMS + 1).to_string()), "should name the count: {e:?}");
     }
 
     #[test]

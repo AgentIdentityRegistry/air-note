@@ -20,6 +20,14 @@ pub fn binding_hash(binding: &Binding) -> [u8; 32] {
 /// L1 internal consistency: the identity signature verifies over `jcs(payload)` against the EMBEDDED
 /// `identity_verifying_key`. ZERO identity assurance (the key is attacker-choosable, C3).
 pub fn verify_binding_internal(binding: &Binding) -> bool {
+    // CALLER-PROOF DoS gate. This function is `pub` and re-exported, so the verifier's own
+    // call-site gate must not be the only one — Task 9's CLI and SP-V2's resolver will call it
+    // directly and would silently re-open the hang. `multibase::decode` is O(n²) on base58
+    // (measured on this very string: 100k chars ≈ 1.17 s, 200k ≈ 4.72 s). The key below is already
+    // gated inside `decode_ed25519_key`; this is the signature's equivalent.
+    if binding.identity_signature.len() > MAX_ENCODED_SIG_LEN {
+        return false;
+    }
     let Some(raw) = decode_ed25519_key(&binding.payload.identity_verifying_key) else { return false };
     let Ok(vk) = VerifyingKey::from_bytes(&raw) else { return false };
     verify_bytes(&binding_signing_bytes(&binding.payload), &binding.identity_signature, &vk).is_ok()
@@ -28,6 +36,12 @@ pub fn verify_binding_internal(binding: &Binding) -> bool {
 /// Longest accepted encoded key string. A multibase base58btc `0xed01` multikey of 34 bytes is
 /// ~48 chars; 64 leaves headroom for other multibase alphabets while bounding the O(n²) decode.
 const MAX_ENCODED_KEY_LEN: usize = 64;
+
+/// Longest accepted encoded signature string — the sibling of `MAX_ENCODED_KEY_LEN`, same O(n²)
+/// reasoning, different payload. An Ed25519 signature is 64 bytes ⇒ ~90 base58btc chars; 128 leaves
+/// headroom for other multibase alphabets. Lives here, next to the decode sites it protects, so
+/// `verify_binding_internal` and `verify.rs`'s call-site gates share ONE number.
+pub(crate) const MAX_ENCODED_SIG_LEN: usize = 128;
 
 /// Decode a multibase Ed25519 public key to its raw 32 bytes, accepting BOTH the bare-32 form and
 /// the `0xed01`-prefixed multikey form (finding #6: the registry publishes multikey; the binding
@@ -71,6 +85,30 @@ mod tests {
         b.payload.did = "did:wba:evil.com:attacker".into();
         assert!(!verify_binding_internal(&b));
     }
+    #[test]
+    fn internal_verify_refuses_an_oversized_signature_without_quadratic_decode() {
+        // This function is `pub` and re-exported, so it must be caller-proof on its own: the
+        // verifier's call-site gate does not protect Task 9's CLI or SP-V2's resolver. Without the
+        // internal gate this call takes seconds (200k chars ≈ 4.7 s of base58 decode).
+        let mut b = signed_binding(&SigningKey::from_bytes(&[3u8; 32]), 1);
+        b.identity_signature = format!("z{}", "Z".repeat(200_000));
+        // The RESULT alone cannot prove the gate exists — an ungated decode also returns false
+        // (200k base58 chars are not a 64-byte signature), just seconds later. So assert the SPEED:
+        // rejecting on length is microseconds, while decoding first measured 24 s here. The 2 s
+        // bound is deliberately loose so a loaded CI box can never flake it, and still leaves >10×
+        // margin over the regression it exists to catch.
+        let started = std::time::Instant::now();
+        assert!(!verify_binding_internal(&b));
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?} — the length gate is not short-circuiting the O(n²) decode");
+        // Regression guard on the cap being too tight: a REAL signature still fits and still passes.
+        let good = signed_binding(&SigningKey::from_bytes(&[3u8; 32]), 1);
+        assert!(good.identity_signature.len() <= MAX_ENCODED_SIG_LEN,
+            "real signature is {} chars", good.identity_signature.len());
+        assert!(verify_binding_internal(&good));
+    }
+
     #[test]
     fn binding_hash_covers_signature() {
         let b = signed_binding(&SigningKey::from_bytes(&[3u8; 32]), 1);
