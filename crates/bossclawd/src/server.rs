@@ -520,6 +520,12 @@ async fn dispatch(engine: &Arc<EngineHandle>, role: Role, req: Request) -> Respo
     }
 }
 
+/// The refusal a caller sees when the memory chain does not verify. `const` because BOTH paths that
+/// can report it — core's own `ExportError::ChainInvalid` arm and [`oversize_verdict`]'s probe —
+/// must say the same thing; two copies of this sentence could drift into two different diagnoses of
+/// one condition.
+const EXPORT_CHAIN_INVALID: &str = "cannot export: memory chain does not verify";
+
 /// Rung-5 §2.4 — the `ExportBundle` seam: coarse size guard → bounded session-body reads → build +
 /// seal → the authoritative pre-frame size guard.
 ///
@@ -546,11 +552,11 @@ async fn export_dispatch(
     // 1. Coarse, pre-body, pre-seal guard.
     match engine.estimate_export_bytes(onboarded, selection.clone()).await {
         Ok(bytes) if bytes > MAX_EXPORT_BYTES => {
-            return Response::BundleTooLarge {
-                bytes,
-                max: MAX_EXPORT_BYTES,
-                limit: BundleLimitWire::ExportBytes,
-            }
+            // The chain probe runs ONLY here, on the path that has already decided to refuse — see
+            // `oversize_verdict` for why the precedence matters and why probing earlier would be
+            // the wrong trade.
+            let chain_ok = engine.status(onboarded).await.chain_ok;
+            return oversize_verdict(bytes, chain_ok);
         }
         Ok(_) => {}
         Err(e) => return op_error_response(e),
@@ -605,15 +611,49 @@ async fn export_dispatch(
             // TEXT semantics — NOT the escaped-frame semantics `frame_guard` reports.
             Response::BundleTooLarge { bytes, max, limit: BundleLimitWire::ExportBytes }
         }
-        Ok(Err(ExportError::ChainInvalid)) => {
-            export_rejected("cannot export: memory chain does not verify")
-        }
+        Ok(Err(ExportError::ChainInvalid)) => export_rejected(EXPORT_CHAIN_INVALID),
         Ok(Err(ExportError::EmptySelection)) => export_rejected("empty selection"),
         Ok(Err(ExportError::BindingUnavailable)) => export_rejected("no identity binding stored"),
         Ok(Err(ExportError::NotExportable(reason))) => export_rejected(&reason),
         Ok(Err(ExportError::Core(message))) => {
             Response::Err { kind: OpErrorKindWire::Core, message }
         }
+    }
+}
+
+/// The verdict for a selection the pre-build estimate has already judged over-cap: `ChainInvalid`
+/// when the log does not verify, `BundleTooLarge` otherwise.
+///
+/// WHY THE PRECEDENCE MATTERS (Task-8 security review, triaged at the Task-11 gate). Core's own
+/// ordering puts `verify_chain` FIRST — a tampered log reports `ChainInvalid` whatever the selection
+/// size. But [`export_dispatch`] prepends the size estimate and the session-body reads BEFORE core
+/// runs at all, so without this probe an owner whose memory chain had been tampered with, who
+/// happened to select too much, would be told "too big, select fewer memories" and would never learn
+/// the thing they most need to know. Nothing is sealed or disclosed either way, so this was a
+/// precedence/diagnostic bug rather than a security hole — but it hid the one diagnosis that matters.
+///
+/// WHY THE PROBE IS HERE AND NOT BEFORE THE ESTIMATE. The other option considered was running a
+/// chain probe up front, ahead of the estimate. That would charge every honest export a full
+/// `verify_chain` over the whole log, and then charge it a SECOND time inside core — a real cost on
+/// a large brain, paid on the happy path, to improve a message on the failure path. Probing on the
+/// refusal path costs nothing when nothing is wrong, and produces exactly the same verdict core
+/// would have produced: for any input, this now agrees with core's precedence.
+///
+/// A probe that cannot answer (an engine that will not open, a join failure) reports `chain_ok:
+/// false`, so this fails CLOSED — it says "the chain does not verify" rather than quietly falling
+/// back to the size complaint.
+///
+/// Pure, and separate from the `async` dispatch, for the reason [`frame_guard`] is: as an inline
+/// branch its untaken side would need a real tampered log plus a real over-cap selection to reach,
+/// and a guard nothing exercises is a guard that can be deleted without a test noticing.
+fn oversize_verdict(bytes: u64, chain_ok: bool) -> Response {
+    if !chain_ok {
+        return export_rejected(EXPORT_CHAIN_INVALID);
+    }
+    Response::BundleTooLarge {
+        bytes,
+        max: bossclaw_core::log::MAX_EXPORT_BYTES,
+        limit: BundleLimitWire::ExportBytes,
     }
 }
 
@@ -1463,5 +1503,38 @@ mod tests {
         );
         // A non-Bundle response is never refused on size (the guard is response-shape agnostic).
         assert!(frame_guard(&Response::Ok).is_none());
+    }
+
+    /// The over-cap refusal reports the CHAIN when the chain is broken, and the SIZE otherwise.
+    ///
+    /// This is the Task-11 triage of the Task-8 finding: the daemon estimates size before core ever
+    /// runs `verify_chain`, so without the probe an owner holding a tampered log who selected too
+    /// much would be told "too big" and never that their memory chain does not verify. Both arms are
+    /// asserted, because a probe that always fired would break every honest over-cap refusal and a
+    /// probe that never fired would be the bug itself.
+    #[test]
+    fn an_oversize_refusal_reports_a_broken_chain_ahead_of_the_size() {
+        let bytes = bossclaw_core::log::MAX_EXPORT_BYTES + 1;
+
+        // Chain broken → the diagnosis the owner actually needs, matching core's own precedence.
+        match oversize_verdict(bytes, false) {
+            Response::Err { kind: OpErrorKindWire::Rejected, message } => {
+                assert_eq!(
+                    message, EXPORT_CHAIN_INVALID,
+                    "the probe must speak with core's ChainInvalid voice, not a second wording"
+                );
+            }
+            other => panic!("a tampered log must report the chain, got {other:?}"),
+        }
+
+        // Chain fine → the honest size refusal, with TEXT (not frame) semantics.
+        match oversize_verdict(bytes, true) {
+            Response::BundleTooLarge { bytes: reported, max, limit } => {
+                assert_eq!(reported, bytes, "the estimate is reported verbatim");
+                assert_eq!(max, bossclaw_core::log::MAX_EXPORT_BYTES, "the export-bytes ceiling");
+                assert_eq!(limit, BundleLimitWire::ExportBytes, "tagged as export-text semantics");
+            }
+            other => panic!("a healthy log over the cap must report the size, got {other:?}"),
+        }
     }
 }

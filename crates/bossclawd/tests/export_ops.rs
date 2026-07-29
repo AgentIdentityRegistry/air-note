@@ -26,8 +26,8 @@ use bossclawd::capture::store::{store_capture, CaptureIdentity, CAPTURE_TOOL};
 use bossclawd::engine::EngineHandle;
 use bossclawd::server;
 use bossclawd_proto::{
-    read_frame, write_frame, ExportSelectionWire, Hello, HelloOk, OpErrorKindWire, Request, Response,
-    Role, PROTO_VERSION,
+    read_frame, write_frame, BundleLimitWire, ExportSelectionWire, Hello, HelloOk, OpErrorKindWire,
+    Request, Response, Role, PROTO_VERSION,
 };
 use tokio::net::UnixStream;
 
@@ -281,6 +281,74 @@ async fn export_bundle_refusals_are_typed_and_ordered() {
     };
     let resp = app.call(Request::ExportBundle { onboarded: true, selection: unbound }).await;
     assert_rejected(&resp, "no identity binding stored");
+}
+
+/// The coarse pre-build guard, over the real wire: an over-cap selection comes back as the TYPED
+/// `BundleTooLarge` with export-text semantics — before a single session body is read.
+///
+/// `approx_bytes` is caller-supplied fold METADATA, so a capture can claim a body far larger than
+/// anything on disk; that is what lets this reach a 30 MiB bound with a tiny file, and it is also
+/// the exact shape the estimate exists to catch (it cannot open the body to check).
+///
+/// This is also the live half of the Task-11 triage: the refusal path now probes the chain first
+/// (`server::oversize_verdict`), so a healthy brain must still get the SIZE answer and not a chain
+/// complaint. The broken-chain half is unit-tested on the pure function — reaching it here would
+/// mean corrupting an encrypted store from a test.
+#[tokio::test]
+async fn an_over_cap_selection_is_refused_with_the_typed_size_signal() {
+    let (dir, sock, engine) = spawn_daemon_with_engine().await;
+    let mut app = AppClient::connect(&sock).await;
+    let brain_key = app.brain_key().await;
+
+    let identity = CaptureIdentity {
+        session_id: "oversize-session".into(),
+        project: "/Users/someone/air-note".into(),
+        tool: CAPTURE_TOOL.into(),
+    };
+    let rendered = Rendered {
+        title: "a session that claims to be enormous".into(),
+        markdown: "IGNORED BY THE STORE".into(),
+        body: "## You\nhi\n".into(),
+        sha256: "ee".repeat(32),
+        started_at: 1_783_764_000,
+        ended_at: 1_783_764_009,
+        // The claim the estimate has to take at face value.
+        approx_bytes: bossclaw_core::log::MAX_EXPORT_BYTES,
+        dropped_torn_tail: false,
+        oversized_lines: 0,
+        skipped_unknown: 0,
+    };
+    store_capture(&engine, dir.path(), &identity, &rendered).await.expect("capture stored");
+
+    let binding = mint_binding(&SigningKey::from_bytes(&[7u8; 32]), &brain_key, 1);
+    let resp = app
+        .call(Request::SetBinding { onboarded: true, attestation: attestation(&binding) })
+        .await;
+    assert!(matches!(resp, Response::Ok), "binding stored, got {resp:?}");
+
+    let event_id = engine
+        .current_sessions()
+        .await
+        .expect("session fold")
+        .into_iter()
+        .find(|s| s.session_id == "oversize-session")
+        .expect("the capture is a CURRENT session")
+        .event_id;
+
+    let selection = ExportSelectionWire {
+        note_event_ids: vec![],
+        session_event_ids: vec![event_id],
+        ingest_event_ids: vec![],
+        description: "too much".into(),
+    };
+    match app.call(Request::ExportBundle { onboarded: true, selection }).await {
+        Response::BundleTooLarge { bytes, max, limit } => {
+            assert!(bytes > max, "the estimate ({bytes}) crossed the ceiling ({max})");
+            assert_eq!(max, bossclaw_core::log::MAX_EXPORT_BYTES, "the export-bytes ceiling");
+            assert_eq!(limit, BundleLimitWire::ExportBytes, "text semantics, not frame semantics");
+        }
+        other => panic!("an over-cap selection must be refused with the typed signal, got {other:?}"),
+    }
 }
 
 /// End-to-end over the socket: remember a note, mint + store the binding, export it — and VERIFY the

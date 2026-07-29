@@ -14210,4 +14210,182 @@ mod tests {
             "the description length is actually counted"
         );
     }
+
+    // ---- STORY C: the whole-brain export (notes + sessions + ingests) ----
+
+    /// A `.md` file whose text MUST survive into the bundle — the ingest arm's positive control.
+    #[cfg(unix)]
+    const STORY_C_FILE_TEXT: &str = "The lease term begins on the first of the month.";
+
+    /// STORY C, end to end and at scale: notes + a captured session + a REAL ingested file, exported
+    /// together, verified with the real verifier, and swept for every no-leak guarantee at once.
+    ///
+    /// The ingest arm is what makes this different from the per-class tests above. It runs the
+    /// ACTUAL unix ingest pipeline against a real file on disk, so the `file_ingested` event carries
+    /// a genuine `provenance { canonical_path, content_hash, grant_root, … }` block
+    /// (`ingest.rs::file_ingested_content`) — the exporter's own machine, spelled out. A synthetic
+    /// hand-built event could be stripped by accident; this one can only be stripped on purpose.
+    ///
+    /// Three things are asserted that no single-class test can:
+    /// * (a) a mixed select-all VERIFIES, with `item_count` equal to the selection and each class
+    ///   carrying its own honest label;
+    /// * (b) `estimate_export_bytes` crosses [`MAX_EXPORT_BYTES`] for a padded selection, which is
+    ///   what the daemon turns into `BundleTooLarge` before it reads a single session body;
+    /// * (c) NEW-B: the serialized `.airmem` contains NONE of the local-metadata field names or
+    ///   values — from the ingest's real provenance block, the session's fold row, or either
+    ///   subject's absolute paths.
+    ///
+    /// The AUTHORITATIVE wire-length belt (a serialized `Response::Bundle` measured against
+    /// `MAX_FRAME`, which the raw-text estimate cannot see because of JSON-in-JSON escaping) lives in
+    /// the daemon's own `frame_guard` test; this covers the coarse pre-build estimate only.
+    #[cfg(unix)]
+    #[test]
+    fn story_c_whole_brain_export_verifies_and_leaks_no_local_metadata() {
+        use crate::ingest::ParserRouter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+
+        // ── Notes: a dozen stamped external memories. ──
+        let note_ids: Vec<String> = (0..12)
+            .map(|i| log.remember(&embedder, &format!("fact number {i} about the lease")).unwrap())
+            .collect();
+
+        // ── A REAL ingest through the real pipeline, so the event carries real provenance. ──
+        let folder = dir.path().join("SENTINELFOLDER");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("SENTINELFILE.md"), STORY_C_FILE_TEXT.as_bytes()).unwrap();
+        log.add_grant(&folder).unwrap();
+        let report = log.ingest_all(&ParserRouter::native_only(), &embedder).unwrap();
+        assert_eq!(report.ingested, 1, "the granted folder's file was really ingested");
+        let ingests = log.current_ingests().unwrap();
+        assert_eq!(ingests.len(), 1, "the ingest is a CURRENT export subject");
+        // The event really does carry the provenance this test proves is stripped — without this
+        // the no-leak sweep could pass against a shape that never had anything to leak.
+        let ingest_event = log.event_by_id(&ingests[0].event_id).unwrap().unwrap();
+        for field in ["canonical_path", "content_hash", "grant_root"] {
+            assert!(
+                ingest_event.content["provenance"].get(field).is_some(),
+                "the stored file_ingested event must carry `{field}` for this test to mean anything"
+            );
+        }
+
+        // ── A captured session, with every local-metadata field set to a distinctive sentinel. ──
+        let session_sha = "cc".repeat(32);
+        let session_ev = log
+            .capture_session(
+                &embedder,
+                &SessionMeta {
+                    project: "/Users/SENTINELUSER/SENTINELPROJECT".into(),
+                    ..session_meta("SENTINEL-SESSION-ID", &session_sha)
+                },
+            )
+            .unwrap();
+
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+
+        // ── (a) Select EVERYTHING and export. ──
+        let transcript = "## You\nHow do I revoke a trust?\n\n## Assistant\nFile a revocation.\n";
+        let bodies = HashMap::from([(session_ev.clone(), transcript.to_string())]);
+        let all = ExportSelection {
+            note_event_ids: note_ids.clone(),
+            session_event_ids: vec![session_ev.clone()],
+            ingest_event_ids: ingests.iter().map(|i| i.event_id.clone()).collect(),
+            description: "my whole brain".into(),
+            created_at: "2026-07-21T00:00:00Z".into(),
+        };
+        let started = std::time::Instant::now();
+        let text = log.export_bundle(&all, &bodies).expect("the whole-brain export builds");
+        let elapsed = started.elapsed();
+
+        let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
+        let verdict = bossclaw_bundle::verify(&bundle, &bossclaw_bundle::OfflineResolver)
+            .expect("the whole-brain bundle verifies");
+        let expected_items = note_ids.len() + 1 + ingests.len();
+        assert_eq!(
+            bundle.manifest.item_count, expected_items as u64,
+            "every selected subject became exactly one item"
+        );
+        assert_eq!(bundle.items.len(), expected_items);
+        assert_eq!(verdict.item_labels.len(), expected_items, "one honest label per item");
+        // Class order inside the export is notes → ingests → sessions, and each class gets its own
+        // phrasing — a mixed bundle must never cross-render them (§3-H2).
+        assert!(verdict.item_labels[0].contains("provenance of the underlying text is not asserted"));
+        assert_eq!(
+            verdict.item_labels[note_ids.len()],
+            "ingested file extract; not independently verified"
+        );
+        assert_eq!(
+            verdict.item_labels[expected_items - 1],
+            "captured session, content only; not independently verified"
+        );
+        // The positive controls: both bodies really did ship, so a passing sweep below cannot be
+        // "nothing was exported".
+        assert!(text.contains(STORY_C_FILE_TEXT), "the ingested file's text is disclosed");
+        assert!(text.contains("How do I revoke a trust?"), "the session transcript is disclosed");
+        assert!(text.contains("SENTINELPROJECT"), "the folder NAME still rides in display.project");
+
+        // ── (c) NEW-B: the no-leak sweep, over the WHOLE serialized bundle. ──
+        let grant_root = std::fs::canonicalize(&folder).unwrap().to_string_lossy().to_string();
+        let leaks: Vec<&str> = [
+            // Field NAMES that would betray a shape change on any class.
+            "canonical_path",
+            "content_hash",
+            "grant_root",
+            "session_id",
+            "sha256",
+            "prompt_hash",
+            "source_event_ids",
+            // VALUES from this brain's own machine.
+            "SENTINEL-SESSION-ID",
+            "SENTINELFILE",
+            "/Users/SENTINELUSER",
+            session_sha.as_str(),
+            grant_root.as_str(),
+            dir.path().to_str().unwrap(),
+        ]
+        .into_iter()
+        .filter(|needle| text.contains(needle))
+        .collect();
+        assert!(leaks.is_empty(), "the whole-brain export leaked {leaks:?}");
+
+        // ── Size + duration, characterized against the bounds this design promises. ──
+        assert!(
+            (text.len() as u64) < MAX_EXPORT_BYTES,
+            "a 14-item whole-brain export is {} bytes — nowhere near the {MAX_EXPORT_BYTES}-byte \
+             ceiling, which is what makes the cap a guard on pathological selections rather than a \
+             limit real owners meet",
+            text.len()
+        );
+        // A canary for accidental quadratic work in the gather/leaf path, not a performance gate:
+        // deliberately loose so a loaded CI box can never flake it (observed: milliseconds).
+        assert!(elapsed < std::time::Duration::from_secs(30), "export took {elapsed:?}");
+
+        // ── (b) The pre-build estimate crosses the cap on a padded selection. ──
+        // `approx_bytes` is fold METADATA the capture supplies, so a session can claim a body far
+        // larger than anything on disk — exactly the shape the daemon must refuse BEFORE it reads
+        // any body. No 30 MiB allocation is needed to reach the bound.
+        let padded_ev = log
+            .capture_session(
+                &embedder,
+                &SessionMeta {
+                    approx_bytes: MAX_EXPORT_BYTES,
+                    ..session_meta("PADDED-SESSION", &"dd".repeat(32))
+                },
+            )
+            .unwrap();
+        let padded = ExportSelection { session_event_ids: vec![padded_ev], ..all.clone() };
+        let estimate = log.estimate_export_bytes(&padded).unwrap();
+        assert!(
+            estimate > MAX_EXPORT_BYTES,
+            "the pre-build estimate ({estimate}) must cross {MAX_EXPORT_BYTES} — this is the value \
+             the daemon turns into BundleTooLarge before it reads a single session body"
+        );
+        // ...and the honest selection stays comfortably under it, so the guard is not a blanket no.
+        assert!(
+            log.estimate_export_bytes(&all).unwrap() < MAX_EXPORT_BYTES,
+            "the real whole-brain selection is still exportable"
+        );
+    }
 }
