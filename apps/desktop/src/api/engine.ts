@@ -184,8 +184,15 @@ export const mandateWrites = (): Promise<MandateWriteDto[]> =>
 // snake_case field names mirror C1's serde DTOs (the wire contract). i64/u64 timestamps + byte
 // counts arrive as `number`; every `Option<_>` arrives as `null` when absent (serde emits all fields).
 
-/** One captured-session Library row. */
+/**
+ * One captured-session Library row.
+ *
+ * TWO ids, NOT interchangeable: `session_id` is what `getSession`/`deleteSession` take, while
+ * `capture_event_id` is the EXPORT address — the only id `exportBundle`'s session bucket accepts.
+ * Sending `session_id` there is refused by the daemon ("… is not a current session").
+ */
 export type SessionSummaryDto = {
+  capture_event_id: string;
   session_id: string;
   title: string;
   project: string;

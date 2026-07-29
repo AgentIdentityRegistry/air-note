@@ -826,6 +826,10 @@ fn mandate_write_summary_from_wire(w: MandateWriteSummaryWire) -> MandateWriteSu
 
 fn session_summary_from_wire(w: SessionSummaryWire) -> SessionSummary {
     SessionSummary {
+        // The wire's bare `event_id` becomes `capture_event_id` here — the ONE place the two ids
+        // meet, so the one place to name the difference. This is the export address; `session_id`
+        // (below) is not, and the daemon refuses it.
+        capture_event_id: w.event_id,
         session_id: w.session_id,
         title: w.title,
         project: w.project,
@@ -1578,6 +1582,9 @@ mod tests {
         let got = bounded(client.list_sessions(true)).await.expect("list_sessions");
         assert_eq!(got.len(), 1);
         let s = &got[0];
+        // The wire's `event_id` becomes `capture_event_id` — the EXPORT address, and deliberately
+        // a different value from `session_id` here so a swapped mapping cannot pass.
+        assert_eq!(s.capture_event_id, "e1");
         assert_eq!(s.session_id, "s1");
         assert_eq!(s.title, "Refactor");
         assert_eq!(s.project, "air-note");
@@ -1605,6 +1612,7 @@ mod tests {
         };
         let client = EngineClient::new(Arc::new(CannedTransport(Response::Session(wire))));
         let d = bounded(client.get_session(true, "s2".into())).await.expect("get_session");
+        assert_eq!(d.summary.capture_event_id, "e2");
         assert_eq!(d.summary.session_id, "s2");
         assert_eq!(d.summary.approx_bytes, 8);
         assert_eq!(d.markdown, "# hello\n");

@@ -22,6 +22,7 @@ describe("library bindings", () => {
   it("listSessions invokes engine_list_sessions and returns typed rows", async () => {
     const rows: SessionSummaryDto[] = [
       {
+        capture_event_id: "e1",
         session_id: "s1",
         title: "First",
         project: "air-note",
@@ -44,6 +45,7 @@ describe("library bindings", () => {
   it("getSession invokes engine_get_session with the session id", async () => {
     const detail: SessionDetailDto = {
       summary: {
+        capture_event_id: "e1",
         session_id: "s1",
         title: "First",
         project: "air-note",

@@ -11,6 +11,8 @@ const file = (p: string, id: string): FileRecordDto => ({
   canonical_path: p, file_event_id: id, content_hash: "h", grant_root: "/r", writable: false,
 });
 const session = (id: string, title: string, project: string): SessionSummaryDto => ({
+  // Distinct from `session_id` on purpose — the two ids are not interchangeable.
+  capture_event_id: `e-${id}`,
   session_id: id, title, project, tool: "claude-code", started_at: 1, ended_at: 2, approx_bytes: 100,
 });
 

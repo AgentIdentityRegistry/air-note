@@ -683,6 +683,9 @@ pub async fn engine_model_status(state: State<'_, AppState>) -> Result<ModelStat
 /// One captured-session Library row. Mirrors the TS twin the C2 wrapper consumes (snake_case keys).
 #[derive(Serialize)]
 pub struct SessionSummaryDto {
+    /// The capture EVENT id — what an export selection addresses a session by. Distinct from
+    /// `session_id`, which is what view/delete take; see `engine::SessionSummary`.
+    pub capture_event_id: String,
     pub session_id: String,
     pub title: String,
     pub project: String,
@@ -694,6 +697,7 @@ pub struct SessionSummaryDto {
 impl From<crate::engine::SessionSummary> for SessionSummaryDto {
     fn from(s: crate::engine::SessionSummary) -> Self {
         Self {
+            capture_event_id: s.capture_event_id,
             session_id: s.session_id,
             title: s.title,
             project: s.project,
@@ -949,6 +953,9 @@ mod tests {
     #[test]
     fn session_summary_dto_maps_all_fields() {
         let dto = SessionSummaryDto::from(crate::engine::SessionSummary {
+            // DELIBERATELY different values: the two ids must not be swappable without a test
+            // noticing (an export addressed by `session_id` is refused by the daemon).
+            capture_event_id: "e1".into(),
             session_id: "s1".into(),
             title: "T".into(),
             project: "p".into(),
@@ -957,6 +964,7 @@ mod tests {
             ended_at: 200,
             approx_bytes: 4096,
         });
+        assert_eq!(dto.capture_event_id, "e1", "the export address rides across");
         assert_eq!(dto.session_id, "s1");
         assert_eq!(dto.title, "T");
         assert_eq!(dto.project, "p");
@@ -970,6 +978,7 @@ mod tests {
     fn session_detail_dto_maps_summary_and_markdown() {
         let dto = SessionDetailDto::from(crate::engine::SessionDetail {
             summary: crate::engine::SessionSummary {
+                capture_event_id: "e2".into(),
                 session_id: "s2".into(),
                 title: "T".into(),
                 project: "p".into(),
@@ -1022,6 +1031,7 @@ mod tests {
     #[test]
     fn library_dtos_serialize_snake_case() {
         let summary = SessionSummaryDto::from(crate::engine::SessionSummary {
+            capture_event_id: "e".into(),
             session_id: "s".into(),
             title: "t".into(),
             project: "p".into(),
@@ -1032,6 +1042,7 @@ mod tests {
         });
         let json = serde_json::to_value(&summary).unwrap();
         assert!(json.get("session_id").is_some(), "session_id key present, got {json}");
+        assert!(json.get("capture_event_id").is_some(), "capture_event_id key present, got {json}");
         assert!(json.get("started_at").is_some(), "started_at key present, got {json}");
         assert!(json.get("ended_at").is_some(), "ended_at key present, got {json}");
         assert!(json.get("approx_bytes").is_some(), "approx_bytes key present, got {json}");

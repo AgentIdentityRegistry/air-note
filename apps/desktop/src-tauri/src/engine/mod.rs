@@ -182,8 +182,17 @@ pub struct PreviewData {
 /// other Family-2 summary structs, the wire type has no core equivalent and no proto `From` (proto
 /// isn't a desktop dep), so the client fills this field-by-field. `started_at`/`ended_at` are
 /// unix-epoch seconds; `approx_bytes` is the rendered `.md` size (a cheap "how big" hint).
+///
+/// It carries TWO ids and they are NOT interchangeable (the wire type documents the same split):
+/// `session_id` is the identity key `get_session`/`delete_session` take, while
+/// [`SessionSummary::capture_event_id`] is the EXPORT address. Renamed from the wire's bare
+/// `event_id` on the way in, because a field called `event_id` sitting next to `session_id` is
+/// exactly the pair a future refactor swaps by accident — and the daemon answers that mistake with
+/// `NotExportable("… is not a current session")`, not with anything the compiler catches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
+    /// The capture EVENT id — the only id an export selection accepts (`session_event_ids`).
+    pub capture_event_id: String,
     pub session_id: String,
     pub title: String,
     pub project: String,

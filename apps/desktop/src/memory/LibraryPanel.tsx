@@ -220,24 +220,25 @@ export function LibraryPanel() {
 
   // ---- Rung-5 SP-V1: export a selection as a signed .airmem ----
   //
-  // Notes and ingested files only. A session is addressed in an export by its CAPTURE EVENT id.
-  // `SessionSummaryWire` now carries that id (daemon commit `ed3c14a`), but the desktop side still
-  // drops it: `session_summary_from_wire` does not copy it, `engine::SessionSummary` has no field
-  // for it, and `SessionSummaryDto` does not expose it — so the panel has no id to send yet. The
-  // review sheet already renders sessions honestly; finishing the hop is those three layers plus
-  // a checkbox here (pinned by the `it.todo` in this panel's test).
+  // All three classes. A session is addressed by its CAPTURE EVENT id (`capture_event_id`), NEVER
+  // by `session_id` — the two are different values, and the daemon refuses the wrong one with
+  // "… is not a current session". The selection sets therefore hold capture event ids, which is
+  // also what `deleteSession`'s `session_id` calls elsewhere in this panel must not be confused with.
+  const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set());
   const [selectedNotes, setSelectedNotes] = useState<Set<string>>(new Set());
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const [reviewing, setReviewing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
-  // Resolve the selection against the CURRENT lists, so a note that was superseded (or a file that
-  // was re-ingested) between selecting and exporting silently drops out instead of being sent as a
-  // stale id the daemon would refuse.
+  // Resolve the selection against the CURRENT lists, so anything that stopped being current between
+  // selecting and exporting silently drops out instead of being sent as a stale id the daemon would
+  // refuse — a note that was superseded, a file that was re-ingested, or a session that was deleted
+  // or re-captured (a new capture supersedes the old event, so the fold head's id changes).
+  const chosenSessions = sessions.filter((s) => selectedSessions.has(s.capture_event_id));
   const chosenNotes = notes.filter((n) => selectedNotes.has(n.event_id));
   const chosenFiles = files.filter((f) => selectedFiles.has(f.file_event_id));
-  const chosenCount = chosenNotes.length + chosenFiles.length;
+  const chosenCount = chosenSessions.length + chosenNotes.length + chosenFiles.length;
 
   const openReview = () => {
     setNotice(null);
@@ -251,7 +252,8 @@ export function LibraryPanel() {
     try {
       const path = await exportBundle(
         chosenNotes.map((n) => n.event_id),
-        [],
+        // The CAPTURE EVENT id, not `s.session_id` — the daemon refuses the latter.
+        chosenSessions.map((s) => s.capture_event_id),
         chosenFiles.map((f) => f.file_event_id),
         description,
       );
@@ -259,6 +261,7 @@ export function LibraryPanel() {
       // A cancelled save dialog yields null — nothing was written, so say nothing happened.
       setNotice(path === null ? "Export cancelled — nothing was saved." : `Saved to ${path}`);
       if (path !== null) {
+        setSelectedSessions(new Set());
         setSelectedNotes(new Set());
         setSelectedFiles(new Set());
       }
@@ -338,7 +341,7 @@ export function LibraryPanel() {
             {chosenCount === 0 ? "Export signed bundle" : `Export signed bundle (${chosenCount})`}
           </Button>
           <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
-            Tick notes or files to send them as one signed file. Sessions can’t be exported yet.
+            Tick sessions, notes, or files to send them as one signed file.
           </span>
         </div>
       )}
@@ -405,10 +408,22 @@ export function LibraryPanel() {
                 {visibleSessions.map((s) => (
                   <li key={s.session_id} style={{ padding: "10px 0", borderBottom: "1px solid var(--border-soft)" }}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                      <div>
-                        <div style={{ fontSize: 14, fontWeight: 600 }}>{s.title}</div>
-                        <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
-                          <span>{s.project}</span> · <span>{formatDay(s.started_at)}</span>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                        <input
+                          type="checkbox"
+                          // Keyed by the CAPTURE EVENT id — the export address, not `session_id`.
+                          checked={selectedSessions.has(s.capture_event_id)}
+                          onChange={() =>
+                            setSelectedSessions((prev) => toggled(prev, s.capture_event_id))
+                          }
+                          aria-label={`Select session for export: ${s.title}`}
+                          style={{ marginTop: 3, flexShrink: 0 }}
+                        />
+                        <div>
+                          <div style={{ fontSize: 14, fontWeight: 600 }}>{s.title}</div>
+                          <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
+                            <span>{s.project}</span> · <span>{formatDay(s.started_at)}</span>
+                          </div>
                         </div>
                       </div>
                       {/* C5: session View (opens the reader) / Delete (honest confirm) row actions. */}
@@ -484,7 +499,7 @@ export function LibraryPanel() {
       {reviewing ? (
         <ExportReviewSheet
           notes={chosenNotes.map((n) => ({ id: n.event_id, text: n.text }))}
-          sessions={[]}
+          sessions={chosenSessions.map((s) => ({ id: s.capture_event_id, title: s.title }))}
           ingests={chosenFiles.map((f) => ({ id: f.file_event_id, path: f.canonical_path }))}
           exporting={exporting}
           error={exportError}

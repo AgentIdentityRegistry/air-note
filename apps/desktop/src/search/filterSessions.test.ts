@@ -3,6 +3,9 @@ import { filterSessions } from "./filterSessions";
 import type { SessionSummaryDto } from "../api/engine";
 
 const session = (id: string, title: string, project: string): SessionSummaryDto => ({
+  // The capture event id is a DIFFERENT value from the session id (see `SessionSummaryDto`); the
+  // filter reads neither, but the fixture keeps them distinct so no test can conflate them.
+  capture_event_id: `e-${id}`,
   session_id: id, title, project, tool: "claude-code", started_at: 1, ended_at: 2, approx_bytes: 100,
 });
 

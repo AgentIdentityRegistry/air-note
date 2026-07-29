@@ -22,11 +22,16 @@ vi.mock("../api/engine", async (importOriginal) => {
 vi.mock("../api/export", () => ({ exportBundle: vi.fn() }));
 
 // Two sessions, deliberately given oldest-first so the newest-first sort is actually exercised.
+// Two sessions whose `capture_event_id` and `session_id` are DELIBERATELY different values: an
+// export addresses a session by the capture event id, and the daemon refuses the session id, so a
+// panel that sent the wrong one must fail a test rather than fail at runtime.
 const S_OLD: SessionSummaryDto = {
+  capture_event_id: "e-old",
   session_id: "s-old", title: "Refactor auth", project: "air-note", tool: "claude-code",
   started_at: 1_700_000_000, ended_at: 1_700_003_600, approx_bytes: 1024,
 };
 const S_NEW: SessionSummaryDto = {
+  capture_event_id: "e-new",
   session_id: "s-new", title: "Design memory hub", project: "air-note", tool: "claude-code",
   started_at: 1_800_000_000, ended_at: 1_800_003_600, approx_bytes: 2048,
 };
@@ -527,11 +532,61 @@ describe("LibraryPanel", () => {
     expect(screen.getByRole("button", { name: /Export signed bundle/ })).toBeDisabled();
   });
 
-  // The wire carries a session's capture `event_id` as of daemon commit `ed3c14a`, but the desktop
-  // mapping still drops it (`session_summary_from_wire` → `engine::SessionSummary` →
-  // `SessionSummaryDto`), so `exportBundle`'s session bucket is hard-coded `[]` here. This marker
-  // exists so that stays visible instead of quietly remaining empty once the hop is finished.
-  it.todo("exports selected sessions once the desktop DTO carries the capture event_id");
+  /**
+   * Story C: notes + sessions + ingests in ONE signed file. The load-bearing detail is which id a
+   * session travels as — `capture_event_id`, never `session_id`. The daemon refuses the wrong one
+   * (`NotExportable("… is not a current session")`), so getting it backwards would look fine in the
+   * UI and fail only at export time; the fixtures give the two ids different values so this test
+   * fails loudly instead.
+   */
+  it("exports all three classes and addresses a session by its CAPTURE EVENT id", async () => {
+    primeArchive([S_NEW], [NOTE], [FILE]);
+    render(<LibraryPanel />);
+    await screen.findByText("Design memory hub");
+
+    fireEvent.click(screen.getByLabelText(/Select session for export/));
+    fireEvent.click(screen.getByLabelText(/Select note for export/));
+    fireEvent.click(screen.getByLabelText(/Select file for export/));
+    fireEvent.click(screen.getByRole("button", { name: /Export signed bundle \(3\)/ }));
+
+    // The sheet names the session by title, with the session-class disclosure.
+    const sheet = await screen.findByRole("dialog", { name: /Review what you are about to export/i });
+    expect(within(sheet).getByText("Design memory hub")).toBeInTheDocument();
+    expect(within(sheet).getByText(/FULL transcript/i)).toBeInTheDocument();
+
+    fireEvent.click(within(sheet).getByRole("button", { name: /Export signed bundle/ }));
+
+    await waitFor(() => expect(exportBundle).toHaveBeenCalledWith(["n1"], ["e-new"], ["f1"], ""));
+    // Belt and braces: the SESSION id must not appear anywhere in the call.
+    const [, sessionIds] = vi.mocked(exportBundle).mock.calls[0];
+    expect(sessionIds).not.toContain(S_NEW.session_id);
+  });
+
+  it("a session that stopped being current drops out of the export, like notes and files", async () => {
+    // Same currency rule for all three classes: the selection is resolved against the CURRENT list,
+    // so a session deleted (or re-captured under a new event id) between ticking and exporting is
+    // never sent as a stale id.
+    primeArchive([S_OLD, S_NEW], []);
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    render(<LibraryPanel />);
+    await screen.findByText("Design memory hub");
+
+    fireEvent.click(screen.getByLabelText(/Select session for export: Design memory hub/));
+    fireEvent.click(screen.getByLabelText(/Select session for export: Refactor auth/));
+    expect(screen.getByRole("button", { name: /Export signed bundle \(2\)/ })).toBeInTheDocument();
+
+    // Delete one of the two; the row leaves the list, so the selection resolves to just the other.
+    const row = screen.getByText("Design memory hub").closest("li") as HTMLElement;
+    fireEvent.click(within(row).getByRole("button", { name: "Delete" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete session" }));
+    await waitFor(() => expect(screen.queryByText("Design memory hub")).toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: /Export signed bundle \(1\)/ }));
+    const sheet = await screen.findByRole("dialog", { name: /Review what you are about to export/i });
+    fireEvent.click(within(sheet).getByRole("button", { name: /Export signed bundle/ }));
+
+    await waitFor(() => expect(exportBundle).toHaveBeenCalledWith([], ["e-old"], [], ""));
+  });
 
   it("a files-list failure hides the Files section without breaking the Library", async () => {
     primeArchive([S_NEW], [NOTE]);
