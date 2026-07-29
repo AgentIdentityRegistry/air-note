@@ -59,9 +59,27 @@ mod tests {
     }
     #[test]
     fn domain_separation_defeats_leaf_as_internal_second_preimage() {
+        // The real threat: the SAME bytes hashed under the leaf domain vs the internal domain must
+        // never collide. (The prior form compared unrelated inputs and survived deleting both tags.)
         let l = leaf_hash(&item("", "l"));
         let r = leaf_hash(&item("", "r"));
-        assert_ne!(root(&[l, r]), leaf_hash(&item("", "forge")));
+        let payload = [l, r].concat(); // the 64 bytes an internal node commits to
+        let mut as_leaf = Sha256::new();
+        as_leaf.update([0x00]);
+        as_leaf.update(&payload);
+        let mut as_internal = Sha256::new();
+        as_internal.update([0x01]);
+        as_internal.update(&payload);
+        assert_ne!(
+            <[u8; 32]>::from(as_leaf.finalize()),
+            <[u8; 32]>::from(as_internal.finalize()),
+            "leaf and internal domains must differ for identical payloads"
+        );
+        // And the real root of [l, r] must not equal a leaf hash of the same payload.
+        let mut bare_leaf = Sha256::new();
+        bare_leaf.update([0x00]);
+        bare_leaf.update(&payload);
+        assert_ne!(root(&[l, r]), <[u8; 32]>::from(bare_leaf.finalize()));
     }
     #[test]
     fn odd_node_promoted_unpaired_not_duplicated() {
