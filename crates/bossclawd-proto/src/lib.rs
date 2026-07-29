@@ -405,11 +405,17 @@ pub enum Response {
     /// real numbers) instead of a fault. Emitted either by the pre-build estimate or by the
     /// authoritative pre-frame check on the SERIALIZED response length (see the daemon's
     /// `export_dispatch`): a generic frame error must never replace this typed refusal.
+    ///
+    /// `limit` is REQUIRED reading before rendering `bytes`/`max`: the two paths measure different
+    /// things against different ceilings (see [`BundleLimitWire`]), so presenting the pair without
+    /// it can show the owner a size and a ceiling that do not correspond to the same quantity.
     BundleTooLarge {
-        /// The measured (or estimated) size in bytes.
+        /// The measured (or estimated) size in bytes, in `limit`'s units.
         bytes: u64,
-        /// The ceiling that was exceeded.
+        /// The ceiling that was exceeded, in `limit`'s units.
         max: u64,
+        /// WHICH ceiling `bytes`/`max` refer to.
+        limit: BundleLimitWire,
     },
     /// The engine is not onboarded (mirrors `EngineError::NotOnboarded`). A signal,
     /// not a fault — the UI shows onboarding.
@@ -465,6 +471,26 @@ pub enum OpErrorKindWire {
     /// renders it under the generic engine-error prefix. The desktop app never receives it (it is
     /// always `App`), but the arm keeps the wire enum exhaustive.
     NotPermitted,
+}
+
+/// Which ceiling a [`Response::BundleTooLarge`] was measured against. The two refusal paths measure
+/// GENUINELY DIFFERENT quantities, and one app message renders both, so the pair `{bytes, max}` is
+/// meaningless without this tag:
+///
+/// - [`BundleLimitWire::ExportBytes`] — the `.airmem` TEXT, against core's `MAX_EXPORT_BYTES`.
+/// - [`BundleLimitWire::WireFrame`] — that same text after JSON-ESCAPING into the response frame
+///   (roughly 2× for escape-heavy content, and stamped items escape already-escaped JSON, so ~4×),
+///   against [`MAX_FRAME`].
+///
+/// Both are fixed by the same owner action — select fewer memories — but the NUMBERS differ, so a
+/// renderer that ignores this tag can tell the owner they are 1 MiB over a 30 MiB ceiling while the
+/// refusal actually came from a 32 MiB frame bound measuring twice as many bytes.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BundleLimitWire {
+    /// `bytes`/`max` are `.airmem` TEXT bytes against `bossclaw_core::log::MAX_EXPORT_BYTES`.
+    ExportBytes,
+    /// `bytes`/`max` are ESCAPED wire-frame bytes against [`MAX_FRAME`].
+    WireFrame,
 }
 
 /// A recall [`HitMirror`] paired with its hydrated snippet text, mirroring the
@@ -986,7 +1012,16 @@ mod protocol_tests {
         let responses = [
             Response::BrainVerifyingKey("z6Mk...".into()),
             Response::Bundle("{\"manifest\":{}}".into()),
-            Response::BundleTooLarge { bytes: 33 * 1024 * 1024, max: MAX_FRAME as u64 },
+            Response::BundleTooLarge {
+                bytes: 33 * 1024 * 1024,
+                max: MAX_FRAME as u64,
+                limit: BundleLimitWire::WireFrame,
+            },
+            Response::BundleTooLarge {
+                bytes: 31 * 1024 * 1024,
+                max: 30 * 1024 * 1024,
+                limit: BundleLimitWire::ExportBytes,
+            },
         ];
         for resp in &responses {
             let back: Response = serde_json::from_slice(&serde_json::to_vec(resp).unwrap()).unwrap();

@@ -200,6 +200,58 @@ async fn set_binding_validates_before_storing() {
         .call(Request::SetBinding { onboarded: true, attestation: serde_json::Value::Null })
         .await;
     assert_rejected(&resp, "malformed binding");
+
+    // The epoch-1 card that was accepted FIRST is still the stored one — every refusal above left
+    // the log alone, so the export still seals under the original card's did.
+    let selection = ExportSelectionWire {
+        note_event_ids: vec![],
+        session_event_ids: vec![],
+        ingest_event_ids: vec!["01J-NOT-A-REAL-INGEST".into()],
+        description: "probe".into(),
+    };
+    let resp = app.call(Request::ExportBundle { onboarded: true, selection }).await;
+    assert_rejected(&resp, "is not a current file");
+}
+
+/// A binding naming a FOREIGN did is refused. `export_bundle` copies `payload.did` straight into
+/// `manifest.did`, so storing one would silently re-attribute every future bundle — and nothing
+/// downstream catches it in SP-V1 (`binding.did == manifest.did` holds by construction, and only the
+/// inert `OfflineResolver` ships). A card naming the OWNER's did, identical in every other respect,
+/// is accepted — so the refusal is provably the did check and not some other gate.
+#[tokio::test]
+async fn set_binding_refuses_a_foreign_did() {
+    let (_dir, sock) = spawn_onboarded_daemon().await;
+    let mut app = AppClient::connect(&sock).await;
+    let brain_key = app.brain_key().await;
+    let identity_key = SigningKey::from_bytes(&[7u8; 32]);
+
+    let mut foreign = mint_binding(&identity_key, &brain_key, 1);
+    foreign.payload.did = "did:wba:evil.com:attacker".to_string();
+    // Re-sign, so the identity signature is VALID over the foreign did — the card is internally
+    // consistent and only the owner-identity check can reject it.
+    foreign.identity_signature =
+        sign_bytes(&binding_signing_bytes(&foreign.payload), &identity_key);
+    let resp = app
+        .call(Request::SetBinding { onboarded: true, attestation: attestation(&foreign) })
+        .await;
+    assert_rejected(&resp, "did does not match");
+
+    // Nothing was stored: the export still reports "no identity binding stored".
+    let selection = ExportSelectionWire {
+        note_event_ids: vec!["01J-DOES-NOT-EXIST".into()],
+        session_event_ids: vec![],
+        ingest_event_ids: vec![],
+        description: "probe".into(),
+    };
+    let resp = app.call(Request::ExportBundle { onboarded: true, selection }).await;
+    assert_rejected(&resp, "no identity binding stored");
+
+    // The SAME epoch, same keys, same everything — but the owner's did — is accepted.
+    let owned = mint_binding(&identity_key, &brain_key, 1);
+    let resp = app
+        .call(Request::SetBinding { onboarded: true, attestation: attestation(&owned) })
+        .await;
+    assert!(matches!(resp, Response::Ok), "the owner's own did is accepted, got {resp:?}");
 }
 
 /// The typed `ExportBundle` refusals reach the wire in core's order: an empty selection is refused

@@ -337,6 +337,16 @@ pub struct EngineHandle {
     /// `evolve_lock`: a long evolve tick must never block a reflect tick and vice-versa (the Rung-3
     /// dedicated-lock lesson).
     reflect_lock: Mutex<()>,
+    /// Serializes Rung-5 `SetBinding` writes. The epoch idempotency check is read-then-append across
+    /// TWO separate acquisitions of the store mutex (`binding_epochs()` then `set_binding()`), so
+    /// without this the "a repeated epoch is rejected, NEVER overwritten" invariant is a TOCTOU:
+    /// concurrent same-epoch writes can all read an empty epoch set and all append. Demonstrated in
+    /// review — widening the window to 50 ms let 8/8 concurrent same-epoch cards through, silently
+    /// replacing the stored card. Same remedy and shape as `resolve_lock`: `.lock().await` WAITS
+    /// (never `Busy`-rejects), so the second writer observes the first's stored epoch and gets the
+    /// deterministic first-wins `Rejected`. DEDICATED, not reused: binding writes must not queue
+    /// behind a long evolve/conflict/reflect tick.
+    binding_lock: Mutex<()>,
     /// Session reflection telemetry (poison-recovered on read). Mirrors `conflict_tel`.
     reflect_tel: std::sync::Mutex<ReflectTelemetry>,
     /// The shared reasoner-config cell the daemon's `ConfigReasonerProvider` closure reads on
@@ -379,6 +389,7 @@ impl EngineHandle {
             evolve_tel: std::sync::Mutex::new(EvolveTelemetry::default()),
             conflict_tel: std::sync::Mutex::new(ConflictTelemetry::default()),
             reflect_lock: Mutex::new(()),
+            binding_lock: Mutex::new(()),
             reflect_tel: std::sync::Mutex::new(ReflectTelemetry::default()),
             reasoner_cell: None,
             probe_reasoner_for_test: None,
@@ -1246,16 +1257,41 @@ impl EngineHandle {
     /// 3. the identity signature verifies over `jcs(payload)` against the EMBEDDED identity key
     ///    (L1 internal consistency — zero identity assurance, but a garbled card is refused);
     /// 4. `payload.brain_verifying_key` equals THIS brain's key, and the epoch is not already
-    ///    stored (first-write-wins, A8/C9 — a repeated epoch is rejected, NEVER overwritten).
+    ///    stored (first-write-wins, A8/C9 — a repeated epoch is rejected, NEVER overwritten);
+    /// 5. `payload.did` is the OWNER's did (see below).
     ///
     /// Without (4) a buggy app could persist a card that makes every future export fail verification
-    /// or silently rewrite the rotation history.
+    /// or silently rewrite the rotation history. The epoch half of (4) is a read-then-append across
+    /// two separate store-mutex acquisitions, so `binding_lock` (held across the whole op, exactly as
+    /// `resolve_conflict` holds `resolve_lock`) is what makes first-wins real rather than racy.
+    ///
+    /// Check (5) — the DID check, and why it fails OPEN when the did is unreadable. `export_bundle`
+    /// copies `binding.payload.did` straight into `manifest.did`, so a card naming a foreign did
+    /// silently re-attributes every future bundle to that identity. Nothing catches it today: the
+    /// verifier's `binding.did == manifest.did` rule is satisfied by construction (both come from the
+    /// same card), and SP-V1 ships only `OfflineResolver`, so L2 is inert — it becomes a hard failure
+    /// the moment SP-V2's real registry resolver lands. That is the same "a card that fails on every
+    /// future export should never be storable" argument the spec makes for the brain key, so the
+    /// check belongs here. It is NOT in spec §2.3's C-NEW-4 list (which names only the signature,
+    /// brain-key, and epoch checks) — recorded as a deliberate addition.
+    ///
+    /// The owner's did comes from the app's `<data_dir>/identity.json`, because core cannot supply
+    /// it: `EventLog::signer_did` still returns the `did:wba:bossclaw-engine` placeholder (log.rs
+    /// `ENGINE_SIGNER_DID`, a documented M4/M7 gap). When that file cannot be read as a string did,
+    /// the check is SKIPPED rather than refusing: the daemon must never make export permanently
+    /// unavailable because of an `identity.json` hiccup, and `SetBinding` is an App-only op whose
+    /// `onboarded` flag the App already asserts (I3). So this gate catches the realistic threat — a
+    /// BUGGY app minting the wrong did — and does not pretend to bind a hostile one.
     pub async fn set_binding(
         &self,
         onboarded: bool,
         attestation: serde_json::Value,
     ) -> Result<(), EngineOpError> {
         use serde::Deserialize;
+        // Held across the whole op — acquired BEFORE `get_or_open`, dropped at return after the
+        // `spawn_blocking` await — so the epoch read and the append cannot interleave.
+        let _binding_guard = self.binding_lock.lock().await;
+        let owner_did = self.data_dir().and_then(crate::identity::owner_did);
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || {
             // Borrow-deserialize so the attestation is parsed WITHOUT cloning it — the same
@@ -1276,6 +1312,13 @@ impl EngineHandle {
             if binding.payload.brain_verifying_key != log.brain_verifying_key_multibase() {
                 return Err(EngineOpError::Rejected(
                     "binding brain key does not match this brain".to_string(),
+                ));
+            }
+            // The did is NOT echoed back: it is attacker-influenceable in the sense that matters
+            // here (a wrong value is what we are refusing), and the App already knows what it sent.
+            if owner_did.is_some_and(|owner| binding.payload.did != owner) {
+                return Err(EngineOpError::Rejected(
+                    "binding did does not match this owner's identity".to_string(),
                 ));
             }
             let epochs = log.binding_epochs().map_err(|e| EngineOpError::Core(e.to_string()))?;

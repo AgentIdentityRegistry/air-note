@@ -21,7 +21,10 @@ const METADATA_FILE: &str = "identity.json";
 /// (`username` is `#[serde(default)]` in the app, so it is not required here.)
 #[derive(Deserialize)]
 struct IdentityMetadataProbe {
-    #[allow(dead_code)]
+    /// Kept `serde_json::Value` (NOT `String`) deliberately: [`is_onboarded`]'s verdict must stay
+    /// byte-for-byte the app's — "the file parses" — and narrowing this to `String` would newly
+    /// report a non-string `did` as NOT onboarded. [`owner_did`] does the string narrowing instead,
+    /// where a `None` is harmless.
     did: serde_json::Value,
     #[allow(dead_code)]
     name: String,
@@ -39,6 +42,19 @@ pub fn is_onboarded(data_dir: &Path) -> bool {
         return false;
     };
     serde_json::from_str::<IdentityMetadataProbe>(&json).is_ok()
+}
+
+/// The owner's AIR did from `<data_dir>/identity.json`, or `None` if it cannot be read as a string
+/// (absent, unreadable, malformed, or a non-string `did`). The app's `Did` is a newtype over `String`
+/// (`air/types.rs:4`), so it always serializes as a plain JSON string.
+///
+/// Added for the Rung-5 `SetBinding` did check: an identity binding naming a FOREIGN did is copied
+/// straight into `manifest.did` by the export, so every bundle would be attributed to that did.
+/// `None` is deliberately NOT a refusal at the call site — see the note there.
+pub fn owner_did(data_dir: &Path) -> Option<String> {
+    let json = std::fs::read_to_string(data_dir.join(METADATA_FILE)).ok()?;
+    let probe: IdentityMetadataProbe = serde_json::from_str(&json).ok()?;
+    probe.did.as_str().map(str::to_string)
 }
 
 #[cfg(test)]

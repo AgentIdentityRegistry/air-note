@@ -32,8 +32,8 @@ use bossclawd_proto::types::{
     SessionSummaryWire,
 };
 use bossclawd_proto::{
-    read_frame, write_frame, ExportSelectionWire, Hello, HelloOk, HitWire, OpErrorKindWire, Request,
-    Response, RetireTarget, Role, MAX_FRAME, PROTO_VERSION,
+    read_frame, write_frame, BundleLimitWire, ExportSelectionWire, Hello, HelloOk, HitWire,
+    OpErrorKindWire, Request, Response, RetireTarget, Role, MAX_FRAME, PROTO_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -546,7 +546,11 @@ async fn export_dispatch(
     // 1. Coarse, pre-body, pre-seal guard.
     match engine.estimate_export_bytes(onboarded, selection.clone()).await {
         Ok(bytes) if bytes > MAX_EXPORT_BYTES => {
-            return Response::BundleTooLarge { bytes, max: MAX_EXPORT_BYTES }
+            return Response::BundleTooLarge {
+                bytes,
+                max: MAX_EXPORT_BYTES,
+                limit: BundleLimitWire::ExportBytes,
+            }
         }
         Ok(_) => {}
         Err(e) => return op_error_response(e),
@@ -593,25 +597,13 @@ async fn export_dispatch(
         // brain still answers with the onboarding SIGNAL rather than a fault.
         Err(e) => op_error_response(e),
         Ok(Ok(text)) => {
-            // The AUTHORITATIVE size gate. The frame is `serde_json::to_vec(&Response::Bundle(..))`,
-            // which JSON-ESCAPES the already-JSON `.airmem`; that escaping overhead is far larger
-            // than the 2 MiB gap between MAX_EXPORT_BYTES (30 MiB) and MAX_FRAME (32 MiB), so a
-            // bundle that passed BOTH the estimate and core's own byte belt can still overflow the
-            // frame. Bound the ACTUAL serialized length here — a generic frame write error must
-            // never replace the typed refusal the app renders (spec §7).
             let response = Response::Bundle(text);
-            match serde_json::to_vec(&response) {
-                Ok(wire) if wire.len() > MAX_FRAME => {
-                    Response::BundleTooLarge { bytes: wire.len() as u64, max: MAX_FRAME as u64 }
-                }
-                Ok(_) => response,
-                Err(e) => {
-                    Response::Err { kind: OpErrorKindWire::Core, message: e.to_string() }
-                }
-            }
+            frame_guard(&response).unwrap_or(response)
         }
         Ok(Err(ExportError::BundleTooLarge { bytes, max })) => {
-            Response::BundleTooLarge { bytes, max }
+            // Core measured the `.airmem` TEXT against its own byte belt, so this refusal carries
+            // TEXT semantics — NOT the escaped-frame semantics `frame_guard` reports.
+            Response::BundleTooLarge { bytes, max, limit: BundleLimitWire::ExportBytes }
         }
         Ok(Err(ExportError::ChainInvalid)) => {
             export_rejected("cannot export: memory chain does not verify")
@@ -623,6 +615,33 @@ async fn export_dispatch(
             Response::Err { kind: OpErrorKindWire::Core, message }
         }
     }
+}
+
+/// The AUTHORITATIVE pre-frame size bound. `None` = the response fits and may be sent as-is;
+/// `Some(refusal)` = send this typed [`Response::BundleTooLarge`] instead.
+///
+/// Why it exists at all: the frame written on the wire is `serde_json::to_vec(&response)`, which
+/// JSON-ESCAPES the already-JSON `.airmem`. That overhead (≈2× for escape-heavy text, ≈4× for
+/// stamped items, whose `event_bytes` are escaped JSON being escaped again) dwarfs the 2 MiB gap
+/// between core's `MAX_EXPORT_BYTES` (30 MiB) and [`MAX_FRAME`] (32 MiB) — so a bundle that passed
+/// BOTH the pre-build estimate AND core's own byte belt can still overflow the frame. Without this,
+/// `write_frame` errors and the connection closes with NO response, and the app shows "engine
+/// unavailable" instead of "too big, select fewer memories" (spec §7: a generic frame error must
+/// never replace the typed refusal).
+///
+/// Extracted as a pure function so the bound is unit-testable on BOTH sides of the boundary — as a
+/// `match` arm inside `export_dispatch` it needed a real ~30 MiB export to reach, and review proved
+/// that deleting it there was invisible to the whole suite.
+///
+/// A serialization failure returns `None` (the response is sent, and the send path's own
+/// `encode` fallback handles it) — this function's job is the SIZE verdict, not error reporting.
+fn frame_guard(response: &Response) -> Option<Response> {
+    let wire = serde_json::to_vec(response).ok()?;
+    (wire.len() > MAX_FRAME).then_some(Response::BundleTooLarge {
+        bytes: wire.len() as u64,
+        max: MAX_FRAME as u64,
+        limit: BundleLimitWire::WireFrame,
+    })
 }
 
 /// A typed `Rejected` refusal for the Rung-5 export ops. DELIBERATELY distinct from
@@ -1403,5 +1422,42 @@ mod tests {
             assert!(!field.contains("<<") && !field.contains(">>"), "fence-free: {field:?}");
             assert!(field.chars().count() <= SNAPSHOT_FIELD_MAX, "bounded: {field:?}");
         }
+    }
+
+    /// The authoritative pre-frame bound fires on an over-frame bundle and stays out of the way
+    /// otherwise. BOTH sides are asserted: a guard that always fires would break every export, and a
+    /// guard that never fires (the regression this exists to catch — review deleted it and the whole
+    /// suite still passed) drops the typed refusal for a closed connection.
+    ///
+    /// Escape-heavy text, so the over-frame case is reached without materializing a real 30 MiB
+    /// bundle: each `\"` pair doubles under JSON escaping, so ~half of MAX_FRAME of it lands just
+    /// over the bound.
+    #[test]
+    fn frame_guard_refuses_only_an_over_frame_response() {
+        // Each `\"` pair is 2 raw bytes that escape to 4. At MAX_FRAME/3 pairs the raw text is
+        // 2/3·MAX_FRAME (comfortably UNDER the frame) while the escaped wire is 4/3·MAX_FRAME
+        // (over it) — exactly the escaping-overhead case this guard exists for.
+        let over = Response::Bundle("\\\"".repeat(MAX_FRAME / 3));
+        match frame_guard(&over) {
+            Some(Response::BundleTooLarge { bytes, max, limit }) => {
+                assert!(bytes > MAX_FRAME as u64, "reports the ESCAPED length: {bytes}");
+                assert_eq!(max, MAX_FRAME as u64, "reports the frame ceiling");
+                assert_eq!(limit, BundleLimitWire::WireFrame, "tagged as frame semantics");
+            }
+            other => panic!("an over-frame bundle must be refused, got {other:?}"),
+        }
+
+        // The raw text alone is UNDER the frame — proving the guard measures the escaped wire, not
+        // the string it was handed (a guard reading `text.len()` would pass this one through).
+        let Response::Bundle(raw) = &over else { unreachable!() };
+        assert!(raw.len() < MAX_FRAME, "raw text is under the frame; only escaping pushes it over");
+
+        // Just UNDER: a normal bundle is returned untouched.
+        assert!(
+            frame_guard(&Response::Bundle("{\"manifest\":{}}".to_string())).is_none(),
+            "a bundle that fits must pass through so the export actually reaches the app"
+        );
+        // A non-Bundle response is never refused on size (the guard is response-shape agnostic).
+        assert!(frame_guard(&Response::Ok).is_none());
     }
 }
