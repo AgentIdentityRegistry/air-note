@@ -57,6 +57,12 @@ pub struct BuildInput<'a> {
 }
 
 /// Build + seal. `items` MUST be non-empty (caller enforces `EmptySelection`).
+///
+/// # Panics
+/// Panics if `items` is empty — `merkle::root` asserts a non-empty leaf slice. This is a
+/// caller-honored precondition on the owner-side export path (Task 7 rejects an empty selection
+/// before calling here); it is NOT attacker-reachable. The verify side must never reach the same
+/// assert with a received bundle — it rejects `items: []` as `Malformed` first.
 pub fn build_bundle(input: BuildInput<'_>) -> Airmem {
     let mut items: Vec<AirmemItem> = input
         .items
@@ -147,6 +153,9 @@ mod tests {
             ],
             binding: binding(&brain_mb), brain_key: &brain,
         });
+        // THIS loop — not the root assert below — is what pins leaf↔item pairing. The root assert
+        // recomputes leaves from the items, so it is blind to any permutation of the stored `leaf`
+        // strings. Mutation-verified: reversing or rotating the zip kills only this assert.
         for item in &a.items {
             assert_eq!(item.leaf, hex::encode(merkle::leaf_hash(item)), "stored leaf must be self-consistent");
         }
