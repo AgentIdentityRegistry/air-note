@@ -1976,6 +1976,16 @@ Steps:
 
 ## Task 11 — Conformance vectors + Story-C large fixture + final exit gate
 
+> **OPEN, from the Task-8 security review (2026-07-29) — triage at this gate, not before:**
+> `BundleTooLarge` can MASK `ChainInvalid`. Core's internal ordering is correct (`verify_chain` → dedupe →
+> empty → item ceiling → binding → per-class → build → size), but the DAEMON prepends two steps before
+> core runs: the size estimate and the session-body disk reads. So on a tampered log with an over-cap
+> selection, the owner is told "too big, select fewer" and never learns their memory chain does not
+> verify. Nothing is sealed or disclosed either way, so this is a precedence/UX question rather than a
+> security hole — but the diagnostic the owner most needs is the one they don't get. Options: run a cheap
+> chain probe before the estimate, or document the precedence in the app's error copy. Deliberately not
+> folded into Task 8 because changing that ordering deserves its own change + review.
+>
 > **CARRY-FORWARD from the Task-3/4 rounds (2026-07-29) — what the unit tests do and do NOT guard:**
 > - **The frozen Merkle tag bytes (`0x00` leaf / `0x01` internal) have only INDIRECT unit-test protection.** Verified by mutation (implementer, not asserted): deleting both tags is caught ONLY by `odd_node_promoted_unpaired_not_duplicated`, which hardcodes `0x01` in its hand-computed expectation. The `domain_separation_*` test catches the *domains-collide* mutant (internal tag → `0x00`) but SURVIVES deletion of both tags, and its first assertion is a pure SHA-256 property that can never fail regardless of source. ⇒ **This task must add a hardcoded-digest conformance vector** (a fixed `.airmem` with its expected `merkle_root` written out) so the tag bytes get a direct, cross-repo-checkable guard. That is the vectors' job, not the unit tests'.
 > - Commit `4482a60`'s message says "mutation-proven"; accurate only for the collision mutant. Not amended (intermediate commit; the squash-merge message supersedes it) — recorded here so the branch review has the true picture.
