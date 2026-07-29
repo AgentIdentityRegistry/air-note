@@ -96,6 +96,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "air-verify"
+version = "0.0.1"
+dependencies = [
+ "bossclaw-bundle",
+ "bossclaw-canon",
+ "multibase",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "air_agent_desktop"
 version = "0.0.1"
 dependencies = [

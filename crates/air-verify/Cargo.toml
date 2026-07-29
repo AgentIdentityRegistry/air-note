@@ -1,0 +1,26 @@
+[package]
+name = "air-verify"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "air-verify: offline .airmem bundle verifier CLI (Rung-5 SP-V1). L1 self-consistency + honest kind-aware labels."
+repository = "https://github.com/AgentIdentityRegistry/air-note"
+
+[[bin]]
+name = "air-verify"
+path = "src/main.rs"
+
+[dependencies]
+# The format + the whole verifier. This crate exists ONLY so `bossclaw-bundle` stays a pure,
+# wasm-clean lib with no `std::process`/`std::fs`/argv surface of its own.
+bossclaw-bundle = { path = "../bossclaw-bundle" }
+# The parse boundary itself — `from_slice` over BYTES, so serde_json's 128-level depth limit and
+# out-of-range-float rejection stay in force (they do not on a pre-parsed value).
+serde_json = "1"
+
+[dev-dependencies]
+# Fixture minting only: the tests mint their own brain + identity keys and seal a real bundle
+# through `bossclaw-bundle`'s public build API rather than checking in a golden file.
+bossclaw-canon = { path = "../bossclaw-canon" }
+multibase = "=0.9.2"
+tempfile = "3"
