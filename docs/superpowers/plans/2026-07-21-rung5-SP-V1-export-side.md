@@ -1764,6 +1764,15 @@ Steps:
 > cap raw input bytes BEFORE `serde_json::from_*`,** and must parse from BYTES (not from a JS value)
 > so `serde_json`'s 128-level depth limit and out-of-range-float rejection stay in force. An attacker
 > mints their own brain key, so an arbitrarily large INTERNALLY VALID bundle is trivially producible.
+>
+> ⚠️ **AND TEST IT FOR TIMING, NOT JUST OUTCOME** (lesson earned in Task 6, third hollow-test catch of
+> this build — this one found by the implementer auditing its own new test). A test asserting only
+> "oversized input is rejected" SURVIVES deletion of the guard: without the cap the input is still
+> rejected, just 25 s later. The assertion passes; only the wall clock knows the guard is gone. The
+> byte cap has EXACTLY this shape. Assert a wall-clock bound (Task 6 used `< 2 s` against a measured
+> 25.7 s ungated — loose enough not to flake on a loaded runner, >10× margin) so the mutant dies by
+> assertion. **General rule for this project: any guard whose removal changes SPEED rather than
+> OUTCOME needs a timing assertion, or it only looks tested.**
 
 
 
