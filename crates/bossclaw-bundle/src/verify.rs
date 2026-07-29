@@ -105,7 +105,11 @@ const SUPPORTED_MAJOR: u64 = 1;
 /// be internally valid and force 100% of the work — an unbounded count is therefore an availability
 /// hole, not merely a slow path. Generous enough for a whole-brain Story-C export. The host must
 /// ALSO cap raw bytes before parsing; that bound belongs at the parse boundary, not here.
-const MAX_ITEMS: usize = 50_000;
+///
+/// `pub` so the WRITE side enforces the SAME ceiling: without it an export could build a bundle
+/// that AIR's own verifier then refuses as `Malformed` (demonstrated in review with 50,001 items),
+/// and a re-typed literal on the build side could drift from the value enforced here.
+pub const MAX_ITEMS: usize = 50_000;
 
 /// The only legal binding purpose — a domain-separation tag (spec §2.3), so a card minted for any
 /// other identity-signed protocol can never be lifted into a bundle and honored here.

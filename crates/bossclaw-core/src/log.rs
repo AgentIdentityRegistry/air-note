@@ -285,9 +285,13 @@ const BINDING_KEY: &str = "identity_binding";
 
 /// Ceiling on a serialized `.airmem`, with headroom below the daemon wire cap
 /// (`bossclawd_proto::MAX_FRAME` = 32 MiB, `crates/bossclawd-proto/src/lib.rs:443`) so a bundle
-/// that builds can always be framed. Enforced twice: [`EventLog::estimate_export_bytes`] is the
-/// PRIMARY guard (the daemon runs it BEFORE reading any session body), and
-/// [`EventLog::export_bundle`] re-checks the real serialized length as belt-and-suspenders.
+/// that builds can always be framed.
+///
+/// Checked in two places, and it matters which one is load-bearing.
+/// [`EventLog::export_bundle`]'s check against the REAL serialized length is the AUTHORITATIVE
+/// guard — nothing over the cap can get past it. [`EventLog::estimate_export_bytes`] is a cheap
+/// ADVISORY pre-filter the daemon can run before reading any session body, so an obviously-oversized
+/// selection is refused early; it is an estimate over fold metadata and can under-count badly.
 pub const MAX_EXPORT_BYTES: u64 = 30 * 1024 * 1024;
 
 /// [`EventLog::estimate_export_bytes`] allowance for the parts of an `.airmem` that do not scale
@@ -302,6 +306,13 @@ const EXPORT_PER_ITEM_OVERHEAD_BYTES: u64 = 256;
 /// [`EventLog::estimate_export_bytes`] per-session allowance: the per-item scaffolding plus the
 /// session's `display` object, which no other item class carries.
 const EXPORT_PER_SESSION_OVERHEAD_BYTES: u64 = 512;
+
+/// [`EventLog::estimate_export_bytes`] worst-case expansion for content embedded as a JSON string.
+/// A control character serializes as `\u00XX` — six bytes out of one — so raw byte counts under-count
+/// by up to this factor. Multi-byte UTF-8 needs no allowance (`str::len` is already bytes and
+/// `serde_json` emits it verbatim). Deliberately the WORST case: an estimate that under-counts
+/// waves through a selection the real check then refuses, which is the failure mode worth avoiding.
+const EXPORT_ESCAPING_MULTIPLIER: u64 = 6;
 
 /// A typed identifier for a control-`config` key, mapping to the private `*_KEY` consts. Used by
 /// `EventLog::explicitly_set` (and the capture getters) so callers (e.g. the desktop
@@ -495,7 +506,9 @@ pub enum ExportError {
         /// The ceiling that was exceeded ([`MAX_EXPORT_BYTES`]).
         max: u64,
     },
-    /// A selected id is not an exportable subject (wrong kind / not current). Carries a reason.
+    /// The selection cannot be exported: a selected id is not an exportable subject (wrong kind,
+    /// or superseded/retired/not current), or the selection as a whole exceeds
+    /// [`bossclaw_bundle::verify::MAX_ITEMS`]. Carries a reason.
     NotExportable(String),
     /// Any other core failure.
     Core(String),
@@ -542,7 +555,24 @@ fn checked_display(display: serde_json::Value) -> Result<serde_json::Value, Expo
 /// whole (out of scope for today's fixtures, but the failure mode there would be a silent leak).
 fn project_display_name(project: &str) -> Option<String> {
     let name = project.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next()?;
-    (!name.is_empty()).then(|| name.to_string())
+    // `.` and `..` name no project a receiver could recognize — omit them like the root case
+    // rather than shipping a component that means "wherever the exporter happened to be".
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// The selected ids of one class, in the owner's order, with duplicates removed.
+///
+/// A repeated id is not an error — the App may legitimately send one twice — but it must not become
+/// a repeated ITEM. Review built a 6.4 MB bundle out of 50,001 copies of a single id: far under the
+/// byte cap, yet `bossclaw_bundle::verify` refused it as `Malformed` for exceeding
+/// [`bossclaw_bundle::verify::MAX_ITEMS`]. Deduping first is what makes that ceiling a statement
+/// about how much the owner actually selected.
+fn deduped(ids: &[String]) -> Vec<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    ids.iter().map(String::as_str).filter(|id| seen.insert(id)).collect()
 }
 
 /// One CURRENT remembered note, folded from the log: a `memory`-kind event
@@ -8062,6 +8092,11 @@ impl EventLog {
     /// stores what it is given. Carries no model fields, so it never disturbs
     /// [`EventLog::active_model`].
     ///
+    /// LAYERING — core does NOT enforce first-write-wins. Within an EQUAL epoch the last append
+    /// wins at read time ([`EventLog::latest_binding`]); refusing an epoch that already exists is
+    /// the DAEMON's job, via [`EventLog::binding_epochs`]. A future caller must not assume core
+    /// rejects a re-mint at an occupied epoch.
+    ///
     /// # Errors
     /// Propagates any append/signing failure as [`BossclawError`].
     pub fn set_binding(&self, attestation: serde_json::Value) -> Result<(), BossclawError> {
@@ -8086,13 +8121,22 @@ impl EventLog {
         Ok(())
     }
 
-    /// The stored binding with the HIGHEST `payload.epoch`, or `None` if one was never set (spec
-    /// §2.3). Deliberately NOT [`EventLog::latest_config_value`]'s newest-event-wins stickiness:
-    /// epochs are the rotation order, so the newest EPOCH wins even if an older card was appended
-    /// later. An epoch-less stored card sorts as `0`.
+    /// The USABLE stored binding with the highest `payload.epoch`, or `None` if one was never set
+    /// (spec §2.3). Deliberately NOT [`EventLog::latest_config_value`]'s newest-event-wins
+    /// stickiness: epochs are the rotation order, so the highest EPOCH wins even if an older card
+    /// was appended later. Within an EQUAL epoch the last append wins (rows arrive newest-first).
+    ///
+    /// A card that does not deserialize as `bossclaw_bundle::Binding` is SKIPPED, not fatal. The
+    /// log is append-only, so picking the highest epoch before checking that it parses would let a
+    /// single junk high-epoch card dead-end every future export permanently; falling back to the
+    /// highest epoch that actually parses keeps a good card usable. Parsing also settles the epoch
+    /// TYPE — `BindingPayload::epoch` is `u64`, so a string, float, or negative epoch is malformed
+    /// here exactly as [`EventLog::binding_epochs`]' `as_u64()` filter treats it, and the two
+    /// readers cannot disagree about which cards have a real epoch.
     ///
     /// # Errors
-    /// Propagates any SQLite or deserialization failure as [`BossclawError`].
+    /// Propagates any SQLite or event-deserialization failure as [`BossclawError`]. A malformed
+    /// binding CARD is not an error here — it is skipped.
     pub fn latest_binding(&self) -> Result<Option<serde_json::Value>, BossclawError> {
         let store = self.inner.lock().expect(POISON);
         let conn = store.conn();
@@ -8102,22 +8146,23 @@ impl EventLog {
         let mut best: Option<(u64, serde_json::Value)> = None;
         for row in rows {
             let ev: Event = serde_json::from_str(&row?)?;
-            if let Some(v) = ev.content.get(BINDING_KEY) {
-                let epoch = v
-                    .get("payload")
-                    .and_then(|p| p.get("epoch"))
-                    .and_then(|e| e.as_u64())
-                    .unwrap_or(0);
-                if best.as_ref().is_none_or(|(e, _)| epoch > *e) {
-                    best = Some((epoch, v.clone()));
-                }
+            let Some(card) = ev.content.get(BINDING_KEY) else { continue };
+            let Ok(parsed) = bossclaw_bundle::Binding::deserialize(card) else { continue };
+            // Newest-first, so a strict `>` keeps the LAST-APPENDED card within an equal epoch.
+            if best.as_ref().is_none_or(|(e, _)| parsed.payload.epoch > *e) {
+                best = Some((parsed.payload.epoch, card.clone()));
             }
         }
         Ok(best.map(|(_, v)| v))
     }
 
-    /// The binding epochs already stored — the daemon's first-write-wins idempotency check
-    /// (spec §2.3 A8/C9). An epoch-less stored card contributes nothing.
+    /// The binding epochs already RESERVED — the daemon's first-write-wins idempotency check
+    /// (spec §2.3 A8/C9). An epoch-less or non-`u64`-epoch card contributes nothing, matching
+    /// which cards [`EventLog::latest_binding`] will consider.
+    ///
+    /// Deliberately a SUPERSET of what `latest_binding` can return: a stored card burns its epoch
+    /// even if the rest of it is malformed and therefore unusable. Reservation is about what was
+    /// written; `latest_binding` is about what can be used.
     ///
     /// # Errors
     /// Propagates any SQLite or deserialization failure as [`BossclawError`].
@@ -8163,34 +8208,50 @@ impl EventLog {
             .collect())
     }
 
-    /// Estimate the serialized `.airmem` size BEFORE reading any session body or sealing — the
-    /// daemon's pre-frame [`ExportError::BundleTooLarge`] guard. Sums stamped-note canonical
-    /// bytes, ingest text, session `approx_bytes`, and a fixed overhead — all from in-log data
-    /// (notes, ingests) or the session fold (`approx_bytes`), so NO capture `.md` is read here. An
-    /// id that resolves to nothing contributes nothing: this is a size estimate, and
-    /// [`EventLog::export_bundle`] is where an unexportable id is refused.
+    /// A cheap ADVISORY estimate of the serialized `.airmem` size, computable BEFORE reading any
+    /// session body or sealing, so the daemon can refuse an obviously-oversized selection early.
+    /// Sums the `selection.description` (it reaches `manifest.selection_description`), stamped-note
+    /// canonical bytes, ingest text, and session `approx_bytes`, each with a worst-case escaping
+    /// allowance ([`EXPORT_ESCAPING_MULTIPLIER`]) plus fixed overhead. Everything comes from in-log
+    /// data (notes, ingests) or the session fold (`approx_bytes`), so NO capture `.md` is read here.
+    ///
+    /// NOT the authoritative guard, and it must not be mistaken for one: `approx_bytes` is fold
+    /// METADATA that can under-state a body by orders of magnitude, and an id that resolves to
+    /// nothing contributes nothing. [`EventLog::export_bundle`]'s check against the REAL serialized
+    /// length is what actually enforces [`MAX_EXPORT_BYTES`], and it is also where an unexportable
+    /// id is refused. Arithmetic saturates, so a pathological stored size cannot overflow.
     ///
     /// # Errors
     /// Propagates any SQLite, deserialization, or canonicalization failure as [`BossclawError`].
     pub fn estimate_export_bytes(&self, selection: &ExportSelection) -> Result<u64, BossclawError> {
-        let mut total: u64 = EXPORT_FIXED_OVERHEAD_BYTES;
+        // Worst-case JSON-string expansion for attacker-or-owner-supplied content bytes.
+        let escaped = |bytes: u64| bytes.saturating_mul(EXPORT_ESCAPING_MULTIPLIER);
+        let mut total = EXPORT_FIXED_OVERHEAD_BYTES
+            .saturating_add(escaped(selection.description.len() as u64));
         for id in &selection.note_event_ids {
             if let Some(ev) = self.event_by_id(id)? {
-                total += crate::event::canonical_bytes(&ev)?.len() as u64
-                    + ev.signature.as_ref().map_or(0, |s| s.len() as u64)
-                    + EXPORT_PER_ITEM_OVERHEAD_BYTES;
+                // The canonical bytes are embedded as a JSON STRING, so they are escaped too; the
+                // multibase signature is base58 and needs no allowance.
+                total = total
+                    .saturating_add(escaped(crate::event::canonical_bytes(&ev)?.len() as u64))
+                    .saturating_add(ev.signature.as_ref().map_or(0, |s| s.len() as u64))
+                    .saturating_add(EXPORT_PER_ITEM_OVERHEAD_BYTES);
             }
         }
         for id in &selection.ingest_event_ids {
             if let Some(ev) = self.event_by_id(id)? {
                 let text = ev.content.get("text").and_then(|t| t.as_str()).map_or(0, str::len);
-                total += text as u64 + EXPORT_PER_ITEM_OVERHEAD_BYTES;
+                total = total
+                    .saturating_add(escaped(text as u64))
+                    .saturating_add(EXPORT_PER_ITEM_OVERHEAD_BYTES);
             }
         }
         let sessions = self.current_sessions()?;
         for id in &selection.session_event_ids {
-            if let Some(s) = sessions.iter().find(|s| &s.event_id == id) {
-                total += s.approx_bytes + EXPORT_PER_SESSION_OVERHEAD_BYTES;
+            if let Some(s) = sessions.iter().find(|s| s.event_id == *id) {
+                total = total
+                    .saturating_add(escaped(s.approx_bytes))
+                    .saturating_add(EXPORT_PER_SESSION_OVERHEAD_BYTES);
             }
         }
         Ok(total)
@@ -8201,14 +8262,24 @@ impl EventLog {
     /// a session absent from the map gets a placeholder — a missing body must never abort a
     /// whole export. Returns the canonical `.airmem` text.
     ///
-    /// Order: chain check → empty check → binding → per-class gather with SERVER-SIDE guards →
-    /// build → size re-check. The empty check comes before `build_bundle`, which asserts a
-    /// non-empty leaf slice.
+    /// CALLER CONTRACT for `session_bodies`: supply the session's TRANSCRIPT TEXT ONLY, with any
+    /// capture front matter STRIPPED. A-N1 covers a seal-vouched item's `content` exactly as it
+    /// covers its `display`, and this function cannot tell a transcript from a YAML header that
+    /// still carries `project:`, `session_id:`, and `sha256:` — it ships whatever it is handed.
+    /// Every local-metadata guarantee below is therefore conditional on this contract.
+    ///
+    /// Order: chain check → dedupe → empty check → item ceiling → binding → per-class gather with
+    /// SERVER-SIDE guards → build → size check. The empty check comes before `build_bundle`, which
+    /// asserts a non-empty leaf slice.
     ///
     /// PRIVACY (A-N1): only `memory` events reach the STAMPED class, which discloses full
     /// canonical event bytes. Sessions and ingests are seal-vouched CONTENT-ONLY, because their
     /// events carry local paths, `session_id`, `grant_root`, and content hashes. The class is
     /// decided HERE from the loaded event, never taken from the caller.
+    ///
+    /// CURRENCY: every class is checked against its own CURRENT projection, so a superseded or
+    /// retired subject cannot ship. That matters most for notes, which carry the format's
+    /// strongest attestation — a fact the owner explicitly corrected must never leave stamped.
     ///
     /// # Errors
     /// One typed [`ExportError`] per refusal class; the first failure is the verdict.
@@ -8218,11 +8289,21 @@ impl EventLog {
         session_bodies: &HashMap<String, String>,
     ) -> Result<String, ExportError> {
         self.verify_chain().map_err(|_| ExportError::ChainInvalid)?; // S4: never seal a sick brain
-        if selection.note_event_ids.is_empty()
-            && selection.session_event_ids.is_empty()
-            && selection.ingest_event_ids.is_empty()
-        {
+        let note_ids = deduped(&selection.note_event_ids);
+        let ingest_ids = deduped(&selection.ingest_event_ids);
+        let session_ids = deduped(&selection.session_event_ids);
+        if note_ids.is_empty() && session_ids.is_empty() && ingest_ids.is_empty() {
             return Err(ExportError::EmptySelection);
+        }
+        // Mirror the ceiling AIR's own verifier enforces, so an export can never produce a bundle
+        // this project then refuses to read. Checked post-dedupe and pre-gather: it is a statement
+        // about how much the owner actually selected, and it costs no database work to refuse.
+        let item_count = note_ids.len() + ingest_ids.len() + session_ids.len();
+        if item_count > bossclaw_bundle::verify::MAX_ITEMS {
+            return Err(ExportError::NotExportable(format!(
+                "selection has {item_count} items, exceeding the {} the verifier accepts",
+                bossclaw_bundle::verify::MAX_ITEMS
+            )));
         }
         let binding_json = self.latest_binding().map_err(core)?.ok_or(ExportError::BindingUnavailable)?;
         let binding: bossclaw_bundle::Binding = serde_json::from_value(binding_json)
@@ -8231,8 +8312,13 @@ impl EventLog {
 
         let mut items: Vec<bossclaw_bundle::ItemInput> = Vec::new();
 
-        // Stamped notes — SERVER-SIDE A-N1 guard: `memory` + external ONLY, never the caller's word.
-        for id in &selection.note_event_ids {
+        // Stamped notes — SERVER-SIDE A-N1 guard: `memory` + external ONLY, never the caller's
+        // word, and CURRENT, so a note the owner corrected or retired cannot ship carrying the
+        // format's strongest attestation. `current_notes` already excludes both `supersede` and
+        // `note_retired` (an `unretire` restores) — delegate, don't re-derive.
+        let current_note_ids: HashSet<String> =
+            self.current_notes().map_err(core)?.into_iter().map(|n| n.event_id).collect();
+        for id in note_ids {
             let ev = self
                 .event_by_id(id)
                 .map_err(core)?
@@ -8240,6 +8326,11 @@ impl EventLog {
             if ev.event_type != crate::graph::MEMORY_EVENT_TYPE || !crate::event::is_external(&ev) {
                 return Err(ExportError::NotExportable(format!(
                     "{id} is not an exportable external note"
+                )));
+            }
+            if !current_note_ids.contains(id) {
+                return Err(ExportError::NotExportable(format!(
+                    "note {id} is not a current note"
                 )));
             }
             let signature = ev
@@ -8261,7 +8352,7 @@ impl EventLog {
         // path / grant_root / content_hash provenance can ride along.
         let current_ingest_ids: HashSet<String> =
             self.current_ingests().map_err(core)?.into_iter().map(|i| i.event_id).collect();
-        for id in &selection.ingest_event_ids {
+        for id in ingest_ids {
             if !current_ingest_ids.contains(id) {
                 return Err(ExportError::NotExportable(format!(
                     "ingest {id} is not a current file"
@@ -8285,8 +8376,8 @@ impl EventLog {
         // Seal-vouched sessions — body from the daemon-supplied map (placeholder if missing), and
         // a display object that carries NO path, session_id, grant_root, or lineage (A-N1).
         let sessions = self.current_sessions().map_err(core)?;
-        for id in &selection.session_event_ids {
-            let s = sessions.iter().find(|s| &s.event_id == id).ok_or_else(|| {
+        for id in session_ids {
+            let s = sessions.iter().find(|s| s.event_id == *id).ok_or_else(|| {
                 ExportError::NotExportable(format!("session {id} is not a current session"))
             })?;
             let content = session_bodies
@@ -8327,7 +8418,8 @@ impl EventLog {
             bossclaw_bundle::canonical_json(&bundle).map_err(|e| ExportError::Core(e.to_string()))?,
         )
         .map_err(|e| ExportError::Core(e.to_string()))?;
-        // Belt-and-suspenders; the primary guard is the daemon's pre-body `estimate_export_bytes`.
+        // THE authoritative size guard: the real serialized length, not an estimate over fold
+        // metadata. `estimate_export_bytes` is the cheap advisory pre-filter, not this.
         if text.len() as u64 > MAX_EXPORT_BYTES {
             return Err(ExportError::BundleTooLarge {
                 bytes: text.len() as u64,
@@ -13656,6 +13748,12 @@ mod tests {
     /// key. Shared by the export tests so that a refusal a test asserts is the one under test and
     /// never a malformed-card `Core` short-circuit sitting ahead of it.
     fn binding_attestation(log: &EventLog, epoch: u64) -> serde_json::Value {
+        binding_attestation_at(log, epoch, "2026-07-21T00:00:00Z")
+    }
+
+    /// [`binding_attestation`] with a caller-chosen mint time, so a test can store two DISTINCT
+    /// well-formed cards at the SAME epoch and pin the equal-epoch tiebreak.
+    fn binding_attestation_at(log: &EventLog, epoch: u64, created_at: &str) -> serde_json::Value {
         let identity_key = SigningKey::from_bytes(&[9u8; 32]);
         let payload = serde_json::json!({
             "brain_verifying_key": log.brain_verifying_key_multibase(),
@@ -13666,7 +13764,7 @@ mod tests {
             "did": "did:wba:example.com:me",
             "purpose": "memory-signing",
             "epoch": epoch,
-            "created_at": "2026-07-21T00:00:00Z",
+            "created_at": created_at,
         });
         let typed: bossclaw_bundle::BindingPayload =
             serde_json::from_value(payload.clone()).unwrap();
@@ -13699,16 +13797,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = open_log(dir.path());
         assert!(log.latest_binding().unwrap().is_none(), "no binding until one is minted");
-        log.set_binding(serde_json::json!({ "payload": { "epoch": 1 }, "identity_signature": "zA" }))
-            .unwrap();
-        log.set_binding(serde_json::json!({ "payload": { "epoch": 2 }, "identity_signature": "zB" }))
-            .unwrap();
-        log.set_binding(serde_json::json!({ "payload": { "epoch": 1 }, "identity_signature": "zC" }))
-            .unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        log.set_binding(binding_attestation(&log, 3)).unwrap();
+        // Appended LAST at a LOWER epoch, so append order cannot pass this by accident.
+        log.set_binding(binding_attestation(&log, 2)).unwrap();
         let latest = log.latest_binding().unwrap().unwrap();
-        assert_eq!(latest["payload"]["epoch"], 2, "highest epoch wins, not the newest append");
-        assert_eq!(latest["identity_signature"], "zB");
-        assert_eq!(log.binding_epochs().unwrap(), HashSet::from([1_u64, 2_u64]));
+        assert_eq!(latest["payload"]["epoch"], 3, "highest epoch wins, not the newest append");
+        assert_eq!(log.binding_epochs().unwrap(), HashSet::from([1_u64, 2_u64, 3_u64]));
+        // Equal epoch → the LAST append wins (core is not first-write-wins; that is the daemon's
+        // job via `binding_epochs`, as `set_binding` documents).
+        log.set_binding(binding_attestation_at(&log, 3, "2026-07-22T00:00:00Z")).unwrap();
+        assert_eq!(
+            log.latest_binding().unwrap().unwrap()["payload"]["created_at"],
+            "2026-07-22T00:00:00Z",
+            "within an equal epoch the last append wins"
+        );
         assert!(log.verify_chain().is_ok(), "the binding rides the signed hash chain");
     }
 
@@ -13781,17 +13884,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = open_log(dir.path());
         let embedder = MockEmbedder::new(8);
-        let meta = SessionMeta {
-            project: "/Users/testuser/air-note".into(),
-            ..session_meta("sess-abc-123", &"aa".repeat(32))
-        };
-        let session_ev = log.capture_session(&embedder, &meta).unwrap();
-        log.set_binding(binding_attestation(&log, 1)).unwrap();
-        let text = log
-            .export_bundle(&selection(vec![], vec![session_ev], vec![]), &HashMap::new())
+        // Every piece of local metadata is a distinctive SENTINEL, and it lives on the EVENT — the
+        // one place core could leak it from. The supplied body is a real (already-stripped)
+        // transcript containing none of them, so a sentinel appearing in the output can only mean
+        // core put it there.
+        let sha = "cc".repeat(32);
+        let with_body = log
+            .capture_session(
+                &embedder,
+                &SessionMeta {
+                    project: "/Users/SENTINELUSER/SENTINELPROJECT".into(),
+                    ..session_meta("SENTINEL-SESSION-ID", &sha)
+                },
+            )
             .unwrap();
+        let without_body = log
+            .capture_session(
+                &embedder,
+                &SessionMeta {
+                    project: "/Users/SENTINELUSER/SENTINELPROJECT".into(),
+                    ..session_meta("SENTINEL-OTHER-ID", &"bb".repeat(32))
+                },
+            )
+            .unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        let transcript = "the transcript body the receiver is meant to read";
+        let bodies = HashMap::from([(with_body.clone(), transcript.to_string())]);
+        let text = log
+            .export_bundle(&selection(vec![], vec![with_body, without_body], vec![]), &bodies)
+            .unwrap();
+        // The four local-metadata values, plus the field NAMES that would betray a shape change.
         for needle in [
-            "sess-abc-123",
+            "SENTINEL-SESSION-ID",
+            "SENTINEL-OTHER-ID",
+            "/Users/SENTINELUSER",
+            sha.as_str(),
             "/data/sessions/",
             "session_id",
             "grant_root",
@@ -13801,14 +13928,9 @@ mod tests {
             assert!(!text.contains(needle), "the exported session leaked `{needle}`");
         }
         // Owner ruling 2026-07-29: the folder NAME ships, the path around it does not.
-        assert!(text.contains("air-note"), "the receiver still learns which project this was");
         assert!(
-            !text.contains("/Users/testuser"),
-            "the exporter's username and directory layout stay private"
-        );
-        assert!(
-            !text.contains("/Users/testuser/air-note"),
-            "the full project path never ships verbatim"
+            text.contains("SENTINELPROJECT"),
+            "the receiver still learns which project this was"
         );
         let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
         let v = bossclaw_bundle::verify(&bundle, &bossclaw_bundle::OfflineResolver).unwrap();
@@ -13816,9 +13938,147 @@ mod tests {
         assert!(bundle.items[0].event_bytes.is_none(), "seal-vouched discloses no event bytes");
         assert_eq!(
             bundle.items[0].content.as_deref(),
+            Some(transcript),
+            "the transcript the owner chose to disclose is what ships"
+        );
+        assert_eq!(
+            bundle.items[1].content.as_deref(),
             Some("[session body unavailable at export time]"),
             "a body the daemon could not supply becomes a placeholder, never an abort"
         );
+    }
+
+    /// The `session_bodies` contract has teeth, and this is what they cost: `export_bundle` ships
+    /// the supplied body VERBATIM. It cannot tell a transcript from capture front matter, so an
+    /// unstripped body carries its `project:` / `session_id:` / `sha256:` header straight into the
+    /// bundle. Pinned deliberately: the guarantee lives with the CALLER (the daemon strips before
+    /// calling), and anyone who later assumes core sanitizes here will fail this test and read why.
+    #[test]
+    fn a_supplied_session_body_ships_verbatim_so_the_caller_must_strip_front_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let ev = log.capture_session(&embedder, &session_meta("s1", &"aa".repeat(32))).unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        let unstripped = "---\nproject: /Users/SOMEONE/repo\nsession_id: S1\n---\n\ntranscript";
+        let bodies = HashMap::from([(ev.clone(), unstripped.to_string())]);
+        let text = log.export_bundle(&selection(vec![], vec![ev], vec![]), &bodies).unwrap();
+        let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            bundle.items[0].content.as_deref(),
+            Some(unstripped),
+            "content is passed through unchanged — stripping is the caller's contract, not core's"
+        );
+    }
+
+    /// A note the owner CORRECTED must never ship. It is still `memory` + external, so the
+    /// kind/taint guard passes it — only the currency check stops it, and without that check it
+    /// would leave carrying the format's strongest attestation.
+    #[test]
+    fn export_refuses_a_superseded_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let old = log.remember(&embedder, "we deploy on Vercel").unwrap();
+        let new = log.supersede_note(&embedder, &old, "we deploy on Fly").unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        match log.export_bundle(&selection(vec![old], vec![], vec![]), &HashMap::new()) {
+            Err(ExportError::NotExportable(reason)) => {
+                assert!(reason.contains("current note"), "got {reason}");
+            }
+            other => panic!("expected NotExportable, got {other:?}"),
+        }
+        log.export_bundle(&selection(vec![new], vec![], vec![]), &HashMap::new())
+            .expect("the correction itself still exports");
+    }
+
+    /// A note RETIRED via Rung-3 conflict resolution must never ship either, and `unretire` must
+    /// bring it back — the guard tracks the live projection, it does not latch.
+    #[test]
+    fn export_refuses_a_retired_note_until_unretired() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let note = log.remember(&embedder, "we deploy on Vercel").unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        log.retire_memory(&note, None).unwrap();
+        match log.export_bundle(&selection(vec![note.clone()], vec![], vec![]), &HashMap::new()) {
+            Err(ExportError::NotExportable(reason)) => {
+                assert!(reason.contains("current note"), "got {reason}");
+            }
+            other => panic!("expected NotExportable, got {other:?}"),
+        }
+        log.unretire(&note).unwrap();
+        log.export_bundle(&selection(vec![note], vec![], vec![]), &HashMap::new())
+            .expect("unretire restores exportability");
+    }
+
+    /// One junk high-epoch card must not brick export forever: the log is append-only, so
+    /// `latest_binding` falls back to the highest epoch that actually parses.
+    #[test]
+    fn a_malformed_high_epoch_binding_does_not_brick_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let note = log.remember(&embedder, "a shared fact").unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        log.set_binding(serde_json::json!({ "payload": { "epoch": 9 }, "identity_signature": "z" }))
+            .unwrap();
+        // A non-`u64` epoch is malformed for BOTH readers, so neither can prefer it.
+        log.set_binding(
+            serde_json::json!({ "payload": { "epoch": "12" }, "identity_signature": "z" }),
+        )
+        .unwrap();
+        assert_eq!(
+            log.latest_binding().unwrap().unwrap()["payload"]["epoch"],
+            1,
+            "the usable epoch-1 card survives a junk epoch-9 and a non-u64 epoch-12"
+        );
+        assert!(
+            !log.binding_epochs().unwrap().contains(&12),
+            "a non-u64 epoch is invisible to the reservation registry too — the readers agree"
+        );
+        let text = log
+            .export_bundle(&selection(vec![note], vec![], vec![]), &HashMap::new())
+            .expect("export still works");
+        let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
+        bossclaw_bundle::verify(&bundle, &bossclaw_bundle::OfflineResolver).unwrap();
+    }
+
+    /// Duplicate ids collapse to one item rather than one item each, and a selection past the
+    /// verifier's own ceiling is refused HERE — an export must never build a bundle AIR then
+    /// rejects as `Malformed`.
+    #[test]
+    fn export_dedupes_ids_and_refuses_more_items_than_the_verifier_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let note = log.remember(&embedder, "a shared fact").unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        let text = log
+            .export_bundle(
+                &selection(vec![note.clone(), note.clone(), note.clone()], vec![], vec![]),
+                &HashMap::new(),
+            )
+            .unwrap();
+        let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
+        assert_eq!(bundle.items.len(), 1, "the same id three times is still one item");
+        assert_eq!(bundle.manifest.item_count, 1);
+        bossclaw_bundle::verify(&bundle, &bossclaw_bundle::OfflineResolver).unwrap();
+
+        // Past the ceiling: DISTINCT ids, since duplicates would collapse. They need not exist —
+        // the refusal is pre-gather, which is exactly why it costs no database work.
+        let too_many: Vec<String> =
+            (0..=bossclaw_bundle::verify::MAX_ITEMS).map(|i| format!("id-{i}")).collect();
+        match log.export_bundle(&selection(too_many, vec![], vec![]), &HashMap::new()) {
+            Err(ExportError::NotExportable(reason)) => {
+                assert!(
+                    reason.contains(&bossclaw_bundle::verify::MAX_ITEMS.to_string()),
+                    "the refusal names the ceiling: {reason}"
+                );
+            }
+            other => panic!("expected NotExportable, got {other:?}"),
+        }
     }
 
     /// Owner ruling 2026-07-29: a session's `project` ships as its folder NAME only. Covers the
@@ -13842,6 +14102,8 @@ mod tests {
         );
         assert_eq!(project_display_name("/"), None, "a root has no folder to name → omit the key");
         assert_eq!(project_display_name(""), None, "an empty project → omit the key, never \"\"");
+        assert_eq!(project_display_name("."), None, "`.` names nothing a receiver could recognize");
+        assert_eq!(project_display_name(".."), None, "nor does `..`");
         assert_eq!(
             project_display_name(r"C:\Users\testuser\air-note").as_deref(),
             Some("air-note"),
@@ -13888,9 +14150,24 @@ mod tests {
         let with_both = log
             .estimate_export_bytes(&selection(vec![note_id], vec![session_ev], vec![]))
             .unwrap();
-        assert_eq!(nothing, EXPORT_FIXED_OVERHEAD_BYTES, "an empty selection is overhead only");
+        assert_eq!(
+            nothing,
+            EXPORT_FIXED_OVERHEAD_BYTES
+                + "test selection".len() as u64 * EXPORT_ESCAPING_MULTIPLIER,
+            "an empty selection is the fixed overhead plus the description, which reaches the \
+             manifest and must not be free"
+        );
         assert!(with_note > nothing, "a selected note adds its canonical bytes");
         assert!(with_both > with_note, "a selected session adds its approx_bytes");
         assert!(with_both < MAX_EXPORT_BYTES, "a two-item selection is nowhere near the cap");
+        // A longer description costs more — the term is live, not a constant folded in.
+        let wordy = ExportSelection {
+            description: "x".repeat(1000),
+            ..selection(vec![], vec![], vec![])
+        };
+        assert!(
+            log.estimate_export_bytes(&wordy).unwrap() > nothing + 900,
+            "the description length is actually counted"
+        );
     }
 }
