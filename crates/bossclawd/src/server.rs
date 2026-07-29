@@ -970,6 +970,10 @@ fn recall_stats(engine: &EngineHandle) -> RecallStatsWire {
 /// + `sha256` + `event_id` stay daemon-internal and are deliberately NOT surfaced).
 fn session_summary_wire(cs: bossclaw_core::log::CurrentSession) -> SessionSummaryWire {
     SessionSummaryWire {
+        // The capture EVENT id — the address `ExportSelection::session_event_ids` takes (Rung-5
+        // §2.4). It was previously dropped here, which is what left the Library able to list
+        // sessions but unable to name one for export. A daemon-minted ULID, so nothing to sanitize.
+        event_id: cs.event_id,
         session_id: cs.session_id,
         title: cs.title,
         project: cs.project,

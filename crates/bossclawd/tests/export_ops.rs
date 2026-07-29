@@ -327,6 +327,83 @@ async fn export_bundle_round_trip_verifies() {
         .expect("the exported bundle verifies");
 }
 
+/// Story C addressing: the `event_id` a `ListSessions` row carries IS the id `ExportBundle` accepts.
+///
+/// This closes the exact loop the gap lived in. `SessionSummaryWire` used to carry only
+/// `session_id`, so the app could list sessions but had no way to name one in an `ExportSelection`
+/// — the Library shipped `[]` and the honest copy "Sessions can't be exported yet", even though the
+/// engine's seal-vouched session path already worked. Asserting the field merely EXISTS would not
+/// have caught that; feeding the listed value straight into an export does, because the wrong id
+/// (e.g. `session_id`) comes back `NotExportable`, which this test also pins.
+#[tokio::test]
+async fn a_listed_session_event_id_is_the_id_export_accepts() {
+    let (dir, sock, engine) = spawn_daemon_with_engine().await;
+    let mut app = AppClient::connect(&sock).await;
+    let brain_key = app.brain_key().await;
+
+    let identity = CaptureIdentity {
+        session_id: "story-c-session".into(),
+        project: "/Users/someone/air-note".into(),
+        tool: CAPTURE_TOOL.into(),
+    };
+    let rendered = Rendered {
+        title: "whole-brain backup".into(),
+        markdown: "IGNORED BY THE STORE".into(),
+        body: "## You\nBack up everything.\n\n## Assistant\nOn it.\n".into(),
+        sha256: "cc".repeat(32),
+        started_at: 1_783_764_000,
+        ended_at: 1_783_764_009,
+        approx_bytes: 64,
+        dropped_torn_tail: false,
+        oversized_lines: 0,
+        skipped_unknown: 0,
+    };
+    store_capture(&engine, dir.path(), &identity, &rendered).await.expect("capture stored");
+
+    // Take the id the APP would see — straight off the wire, never from the engine.
+    let listed = match app.call(Request::ListSessions { onboarded: true }).await {
+        Response::ListSessions(rows) => rows,
+        other => panic!("ListSessions should succeed, got {other:?}"),
+    };
+    let row = listed.iter().find(|r| r.session_id == "story-c-session").expect("the capture is listed");
+    assert!(!row.event_id.is_empty(), "the Library row carries an export address");
+    assert_ne!(row.event_id, row.session_id, "the export address is the EVENT id, not the identity key");
+
+    let binding = mint_binding(&SigningKey::from_bytes(&[7u8; 32]), &brain_key, 1);
+    let resp = app
+        .call(Request::SetBinding { onboarded: true, attestation: attestation(&binding) })
+        .await;
+    assert!(matches!(resp, Response::Ok), "binding stored, got {resp:?}");
+
+    let select = |id: &str| ExportSelectionWire {
+        note_event_ids: vec![],
+        session_event_ids: vec![id.to_string()],
+        ingest_event_ids: vec![],
+        description: "story C".into(),
+    };
+
+    // The LISTED event id exports.
+    let text = match app
+        .call(Request::ExportBundle { onboarded: true, selection: select(&row.event_id) })
+        .await
+    {
+        Response::Bundle(text) => text,
+        other => panic!("the listed event_id must be exportable, got {other:?}"),
+    };
+    let airmem: bossclaw_bundle::Airmem = serde_json::from_str(&text).expect("parseable .airmem");
+    assert_eq!(airmem.manifest.item_count, 1, "the session was exported");
+    assert_eq!(airmem.items[0].kind, "session", "exported as a session item");
+    assert!(text.contains("Back up everything."), "the transcript rode along");
+    bossclaw_bundle::verify(&airmem, &bossclaw_bundle::OfflineResolver).expect("verifies");
+
+    // The identity key is NOT an export address — pins that the row's two ids are not
+    // interchangeable, so a future refactor cannot quietly swap them.
+    let resp = app
+        .call(Request::ExportBundle { onboarded: true, selection: select(&row.session_id) })
+        .await;
+    assert_rejected(&resp, "is not a current session");
+}
+
 // ── A-N1 sentinels for the session-export privacy test ────────────────────────────────────────
 // Each is a string that MUST NOT survive into the sealed bundle. They are distinctive enough that
 // a hit can only have come from the capture's front matter.

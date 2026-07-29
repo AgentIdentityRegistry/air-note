@@ -769,8 +769,16 @@ pub struct ReasonerConfigWire {
 /// Wire summary of one captured Claude Code session — a Memory-browser Library row. `started_at`/
 /// `ended_at` are unix-epoch seconds; `approx_bytes` is the rendered `.md`'s size (a cheap Library
 /// "how big" hint, not a security boundary).
+///
+/// TWO ids, deliberately, because the ops address a session differently:
+/// - `session_id` is the session's stable IDENTITY key — what `GetSession`/`DeleteSession` take.
+/// - `event_id` is the capture EVENT's id — what `ExportSelection::session_event_ids` takes
+///   (Rung-5 §2.4). Without it on this row the app can list sessions but cannot name one for
+///   export, which is what blocked Story C (whole-brain backup) even though the engine path worked.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct SessionSummaryWire {
+    /// The current `session_captured` event's id — the export address (see the type doc).
+    pub event_id: String,
     pub session_id: String,
     pub title: String,
     pub project: String,
@@ -1239,6 +1247,7 @@ mod tests {
     #[test]
     fn session_summary_wire_serde_roundtrip() {
         let s = SessionSummaryWire {
+            event_id: "01J-CAPTURE-EVENT".to_string(),
             session_id: "01J-SESSION".to_string(),
             title: "Fix the login bug".to_string(),
             project: "/home/me/repo".to_string(),
@@ -1250,12 +1259,16 @@ mod tests {
         let bytes = serde_json::to_vec(&s).unwrap();
         let back: SessionSummaryWire = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(s, back);
+        // The two ids are DISTINCT values on the row, not aliases: a round-trip that dropped or
+        // conflated `event_id` would leave the export unable to address the session.
+        assert_ne!(back.event_id, back.session_id);
     }
 
     #[test]
     fn session_detail_wire_serde_roundtrip() {
         let s = SessionDetailWire {
             summary: SessionSummaryWire {
+                event_id: "01J-CAPTURE-EVENT".to_string(),
                 session_id: "01J-SESSION".to_string(),
                 title: "Fix the login bug".to_string(),
                 project: "/home/me/repo".to_string(),

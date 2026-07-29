@@ -1565,6 +1565,7 @@ mod tests {
     async fn list_sessions_maps_wire_fields() {
         use bossclawd_proto::types::SessionSummaryWire;
         let wire = SessionSummaryWire {
+            event_id: "e1".into(),
             session_id: "s1".into(),
             title: "Refactor".into(),
             project: "air-note".into(),
@@ -1591,6 +1592,7 @@ mod tests {
         use bossclawd_proto::types::{SessionDetailWire, SessionSummaryWire};
         let wire = SessionDetailWire {
             summary: SessionSummaryWire {
+                event_id: "e2".into(),
                 session_id: "s2".into(),
                 title: "T".into(),
                 project: "p".into(),
