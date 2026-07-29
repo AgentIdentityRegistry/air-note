@@ -19,7 +19,14 @@ pub struct Airmem {
 }
 
 /// The seal's message.
+///
+/// `deny_unknown_fields` is load-bearing, not hygiene: verify re-serializes THIS PARSED STRUCT via
+/// [`canonical_json`] rather than trusting the received byte stream, so without the attribute an
+/// injected extra key would be silently dropped at parse time and the seal would still verify —
+/// letting the attacker smuggle a field that every consumer downstream of verify might render.
+/// Rejecting at the parse boundary is what makes canonicalize-from-struct safe (Task-2 review #2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Semver; verifier refuses a newer major.
     pub format_version: String,
@@ -52,7 +59,12 @@ pub enum ItemClass {
 /// One disclosed memory. `leaf` and `carried_origin` are EXCLUDED from the leaf hash (finding A7 +
 /// critic C-origin: `carried_origin` is a display token whose integrity comes from the verifier's
 /// cross-check against the stamp-covered event bytes, so a flip yields `OriginMismatch`, not a hash break).
+///
+/// The type is deliberately FLAT (one struct, two classes), so it permits combinations the format
+/// forbids. `deny_unknown_fields` closes the injected-key channel; the class↔field-set invariant
+/// (`verify::check_item_shape`) closes the illegal-combination channel. Neither is optional.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AirmemItem {
     /// Hex of this item's Merkle leaf hash. Excluded when computing the leaf (see merkle.rs).
     pub leaf: String,
@@ -80,6 +92,7 @@ pub struct AirmemItem {
 
 /// The ID card payload (canonical) + its identity signature.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Binding {
     /// The signed fields (spec §2.3).
     pub payload: BindingPayload,
@@ -89,6 +102,7 @@ pub struct Binding {
 
 /// The binding payload — hash-committed by `manifest.binding_hash`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindingPayload {
     /// The brain verifying key (multibase). MUST equal `manifest.brain_verifying_key` (C1).
     pub brain_verifying_key: String,
@@ -149,6 +163,40 @@ mod tests {
         let s = String::from_utf8(canonical_json(&a.manifest).unwrap()).unwrap();
         assert!(s.find("binding_hash").unwrap() < s.find("brain_verifying_key").unwrap(), "JCS sorts keys");
     }
+    /// Re-serialize `a`, splice `extra` into the object at `pointer`, and try to parse it back.
+    fn parse_with_injected_field(a: &Airmem, pointer: &str, extra: &str) -> Result<Airmem, serde_json::Error> {
+        let mut v: serde_json::Value = serde_json::to_value(a).unwrap();
+        let target = if pointer.is_empty() { &mut v } else { v.pointer_mut(pointer).expect("pointer resolves") };
+        target.as_object_mut().unwrap().insert(extra.into(), serde_json::json!("smuggled"));
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_the_parse_boundary() {
+        // Verify canonicalizes FROM THE PARSED STRUCT, so a silently-dropped extra key would ride
+        // under a still-valid seal. These four types are the ones that feed hashes/signatures.
+        let a = sample();
+        for (pointer, field) in [
+            ("/manifest", "evil"),
+            ("/items/0", "evil"),
+            ("/binding", "evil"),
+            ("/binding/payload", "evil"),
+        ] {
+            assert!(
+                parse_with_injected_field(&a, pointer, field).is_err(),
+                "an injected `{field}` at `{pointer}` must fail to parse, never be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn known_fields_still_parse() {
+        // Regression guard: deny_unknown_fields must not have broken the honest round-trip.
+        let a = sample();
+        let back: Airmem = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+        assert_eq!(a, back);
+    }
+
     #[test]
     fn seal_vouched_item_round_trips() {
         let mut a = sample();

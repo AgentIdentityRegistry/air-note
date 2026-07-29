@@ -17,8 +17,22 @@ pub fn leaf_hash(item: &AirmemItem) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// The Merkle root over pre-computed leaf hashes (leaf order preserved). Empty input is disallowed
-/// upstream (`EmptySelection`); a single leaf is its own root.
+/// The Merkle root over pre-computed leaf hashes (leaf order preserved). A single leaf is its own
+/// root.
+///
+/// # Panics
+/// Panics on empty input. BOTH callers must reject an empty selection BEFORE calling, because
+/// `assert!` is NOT compiled out in release — on the verify side an empty `items` array in a
+/// received `.airmem` would otherwise become an unconditional trap/abort in the WASM verifier
+/// instead of a clean ❌ (Task-3 review #4):
+/// * export side — Task 7 rejects the empty selection (`EmptySelection`) before `build_bundle`;
+/// * verify side — `verify::verify` rejects `items: []` as `Malformed` before reaching here.
+///
+/// FUTURE (Task-3 review #6): any inclusion-proof API added here MUST bind `(item_count, index)`
+/// and derive the expected path shape from `n`. Under odd-node promotion, node positions differ per
+/// `n`, so a "fold the path upward" verifier that trusts caller-supplied direction bits is
+/// shape-agnostic. This is a well-formedness requirement, not a forgery hole — domain separation
+/// already prevents forging membership of a new item. Relevant when the deferred sub-share UX lands.
 pub fn root(leaves: &[[u8; 32]]) -> [u8; 32] {
     assert!(!leaves.is_empty(), "root() requires >= 1 leaf; empty selection is rejected upstream");
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
