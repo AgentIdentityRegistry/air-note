@@ -13,6 +13,13 @@
 //! [`MAX_INPUT_BYTES`] a ~100 MB file costs a multi-hundred-MB `serde_json` allocation and tens of
 //! seconds of parse before `verify` is ever called. See [`read_bounded`].
 //!
+//! NOTHING THE FILE CHOSE IS PRINTED RAW. The same premise that makes the size cap necessary — the
+//! producer picked every key, so any string can ride in a bundle that verifies — makes a `did` full
+//! of newlines and ANSI escapes able to print a forged `identity: registry-resolved` line, or erase
+//! the honest ones outright. Every attacker-reachable string goes through
+//! [`bossclaw_bundle::sanitize_for_display`] first; the verifier's own detail strings are sanitized
+//! where they are BUILT, and re-sanitized here as a second gate.
+//!
 //! HONESTY CONTRACT (spec §2.5 C3): an L1 pass is NEVER identity evidence. Every key L1 touches is
 //! chosen by whoever produced the file, so the offline verdict renders the did as a CLAIM and the
 //! identity as "unverified (offline)". Only [`IdentityLevel::RegistryResolved`] — unreachable in
@@ -26,10 +33,14 @@
 //! rather than the guard, and would flake at any bound tight enough to be worth asserting.
 #![forbid(unsafe_code)]
 
+use std::ffi::OsString;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use bossclaw_bundle::{verify, Airmem, IdentityLevel, OfflineResolver, Verdict, VerifyError};
+use bossclaw_bundle::{
+    sanitize_for_display, verify, Airmem, IdentityLevel, OfflineResolver, Verdict, VerifyError,
+};
 
 /// Ceiling on the RAW BYTES this verifier will read before handing anything to `serde_json`.
 ///
@@ -40,8 +51,8 @@ use bossclaw_bundle::{verify, Airmem, IdentityLevel, OfflineResolver, Verdict, V
 /// stranger's file, and the two must be free to move independently.
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Exit code for a VERIFIED document.
-const EXIT_VERIFIED: u8 = 0;
+/// Exit code for success: a VERIFIED document, or an answered `--help`.
+const EXIT_OK: u8 = 0;
 
 /// Exit code for a REFUSED document: unreadable as `.airmem`, over [`MAX_INPUT_BYTES`], or verified
 /// and found inconsistent. One code for "do not trust this file", whatever the reason.
@@ -51,8 +62,31 @@ const EXIT_REJECTED: u8 = 1;
 /// about a document. Printed to stderr so it never pollutes a piped verdict.
 const EXIT_USAGE: u8 = 2;
 
-/// The one-line usage string.
+/// The one-line usage string, printed with a complaint. The full [`HELP`] is only for `--help`.
 const USAGE: &str = "usage: air-verify <file.airmem> [--offline]";
+
+/// The `--help` text. This is the first surface a stranger touches, and the exit codes are the only
+/// thing a script reads, so both the meaning of a ✅ and the code legend belong here rather than
+/// only in the source.
+const HELP: &str = "\
+air-verify — check an .airmem memory bundle offline.
+
+usage: air-verify <file.airmem> [--offline]
+
+  --offline    No network, no registry. Today this is the only mode; the flag is
+               accepted now so the command a receiver is told to run keeps working.
+  -h, --help   Show this.
+
+A ✅ result means the file is INTERNALLY consistent: nothing in it has changed
+since it was sealed, and one key sealed all of it. It does NOT tell you who
+recorded it — offline, the did in the file is an unverified claim, because
+whoever produced the file chose every key it contains — and it does not make the
+content true.
+
+exit codes:
+  0  verified (internally consistent)
+  1  do not trust this file: refused, unreadable as .airmem, or inconsistent
+  2  bad invocation, or a path that could not be read";
 
 /// What a run produced: the text the receiver sees, and the process exit code.
 #[derive(Debug, PartialEq, Eq)]
@@ -69,9 +103,19 @@ impl Report {
     }
 }
 
+/// What the arguments asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    /// Verify this path.
+    Verify(PathBuf),
+    /// An explicit `--help` — an answered request, not a usage error.
+    Help,
+}
+
 fn main() -> ExitCode {
-    let report = match parse_args(std::env::args().skip(1)) {
-        Ok(path) => run(&path),
+    let report = match parse_args(std::env::args_os().skip(1)) {
+        Ok(Invocation::Verify(path)) => run(&path),
+        Ok(Invocation::Help) => Report::new(EXIT_OK, HELP),
         Err(complaint) => Report::new(EXIT_USAGE, complaint),
     };
     if report.code == EXIT_USAGE {
@@ -83,15 +127,18 @@ fn main() -> ExitCode {
 }
 
 /// The whole pipeline: bounded read → parse from bytes → verify → render.
-fn run(path: &str) -> Report {
+fn run(path: &Path) -> Report {
+    // The FILENAME is attacker-influenced too — a receiver saves the file under whatever name it
+    // arrived with — so it is sanitized everywhere it is echoed, exactly like the did.
+    let shown = sanitize_for_display(&path.to_string_lossy());
     let bytes = match read_bounded(path) {
         Ok(b) => b,
-        Err(InputError::Io(detail)) => return Report::new(EXIT_USAGE, detail),
+        Err(InputError::Io(e)) => return Report::new(EXIT_USAGE, format!("cannot read {shown}: {e}")),
         Err(InputError::TooLarge) => {
             return Report::new(
                 EXIT_REJECTED,
                 format!(
-                    "❌ REFUSED — {path} is larger than the {MAX_INPUT_BYTES} bytes this verifier \
+                    "❌ REFUSED — {shown} is larger than the {MAX_INPUT_BYTES} bytes this verifier \
                      will read; refused before parsing (an AIR export is at most 30 MiB)"
                 ),
             )
@@ -102,12 +149,22 @@ fn run(path: &str) -> Report {
     let bundle: Airmem = match serde_json::from_slice(&bytes) {
         Ok(b) => b,
         Err(e) => {
-            return Report::new(EXIT_REJECTED, format!("❌ INVALID — not a well-formed .airmem: {e}"))
+            // The parser quotes the offending field back, and a JSON-escaped control character
+            // survives into that message, so it is attacker-controlled text like any other.
+            return Report::new(
+                EXIT_REJECTED,
+                format!(
+                    "❌ INVALID — not a well-formed .airmem: {}",
+                    sanitize_for_display(&e.to_string())
+                ),
+            );
         }
     };
     match verify(&bundle, &OfflineResolver) {
-        Ok(verdict) => Report::new(EXIT_VERIFIED, render_verdict(&bundle, &verdict)),
-        Err(e) => Report::new(EXIT_REJECTED, format!("❌ FAILED — {}", render_err(&e))),
+        Ok(verdict) => Report::new(EXIT_OK, render_verdict(&bundle.manifest.did, &verdict)),
+        // Second gate: `Malformed` details are already sanitized where the verifier builds them, so
+        // this cannot be the only defence — it is what keeps a future variant from re-opening it.
+        Err(e) => Report::new(EXIT_REJECTED, format!("❌ FAILED — {}", sanitize_for_display(&render_err(&e)))),
     }
 }
 
@@ -116,27 +173,36 @@ fn run(path: &str) -> Report {
 /// `--offline` is accepted and does nothing because offline is the ONLY mode SP-V1 has
 /// ([`OfflineResolver`] is the only resolver that ships). Taking it now means the flag a receiver is
 /// told to pass keeps working unchanged when SP-V2 adds registry resolution and makes it meaningful.
-fn parse_args(args: impl Iterator<Item = String>) -> Result<String, String> {
-    let mut file: Option<String> = None;
+///
+/// Arguments arrive as [`OsString`], never `String`: `std::env::args()` PANICS on a non-UTF-8
+/// argument, and a path this tool cannot name is a path a receiver may well have.
+fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Invocation, String> {
+    let mut file: Option<PathBuf> = None;
     for a in args {
-        match a.as_str() {
-            "--offline" => {}
-            "-h" | "--help" => return Err(USAGE.to_string()),
-            s if s.starts_with('-') => return Err(format!("unknown flag: {s}\n{USAGE}")),
-            s => {
-                if file.replace(s.to_string()).is_some() {
-                    return Err(format!("only one file argument allowed\n{USAGE}"));
-                }
+        // Every flag is ASCII by construction, so a non-UTF-8 argument can only be a path.
+        let flagish = a.to_str();
+        if flagish == Some("--offline") {
+            continue;
+        }
+        if flagish == Some("-h") || flagish == Some("--help") {
+            return Ok(Invocation::Help);
+        }
+        if let Some(s) = flagish {
+            if s.starts_with('-') {
+                return Err(format!("unknown flag: {}\n{USAGE}", sanitize_for_display(s)));
             }
         }
+        if file.replace(PathBuf::from(a)).is_some() {
+            return Err(format!("only one file argument allowed\n{USAGE}"));
+        }
     }
-    file.ok_or_else(|| USAGE.to_string())
+    file.map(Invocation::Verify).ok_or_else(|| USAGE.to_string())
 }
 
 /// Why an input never reached the parser.
 enum InputError {
     /// The path could not be opened or read — the invocation is wrong, so this is not a verdict.
-    Io(String),
+    Io(std::io::Error),
     /// The file is over [`MAX_INPUT_BYTES`]. Detected WITHOUT reading past the ceiling.
     TooLarge,
 }
@@ -146,14 +212,14 @@ enum InputError {
 /// `take(MAX + 1)` is what makes the guard cheap as well as correct: the reader stops one byte past
 /// the ceiling, so a 100 MB file costs a bounded read and an immediate refusal instead of a
 /// multi-hundred-MB allocation and a tens-of-seconds parse. That one extra byte is the whole
-/// detection: `len > MAX` can only be true if the file had more to give.
+/// detection: `len > MAX` can only be true if the file had more to give — and `>`, not `>=`, is why
+/// a file of EXACTLY the ceiling still gets verified.
 ///
 /// That stream bound is the AUTHORITATIVE one. The `metadata().len()` pre-check is never the guard:
 /// it is a claim about a file that can grow between the stat and the read, and it is absent or a lie
 /// for the non-regular paths an argument can name (`/dev/zero` reports 0 and yields bytes forever).
-fn read_bounded(path: &str) -> Result<Vec<u8>, InputError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| InputError::Io(format!("cannot read {path}: {e}")))?;
+fn read_bounded(path: &Path) -> Result<Vec<u8>, InputError> {
+    let file = std::fs::File::open(path).map_err(InputError::Io)?;
     // Fast path: when the size is already known, refusing costs a stat instead of a 32 MiB read
     // (measured: 0.41 s off a cold cache, for a file this verifier was never going to look at).
     // `file.metadata()` fstats THE OPEN HANDLE, so it cannot be raced onto a different file, and an
@@ -162,9 +228,7 @@ fn read_bounded(path: &str) -> Result<Vec<u8>, InputError> {
         return Err(InputError::TooLarge);
     }
     let mut bytes = Vec::new();
-    file.take(MAX_INPUT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| InputError::Io(format!("cannot read {path}: {e}")))?;
+    file.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes).map_err(InputError::Io)?;
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(InputError::TooLarge);
     }
@@ -175,7 +239,11 @@ fn read_bounded(path: &str) -> Result<Vec<u8>, InputError> {
 /// the did is an unverified claim the file makes about itself: the brain key in the manifest and the
 /// identity key in the binding were both chosen by whoever produced the file, so a self-consistent
 /// bundle proves internal consistency and NOTHING about who recorded it (spec §2.5 C3).
-fn render_verdict(bundle: &Airmem, verdict: &Verdict) -> String {
+///
+/// Takes the did rather than the whole [`Airmem`] so the [`IdentityLevel::RegistryResolved`] arm —
+/// unreachable in SP-V1, and the ONLY copy in this tool allowed to make the strong identity claim —
+/// can be exercised by a test before SP-V2 makes it live.
+fn render_verdict(did: &str, verdict: &Verdict) -> String {
     let (identity, did_qualifier, note) = match verdict.identity {
         IdentityLevel::UnverifiedOffline => (
             "unverified (offline)",
@@ -194,7 +262,10 @@ fn render_verdict(bundle: &Airmem, verdict: &Verdict) -> String {
     };
     let mut lines = vec![
         "✅ VERIFIED (L1 self-consistent)".to_string(),
-        format!("did: {} ({did_qualifier})", bundle.manifest.did),
+        // The did is chosen by whoever produced the file. Printed raw, a newline in it prints a
+        // forged `identity:` line of this tool's own output, and an ANSI cursor-up erases the
+        // honest one — a green verdict with someone else's name on it.
+        format!("did: {} ({did_qualifier})", sanitize_for_display(did)),
         format!("identity: {identity}"),
     ];
     lines.extend(
@@ -229,18 +300,28 @@ fn render_err(e: &VerifyError) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::path::Path;
     use std::time::{Duration, Instant};
 
-    fn args(list: &[&str]) -> Result<String, String> {
-        parse_args(list.iter().map(|s| (*s).to_string()))
+    /// A did that tries to print its own verdict line and then erase the honest one above it.
+    const FORGED_DID: &str =
+        "did:wba:evil.com:x\nidentity: registry-resolved\u{1b}[1A\u{1b}[2K";
+
+    fn args(list: &[&str]) -> Result<Invocation, String> {
+        parse_args(list.iter().map(OsString::from))
+    }
+
+    fn verify_path(list: &[&str]) -> PathBuf {
+        match args(list).unwrap() {
+            Invocation::Verify(p) => p,
+            other => panic!("expected a path, got {other:?}"),
+        }
     }
 
     #[test]
     fn parse_args_takes_one_path_and_the_inert_offline_flag() {
-        assert_eq!(args(&["a.airmem"]).unwrap(), "a.airmem");
-        assert_eq!(args(&["a.airmem", "--offline"]).unwrap(), "a.airmem");
-        assert_eq!(args(&["--offline", "a.airmem"]).unwrap(), "a.airmem");
+        assert_eq!(verify_path(&["a.airmem"]), PathBuf::from("a.airmem"));
+        assert_eq!(verify_path(&["a.airmem", "--offline"]), PathBuf::from("a.airmem"));
+        assert_eq!(verify_path(&["--offline", "a.airmem"]), PathBuf::from("a.airmem"));
     }
 
     #[test]
@@ -248,7 +329,30 @@ mod tests {
         assert!(args(&[]).is_err());
         assert!(args(&["a.airmem", "b.airmem"]).is_err());
         assert!(args(&["--nope", "a.airmem"]).unwrap_err().contains("unknown flag: --nope"));
-        assert!(args(&["-h"]).unwrap_err().contains("usage:"));
+    }
+
+    #[test]
+    fn help_is_an_answer_not_a_usage_error() {
+        // An explicit request, so it exits 0 on stdout — `main` only routes EXIT_USAGE to stderr.
+        assert_eq!(args(&["-h"]).unwrap(), Invocation::Help);
+        assert_eq!(args(&["--help"]).unwrap(), Invocation::Help);
+        // The exit codes live nowhere else a user can see them.
+        for line in ["  0  verified", "  1  do not trust this file", "  2  bad invocation"] {
+            assert!(HELP.contains(line), "help must document the exit codes: missing {line:?}");
+        }
+        assert!(HELP.contains("does NOT tell you who"), "help must say what a ✅ is not");
+    }
+
+    #[test]
+    fn a_non_utf8_path_is_a_path_not_a_panic() {
+        // `std::env::args()` panics on this; `args_os` is why the tool merely fails to open it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(b"/tmp/\xff\xfe.airmem".to_vec());
+            let inv = parse_args(std::iter::once(raw.clone())).unwrap();
+            assert_eq!(inv, Invocation::Verify(PathBuf::from(raw)));
+        }
     }
 
     #[test]
@@ -281,9 +385,50 @@ mod tests {
 
     #[test]
     fn an_unreadable_path_is_a_usage_complaint_not_a_verdict() {
-        let report = run("/nonexistent/nope.airmem");
+        let report = run(Path::new("/nonexistent/nope.airmem"));
         assert_eq!(report.code, EXIT_USAGE);
         assert!(report.text.starts_with("cannot read "), "text={}", report.text);
+    }
+
+    // ---- The honesty contract, on both arms of the identity level. ----
+
+    #[test]
+    fn only_the_registry_resolved_arm_makes_the_strong_identity_claim() {
+        // L2 is inert in SP-V1 (`OfflineResolver` is the only resolver that ships), so without this
+        // the one copy allowed to say who recorded the bytes would go live in SP-V2 never having
+        // been rendered once.
+        let labels = vec!["captured session, content only; not independently verified".to_string()];
+        let did = "did:wba:example.com:me";
+
+        let strong = render_verdict(
+            did,
+            &Verdict { item_labels: labels.clone(), identity: IdentityLevel::RegistryResolved },
+        );
+        assert!(strong.contains("identity: registry-resolved"), "{strong}");
+        assert!(strong.contains("which registered identity's brain recorded these exact bytes"), "{strong}");
+        assert!(!strong.contains("NOT verified"), "the L1 qualifier must not leak into L2: {strong}");
+
+        let offline = render_verdict(
+            did,
+            &Verdict { item_labels: labels, identity: IdentityLevel::UnverifiedOffline },
+        );
+        assert!(offline.contains("identity: unverified (offline)"), "{offline}");
+        assert!(offline.contains("(claimed by this file, NOT verified)"), "{offline}");
+        assert!(!offline.contains("which registered identity"), "{offline}");
+    }
+
+    #[test]
+    fn an_attacker_chosen_did_cannot_forge_a_line_of_this_tool_s_output() {
+        let text = render_verdict(
+            FORGED_DID,
+            &Verdict { item_labels: vec!["l".into()], identity: IdentityLevel::UnverifiedOffline },
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("identity:")).count(),
+            1,
+            "the file printed its own identity line: {text}"
+        );
+        assert!(!text.contains('\u{1b}'), "an ANSI escape reached the terminal: {text:?}");
     }
 
     // ---- The parse boundary. ----
@@ -305,7 +450,7 @@ mod tests {
     const OVERSIZED_DISPLAY_DEPTH: usize = 16;
 
     /// Wall-clock ceiling on the refusal. The measurement is IN-PROCESS (no `Command`, no exec
-    /// latency in the number), so the gated path — an `fstat` and a rejection — has ~400× headroom
+    /// latency in the number), so the gated path — an `fstat` and a rejection — has ~1000× headroom
     /// under this and cannot flake, while the ungated path is 4× to 13× OVER it.
     const REFUSAL_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -329,7 +474,7 @@ mod tests {
         format!(r#"{{"leaf":"00","class":"seal_vouched","kind":"session","display":{display}}}"#)
     }
 
-    fn write_oversized(dir: &Path) -> std::path::PathBuf {
+    fn write_oversized(dir: &Path) -> PathBuf {
         let path = dir.join("huge.airmem");
         let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
         out.write_all(OVERSIZED_HEADER.as_bytes()).unwrap();
@@ -363,7 +508,7 @@ mod tests {
         );
 
         let started = Instant::now();
-        let report = run(path.to_str().unwrap());
+        let report = run(&path);
         let elapsed = started.elapsed();
 
         // The deadline is asserted FIRST, deliberately: it is the assertion the mutant must die by,
@@ -377,6 +522,31 @@ mod tests {
         assert_eq!(report.code, EXIT_REJECTED, "text={}", report.text);
         assert!(report.text.contains("❌ REFUSED"), "text={}", report.text);
         assert!(report.text.contains("refused before parsing"), "text={}", report.text);
+    }
+
+    #[test]
+    fn the_ceiling_is_exact_to_the_byte() {
+        // Without this, a one-byte drift (`>` to `>=`, or `take(MAX)`) changes which documents are
+        // refusable and NO test notices: the oversized fixture is refused either way.
+        let dir = tempfile::tempdir().unwrap();
+
+        let at_limit = dir.path().join("at-limit.airmem");
+        std::fs::write(&at_limit, vec![b'a'; MAX_INPUT_BYTES as usize]).unwrap();
+        let report = run(&at_limit);
+        assert!(
+            report.text.contains("❌ INVALID"),
+            "a file of exactly {MAX_INPUT_BYTES} bytes must reach the parser, got: {}",
+            report.text
+        );
+
+        let over = dir.path().join("over.airmem");
+        std::fs::write(&over, vec![b'a'; MAX_INPUT_BYTES as usize + 1]).unwrap();
+        let report = run(&over);
+        assert!(
+            report.text.contains("❌ REFUSED"),
+            "one byte over the ceiling must be refused, got: {}",
+            report.text
+        );
     }
 
     // The OTHER half of the bound — that `take(MAX + 1)`, not the `metadata()` pre-check, is what

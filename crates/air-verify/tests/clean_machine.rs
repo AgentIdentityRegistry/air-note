@@ -26,9 +26,18 @@ fn run(path: &Path, home: &Path) -> Output {
         .expect("air-verify runs")
 }
 
+/// The did an honest fixture claims.
+const HONEST_DID: &str = "did:wba:example.com:me";
+
 /// Mint a brain key + an identity card and seal a real one-session bundle through the public build
 /// API. Nothing is checked in: the fixture is produced by the same code the verifier verifies.
 fn write_valid(dir: &Path) -> PathBuf {
+    write_valid_with_did(dir, HONEST_DID, "fixture.airmem")
+}
+
+/// The same, with the did as a parameter — an attacker mints their OWN keys, so the did in a bundle
+/// that verifies is whatever they typed.
+fn write_valid_with_did(dir: &Path, did: &str, name: &str) -> PathBuf {
     let brain = SigningKey::from_bytes(&[1u8; 32]);
     let brain_mb = multibase::encode(multibase::Base::Base58Btc, brain.verifying_key().to_bytes());
     let idk = SigningKey::from_bytes(&[9u8; 32]);
@@ -36,7 +45,7 @@ fn write_valid(dir: &Path) -> PathBuf {
     let payload = BindingPayload {
         brain_verifying_key: brain_mb.clone(),
         identity_verifying_key: idvk,
-        did: "did:wba:example.com:me".into(),
+        did: did.into(),
         purpose: "memory-signing".into(),
         epoch: 1,
         created_at: "2026-07-21T00:00:00Z".into(),
@@ -44,7 +53,7 @@ fn write_valid(dir: &Path) -> PathBuf {
     let bsig = sign_bytes(&binding_signing_bytes(&payload), &idk);
     let bundle = build_bundle(BuildInput {
         created_at: "2026-07-21T00:00:00Z".into(),
-        did: "did:wba:example.com:me".into(),
+        did: did.into(),
         brain_verifying_key: brain_mb,
         selection_description: "1 session".into(),
         items: vec![ItemInput::SealVouched {
@@ -55,7 +64,7 @@ fn write_valid(dir: &Path) -> PathBuf {
         binding: Binding { payload, identity_signature: bsig },
         brain_key: &brain,
     });
-    let path = dir.join("fixture.airmem");
+    let path = dir.join(name);
     std::fs::write(&path, canonical_json(&bundle).expect("bundle serializes")).unwrap();
     path
 }
@@ -97,6 +106,38 @@ fn an_offline_pass_never_renders_as_a_verified_identity() {
     assert!(out.contains("did:wba:example.com:me (claimed by this file, NOT verified)"), "stdout={out}");
     assert!(!out.contains("registry-resolved"), "stdout={out}");
     assert!(!out.contains("which registered identity"), "stdout={out}");
+}
+
+#[test]
+fn a_verifying_bundle_cannot_forge_a_verdict_line_through_its_did() {
+    // THE ATTACK, end to end and on the real binary: the producer mints their own brain AND identity
+    // key — that is the premise of L1 — so this bundle VERIFIES (exit 0) while its did carries a
+    // newline plus an ANSI cursor-up and erase-line. Printed raw, it prints its own
+    // `identity: registry-resolved` above the honest line and then deletes the honest one, leaving a
+    // clean forged green verdict with no residue.
+    let dir = tempfile::tempdir().unwrap();
+    let forged_did = "did:wba:evil.com:x\nidentity: registry-resolved\u{1b}[1A\u{1b}[2K";
+    let path = write_valid_with_did(dir.path(), forged_did, "forged.airmem");
+
+    let out = run(&path, dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "the bundle really does verify — that is the premise: {stdout}");
+    assert_eq!(
+        stdout.lines().filter(|l| l.starts_with("identity:")).count(),
+        1,
+        "the file printed an identity line of its own: {stdout}"
+    );
+    assert!(!out.stdout.contains(&0x1b), "a raw ESC byte reached the terminal: {stdout:?}");
+    assert!(stdout.contains("identity: unverified (offline)"), "{stdout}");
+}
+
+#[test]
+fn help_exits_zero_on_stdout_and_publishes_the_exit_codes() {
+    let out = Command::new(env!("CARGO_BIN_EXE_air-verify")).arg("--help").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(stdout.contains("exit codes:"), "{stdout}");
+    assert!(String::from_utf8_lossy(&out.stderr).is_empty(), "help is an answer, not a complaint");
 }
 
 #[test]

@@ -41,6 +41,7 @@ use bossclaw_canon::sign::{verify_bytes, verify_hash, VerifyingKey};
 
 use self::semver_lite::major;
 use crate::binding::{binding_hash, decode_ed25519_key, verify_binding_internal, MAX_ENCODED_SIG_LEN};
+use crate::display::sanitize_for_display;
 use crate::format::{Airmem, AirmemItem, ItemClass};
 use crate::merkle;
 use crate::resolver::IdentityResolver;
@@ -192,9 +193,12 @@ pub fn verify(bundle: &Airmem, resolver: &dyn IdentityResolver) -> Result<Verdic
     // a second one exists with these six fields, an unenforced `purpose` lets an attacker lift that
     // card over their own brain key and reach RegistryResolved — re-attribution (C1) by side door.
     if bundle.binding.payload.purpose != BINDING_PURPOSE {
+        // Sanitized where the detail is BUILT, not where it is printed: the producer of a
+        // verifying bundle chooses this string, and every surface that quotes it back — the CLI,
+        // the app sheet, SP-V2's WASM host — would otherwise have to re-solve the same hole.
         return Err(VerifyError::Malformed(format!(
             "binding.payload.purpose must be \"{BINDING_PURPOSE}\", got \"{}\"",
-            bundle.binding.payload.purpose
+            sanitize_for_display(&bundle.binding.payload.purpose)
         )));
     }
 
@@ -257,9 +261,10 @@ fn check_item_shape(i: usize, item: &AirmemItem) -> Result<(), VerifyError> {
     match item.class {
         ItemClass::Stamped => {
             if item.kind != KIND_NOTE {
+                // Sanitized at the build point, for the same reason as `purpose` above.
                 return Err(bad(&format!(
                     "class=stamped requires kind=\"{KIND_NOTE}\", got \"{}\"",
-                    item.kind
+                    sanitize_for_display(&item.kind)
                 )));
             }
             let Some(signature) = item.signature.as_deref() else {
@@ -558,6 +563,41 @@ mod tests {
         // ...so the purpose tag is provably the only thing rejecting it.
         let e = verify(&b, &off()).unwrap_err();
         assert!(malformed_detail(&e).contains("purpose"), "got {e:?}");
+    }
+
+    // ---- The two details that QUOTE attacker-chosen text are sanitized where they are BUILT ----
+    #[test]
+    fn malformed_details_never_carry_attacker_control_characters() {
+        // The premise of L1: the producer mints their own keys, so a bundle can carry any string it
+        // likes and still be internally consistent. A `\n` here prints a whole extra line of the
+        // verifier's own output on whatever surface quotes the detail back.
+        let forged = "x\nidentity: registry-resolved\u{1b}[1A\u{1b}[2K";
+        let no_control = |detail: &str| {
+            assert!(
+                !detail.chars().any(char::is_control),
+                "this detail can forge a line on any surface that prints it: {detail:?}"
+            );
+        };
+
+        // (a) `binding.payload.purpose` — re-signed and re-committed exactly as in the
+        //     domain-separation test above, so the purpose tag is the only thing rejecting it.
+        let mut b = valid_bundle();
+        let idk = SigningKey::from_bytes(&[9u8; 32]);
+        b.binding.payload.purpose = forged.into();
+        b.binding.identity_signature = sign_bytes(&binding_signing_bytes(&b.binding.payload), &idk);
+        b.manifest.binding_hash = hex::encode(crate::binding::binding_hash(&b.binding));
+        reseal(&mut b);
+        let detail = malformed_detail(&verify(&b, &off()).unwrap_err()).to_string();
+        assert!(detail.contains("purpose"), "{detail}");
+        no_control(&detail);
+
+        // (b) `items[].kind` on a stamped item, with every hash and the seal made green again.
+        let mut b = valid_bundle();
+        b.items[0].kind = forged.into();
+        reindex(&mut b);
+        let detail = malformed_detail(&verify(&b, &off()).unwrap_err()).to_string();
+        assert!(detail.contains("kind"), "{detail}");
+        no_control(&detail);
     }
 
     // ---- RE-ATTRIBUTION FORGERY (C1): fresh binding by a DIFFERENT identity over the same brain key.
