@@ -65,14 +65,26 @@ describe("ExportReviewSheet", () => {
     expect(within(row).getByText(/which tool ran it/i)).toBeInTheDocument();
     expect(within(row).getByText(/when it started and ended/i)).toBeInTheDocument();
     expect(within(row).getByText(/rough size/i)).toBeInTheDocument();
-    expect(within(row).getByText(/folder name/i)).toBeInTheDocument();
+    // The project label is the HOME-RELATIVE remainder, and it has THREE shapes — the copy must be
+    // true of all of them (see `receiver_safe_project`, `crates/bossclawd/src/capture/paths.rs`).
+    // "the project's folder name" was true of only the first, which is why this is pinned by
+    // example rather than by adjective.
+    expect(within(row).getByText(/where the project sits inside your home folder/i)).toBeInTheDocument();
+    expect(within(row).getByText(/“air-note”/)).toBeInTheDocument();          // directly under home
+    expect(within(row).getByText(/“Desktop-QT”/)).toBeInTheDocument();        // nested: dash-joined
+    expect(within(row).getByText(/nothing at all when that can’t be worked out safely/i))
+      .toBeInTheDocument();                                                   // fails closed: omitted
     // …and what never does — scoped to the LABELS, because the body is a different promise: a
     // captured transcript routinely quotes paths (the daemon's `emit_tool_use` writes each tool
     // call's `input` JSON verbatim, so a Read/Edit call carries its `file_path`). "Ships the FULL
     // transcript" and "never the full path" in one breath would read as a promise about the file.
-    expect(within(row).getByText(/never the full path or the session id in the file’s labels/i))
-      .toBeInTheDocument();
+    expect(within(row).getByText(/never anything above your home folder/i)).toBeInTheDocument();
+    expect(within(row).getByText(/never your user name/i)).toBeInTheDocument();
+    expect(within(row).getByText(/never the session id, in the file’s labels/i)).toBeInTheDocument();
     expect(within(row).getByText(/transcript itself may quote paths/i)).toBeInTheDocument();
+
+    // The narrower claim must not come back: a bare "folder name" is false for `Desktop-QT`.
+    expect(within(row).queryByText(/folder name —|project’s folder name/i)).toBeNull();
     // The receiver's verifier labels it exactly this way.
     expect(within(row).getByText(/captured session, content only/i)).toBeInTheDocument();
     expect(within(row).getByText(/not independently verified/i)).toBeInTheDocument();

@@ -20,7 +20,13 @@ export type ExportIngest = { id: string; path: string };
  *   `event_bytes`. That test also pins that `signed_by_did` is the ENGINE placeholder, not the
  *   owner's did (`ENGINE_SIGNER_DID`, the M4/M7 gap): this line must not claim the owner's name is
  *   inside the note. When M4/M7 lands, that test fails and the clause gets restored.
- * - `session` ↔ `a_session_display_discloses_exactly_these_fields` — the six `display` fields.
+ * - `session` ↔ `a_session_display_discloses_exactly_these_fields` — the `display` fields. `project`
+ *   is CONDITIONAL and its value is decoded daemon-side by `receiver_safe_project`
+ *   (`crates/bossclawd/src/capture/paths.rs`): the owner's home slug is stripped off Claude Code's
+ *   dash-encoded project slug, so what survives is the HOME-RELATIVE remainder, still dash-joined
+ *   (`-Users-x-Desktop-QT` → `Desktop-QT`, never `QT` — the encoding is ambiguous and trimming
+ *   further would be guessing). It fails CLOSED to `None` — key omitted — for a project outside
+ *   home, for home itself, and when `$HOME` is unset. All three shapes must be true of this line.
  */
 const DISCLOSURE = {
   note:
@@ -29,8 +35,11 @@ const DISCLOSURE = {
     "that signature on its own.",
   session:
     "Ships the FULL transcript of this session, plus its title, which tool ran it, when it started " +
-    "and ended, its rough size, and the project’s folder name — never the full path or the session " +
-    "id in the file’s labels. The transcript itself may quote paths you or your tools typed.",
+    "and ended, its rough size, and where the project sits inside your home folder — “air-note” for " +
+    "a project in your home folder, “Desktop-QT” for one inside Desktop, and nothing at all when " +
+    "that can’t be worked out safely. Never anything above your home folder, never your user name, " +
+    "never the session id, in the file’s labels. The transcript itself may quote paths you or your " +
+    "tools typed.",
   ingest:
     "Ships the full extracted text of this file — content only. No path, no folder, no file hash " +
     "travels with it; the path below is only shown here so you can tell the files apart.",
