@@ -13971,6 +13971,61 @@ mod tests {
         );
     }
 
+    /// FROZEN: exactly what a STAMPED note item discloses — the sibling of the session test below,
+    /// and the coupling whose ABSENCE let the app's note copy drift.
+    ///
+    /// The app's export review sheet (`apps/desktop/src/memory/ExportReviewSheet.tsx`,
+    /// `DISCLOSURE.note`) enumerates these to the owner. A stamped item ships `event_bytes` — the
+    /// WHOLE canonical event — so every key here is disclosed, and the sheet must name them.
+    ///
+    /// **The `signed_by_did` assertion is the point of this test.** The field ships, but its value
+    /// is [`ENGINE_SIGNER_DID`] — a constant identical on every install (`signer_did`, the
+    /// documented M4/M7 gap), NOT the owner's did. The owner's real did travels via `manifest.did`
+    /// (asserted below) and the binding card. A review once read "the field ships" as "the owner's
+    /// did ships" and had the app promise it; this pins the difference so the mistake needs a
+    /// deliberate edit. **When M4/M7 threads the real did, this test fails — and that is the signal
+    /// to restore the "your AIR name (your did), which is written inside the note itself" clause to
+    /// `DISCLOSURE.note`.**
+    #[test]
+    fn a_stamped_note_discloses_exactly_these_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = open_log(dir.path());
+        let embedder = MockEmbedder::new(8);
+        let note_id = log.remember(&embedder, "a shared fact").unwrap();
+        log.set_binding(binding_attestation(&log, 1)).unwrap();
+        let text = log
+            .export_bundle(&selection(vec![note_id], vec![], vec![]), &HashMap::new())
+            .unwrap();
+        let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
+
+        let event_bytes =
+            bundle.items[0].event_bytes.as_deref().expect("a stamped note ships its event bytes");
+        let event: serde_json::Value = serde_json::from_str(event_bytes).unwrap();
+        let mut keys: Vec<&str> =
+            event.as_object().expect("an event is an object").keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["content", "id", "prev_hash", "signed_by_did", "ts", "type"],
+            "the owner-facing export disclosure enumerates exactly these"
+        );
+
+        // The `signed_by_did` VALUE is the engine placeholder, not the owner. See the doc above
+        // before "fixing" the app copy on the strength of the field's existence.
+        assert_eq!(
+            event["signed_by_did"], ENGINE_SIGNER_DID,
+            "still the engine placeholder — if this fails, M4/M7 landed: restore the did clause in \
+             apps/desktop/src/memory/ExportReviewSheet.tsx DISCLOSURE.note"
+        );
+        // …and THIS is where the owner's real did travels (from the binding card), which is what
+        // the sheet's always-on identifier paragraph discloses.
+        assert_eq!(
+            bundle.manifest.did, "did:wba:example.com:me",
+            "the manifest carries the owner's did, and it is NOT the engine placeholder"
+        );
+        assert_ne!(bundle.manifest.did, ENGINE_SIGNER_DID);
+    }
+
     /// FROZEN: exactly which fields a session's `display` object discloses.
     ///
     /// The app's export review sheet (`apps/desktop/src/memory/ExportReviewSheet.tsx`,

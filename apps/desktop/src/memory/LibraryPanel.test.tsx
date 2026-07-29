@@ -467,8 +467,9 @@ describe("LibraryPanel", () => {
     });
     fireEvent.click(within(sheet).getByRole("button", { name: /Export signed bundle/ }));
 
-    // Note ids and ingest ids travel in their OWN buckets (they seal as different item classes);
-    // sessions are empty until the wire carries their capture event id.
+    // Note ids and ingest ids travel in their OWN buckets (they seal as different item classes).
+    // Sessions are empty here only because none was ticked — the three-class case is covered by
+    // "exports all three classes and addresses a session by its CAPTURE EVENT id" below.
     await waitFor(() =>
       expect(exportBundle).toHaveBeenCalledWith(["n1"], [], ["f1"], "for review"),
     );

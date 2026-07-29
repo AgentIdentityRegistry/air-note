@@ -38,10 +38,15 @@ describe("ExportReviewSheet", () => {
     expect(within(row).getByText(/exact text/i)).toBeInTheDocument();
     expect(within(row).getByText(/when you saved it/i)).toBeInTheDocument();
     expect(within(row).getByText(/brain’s signature/i)).toBeInTheDocument();
-    // …including the owner's did: `Event.signed_by_did` has no `skip_serializing_if`, and
-    // `canonical_bytes` strips only `hash`/`signature`, so the did is inside every stamped item's
-    // `event_bytes`. An exhaustive list missing an item is the failure this sheet exists to prevent.
-    expect(within(row).getByText(/your AIR name \(your did\)/i)).toBeInTheDocument();
+    // …and NOT the owner's did. `event_bytes` does carry a `signed_by_did` FIELD, but its VALUE is
+    // `ENGINE_SIGNER_DID` (`did:wba:bossclaw-engine`) — a constant identical on every install, the
+    // documented M4/M7 gap. The owner's real did travels via `manifest.did` and the binding, which
+    // the always-on paragraph discloses. Claiming it is "inside the note" over-states what ships,
+    // and this sheet must be exact in BOTH directions. Pinned in core by
+    // `a_stamped_note_discloses_exactly_these_fields`, which fails the day M4/M7 plumbs the real
+    // did — at which point this sentence gets restored.
+    expect(within(row).queryByText(/your AIR name/i)).toBeNull();
+    expect(within(row).queryByText(/\bdid\b/i)).toBeNull();
     // The chain link is to the previous EVENT in the whole log — which may be a session capture or
     // an ingest, not a note — so the copy must not promise "the note before it".
     expect(within(row).getByText(/whatever you recorded just before it/i)).toBeInTheDocument();
@@ -61,8 +66,13 @@ describe("ExportReviewSheet", () => {
     expect(within(row).getByText(/when it started and ended/i)).toBeInTheDocument();
     expect(within(row).getByText(/rough size/i)).toBeInTheDocument();
     expect(within(row).getByText(/folder name/i)).toBeInTheDocument();
-    // …and what never does.
-    expect(within(row).getByText(/never the full path or the session id/i)).toBeInTheDocument();
+    // …and what never does — scoped to the LABELS, because the body is a different promise: a
+    // captured transcript routinely quotes paths (the daemon's `emit_tool_use` writes each tool
+    // call's `input` JSON verbatim, so a Read/Edit call carries its `file_path`). "Ships the FULL
+    // transcript" and "never the full path" in one breath would read as a promise about the file.
+    expect(within(row).getByText(/never the full path or the session id in the file’s labels/i))
+      .toBeInTheDocument();
+    expect(within(row).getByText(/transcript itself may quote paths/i)).toBeInTheDocument();
     // The receiver's verifier labels it exactly this way.
     expect(within(row).getByText(/captured session, content only/i)).toBeInTheDocument();
     expect(within(row).getByText(/not independently verified/i)).toBeInTheDocument();
@@ -91,11 +101,16 @@ describe("ExportReviewSheet", () => {
    * is correct; staying quiet about the identifier travelling at all is under-disclosure — and the
    * consequence an owner would actually want is that the did is the SAME across exports.
    */
-  it("discloses that a durable identifier and the public keys ship in every file", () => {
+  it("discloses the identifier and linkability WITHOUT promising the name proves anything", () => {
     renderSheet();
     const disclosure = screen.getByText(/your AIR name \(your did\) and your public keys/i);
     expect(disclosure).toBeInTheDocument();
+    // Linkability — the consequence an owner most needs.
     expect(disclosure).toHaveTextContent(/two receivers can tell two files came from the same person/i);
+    // Matching is something a receiver who ALREADY knows the name can do…
+    expect(disclosure).toHaveTextContent(/already knows your AIR name can match it against the file/i);
+    // …and offline the name is only a claim (`did_injection.airmem`: any did verifies green).
+    expect(disclosure).toHaveTextContent(/a claim they cannot check yet/i);
   });
 
   /**
@@ -113,6 +128,9 @@ describe("ExportReviewSheet", () => {
     // and "cryptographically verifies you" would all slip past them. Match the SHAPE of the claim.
     expect(copy).not.toMatch(/\b(prov|verif|confirm)\w*\s+(your|which|the)\s+identity/i);
     expect(copy).not.toMatch(/\b(prov|verif|confirm)\w*\s+who\s+you\s+are/i);
+    // The same claim wearing plainer clothes — "so the receiver can tell it came from you" promises
+    // identity without using any of the verbs above, and slipped past the tripwire once already.
+    expect(copy).not.toMatch(/\b(tell|know|see)\w*\s+(it|they)\s+came\s+from\s+you/i);
     // It says the honest thing instead: sealing is about authorship, not secrecy.
     expect(copy).toMatch(/does not keep it secret/i);
   });

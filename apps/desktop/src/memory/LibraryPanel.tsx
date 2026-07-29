@@ -290,7 +290,10 @@ export function LibraryPanel() {
         <p style={{ fontSize: 13, color: "var(--error)", margin: "0 0 12px" }}>
           Couldn’t load your library: {loadError}
         </p>
-        <Button variant="secondary" onClick={() => void load()}>Try again</Button>
+        {/* Retry ALL three lists: `load` covers sessions+notes, `loadFiles` is its own quiet loader,
+            and a retry that silently skipped one would leave the Files section empty for the rest
+            of the session with no way to ask again. */}
+        <Button variant="secondary" onClick={() => { void load(); void loadFiles(); }}>Try again</Button>
       </Card>
     );
   }

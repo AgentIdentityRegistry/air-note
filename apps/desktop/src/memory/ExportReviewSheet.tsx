@@ -14,19 +14,23 @@ export type ExportIngest = { id: string; path: string };
  * entire signed event, a session as its entire transcript. Showing the owner less than what leaves
  * their machine would make this sheet a lie.
  *
- * `session` ENUMERATES the six fields core puts in a session's `display` object, so it is coupled to
- * core by a frozen-key test — `a_session_display_discloses_exactly_these_fields` in
- * `crates/bossclaw-core/src/log.rs`. Adding a seventh field there fails that test, which names this
- * constant in its message. Do not edit one side without the other.
+ * Both enumerating lines are coupled to core by frozen-key tests in `crates/bossclaw-core/src/log.rs`,
+ * which name this constant in their failure messages. Do not edit one side without the other:
+ * - `note` ↔ `a_stamped_note_discloses_exactly_these_fields` — the canonical event fields inside
+ *   `event_bytes`. That test also pins that `signed_by_did` is the ENGINE placeholder, not the
+ *   owner's did (`ENGINE_SIGNER_DID`, the M4/M7 gap): this line must not claim the owner's name is
+ *   inside the note. When M4/M7 lands, that test fails and the clause gets restored.
+ * - `session` ↔ `a_session_display_discloses_exactly_these_fields` — the six `display` fields.
  */
 const DISCLOSURE = {
   note:
     "Ships the full signed record of this note: its exact text, when you saved it, its id, the link " +
-    "to whatever you recorded just before it, your AIR name (your did), which is written inside the " +
-    "note itself, and your brain’s signature. The receiver can check that signature on its own.",
+    "to whatever you recorded just before it, and your brain’s signature. The receiver can check " +
+    "that signature on its own.",
   session:
     "Ships the FULL transcript of this session, plus its title, which tool ran it, when it started " +
-    "and ended, its rough size, and the project’s folder name — never the full path or the session id.",
+    "and ended, its rough size, and the project’s folder name — never the full path or the session " +
+    "id in the file’s labels. The transcript itself may quote paths you or your tools typed.",
   ingest:
     "Ships the full extracted text of this file — content only. No path, no folder, no file hash " +
     "travels with it; the path below is only shown here so you can tell the files apart.",
@@ -130,12 +134,16 @@ export function ExportReviewSheet({
           publish anything.
         </p>
 
-        {/* The identifier disclosure. How STRONG the identity claim is belongs to the receiver's
-            verifier, not here — but THAT it travels, in every file, is the owner's to know, and the
-            linkability consequence is the part they would actually want warned about. */}
+        {/* The identifier disclosure. THAT the name travels, in every file, is the owner's to know,
+            and the linkability consequence is the part they would actually want warned about. What
+            this must NOT do is promise the name proves anything: a bundle can name any did and
+            still verify green offline (the branch's own `did_injection.airmem` vector), which is
+            why `air-verify` prints "claimed by this file, NOT verified". Matching is something a
+            receiver who ALREADY knows the name can do; checking it needs the registry (SP-V2). */}
         <p style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.5, margin: 0 }}>
-          Every file also carries your AIR name (your did) and your public keys, so the receiver can
-          tell it came from you — and so two receivers can tell two files came from the same person.
+          Every file also carries your AIR name (your did) and your public keys, so a receiver who
+          already knows your AIR name can match it against the file, and so two receivers can tell
+          two files came from the same person. Offline, that name is a claim they cannot check yet.
         </p>
 
         {notes.length > 0 ? (
