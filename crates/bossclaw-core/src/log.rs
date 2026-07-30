@@ -478,6 +478,27 @@ pub struct ExportSelection {
     pub created_at: String,
 }
 
+/// What the DAEMON discloses for one selected session (Rung-5 §2.4). Both fields are supplied by
+/// the daemon because core cannot derive either safely:
+///
+/// - `body` — core is fs-free, so it cannot read the capture `.md`.
+/// - `project` — core cannot decode `CurrentSession::project`. In this product that field is Claude
+///   Code's cwd ENCODING (`-Users-ahnkwangwook-air-note`), not a path; decoding it needs `$HOME` and
+///   the encoding rule, both of which live daemon-side. Core guessing here is what shipped the
+///   owner's username in every session bundle (whole-branch security review).
+///
+/// `None` project means "the daemon could not produce a receiver-safe name" — core then falls back
+/// to [`project_display_name`], which refuses anything it cannot prove is a path, so the key is
+/// OMITTED rather than guessed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDisclosure {
+    /// The session's TRANSCRIPT TEXT ONLY, capture front matter already stripped (see the
+    /// caller contract on [`EventLog::export_bundle`]).
+    pub body: String,
+    /// The receiver-safe project name the daemon decoded, or `None` to omit the key.
+    pub project: Option<String>,
+}
+
 /// A CURRENT ingested file as an export subject. Mirrors the [`CurrentSession`] shape (event id
 /// plus a display key). The `canonical_path` is for the APP's selection list ONLY — it NEVER
 /// enters the bundle (spec A-N1).
@@ -554,6 +575,18 @@ fn checked_display(display: serde_json::Value) -> Result<serde_json::Value, Expo
 /// as well as `/` so a Windows-shaped value degrades to its last component instead of shipping
 /// whole (out of scope for today's fixtures, but the failure mode there would be a silent leak).
 fn project_display_name(project: &str) -> Option<String> {
+    // FAIL CLOSED on a value with no path separator. This function can only reduce a PATH; a
+    // separator-less string is not proven receiver-safe, and treating it as "already just a folder
+    // name" is exactly the bug the whole-branch security review found: this product's only producer
+    // (`bossclawd`'s `transcript_project_slug`) supplies Claude Code's cwd ENCODING, where `/` is
+    // already rewritten to `-`. `-Users-ahnkwangwook-air-note` has nothing to split on, so `rsplit`
+    // returned it whole and every exported session shipped the owner's username and directory
+    // layout — defeating the owner ruling (`d0c5b14`: folder name only, never the path) and A-N1.
+    // Core cannot decode that slug (it knows neither `$HOME` nor the encoding), so it must refuse
+    // rather than guess; the DAEMON supplies the decoded name via `SessionDisclosure::project`.
+    if !project.contains('/') && !project.contains('\\') {
+        return None;
+    }
     let name = project.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next()?;
     // `.` and `..` name no project a receiver could recognize — omit them like the root case
     // rather than shipping a component that means "wherever the exporter happened to be".
@@ -8258,15 +8291,19 @@ impl EventLog {
     }
 
     /// Build a sealed `.airmem` for `selection`. PURE-READ (spec §2.4) and FS-FREE:
-    /// `session_bodies` maps each selected session event id → its (daemon-read, bounded) body, and
-    /// a session absent from the map gets a placeholder — a missing body must never abort a
-    /// whole export. Returns the canonical `.airmem` text.
+    /// `session_disclosures` maps each selected session event id → what the daemon discloses for it
+    /// (see [`SessionDisclosure`]), and a session absent from the map gets a placeholder body — a
+    /// missing body must never abort a whole export. Returns the canonical `.airmem` text.
     ///
-    /// CALLER CONTRACT for `session_bodies`: supply the session's TRANSCRIPT TEXT ONLY, with any
-    /// capture front matter STRIPPED. A-N1 covers a seal-vouched item's `content` exactly as it
-    /// covers its `display`, and this function cannot tell a transcript from a YAML header that
-    /// still carries `project:`, `session_id:`, and `sha256:` — it ships whatever it is handed.
+    /// CALLER CONTRACT for [`SessionDisclosure::body`]: supply the session's TRANSCRIPT TEXT ONLY,
+    /// with any capture front matter STRIPPED. A-N1 covers a seal-vouched item's `content` exactly
+    /// as it covers its `display`, and this function cannot tell a transcript from a YAML header
+    /// that still carries `project:`, `session_id:`, and `sha256:` — it ships whatever it is handed.
     /// Every local-metadata guarantee below is therefore conditional on this contract.
+    ///
+    /// CALLER CONTRACT for [`SessionDisclosure::project`]: supply a name that is safe for a stranger
+    /// to read, or `None`. Core will NOT rescue a bad one — it only refuses a value it cannot prove
+    /// is a path (see [`project_display_name`]).
     ///
     /// Order: chain check → dedupe → empty check → item ceiling → binding → per-class gather with
     /// SERVER-SIDE guards → build → size check. The empty check comes before `build_bundle`, which
@@ -8286,7 +8323,7 @@ impl EventLog {
     pub fn export_bundle(
         &self,
         selection: &ExportSelection,
-        session_bodies: &HashMap<String, String>,
+        session_disclosures: &HashMap<String, SessionDisclosure>,
     ) -> Result<String, ExportError> {
         self.verify_chain().map_err(|_| ExportError::ChainInvalid)?; // S4: never seal a sick brain
         let note_ids = deduped(&selection.note_event_ids);
@@ -8380,9 +8417,9 @@ impl EventLog {
             let s = sessions.iter().find(|s| s.event_id == *id).ok_or_else(|| {
                 ExportError::NotExportable(format!("session {id} is not a current session"))
             })?;
-            let content = session_bodies
-                .get(id)
-                .cloned()
+            let disclosure = session_disclosures.get(id);
+            let content = disclosure
+                .map(|d| d.body.clone())
                 .unwrap_or_else(|| "[session body unavailable at export time]".to_string());
             let mut display = serde_json::json!({
                 "title": s.title,
@@ -8394,7 +8431,14 @@ impl EventLog {
             // `json!` cannot conditionally include a key, and A-N1 wants the field OMITTED rather
             // than emitted empty when the project reduces to nothing. JCS sorts keys, so inserting
             // out of order here does not affect the canonical bytes.
-            if let Some(project) = project_display_name(&s.project) {
+            //
+            // The DAEMON's decoded name wins; `project_display_name` is the belt-and-braces
+            // fallback for a caller that supplied none, and it refuses anything it cannot prove is
+            // a path — so an undecoded slug omits the key instead of shipping the username.
+            let display_project = disclosure
+                .and_then(|d| d.project.clone())
+                .or_else(|| project_display_name(&s.project));
+            if let Some(project) = display_project {
                 display["project"] = serde_json::Value::String(project);
             }
             let display = checked_display(display)?;
@@ -13773,6 +13817,13 @@ mod tests {
         serde_json::json!({ "payload": payload, "identity_signature": identity_signature })
     }
 
+    /// A daemon-shaped [`SessionDisclosure`] carrying only a body. `project: None` is the daemon's
+    /// FAIL-CLOSED shape (it could not decode the slug), which exercises core's
+    /// `project_display_name` fallback — the belt-and-braces path.
+    fn disclosure(body: &str) -> SessionDisclosure {
+        SessionDisclosure { body: body.to_string(), project: None }
+    }
+
     /// An [`ExportSelection`] with fixed description/`created_at`, so an export test varies only
     /// the ids it is about.
     fn selection(
@@ -13898,18 +13949,22 @@ mod tests {
                 },
             )
             .unwrap();
+        // The SECOND session carries the shape production actually emits: Claude Code's cwd
+        // ENCODING, where `/` is already `-`. The slash fixture above cannot catch the leak this
+        // test exists to prevent — `rsplit` reduces it correctly — so without this one the whole
+        // suite stayed green while every real export shipped the username.
         let without_body = log
             .capture_session(
                 &embedder,
                 &SessionMeta {
-                    project: "/Users/SENTINELUSER/SENTINELPROJECT".into(),
+                    project: "-Users-SENTINELUSER-SENTINELPROJECT".into(),
                     ..session_meta("SENTINEL-OTHER-ID", &"bb".repeat(32))
                 },
             )
             .unwrap();
         log.set_binding(binding_attestation(&log, 1)).unwrap();
         let transcript = "the transcript body the receiver is meant to read";
-        let bodies = HashMap::from([(with_body.clone(), transcript.to_string())]);
+        let bodies = HashMap::from([(with_body.clone(), disclosure(transcript))]);
         let text = log
             .export_bundle(&selection(vec![], vec![with_body, without_body], vec![]), &bodies)
             .unwrap();
@@ -13918,6 +13973,10 @@ mod tests {
             "SENTINEL-SESSION-ID",
             "SENTINEL-OTHER-ID",
             "/Users/SENTINELUSER",
+            // The BARE username, with no separators. The slash-qualified needle above cannot catch
+            // a dash-encoded slug leak (`-Users-SENTINELUSER-...` contains no `/Users/`), which is
+            // precisely why the original sweep passed while the bundle carried the username.
+            "SENTINELUSER",
             sha.as_str(),
             "/data/sessions/",
             "session_id",
@@ -13927,12 +13986,24 @@ mod tests {
         ] {
             assert!(!text.contains(needle), "the exported session leaked `{needle}`");
         }
-        // Owner ruling 2026-07-29: the folder NAME ships, the path around it does not.
+        // Owner ruling 2026-07-29: the folder NAME ships, the path around it does not. The
+        // slash-path session still reduces to its basename; the dash-encoded one now omits the key
+        // entirely (core refuses what it cannot prove is a path — the daemon decodes those).
         assert!(
             text.contains("SENTINELPROJECT"),
-            "the receiver still learns which project this was"
+            "the receiver still learns which project the slash-path session was"
         );
         let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
+        // Exactly ONE session names a project: the decodable slash path. The dash-encoded slug
+        // omits the key rather than guessing — that omission IS the fix.
+        let named_projects = bundle
+            .items
+            .iter()
+            .filter(|i| {
+                i.display.as_ref().is_some_and(|d| d.get("project").is_some())
+            })
+            .count();
+        assert_eq!(named_projects, 1, "the undecodable slug session must omit `project`");
         let v = bossclaw_bundle::verify(&bundle, &bossclaw_bundle::OfflineResolver).unwrap();
         assert_eq!(v.item_labels[0], "captured session, content only; not independently verified");
         assert!(bundle.items[0].event_bytes.is_none(), "seal-vouched discloses no event bytes");
@@ -13961,7 +14032,7 @@ mod tests {
         let ev = log.capture_session(&embedder, &session_meta("s1", &"aa".repeat(32))).unwrap();
         log.set_binding(binding_attestation(&log, 1)).unwrap();
         let unstripped = "---\nproject: /Users/SOMEONE/repo\nsession_id: S1\n---\n\ntranscript";
-        let bodies = HashMap::from([(ev.clone(), unstripped.to_string())]);
+        let bodies = HashMap::from([(ev.clone(), disclosure(unstripped))]);
         let text = log.export_bundle(&selection(vec![], vec![ev], vec![]), &bodies).unwrap();
         let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
         assert_eq!(
@@ -14044,7 +14115,7 @@ mod tests {
         let embedder = MockEmbedder::new(8);
         let ev = log.capture_session(&embedder, &session_meta("s1", &"aa".repeat(32))).unwrap();
         log.set_binding(binding_attestation(&log, 1)).unwrap();
-        let bodies = HashMap::from([(ev.clone(), "transcript".to_string())]);
+        let bodies = HashMap::from([(ev.clone(), disclosure("transcript"))]);
         let text = log.export_bundle(&selection(vec![], vec![ev], vec![]), &bodies).unwrap();
         let bundle: bossclaw_bundle::Airmem = serde_json::from_str(&text).unwrap();
 
@@ -14185,10 +14256,20 @@ mod tests {
             Some("air-note"),
             "an absolute path reduces to its basename"
         );
+        // WAS: `Some("air-note")`, blessed as "a bare name is already receiver-safe". That
+        // assumption is exactly what shipped the leak. The only producer in this product emits
+        // Claude Code's cwd ENCODING (`-Users-ahnkwangwook-air-note`) — separator-less, so it took
+        // this branch and passed through WHOLE, username included. A separator-less value is not
+        // proven safe, so core now refuses it and the daemon supplies the decoded name instead.
         assert_eq!(
-            project_display_name("air-note").as_deref(),
-            Some("air-note"),
-            "a bare name is already receiver-safe"
+            project_display_name("air-note"),
+            None,
+            "a separator-less value is NOT provably receiver-safe → omit the key"
+        );
+        assert_eq!(
+            project_display_name("-Users-ahnkwangwook-air-note"),
+            None,
+            "the PRODUCTION slug shape must never pass through — this is the leak, frozen"
         );
         assert_eq!(
             project_display_name("/a/b/").as_deref(),
@@ -14342,7 +14423,7 @@ mod tests {
 
         // ── (a) Select EVERYTHING and export. ──
         let transcript = "## You\nHow do I revoke a trust?\n\n## Assistant\nFile a revocation.\n";
-        let bodies = HashMap::from([(session_ev.clone(), transcript.to_string())]);
+        let bodies = HashMap::from([(session_ev.clone(), disclosure(transcript))]);
         let all = ExportSelection {
             note_event_ids: note_ids.clone(),
             session_event_ids: vec![session_ev.clone()],

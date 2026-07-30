@@ -37,10 +37,13 @@ use bossclawd_proto::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::capture::paths::{claude_projects_root, open_transcript_confined, valid_session_id};
+use crate::capture::paths::{
+    claude_projects_root, home_project_slug, open_transcript_confined, receiver_safe_project,
+    valid_session_id,
+};
 use crate::capture::render::{render_bounds, render_transcript};
 use crate::capture::store::{
-    capture_body, delete_capture, read_capture_markdown, store_capture, CaptureIdentity,
+    capture_body_strict, delete_capture, read_capture_markdown, store_capture, CaptureIdentity,
     CaptureStoreError, CAPTURE_TOOL,
 };
 use crate::engine::reason::{CloudProvider, ReasonerConfig, ReasonerMode};
@@ -566,12 +569,11 @@ async fn export_dispatch(
     // daemon-authored `sessions/` dir — the SAME defense-in-depth check `get_session` applies), then
     // STRIP THE FRONT MATTER.
     //
-    // A-N1, and the reason `capture_body` is called here: `read_capture_markdown` returns the WHOLE
-    // document, and `compose_document`'s front-matter block carries the project PATH, the
+    // A-N1, and the reason `capture_body_strict` is called here: `read_capture_markdown` returns the
+    // WHOLE document, and `compose_document`'s front-matter block carries the project slug, the
     // `session_id`, and the body `sha256`. A session is disclosed as a SEAL_VOUCHED item — content
-    // ONLY — and core already reduces the `display` project to its folder name (owner ruling
-    // `d0c5b14`); handing over the unstripped document would smuggle the very path that ruling
-    // removed straight back in through `content`.
+    // ONLY — so handing over the unstripped document would smuggle exactly the local metadata the
+    // owner ruling (`d0c5b14`) and A-N1 remove from `display`, straight back in through `content`.
     //
     // A body we cannot read (unconfined path, out-of-band deletion, unreadable file) is simply LEFT
     // ABSENT from the map: core already substitutes its placeholder for a missing id, so the export
@@ -583,6 +585,10 @@ async fn export_dispatch(
             Err(e) => return op_error_response(e),
         };
         let sessions_dir = engine.data_dir().map(|d| d.join("sessions"));
+        // Decoding the project slug needs `$HOME` + Claude Code's encoding, both of which live
+        // HERE and nowhere else — core cannot know either, so it must not guess (it refuses).
+        // Absent HOME → every project is omitted, never guessed.
+        let home_slug = home_project_slug();
         for id in &selection.session_event_ids {
             let Some(captured) = sessions.iter().find(|c| &c.event_id == id) else { continue };
             let confined = sessions_dir
@@ -591,9 +597,18 @@ async fn export_dispatch(
             if !confined {
                 continue;
             }
-            if let Ok(document) = read_capture_markdown(Path::new(&captured.path)) {
-                session_bodies.insert(id.clone(), capture_body(&document).to_string());
-            }
+            let Ok(document) = read_capture_markdown(Path::new(&captured.path)) else { continue };
+            // Fail-closed strip: a document that opens a front-matter frame and never closes it is
+            // SKIPPED rather than sealed whole (that fallback would ship the slug, session_id and
+            // sha256 as `content`). Core substitutes its placeholder for the missing id.
+            let Some(body) = capture_body_strict(&document) else { continue };
+            let project = home_slug
+                .as_deref()
+                .and_then(|home| receiver_safe_project(&captured.project, home));
+            session_bodies.insert(
+                id.clone(),
+                bossclaw_core::log::SessionDisclosure { body: body.to_string(), project },
+            );
         }
     }
 

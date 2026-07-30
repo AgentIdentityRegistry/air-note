@@ -51,6 +51,59 @@ pub fn claude_projects_root() -> std::path::PathBuf {
         .join("projects")
 }
 
+/// The owner's `$HOME` rendered in Claude Code's project-slug encoding (every `/` becomes `-`), or
+/// `None` when `HOME` is unset or empty.
+///
+/// DELIBERATELY not sharing [`claude_projects_root`]'s `.`-fallback: that fallback exists so a
+/// degraded launchd environment still yields a scannable path, but here a wrong home slug would
+/// strip the wrong prefix off a project slug and could ship the owner's username. `None` makes the
+/// caller fail CLOSED instead (omit the project), which is the only safe direction for a value that
+/// gets sealed into a shareable file.
+pub fn home_project_slug() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let home = home.to_string_lossy();
+    if home.is_empty() {
+        return None;
+    }
+    Some(home.trim_end_matches('/').replace('/', "-"))
+}
+
+/// Decode a Claude Code project slug into a name that is safe for a stranger to read, given the
+/// owner's home slug from [`home_project_slug`]. PURE, so the production shape is unit-testable
+/// without touching the environment.
+///
+/// Claude Code names its project directories by rewriting the session's cwd with `/` → `-`, so the
+/// real shape on this machine is `-Users-ahnkwangwook-air-note` — the username is IN the slug, and
+/// nothing downstream can split it back out (`bossclaw_core::project_display_name` has no separator
+/// to work with, which is exactly how the leak shipped). Stripping the home slug is the one
+/// reduction that provably removes the username, because the daemon is the only layer that knows
+/// both `$HOME` and the encoding.
+///
+/// Returns `None` — meaning OMIT the key — unless the slug is provably under home:
+/// - a slug that is not `<home_slug>-<something>` (a project outside home, or a different user
+///   whose name merely starts with ours) cannot be reduced safely;
+/// - a slug equal to the home slug names the home directory itself, which has no project name.
+///
+/// RESIDUAL, accepted and documented: what survives is the path RELATIVE to home, still
+/// dash-joined — `-Users-x-Desktop-QT` yields `Desktop-QT`, not `QT`. The last component is NOT
+/// recoverable, because the encoding is ambiguous: `-Users-x-air-note` could be `air-note` or
+/// `air/note`. Reducing further would have to guess, and guessing is what caused this bug. The
+/// username and everything above home are gone, which is what the owner ruling (`d0c5b14`) and A-N1
+/// require.
+pub fn receiver_safe_project(slug: &str, home_slug: &str) -> Option<String> {
+    if home_slug.is_empty() {
+        return None;
+    }
+    let rest = slug.strip_prefix(home_slug)?;
+    // Require a real component boundary: without this, home slug `-Users-ann` would also strip the
+    // start of `-Users-annabel-repo` and leak a DIFFERENT user's name as `abel-repo`.
+    let rest = rest.strip_prefix('-')?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
 /// Open a transcript with ingest-grade containment (I4). `candidate` is the FULL
 /// transcript path, of which `root` must be a lexical prefix — this fn derives the
 /// root-relative path itself (contrast `bossclaw_core::ingest::open_beneath_confined`,
@@ -192,5 +245,59 @@ mod tests {
         // Without the override → `<home>/.claude/projects`. HOME is left untouched
         // (never mutated), so we assert only the invariant suffix, not the home root.
         assert!(claude_projects_root().ends_with(".claude/projects"));
+    }
+
+    /// The decoder is what stops every exported session from carrying the owner's username.
+    /// Driven with the shape this machine actually holds (`~/.claude/projects` contains
+    /// `-Users-ahnkwangwook-air-note`), and pure, so no environment is touched.
+    #[test]
+    fn receiver_safe_project_strips_the_home_slug_and_fails_closed() {
+        let home = "-Users-ahnkwangwook";
+        // The real production shape → the project, username gone.
+        assert_eq!(
+            receiver_safe_project("-Users-ahnkwangwook-air-note", home).as_deref(),
+            Some("air-note")
+        );
+        // Nested under home: the RELATIVE remainder survives, dash-joined. Documented residual —
+        // the last component is unrecoverable because the encoding is ambiguous.
+        assert_eq!(
+            receiver_safe_project("-Users-ahnkwangwook-Desktop-QT", home).as_deref(),
+            Some("Desktop-QT")
+        );
+        // Whatever comes back, the username is never in it.
+        for slug in ["-Users-ahnkwangwook-air-note", "-Users-ahnkwangwook-Desktop-QT"] {
+            let out = receiver_safe_project(slug, home).unwrap();
+            assert!(!out.contains("ahnkwangwook"), "username survived in {out:?}");
+        }
+        // FAIL CLOSED, every direction:
+        assert_eq!(receiver_safe_project(home, home), None, "home itself names no project");
+        assert_eq!(
+            receiver_safe_project("-opt-work-repo", home),
+            None,
+            "a project outside home cannot be reduced safely"
+        );
+        assert_eq!(receiver_safe_project("-Users-ahnkwangwook-air-note", ""), None, "no home slug");
+        // The boundary check: a DIFFERENT user whose name merely starts with ours must not be
+        // silently truncated into `abel-repo`.
+        assert_eq!(
+            receiver_safe_project("-Users-ahnkwangwookabel-repo", home),
+            None,
+            "a prefix match without a component boundary is refused"
+        );
+    }
+
+    /// `home_project_slug` encodes exactly as Claude Code does (`/` → `-`), including the leading
+    /// separator, so its output is a real prefix of a project slug.
+    #[test]
+    fn home_project_slug_matches_claude_codes_encoding() {
+        // Pure re-derivation of the same rule, so this asserts the transform without mutating HOME.
+        let encode = |home: &str| home.trim_end_matches('/').replace('/', "-");
+        assert_eq!(encode("/Users/ahnkwangwook"), "-Users-ahnkwangwook");
+        assert_eq!(encode("/Users/ahnkwangwook/"), "-Users-ahnkwangwook", "trailing slash ignored");
+        // And the real reader agrees with it for this process's HOME, when HOME is set.
+        if let Some(home) = std::env::var_os("HOME") {
+            let expected = encode(&home.to_string_lossy());
+            assert_eq!(home_project_slug().as_deref(), Some(expected.as_str()));
+        }
     }
 }

@@ -1364,7 +1364,7 @@ impl EngineHandle {
         &self,
         onboarded: bool,
         selection: bossclaw_core::log::ExportSelection,
-        session_bodies: std::collections::HashMap<String, String>,
+        session_bodies: std::collections::HashMap<String, bossclaw_core::log::SessionDisclosure>,
     ) -> Result<Result<String, bossclaw_core::log::ExportError>, EngineOpError> {
         let log = self.get_or_open(onboarded).await.map_err(EngineOpError::Open)?;
         spawn_blocking(move || log.export_bundle(&selection, &session_bodies))

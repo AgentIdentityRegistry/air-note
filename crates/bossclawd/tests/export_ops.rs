@@ -21,6 +21,7 @@ use bossclaw_canon::sign::{sign_bytes, SigningKey};
 use bossclaw_bundle::{
     binding_signing_bytes, Binding, BindingPayload, BINDING_PURPOSE,
 };
+use bossclawd::capture::paths::home_project_slug;
 use bossclawd::capture::render::Rendered;
 use bossclawd::capture::store::{store_capture, CaptureIdentity, CAPTURE_TOOL};
 use bossclawd::engine::EngineHandle;
@@ -302,7 +303,7 @@ async fn an_over_cap_selection_is_refused_with_the_typed_size_signal() {
 
     let identity = CaptureIdentity {
         session_id: "oversize-session".into(),
-        project: "/Users/someone/air-note".into(),
+        project: format!("{}-air-note", home_project_slug().expect("HOME is set")),
         tool: CAPTURE_TOOL.into(),
     };
     let rendered = Rendered {
@@ -411,7 +412,7 @@ async fn a_listed_session_event_id_is_the_id_export_accepts() {
 
     let identity = CaptureIdentity {
         session_id: "story-c-session".into(),
-        project: "/Users/someone/air-note".into(),
+        project: format!("{}-air-note", home_project_slug().expect("HOME is set")),
         tool: CAPTURE_TOOL.into(),
     };
     let rendered = Rendered {
@@ -476,12 +477,8 @@ async fn a_listed_session_event_id_is_the_id_export_accepts() {
 // Each is a string that MUST NOT survive into the sealed bundle. They are distinctive enough that
 // a hit can only have come from the capture's front matter.
 
-/// The owner's username, as it appears inside the stored project path.
-const SENTINEL_USER: &str = "sentineluser";
-/// The full project path the capture records — front matter writes it verbatim as `project:`.
-const SENTINEL_PROJECT_PATH: &str = "/Users/sentineluser/wills-and-trusts";
-/// The folder NAME the owner ruling (`d0c5b14`) DOES allow through, via `display.project`. The
-/// positive control: its presence proves the test is not passing because the export shipped nothing.
+/// The folder NAME the owner ruling (`d0c5b14`) allows through, via `display.project`. The positive
+/// control: its presence proves the test is not passing because the export shipped nothing.
 const ALLOWED_PROJECT_NAME: &str = "wills-and-trusts";
 /// The capture's session id — front matter writes it as `session_id:`.
 const SENTINEL_SESSION_ID: &str = "sentinel-session-4f2a";
@@ -517,9 +514,16 @@ async fn exported_session_discloses_the_body_but_no_front_matter_provenance() {
         oversized_lines: 0,
         skipped_unknown: 0,
     };
+    // THE PRODUCTION SHAPE. Claude Code names its project dirs by rewriting the cwd with `/` → `-`,
+    // so on this machine `~/.claude/projects` holds e.g. `-Users-ahnkwangwook-air-note`. Building
+    // the fixture from the REAL home slug is what lets this test catch the leak: the old
+    // hand-written `/Users/sentineluser/...` slash path reduces correctly via `rsplit`, so it stayed
+    // green while every real export shipped the username.
+    let home_slug = home_project_slug().expect("HOME is set in the test environment");
+    let username = home_slug.rsplit('-').next().expect("the home slug has a last component");
     let identity = CaptureIdentity {
         session_id: SENTINEL_SESSION_ID.into(),
-        project: SENTINEL_PROJECT_PATH.into(),
+        project: format!("{home_slug}-{ALLOWED_PROJECT_NAME}"),
         tool: CAPTURE_TOOL.into(),
     };
     store_capture(&engine, dir.path(), &identity, &rendered).await.expect("capture stored");
@@ -528,7 +532,7 @@ async fn exported_session_discloses_the_body_but_no_front_matter_provenance() {
     // otherwise this test could pass against a capture format that never carried the provenance.
     let stored = std::fs::read_to_string(dir.path().join("sessions").join(format!("{SENTINEL_SESSION_ID}.md")))
         .expect("the capture .md is on disk");
-    for sentinel in [SENTINEL_USER, SENTINEL_SESSION_ID, SENTINEL_SHA] {
+    for sentinel in [username, SENTINEL_SESSION_ID, SENTINEL_SHA] {
         assert!(stored.contains(sentinel), "the stored .md front matter carries {sentinel:?}");
     }
 
@@ -560,12 +564,21 @@ async fn exported_session_discloses_the_body_but_no_front_matter_provenance() {
 
     // The bundle still discloses the transcript AND the allowed folder name (positive control).
     assert!(text.contains("How do I revoke a trust?"), "the transcript is disclosed");
-    assert!(
-        text.contains(ALLOWED_PROJECT_NAME),
-        "the folder NAME still rides in display.project (owner ruling d0c5b14)"
+    let probe: bossclaw_bundle::Airmem = serde_json::from_str(&text).expect("parseable .airmem");
+    let display_project = probe.items[0]
+        .display
+        .as_ref()
+        .and_then(|d| d.get("project"))
+        .and_then(|p| p.as_str());
+    assert_eq!(
+        display_project,
+        Some(ALLOWED_PROJECT_NAME),
+        "display.project must be the decoded folder name — the slug's `{home_slug}-` prefix, which \
+         carries the username, is stripped daemon-side (owner ruling d0c5b14)"
     );
-    // ...and none of the front-matter provenance.
-    for sentinel in [SENTINEL_USER, "/Users/", SENTINEL_SESSION_ID, SENTINEL_SHA] {
+    // ...and none of the front-matter provenance. `username` has NO separators, so this is exactly
+    // the grep the old slash-qualified sweep could not perform.
+    for sentinel in [username, "/Users/", SENTINEL_SESSION_ID, SENTINEL_SHA] {
         assert!(
             !text.contains(sentinel),
             "A-N1 LEAK: the sealed bundle carries {sentinel:?} — the capture front matter was not \

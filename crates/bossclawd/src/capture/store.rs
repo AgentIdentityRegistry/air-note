@@ -99,8 +99,31 @@ const MAX_CAPTURE_MD_BYTES: u64 = 16 * 1024 * 1024;
 pub fn read_capture_markdown(md_path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut buf = Vec::new();
-    std::fs::File::open(md_path)?.take(MAX_CAPTURE_MD_BYTES).read_to_end(&mut buf)?;
+    open_capture_no_follow(md_path)?.take(MAX_CAPTURE_MD_BYTES).read_to_end(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Open a capture `.md` with `O_NOFOLLOW` on the leaf, so a symlink planted at
+/// `<data_dir>/sessions/<id>.md` is refused instead of followed.
+///
+/// The path is daemon-authored under a `0700` dir, so this needs an already-compromised account to
+/// matter — but the Rung-5 export raised the consequence from "shown in the app" to "sealed into a
+/// shareable file", which is worth the one flag. This guards the LEAF only; it is not the
+/// full confinement boundary (that is `open_transcript_confined`, for attacker-supplied paths).
+#[cfg(unix)]
+fn open_capture_no_follow(md_path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(md_path)
+}
+
+/// Non-unix: no `O_NOFOLLOW`, so this is a plain open. Mirrors how `paths` splits its per-OS open
+/// rather than pretending the guarantee holds everywhere.
+#[cfg(not(unix))]
+fn open_capture_no_follow(md_path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(md_path)
 }
 
 /// Recover a captured session's passage TEXT by index (Rung-3 Phase-2): the daemon's side of the
@@ -565,16 +588,32 @@ fn front_matter_block(md: &str) -> Option<&str> {
 /// `sha256`, none of which may leave the machine (spec A-N1). Stripping here means the export and
 /// the healer share ONE definition of "the body", so neither can drift into shipping the block.
 pub(crate) fn capture_body(md: &str) -> &str {
+    // The lenient reading, for the healer: an unclosed frame falls back to the whole document.
+    capture_body_strict(md).unwrap_or(md)
+}
+
+/// [`capture_body`], but FAIL-CLOSED on a malformed frame: `None` when the document opens a
+/// front-matter frame it never closes.
+///
+/// The two callers want opposite defaults, so the difference is exactly this `Option`. For
+/// `heal_orphans`, re-chunking a whole malformed document is harmless and better than chunking
+/// nothing. For the Rung-5 EXPORT it is not: the unclosed-frame fallback returns the front matter
+/// too — project slug, `session_id`, `sha256` — and the export SEALS that into a shareable file.
+/// The export therefore skips the body entirely (core substitutes its placeholder for a missing
+/// id), trading one session's content for never disclosing local metadata.
+///
+/// Reachability is low — every writer goes through `atomic_write_0600`, so a torn frame implies
+/// out-of-band tampering — but the artifact is shareable, which is what earns the strict variant.
+pub(crate) fn capture_body_strict(md: &str) -> Option<&str> {
     let Some(rest) = md.strip_prefix("---\n") else {
-        return md; // not framed — the whole document is body
+        return Some(md); // not framed at all — no front matter exists, the whole document is body
     };
-    let Some(end) = rest.find("\n---\n") else {
-        return md; // opened but never closed — treat the whole document as body
-    };
+    // Framed but never closed → refuse (the lenient caller turns this back into "whole document").
+    let end = rest.find("\n---\n")?;
     let after_fence = &rest[end + "\n---\n".len()..];
     // `compose_document` puts a blank line between the block and the body ("---\n\n"); drop
     // exactly one leading '\n' so the body round-trips to exactly what was composed.
-    after_fence.strip_prefix('\n').unwrap_or(after_fence)
+    Some(after_fence.strip_prefix('\n').unwrap_or(after_fence))
 }
 
 #[cfg(test)]
