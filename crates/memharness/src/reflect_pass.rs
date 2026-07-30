@@ -17,12 +17,27 @@ pub fn drive_to_quiescence(
     mut tick_evolve: impl FnMut() -> anyhow::Result<usize>, // returns remaining evolve queue depth
     mut tick_reflect: impl FnMut() -> anyhow::Result<usize>, // returns open-miss count after the tick
 ) -> anyhow::Result<usize> {
+    let mut prev_evolve_left: Option<usize> = None;
     for cycle in 1..=MAX_QUIESCENCE_CYCLES {
         let evolve_left = tick_evolve()?;
         let misses_left = tick_reflect()?;
-        if evolve_left == 0 && misses_left == 0 {
+        // Per-cycle trace (stderr): a stalled queue must NAME itself — the first live run bailed at
+        // the cap with no way to tell WHICH loop stuck, at what depth, or whether ticks did work.
+        eprintln!(
+            "memharness: reflect-gate — cycle {cycle}/{MAX_QUIESCENCE_CYCLES}: \
+             evolve_left={evolve_left} misses_left={misses_left}"
+        );
+        // Quiescence = reflect drained AND evolve at a FIXED POINT (no progress this cycle).
+        // `evolve_left == 0` was the naive bound and can NEVER converge on a file-heavy corpus:
+        // `queue_depth` counts `memory` + `file_ingested` events (log.rs `evolve_status`), but M4a
+        // extraction processes `memory` events ONLY and never advances its cursor past deferred
+        // file items (extract.rs top-of-module) — the depth is a permanent floor there, not a
+        // backlog. The fixed point converges honestly on both corpus shapes, and the per-cycle
+        // trace keeps a genuinely-stuck queue visible instead of hidden.
+        if misses_left == 0 && prev_evolve_left == Some(evolve_left) {
             return Ok(cycle);
         }
+        prev_evolve_left = Some(evolve_left);
     }
     anyhow::bail!(
         "reflect gate: evolve+reflect did not reach quiescence in {MAX_QUIESCENCE_CYCLES} cycles — refusing \
@@ -98,8 +113,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cycles, 3);
-        // A non-converging pass (queue never drains) fails LOUD at the cap, never silently scores.
-        let err = drive_to_quiescence(|| Ok(1), || Ok(0)).unwrap_err();
+        // Converges on a PERMANENT FLOOR (the file-heavy-corpus reality that broke the first live
+        // run): queue_depth counts deferred `file_ingested` items evolve never processes — a
+        // STABLE nonzero depth with reflect drained IS quiescence under fixed-point semantics.
+        let mut m2 = 3usize;
+        let cycles = drive_to_quiescence(|| Ok(880), || {
+            m2 = m2.saturating_sub(1);
+            Ok(m2)
+        })
+        .unwrap();
+        assert_eq!(cycles, 3, "floor stable since cycle 1; misses drain at cycle 3");
+        // Misses that never drain fail LOUD at the cap, never silently score.
+        let err = drive_to_quiescence(|| Ok(0), || Ok(1)).unwrap_err();
         assert!(err.to_string().contains("did not reach quiescence"), "loud non-convergence: {err}");
+        // An evolve queue that never STABILIZES (churn, not a floor) also fails loud.
+        let mut flip = false;
+        let err = drive_to_quiescence(
+            || {
+                flip = !flip;
+                Ok(if flip { 5 } else { 6 })
+            },
+            || Ok(0),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("did not reach quiescence"), "churn is not quiescence: {err}");
     }
 }
