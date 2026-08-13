@@ -79,8 +79,16 @@ impl IdentityStore {
         if !path.exists() {
             return Ok(None);
         }
-        let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let meta: IdentityMetadata = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let mut meta: IdentityMetadata = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        // Tolerate-and-rewrite (see `repair_legacy_created_at`): repair in place so the bad
+        // value stops propagating to every later reader. The rewrite is BEST-EFFORT — a
+        // read-only data dir must not turn "load your identity" into a hard failure, and the
+        // repaired value is returned either way.
+        if let Some(repaired) = repair_legacy_created_at(&meta.created_at) {
+            meta.created_at = repaired;
+            let _ = self.save_metadata(&meta);
+        }
         Ok(Some(meta))
     }
 
@@ -104,6 +112,29 @@ impl IdentityStore {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+}
+
+/// Repair the legacy `created_at` shape, or `None` if `raw` is not that shape.
+///
+/// An early placeholder in `MockAirClient::now_iso` formatted the Unix epoch into the
+/// SECONDS field of a fixed 1970 date — `1970-01-01T00:00:1782190630Z` — producing a string
+/// that parses as neither a timestamp nor an integer. Because the real epoch is embedded in
+/// it, the true instant is RECOVERABLE, so repair is lossless and no DID is ever reissued.
+///
+/// The discriminator is exact: a genuine RFC3339 timestamp can never carry 60 or more in its
+/// seconds field, so `1970-01-01T00:00:00Z` through `:59Z` are real instants and are left
+/// alone. Anything not positively recognized returns `None` — a well-formed value is never
+/// rewritten, and an unrecognized one is never silently replaced with "now".
+fn repair_legacy_created_at(raw: &str) -> Option<String> {
+    /// Genuine seconds fields are `00`..=`59`; at or above this, the field is the smuggled epoch.
+    const MIN_SMUGGLED_EPOCH: i64 = 60;
+    let seconds_field = raw.strip_prefix("1970-01-01T00:00:")?.strip_suffix('Z')?;
+    let epoch: i64 = seconds_field.parse().ok()?;
+    if epoch < MIN_SMUGGLED_EPOCH {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(epoch, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// One-time rename migration: copy the agent's identity secrets from the legacy
@@ -216,5 +247,57 @@ mod migrate_tests {
         assert_eq!(std::fs::read(new_dir.join("identity.json")).unwrap(), b"{\"did\":\"NEW\"}".to_vec());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The legacy value is not merely malformed — the true instant is RECOVERABLE from it,
+    /// because the placeholder embedded the real Unix epoch in the seconds field. Repair is
+    /// therefore lossless, and no DID needs to be reissued.
+    ///
+    /// 1782190630 is the epoch from Peter's own identity.json; it is 2026-06-23T04:57:10Z,
+    /// which matches that file's mtime exactly.
+    #[test]
+    fn legacy_created_at_is_repaired_losslessly() {
+        assert_eq!(
+            repair_legacy_created_at("1970-01-01T00:00:1782190630Z").as_deref(),
+            Some("2026-06-23T04:57:10Z")
+        );
+    }
+
+    /// Repair must be inert on anything it does not positively recognize, so a good value is
+    /// never rewritten and an unknown shape is never silently replaced with "now".
+    #[test]
+    fn only_the_known_legacy_shape_is_repaired() {
+        for untouched in [
+            "2026-05-18T12:00:00Z",            // already correct
+            "1970-01-01T00:00:00Z",            // a genuine epoch-zero instant, seconds in range
+            "1970-01-01T00:00:notanumber Z",   // not the shape
+            "",
+        ] {
+            assert_eq!(repair_legacy_created_at(untouched), None, "must not rewrite {untouched:?}");
+        }
+    }
+
+    /// Tolerate-and-rewrite: a brain already carrying the legacy value is repaired on read AND
+    /// persisted, so the bad string stops propagating — while did/name/username are preserved
+    /// byte-for-byte. Reissuing the DID would be catastrophic and is never acceptable here.
+    #[test]
+    fn load_metadata_repairs_a_legacy_file_in_place_and_preserves_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IdentityStore::new(std::sync::Arc::new(MockVault::new()), dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("identity.json"),
+            br#"{"did":"did:wba:bossclaw.ai:dc16ac8924c30ba0","name":"Peter's Forever Agent","created_at":"1970-01-01T00:00:1782190630Z"}"#,
+        )
+        .unwrap();
+
+        let loaded = store.load_metadata().unwrap().expect("metadata loads");
+        assert_eq!(loaded.created_at, "2026-06-23T04:57:10Z");
+        assert_eq!(loaded.did.0, "did:wba:bossclaw.ai:dc16ac8924c30ba0", "the DID must never change");
+        assert_eq!(loaded.name, "Peter's Forever Agent");
+
+        let on_disk = std::fs::read_to_string(dir.path().join("identity.json")).unwrap();
+        assert!(on_disk.contains("2026-06-23T04:57:10Z"), "repair must persist, got {on_disk}");
+        assert!(!on_disk.contains("1970-01-01T00:00:1782190630Z"), "legacy value must be gone");
+        assert!(on_disk.contains("dc16ac8924c30ba0"), "the DID must survive the rewrite");
     }
 }
