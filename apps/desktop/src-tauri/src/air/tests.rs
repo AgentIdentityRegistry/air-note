@@ -173,3 +173,36 @@ fn identity_serde_round_trip() {
     assert_eq!(back.name, id.name);
     assert_eq!(back.username, id.username);
 }
+
+/// The identity card's `created_at` must be a real RFC3339 UTC instant, pinned to the
+/// house shape used everywhere else in this codebase (`2026-05-18T12:00:00Z`).
+///
+/// Regression guard: an early placeholder formatted the Unix epoch into the SECONDS
+/// field of a fixed 1970 date (`1970-01-01T00:00:1782190630Z`), which parses as
+/// neither a timestamp nor an integer. Parsing it back and re-formatting proves the
+/// emitted string is genuinely a date, not merely a string that resembles one.
+#[tokio::test]
+async fn mock_registration_stamps_a_parseable_utc_timestamp() {
+    let client = MockAirClient::new();
+    let did = Did("did:wba:example.com:stamp-agent".to_string());
+    let manifest = AgentManifest {
+        name: "Stamp Agent".to_string(),
+        description: "pins the created_at format".to_string(),
+        capabilities: vec![],
+        owner_hint: None,
+    };
+
+    let stamped = client.register(&did, &manifest).await.unwrap().record.created_at;
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(&stamped)
+        .unwrap_or_else(|e| panic!("created_at {stamped:?} is not RFC3339: {e}"));
+    assert_eq!(
+        parsed.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        stamped,
+        "created_at must round-trip in the house shape YYYY-MM-DDTHH:MM:SSZ"
+    );
+    assert!(
+        parsed.timestamp() > 1_700_000_000,
+        "created_at {stamped:?} must be the real mint time, not the 1970 placeholder"
+    );
+}

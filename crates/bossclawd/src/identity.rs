@@ -74,4 +74,30 @@ mod tests {
         std::fs::write(dir.path().join(METADATA_FILE), "not json").unwrap();
         assert!(!is_onboarded(dir.path()));
     }
+
+    /// SEAM GUARD (characterization — passes on first run by design, pinning current behavior).
+    ///
+    /// The desktop repairs a legacy `created_at` on read and REWRITES identity.json via
+    /// `save_metadata`, which emits pretty JSON and, unlike the pre-Milestone-G files, an
+    /// explicit `"username": null`. The daemon parses that same file to decide onboarding, so
+    /// a `deny_unknown_fields` or a tightened `username` type added here later would silently
+    /// turn a repaired brain into "not onboarded" and stall the scheduler. This pins the
+    /// post-repair shape as readable.
+    #[test]
+    fn a_repaired_and_rewritten_identity_file_still_reads_as_onboarded() {
+        let dir = tempfile::tempdir().unwrap();
+        // Byte-shape `IdentityStore::save_metadata` produces after repairing a legacy value.
+        let rewritten = serde_json::json!({
+            "did": "did:wba:bossclaw.ai:dc16ac8924c30ba0",
+            "name": "Peter's Forever Agent",
+            "username": serde_json::Value::Null,
+            "created_at": "2026-06-23T04:57:10Z"
+        });
+        std::fs::write(
+            dir.path().join(METADATA_FILE),
+            serde_json::to_string_pretty(&rewritten).unwrap(),
+        )
+        .unwrap();
+        assert!(is_onboarded(dir.path()), "a repaired identity must stay onboarded");
+    }
 }

@@ -37,14 +37,17 @@ impl MockAirClient {
         valid.then_some(handle)
     }
 
+    /// The house timestamp shape, matching every other `created_at` in this codebase
+    /// (`2026-05-18T12:00:00Z`): RFC3339, UTC, second precision, `Z` suffix.
+    ///
+    /// Was a placeholder that formatted the Unix epoch into the SECONDS field of a fixed
+    /// 1970 date (`1970-01-01T00:00:1782190630Z`) — a string that parses as neither a
+    /// timestamp nor an integer. `MockAirClient` is the DEFAULT registry client in
+    /// production (`main.rs`, unless `AIR_AGENT_USE_REAL_AIR` is set), so that value was
+    /// reaching real `identity.json` files. `repair_legacy_created_at` in `identity.rs`
+    /// recovers the true instant from the ones already written.
     fn now_iso() -> String {
-        // Cheap placeholder; replace with chrono if needed elsewhere
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        format!("1970-01-01T00:00:{}Z", secs)
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
     fn hash_secret(secret: &str) -> String {
